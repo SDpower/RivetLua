@@ -1,19 +1,21 @@
 # RivetLua
 
-RivetLua 是規劃中的獨立開源專案，目標是以純 Rust 建立 Lua 編譯器與執行引擎，供其他應用程式嵌入使用。
+English | [繁體中文](README.zh-TW.md) | [한국어](README.ko.md) | [日本語](README.ja.md)
 
-## 目前狀態
+RivetLua is an independent open-source project in the planning stage. It aims to build a Lua compiler and execution engine in pure Rust for embedding in other applications.
 
-專案目前處於規劃階段。Rust SDK、執行引擎、命令列工具，以及相容性與測試結果，均尚未完成。
+## Current status
 
-## 計畫方向
+The Rust SDK, execution engine, and command-line tools have not been implemented yet. Compatibility and test results have not been verified.
 
-- 將 Lua 原始碼或 AST 編譯為經驗證的 bytecode，並由虛擬機器執行。
-- 提供宿主應用程式使用的 Rust SDK、資源控制及可選的執行能力。
-- 依計畫逐階段驗證 Lua 相容性，並在合適的平台評估 JIT／AOT。
+## Planned direction
+
+- Compile Lua source code or AST into verified bytecode and execute it in a virtual machine.
+- Provide a Rust SDK for host applications, resource controls, and optional execution capabilities.
+- Validate Lua compatibility in stages and evaluate JIT/AOT on suitable platforms.
 
 ## License
 
-本專案採雙授權，使用者可擇一遵循：
+This project is dual-licensed. You may choose either license:
 
 [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE) © [@SteveLuo](https://github.com/sdpower)
