@@ -1,0 +1,11 @@
+target/
+**/*.rs.bk
+
+# 本機開發規劃與追蹤文件
+/docs/plane/
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
