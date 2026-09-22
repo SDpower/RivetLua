@@ -14,3 +14,5 @@ p03.parser,lua54,docs/plane/P03.md#p03-1-to-p03-5,rivetlua-compiler,PARSE-001;PA
 compiler,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,後續階段
 runtime,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,後續階段
 c-api,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,P00 只有風險證據
+p04.resolve,lua55,docs/plane/P04.md#p04-1-to-p04-5,rivetlua-compiler,RES-001;RES-002;RES-003;RES-004;RES-005;RES-006;RES-007;RES-ERR-001;RES-ERR-002,PASS,
+p04.resolve,lua54,docs/plane/P04.md#p04-1-to-p04-5,rivetlua-compiler,RES-001;RES-002;RES-003;RES-004;RES-005;RES-006;RES-007;RES-ERR-001;RES-ERR-002,PASS,

@@ -1,0 +1,17 @@
+# P04 gate 子行程每次讀取；負向驗證可暫改後還原。
+profile.lua55-i64f64=lua55-i64f64
+profile.lua54-i64f64=lua54-i64f64
+RES-001.enabled=true
+RES-001.distinct_bindings=true
+RES-002.enabled=true
+RES-003.enabled=true
+RES-004.enabled=true
+RES-004.lua55.reject_undeclared=true
+RES-005.enabled=true
+RES-006.enabled=true
+RES-007.enabled=true
+RES-ERR-001.enabled=true
+RES-ERR-002.enabled=true
+RES-ERR-002.max_scope_depth=2
+RES-ERR-002.max_gotos=0
+RES-ERR-002.max_upvalues=0

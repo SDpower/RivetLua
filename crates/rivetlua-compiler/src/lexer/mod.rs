@@ -24,6 +24,11 @@ pub struct CompileLimits {
     pub max_statements: usize,
     pub max_list_entries: usize,
     pub max_parameters: usize,
+    pub max_bindings_per_function: usize,
+    pub max_scope_depth: usize,
+    pub max_labels: usize,
+    pub max_gotos: usize,
+    pub max_upvalues_per_function: usize,
 }
 
 impl Default for CompileLimits {
@@ -38,6 +43,11 @@ impl Default for CompileLimits {
             max_statements: 50_000,
             max_list_entries: 50_000,
             max_parameters: 255,
+            max_bindings_per_function: 100_000,
+            max_scope_depth: 128,
+            max_labels: 50_000,
+            max_gotos: 50_000,
+            max_upvalues_per_function: 255,
         }
     }
 }
@@ -48,6 +58,7 @@ pub enum DiagnosticCode {
     Lex,
     CompileLimit,
     Parse,
+    Resolve,
 }
 
 /// 不持有完整輸入的詞法診斷。

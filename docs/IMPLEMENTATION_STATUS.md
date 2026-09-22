@@ -17,12 +17,12 @@ Updated: 2026-09-22. This page lists what is implemented in the repository and w
 - [x] **Errors and truthiness:** Division by zero and invalid operands return inspectable core errors. Only nil and false are false; `and` and `or` preserve the selected operand. The [core API](../crates/rivetlua-core/src/lib.rs) and external integration tests pass.
 - [x] **Lua lexical analysis:** The [compiler API](../crates/rivetlua-compiler/src/lib.rs) tokenizes raw bytes for Lua 5.5 and 5.4, preserving spans, positions, literals, and bounded diagnostics. Lua 5.5 treats `global` as a keyword under the strict manual grammar. Both profiles pass the P02 gate.
 - [x] **Lua syntax analysis:** The [compiler API](../crates/rivetlua-compiler/src/lib.rs) parses P02 tokens into an owned AST, preserving expression precedence, parentheses, calls, declarations, and spans. Both profiles pass the P03 gate. This stage verifies syntax structure only.
+- [x] **Lua scope and name resolution:** The [compiler API](../crates/rivetlua-compiler/src/lib.rs) resolves bindings, nested upvalues, read-only names, jumps, close paths, and Lua 5.5 explicit global declarations into an owned resolved AST. Both profiles pass the P04 gate. This stage does not generate bytecode or execute Lua.
 
 Value, numeric, lexical, and syntax tests call Rust APIs directly. **RivetLua cannot yet execute Lua source code, and full Lua language compatibility has not been verified.**
 
 ## Remaining work
 
-- [ ] Resolve scopes, names, and Lua version differences.
 - [ ] Build an intermediate representation, register conventions, bytecode, and a verifier.
 - [ ] Manage heap objects, roots, handles, and allocation failures.
 - [ ] Build a minimal virtual machine for control flow and assignment.
@@ -55,6 +55,7 @@ cargo run --locked -p rivetlua-xtask -- gate P00
 cargo run --locked -p rivetlua-xtask -- gate P01
 cargo run --locked -p rivetlua-xtask -- gate P02
 cargo run --locked -p rivetlua-xtask -- gate P03
+cargo run --locked -p rivetlua-xtask -- gate P04
 ```
 
-`gate P00` checks the project foundation; `gate P01` checks core values and numbers; `gate P02` checks the lexer; `gate P03` checks the parser and reruns earlier gates. No local planning documents are needed to run them. On 2026-09-22, formatting and workspace tests passed with Rust 1.98.1. The foundation, core, lexer, and parser gates passed 22/22, 35/35, 29/29, and 25/25 checks respectively. Reports are generated under `target/rivetlua-reports/`; that directory is not committed and can be recreated with the commands above. Cargo still declares Rust 1.94.1 as the MSRV.
+`gate P00` checks the project foundation; `gate P01` checks core values and numbers; `gate P02` checks the lexer; `gate P03` checks the parser; `gate P04` checks scope and name resolution and reruns earlier gates. No local planning documents are needed to run them. On 2026-09-22, formatting and workspace tests passed with Rust 1.98.1. The foundation, core, lexer, parser, and resolver gates passed 22/22, 35/35, 29/29, 25/25, and 23/23 checks respectively; P04 includes nine cases for each profile. Reports are generated under `target/rivetlua-reports/`; that directory is not committed and can be recreated with the commands above. Cargo still declares Rust 1.94.1 as the MSRV.
