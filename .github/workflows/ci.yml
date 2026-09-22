@@ -46,6 +46,9 @@ jobs:
       - name: Verify core values and numbers
         run: cargo run --locked -p rivetlua-xtask -- gate P01
 
+      - name: Verify compiler lexer
+        run: cargo run --locked -p rivetlua-xtask -- gate P02
+
       - name: Save gate reports
         if: always()
         uses: actions/upload-artifact@v4

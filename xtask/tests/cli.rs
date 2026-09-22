@@ -198,3 +198,130 @@ fn wrong_num_fixture_makes_p01_gate_fail_and_restores_it() {
         .status()
         .unwrap();
 }
+
+#[test]
+fn p02_gate_succeeds_and_writes_json_report() {
+    let _guard = CLI_TEST_LOCK.lock().unwrap();
+    let output = Command::new(BIN)
+        .current_dir(workspace_root())
+        .args(["gate", "P02"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = workspace_root().join("target/rivetlua-reports/gate-P02.json");
+    let parsed = Command::new("python3")
+        .args([
+            "-c",
+            "import json,sys; report=json.load(open(sys.argv[1])); assert report['status'] == 'PASS'; assert any(check['name'] == 'p02-strict-reference' for check in report['checks'])",
+        ])
+        .arg(report)
+        .output()
+        .unwrap();
+    assert!(
+        parsed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&parsed.stderr)
+    );
+}
+
+#[test]
+fn wrong_long_delimiter_fixture_makes_p02_gate_fail_and_restores_it() {
+    let _guard = CLI_TEST_LOCK.lock().unwrap();
+    let fixture = workspace_root().join("tests/p02/fixtures/wrong-long-delimiter.fixture");
+    let original = fs::read_to_string(&fixture).unwrap();
+    let _restore = RestoreFixture {
+        path: fixture.clone(),
+        contents: original.clone(),
+    };
+    fs::write(
+        &fixture,
+        original.replace("expected=E_LEX", "expected=String"),
+    )
+    .unwrap();
+    let output = Command::new(BIN)
+        .current_dir(workspace_root())
+        .args(["gate", "P02"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report =
+        fs::read_to_string(workspace_root().join("target/rivetlua-reports/gate-P02.json")).unwrap();
+    assert!(report.contains("P02-LONG-NEG-001"));
+    assert_gate_report_is_json(&workspace_root().join("target/rivetlua-reports/gate-P02.json"));
+}
+
+#[test]
+fn p02_missing_case_and_wrong_profile_make_gate_fail_with_json() {
+    let _guard = CLI_TEST_LOCK.lock().unwrap();
+    let csv = workspace_root().join("spec/compatibility.csv");
+    let original = fs::read_to_string(&csv).unwrap();
+    let _restore = RestoreFixture {
+        path: csv.clone(),
+        contents: original.clone(),
+    };
+    fs::write(&csv, original.replacen("LEX-ERR-004", "LEX-MISSING-004", 1)).unwrap();
+    let missing_case = Command::new(BIN)
+        .current_dir(workspace_root())
+        .args(["gate", "P02"])
+        .output()
+        .unwrap();
+    assert!(!missing_case.status.success());
+    let report_path = workspace_root().join("target/rivetlua-reports/gate-P02.json");
+    assert_gate_report_is_json(&report_path);
+    assert!(
+        fs::read_to_string(&report_path)
+            .unwrap()
+            .contains("p02-csv")
+    );
+
+    fs::write(
+        &csv,
+        original.replacen("p02.lexer,lua55,", "p02.lexer,common,", 1),
+    )
+    .unwrap();
+    let wrong_profile = Command::new(BIN)
+        .current_dir(workspace_root())
+        .args(["gate", "P02"])
+        .output()
+        .unwrap();
+    assert!(!wrong_profile.status.success());
+    assert_gate_report_is_json(&report_path);
+    assert!(
+        fs::read_to_string(&report_path)
+            .unwrap()
+            .contains("p02-csv")
+    );
+}
+
+#[test]
+fn oversized_token_fixture_makes_p02_gate_fail_and_restores_it() {
+    let _guard = CLI_TEST_LOCK.lock().unwrap();
+    let fixture = workspace_root().join("tests/p02/fixtures/oversized-token.fixture");
+    let original = fs::read_to_string(&fixture).unwrap();
+    let _restore = RestoreFixture {
+        path: fixture.clone(),
+        contents: original.clone(),
+    };
+    fs::write(
+        &fixture,
+        original.replace("expected=E_COMPILE_LIMIT", "expected=PASS"),
+    )
+    .unwrap();
+    let output = Command::new(BIN)
+        .current_dir(workspace_root())
+        .args(["gate", "P02"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report_path = workspace_root().join("target/rivetlua-reports/gate-P02.json");
+    assert_gate_report_is_json(&report_path);
+    assert!(
+        fs::read_to_string(&report_path)
+            .unwrap()
+            .contains("P02-LIMIT-NEG-001")
+    );
+}

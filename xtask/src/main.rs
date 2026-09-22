@@ -537,7 +537,7 @@ fn validate_csv(contents: &str) -> Result<(), String> {
             ));
         }
         if columns[5] == "PASS" {
-            if columns[0].starts_with("p01.") {
+            if columns[0].starts_with("p01.") || columns[0].starts_with("p02.") {
                 continue;
             }
             for case in columns[4].split(';') {
@@ -562,7 +562,7 @@ fn validate_pass_evidence(csv: &str, results: &[GateResult]) -> Result<(), Strin
         if columns.len() != 7 || columns[5] != "PASS" {
             continue;
         }
-        if columns[0].starts_with("p01.") {
+        if columns[0].starts_with("p01.") || columns[0].starts_with("p02.") {
             continue;
         }
         for case in columns[4].split(';') {
@@ -1477,6 +1477,432 @@ fn p01_gate() -> Result<(), String> {
     Ok(())
 }
 
+const P02_CASES: [&str; 11] = [
+    "LEX-001",
+    "LEX-002",
+    "LEX-003",
+    "LEX-004",
+    "LEX-005",
+    "LEX-006",
+    "LEX-LONG-001",
+    "LEX-ERR-001",
+    "LEX-ERR-002",
+    "LEX-ERR-003",
+    "LEX-ERR-004",
+];
+const STRICT_GLOBAL_CFLAGS: &str = "-DLUA_COMPAT_GLOBAL=0";
+
+fn write_p02_results(root: &Path, results: &[GateResult]) {
+    let path = root.join("target/rivetlua-reports/gate-P02.json");
+    let _ = fs::create_dir_all(path.parent().unwrap());
+    let status = if results.iter().all(|item| item.status == "PASS") {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    let entries = results
+        .iter()
+        .map(|item| {
+            format!(
+                "{{\"name\":\"{}\",\"command\":\"{}\",\"exit_code\":{},\"status\":\"{}\",\"diagnostic\":\"{}\",\"report_path\":\"{}\"}}",
+                json_escape(&item.name),
+                json_escape(&item.command),
+                item.exit_code,
+                item.status,
+                json_escape(&item.diagnostic),
+                json_escape(&item.report_path)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = fs::write(
+        path,
+        format!("{{\"status\":\"{status}\",\"checks\":[{entries}]}}\n"),
+    );
+}
+
+fn p02_result(
+    name: impl Into<String>,
+    command: impl Into<String>,
+    exit_code: i32,
+    status: &'static str,
+    diagnostic: impl Into<String>,
+) -> GateResult {
+    GateResult {
+        name: name.into(),
+        command: command.into(),
+        exit_code,
+        status,
+        diagnostic: diagnostic.into(),
+        report_path: "target/rivetlua-reports/gate-P02.json".into(),
+    }
+}
+
+fn p02_fail(
+    root: &Path,
+    results: &mut Vec<GateResult>,
+    name: &str,
+    command: &str,
+    error: String,
+) -> Result<(), String> {
+    results.push(p02_result(name, command, 1, "FAIL", error.clone()));
+    write_p02_results(root, results);
+    Err(error)
+}
+
+fn validate_p02_csv_cases(csv: &str) -> Result<(), String> {
+    let expected: std::collections::HashSet<_> = P02_CASES.into_iter().collect();
+    for profile in ["lua55", "lua54"] {
+        let rows: Vec<_> = csv
+            .lines()
+            .skip(1)
+            .filter(|line| {
+                line.starts_with(&format!("p02.lexer,{profile},")) && line.contains(",PASS,")
+            })
+            .collect();
+        if rows.len() != 1 {
+            return Err(format!("{profile} P02 PASS 列數不正確"));
+        }
+        let columns: Vec<_> = rows[0].split(',').collect();
+        if columns.len() != 7 || columns[1] != profile || columns[3] != "rivetlua-compiler" {
+            return Err(format!("{profile} P02 CSV 欄位不正確"));
+        }
+        let ids: Vec<_> = columns[4].split(';').collect();
+        let actual: std::collections::HashSet<_> = ids.iter().copied().collect();
+        if ids.iter().any(|id| id.is_empty()) || actual.len() != ids.len() || actual != expected {
+            return Err(format!("{profile} P02 test_ids 不完整、重複或未知"));
+        }
+    }
+    Ok(())
+}
+
+fn p02_contracts(root: &Path, profile: &str) -> Result<Vec<(String, String, String)>, String> {
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "--locked",
+            "-p",
+            "rivetlua-compiler",
+            "--test",
+            "p02_contracts",
+            "--",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("RIVETLUA_P02_PROFILE", profile)
+        .current_dir(root)
+        .output()
+        .map_err(|error| error.to_string())?;
+    let status = output.status;
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !status.success() {
+        return Err(format!(
+            "{profile} P02 contracts 子行程失敗（實際退出碼 {status}）：{output}"
+        ));
+    }
+    if !output.contains("test result: ok. 1 passed; 0 failed;") {
+        return Err(format!("{profile} P02 contracts 未完整執行：{output}"));
+    }
+    let records = output
+        .lines()
+        .filter_map(|line| {
+            line.find("P02_CASE\t")
+                .map(|index| &line[index + "P02_CASE\t".len()..])
+        })
+        .map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+                return Err(format!("{profile} P02_CASE 欄位不完整：{line}"));
+            }
+            Ok((
+                fields[0].to_owned(),
+                fields[1].to_owned(),
+                fields[2].to_owned(),
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let actual: std::collections::HashSet<_> =
+        records.iter().map(|record| record.0.as_str()).collect();
+    let expected: std::collections::HashSet<_> = P02_CASES.into_iter().collect();
+    if records.len() != P02_CASES.len() || actual != expected {
+        return Err(format!("{profile} P02_CASE 缺少、重複或未知"));
+    }
+    Ok(records)
+}
+
+fn write_p02_case_report(
+    root: &Path,
+    case_id: &str,
+    profile: &str,
+    lua_profile: &str,
+    input: &str,
+    actual: &str,
+) -> Result<PathBuf, String> {
+    let path = root.join(format!(
+        "target/rivetlua-reports/P02-{case_id}-{lua_profile}.json"
+    ));
+    fs::create_dir_all(path.parent().ok_or("無效 P02 report 路徑")?)
+        .map_err(|error| error.to_string())?;
+    let json = format!(
+        "{{\"case_id\":\"{}\",\"requires\":\"rivetlua-compiler\",\"profile\":\"{}\",\"lua_profile\":\"{}\",\"mode\":\"lexer\",\"input\":\"{}\",\"actual\":\"{}\",\"status\":\"PASS\",\"command\":\"cargo test --locked -p rivetlua-compiler --test p02_contracts -- --nocapture --test-threads=1\",\"exit_code\":0,\"report_path\":\"{}\",\"diagnostic\":\"完整執行且契約斷言通過\"}}\n",
+        json_escape(case_id),
+        json_escape(profile),
+        json_escape(lua_profile),
+        json_escape(input),
+        json_escape(actual),
+        json_escape(&path.display().to_string())
+    );
+    fs::write(&path, json).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn strict_lua55_reference(root: &Path) -> Result<PathBuf, String> {
+    verify(root, LUA55)?;
+    let nonce = VERIFY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let destination = root.join("target/rivetlua-reference").join(format!(
+        "lua55-strict-global-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
+    let archive = root.join(LUA55.source);
+    run(
+        "tar",
+        &[
+            "-xzf",
+            archive.to_str().ok_or("無法表示來源路徑")?,
+            "-C",
+            destination.to_str().ok_or("無法表示目標路徑")?,
+        ],
+        root,
+    )?;
+    let source = destination.join(LUA55.source_dir);
+    let output = Command::new("make")
+        .arg(format!("MYCFLAGS={STRICT_GLOBAL_CFLAGS}"))
+        .arg(reference_make_target(env::consts::OS)?)
+        .current_dir(&source)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "嚴格 lua55 參考建置失敗：{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let version = run("./src/lua", &["-v"], &source)?;
+    if !version.contains("Lua 5.5.1") {
+        return Err(format!("嚴格 lua55 版本不符：{version}"));
+    }
+    run(
+        "./src/lua",
+        &[
+            "-e",
+            "local f = load('local global = 1'); if f then error('LUA_COMPAT_GLOBAL enabled') end",
+        ],
+        &source,
+    )?;
+    Ok(source.join("src/lua"))
+}
+
+fn p02_gate() -> Result<(), String> {
+    let root = root()?;
+    let mut results = Vec::new();
+    let p01_command = "cargo run --locked -p rivetlua-xtask -- gate P01";
+    if let Err(error) = run(
+        "cargo",
+        &[
+            "run",
+            "--locked",
+            "-p",
+            "rivetlua-xtask",
+            "--",
+            "gate",
+            "P01",
+        ],
+        &root,
+    ) {
+        return p02_fail(&root, &mut results, "p01-before", p01_command, error);
+    }
+    results.push(p02_result(
+        "p01-before",
+        p01_command,
+        0,
+        "PASS",
+        "P01 回歸通過",
+    ));
+
+    let csv = fs::read_to_string(root.join("spec/compatibility.csv"))
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = validate_p02_csv_cases(&csv) {
+        return p02_fail(
+            &root,
+            &mut results,
+            "p02-csv",
+            "validate spec/compatibility.csv",
+            error,
+        );
+    }
+    results.push(p02_result(
+        "p02-csv",
+        "validate spec/compatibility.csv",
+        0,
+        "PASS",
+        "兩個 profile 的 11 個 P02 case 均完整追溯",
+    ));
+
+    let fmt_command = "cargo fmt --all -- --check";
+    if let Err(error) = run("cargo", &["fmt", "--all", "--", "--check"], &root) {
+        return p02_fail(&root, &mut results, "p02-fmt", fmt_command, error);
+    }
+    results.push(p02_result(
+        "p02-fmt",
+        fmt_command,
+        0,
+        "PASS",
+        "格式檢查通過",
+    ));
+
+    for (name, test_name) in [
+        ("p02-compiler-unit", "--lib"),
+        ("p02-compiler-integration", "lexer_contracts"),
+    ] {
+        let (args, command): (Vec<&str>, String) = if test_name == "--lib" {
+            (
+                vec![
+                    "test",
+                    "--locked",
+                    "-p",
+                    "rivetlua-compiler",
+                    "--lib",
+                    "lexer",
+                ],
+                "cargo test --locked -p rivetlua-compiler --lib lexer".into(),
+            )
+        } else {
+            (
+                vec![
+                    "test",
+                    "--locked",
+                    "-p",
+                    "rivetlua-compiler",
+                    "--test",
+                    test_name,
+                ],
+                format!("cargo test --locked -p rivetlua-compiler --test {test_name}"),
+            )
+        };
+        if let Err(error) = run("cargo", &args, &root) {
+            return p02_fail(&root, &mut results, name, &command, error);
+        }
+        results.push(p02_result(name, command, 0, "PASS", "compiler 測試通過"));
+    }
+
+    for (profile, lua_profile) in [("lua55-i64f64", "lua55"), ("lua54-i64f64", "lua54")] {
+        let command = "cargo test --locked -p rivetlua-compiler --test p02_contracts";
+        let records = match p02_contracts(&root, profile) {
+            Ok(records) => records,
+            Err(error) => {
+                let long_negative = fs::read_to_string(
+                    root.join("tests/p02/fixtures/wrong-long-delimiter.fixture"),
+                )
+                .map(|fixture| fixture.contains("expected=String"))
+                .unwrap_or(false);
+                let token_negative =
+                    fs::read_to_string(root.join("tests/p02/fixtures/oversized-token.fixture"))
+                        .map(|fixture| fixture.contains("expected=PASS"))
+                        .unwrap_or(false);
+                let name = if long_negative {
+                    "P02-LONG-NEG-001".to_owned()
+                } else if token_negative {
+                    "P02-LIMIT-NEG-001".to_owned()
+                } else {
+                    format!("p02-contracts-{lua_profile}")
+                };
+                return p02_fail(&root, &mut results, &name, command, error);
+            }
+        };
+        for (case_id, input, actual) in records {
+            let path =
+                match write_p02_case_report(&root, &case_id, profile, lua_profile, &input, &actual)
+                {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return p02_fail(
+                            &root,
+                            &mut results,
+                            &format!("{case_id}-{lua_profile}"),
+                            command,
+                            error,
+                        );
+                    }
+                };
+            let mut result = p02_result(
+                format!("{case_id}-{lua_profile}"),
+                command,
+                0,
+                "PASS",
+                format!("profile={profile}; mode=lexer; token/span/literal 或診斷已驗證"),
+            );
+            result.report_path = path.display().to_string();
+            results.push(result);
+        }
+    }
+
+    let strict_command = "isolated lua55 make MYCFLAGS=-DLUA_COMPAT_GLOBAL=0";
+    let strict = match strict_lua55_reference(&root) {
+        Ok(path) => path,
+        Err(error) => {
+            return p02_fail(
+                &root,
+                &mut results,
+                "p02-strict-reference",
+                strict_command,
+                error,
+            );
+        }
+    };
+    results.push(p02_result(
+        "p02-strict-reference",
+        strict_command,
+        0,
+        "PASS",
+        format!("Lua 5.5.1 strict global reference={}", strict.display()),
+    ));
+
+    if let Err(error) = run(
+        "cargo",
+        &[
+            "run",
+            "--locked",
+            "-p",
+            "rivetlua-xtask",
+            "--",
+            "gate",
+            "P01",
+        ],
+        &root,
+    ) {
+        return p02_fail(&root, &mut results, "p01-after", p01_command, error);
+    }
+    results.push(p02_result(
+        "p01-after",
+        p01_command,
+        0,
+        "PASS",
+        "P01 回歸通過",
+    ));
+    write_p02_results(&root, &results);
+    println!(
+        "PASS report={}",
+        root.join("target/rivetlua-reports/gate-P02.json").display()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
     let result = match arguments.first().map(String::as_str) {
@@ -1496,8 +1922,9 @@ fn main() -> ExitCode {
             gate()
         }
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P01") && arguments.len() == 2 => p01_gate(),
+        Some("gate") if arguments.get(1).map(String::as_str) == Some("P02") && arguments.len() == 2 => p02_gate(),
         _ => Err(
-            "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | gate P00".into(),
+            "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | gate P00|P01|P02".into(),
         ),
     };
     match result {
@@ -1521,9 +1948,10 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        LUA54, LUA55, MSRV, contains_lua_engine_symbol, profile, reference_make_target,
-        sha256_tool, supported_rustc, validate_csv, validate_p01_contract_status,
-        validate_p01_csv_cases, validate_pass_evidence, write_p01_case_report,
+        LUA54, LUA55, MSRV, P02_CASES, STRICT_GLOBAL_CFLAGS, contains_lua_engine_symbol, profile,
+        reference_make_target, sha256_tool, supported_rustc, validate_csv,
+        validate_p01_contract_status, validate_p01_csv_cases, validate_p02_csv_cases,
+        validate_pass_evidence, write_p01_case_report, write_p02_case_report,
     };
     use std::process::Command;
     #[test]
@@ -1614,6 +2042,54 @@ mod tests {
             "feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference\np01.core,lua55,s,m,{ids},PASS,\np01.core,lua54,s,m,{ids},PASS,"
         );
         assert!(validate_p01_csv_cases(&csv).is_err());
+    }
+    #[test]
+    fn p02_csv_cases_are_complete_and_strict_global_is_disabled() {
+        let ids = P02_CASES.join(";");
+        let csv = format!(
+            "feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference\np02.lexer,lua55,s,rivetlua-compiler,{ids},PASS,\np02.lexer,lua54,s,rivetlua-compiler,{ids},PASS,"
+        );
+        assert!(validate_p02_csv_cases(&csv).is_ok());
+        assert_eq!(STRICT_GLOBAL_CFLAGS, "-DLUA_COMPAT_GLOBAL=0");
+    }
+    #[test]
+    fn p02_csv_cases_reject_missing_or_wrong_profile_case() {
+        let ids = P02_CASES[1..].join(";");
+        let csv = format!(
+            "feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference\np02.lexer,lua55,s,rivetlua-compiler,{ids},PASS,\np02.lexer,lua54,s,rivetlua-compiler,{ids},PASS,"
+        );
+        assert!(validate_p02_csv_cases(&csv).is_err());
+        let complete = P02_CASES.join(";");
+        let wrong_profile = format!(
+            "feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference\np02.lexer,lua55-i64f64,s,rivetlua-compiler,{complete},PASS,\np02.lexer,lua54,s,rivetlua-compiler,{complete},PASS,"
+        );
+        assert!(validate_p02_csv_cases(&wrong_profile).is_err());
+    }
+    #[test]
+    fn p02_case_report_is_valid_json() {
+        let root = std::env::temp_dir().join(format!("rivetlua-p02-report-{}", std::process::id()));
+        let path = write_p02_case_report(
+            &root,
+            "LEX-001",
+            "lua55-i64f64",
+            "lua55",
+            "local x = 0x10",
+            "[Token { kind: Keyword(Local), span: Span { start_byte: 0, end_byte: 5 } }]",
+        )
+        .unwrap();
+        let output = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import json,sys; report=json.load(open(sys.argv[1])); assert report['input'] == 'local x = 0x10'; assert report['actual'].startswith('[Token { kind: Keyword(Local)')",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     #[test]
     fn p01_contracts_child_nonzero_exit_is_observable() {

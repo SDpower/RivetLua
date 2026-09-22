@@ -1,0 +1,2 @@
+input=[=[abc]]
+expected=E_LEX

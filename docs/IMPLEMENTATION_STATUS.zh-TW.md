@@ -6,7 +6,7 @@
 
 ## 已實作並驗收
 
-- [x] **專案骨架與治理**：Cargo 工作區包含核心程式庫和驗證工具；專案具有 MIT 或 Apache-2.0 雙授權，以及貢獻、安全與治理文件。
+- [x] **專案骨架與治理**：Cargo 工作區包含核心、編譯器程式庫和驗證工具；專案具有 MIT 或 Apache-2.0 雙授權，以及貢獻、安全與治理文件。
 - [x] **Rust 建置基準**：開發使用系統預設 Rust stable。Cargo 宣告最低支援版本（MSRV）為 1.94.1，建置與測試使用 `Cargo.lock` 及 `--locked`。
 - [x] **官方 Lua 對照資料**：保存 Lua 5.5.1 與 5.4.9 的官方原始碼、各自的獨立測試包及授權快照，並驗證版本與 SHA-256。這些資料只供對照，不連入正式 Rust 產物。
 - [x] **相容性資料與測試工具**：建立[相容性清單](../spec/compatibility.csv)、兩個 Lua 版本各自的設定、案例執行器、可解析報告及故意失敗案例。
@@ -15,12 +15,12 @@
 - [x] **核心值模型**：Rust API 可區分 nil、布林值、64 位元整數、雙精度浮點數與不透明物件參照。
 - [x] **數值規則**：集中處理算術、向下整除、餘數、整數環繞、位元運算、轉換及精確的整數／浮點比較。測試涵蓋大整數、NaN、正負零與位移邊界。
 - [x] **錯誤與真假規則**：零除與無效操作數會回傳可檢查的核心錯誤。只有 nil 和 false 為假；`and`／`or` 保留所選操作數。[核心 API](../crates/rivetlua-core/src/lib.rs) 與 crate 外整合測試已通過。
+- [x] **Lua 詞法分析**：[編譯器 API](../crates/rivetlua-compiler/src/lib.rs) 以原始 bytes 辨識 Lua 5.5 與 5.4 的 token，保留 span、行列、literal 與受控診斷；5.5 的 `global` 採手冊嚴格語法。兩個 profile 的 P02 gate 已通過。
 
-目前的值與數值測試直接呼叫 Rust API。**RivetLua 尚不能讀取並執行 Lua 原始碼，也尚未驗證完整的 Lua 語言相容性。**
+值與數值測試直接呼叫 Rust API，lexer 也透過 Rust API 讀取來源 bytes。**RivetLua 尚不能執行 Lua 原始碼，也尚未驗證完整的 Lua 語言相容性。**
 
 ## 待實作
 
-- [ ] 讀取 Lua 原始碼並辨識詞法元素。
 - [ ] 將語法解析為抽象語法樹。
 - [ ] 處理作用域、名稱與 Lua 版本差異。
 - [ ] 建立中介表示、暫存器慣例、bytecode 與驗證器。
@@ -53,6 +53,7 @@ cargo fmt --all -- --check
 cargo test --locked --workspace
 cargo run --locked -p rivetlua-xtask -- gate P00
 cargo run --locked -p rivetlua-xtask -- gate P01
+cargo run --locked -p rivetlua-xtask -- gate P02
 ```
 
-`gate P00` 檢查專案基礎；`gate P01` 檢查核心值與數值。兩者只是命令名稱，執行時不需要本機規劃文件。2026-09-22 使用 Rust 1.98.1 驗證：格式與工作區測試通過；基礎驗收 22/22、核心驗收 35/35 通過，核心驗收也包含基礎回歸。報告產生於 `target/rivetlua-reports/`；該目錄不納入 Git，可用上述命令重建。Cargo 宣告的 MSRV 仍為 1.94.1。
+`gate P00` 檢查專案基礎；`gate P01` 檢查核心值與數值；`gate P02` 檢查 lexer 並包含前階段回歸。這些命令不需要本機規劃文件。2026-09-22 使用 Rust 1.98.1 驗證：格式與工作區測試通過；基礎驗收 22/22、核心驗收 35/35、詞法驗收 29/29 通過。報告產生於 `target/rivetlua-reports/`；該目錄不納入 Git，可用上述命令重建。Cargo 宣告的 MSRV 仍為 1.94.1。

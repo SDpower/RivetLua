@@ -6,7 +6,7 @@ Updated: 2026-09-22. This page lists what is implemented in the repository and w
 
 ## Implemented and verified
 
-- [x] **Project foundation and governance:** The Cargo workspace contains a core library and a verification tool. The project has MIT or Apache-2.0 licensing, contribution, security, and governance documents.
+- [x] **Project foundation and governance:** The Cargo workspace contains core and compiler libraries plus a verification tool. The project has MIT or Apache-2.0 licensing, contribution, security, and governance documents.
 - [x] **Rust build baseline:** Development uses the system default Rust stable toolchain. Cargo declares Rust 1.94.1 as the minimum supported version (MSRV). Builds and tests use `Cargo.lock` with `--locked`.
 - [x] **Official Lua reference material:** The repository contains verified source archives, separate test archives, and license snapshots for Lua 5.5.1 and 5.4.9. Versions and SHA-256 hashes are checked. These archives are reference material and are not linked into the Rust product.
 - [x] **Compatibility data and test tooling:** The [compatibility inventory](../spec/compatibility.csv), separate settings for the two Lua versions, a case runner, parseable reports, and deliberate failure cases are in place.
@@ -15,12 +15,12 @@ Updated: 2026-09-22. This page lists what is implemented in the repository and w
 - [x] **Core value model:** Rust APIs distinguish nil, booleans, 64-bit integers, double-precision floats, and opaque object references.
 - [x] **Numeric rules:** Centralized operations cover arithmetic, floor division, remainder, integer wrapping, bitwise operations, conversions, and precise integer-to-float comparisons. Tests cover large integers, NaN, signed zero, and shift boundaries.
 - [x] **Errors and truthiness:** Division by zero and invalid operands return inspectable core errors. Only nil and false are false; `and` and `or` preserve the selected operand. The [core API](../crates/rivetlua-core/src/lib.rs) and external integration tests pass.
+- [x] **Lua lexical analysis:** The [compiler API](../crates/rivetlua-compiler/src/lib.rs) tokenizes raw bytes for Lua 5.5 and 5.4, preserving spans, positions, literals, and bounded diagnostics. Lua 5.5 treats `global` as a keyword under the strict manual grammar. Both profiles pass the P02 gate.
 
-These value and numeric tests call Rust APIs directly. **RivetLua cannot yet read and execute Lua source code, and full Lua language compatibility has not been verified.**
+Value and numeric tests call Rust APIs directly. The lexer reads source bytes through a Rust API. **RivetLua cannot yet execute Lua source code, and full Lua language compatibility has not been verified.**
 
 ## Remaining work
 
-- [ ] Read Lua source and recognize lexical tokens.
 - [ ] Parse syntax into an abstract syntax tree.
 - [ ] Resolve scopes, names, and Lua version differences.
 - [ ] Build an intermediate representation, register conventions, bytecode, and a verifier.
@@ -53,6 +53,7 @@ cargo fmt --all -- --check
 cargo test --locked --workspace
 cargo run --locked -p rivetlua-xtask -- gate P00
 cargo run --locked -p rivetlua-xtask -- gate P01
+cargo run --locked -p rivetlua-xtask -- gate P02
 ```
 
-`gate P00` checks the project foundation; `gate P01` checks core values and numbers. These are command names, and no local planning documents are needed to run them. On 2026-09-22, formatting and workspace tests passed with Rust 1.98.1. The foundation gate passed 22/22 checks, and the core gate passed 35/35 checks, including a foundation regression. Reports are generated under `target/rivetlua-reports/`; that directory is not committed and can be recreated with the commands above. Cargo still declares Rust 1.94.1 as the MSRV.
+`gate P00` checks the project foundation; `gate P01` checks core values and numbers; `gate P02` checks the lexer and reruns earlier gates. No local planning documents are needed to run them. On 2026-09-22, formatting and workspace tests passed with Rust 1.98.1. The foundation, core, and lexer gates passed 22/22, 35/35, and 29/29 checks respectively. Reports are generated under `target/rivetlua-reports/`; that directory is not committed and can be recreated with the commands above. Cargo still declares Rust 1.94.1 as the MSRV.

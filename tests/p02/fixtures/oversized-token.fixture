@@ -1,0 +1,3 @@
+input="abcd"
+max_token_bytes=3
+expected=E_COMPILE_LIMIT

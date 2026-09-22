@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "rivetlua-compiler"
+version = "0.0.0"
+dependencies = [
+ "rivetlua-core",
+]
+
+[[package]]
 name = "rivetlua-core"
 version = "0.0.0"
 
