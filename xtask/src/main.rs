@@ -155,11 +155,31 @@ fn run(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
         ))
     }
 }
+
+fn sha256_tool(os: &str) -> Result<(&'static str, &'static [&'static str]), String> {
+    match os {
+        "macos" => Ok(("shasum", &["-a", "256"])),
+        "linux" => Ok(("sha256sum", &[])),
+        _ => Err(format!("不支援的 SHA-256 平台：{os}")),
+    }
+}
+
+fn reference_make_target(os: &str) -> Result<&'static str, String> {
+    match os {
+        "macos" => Ok("macosx"),
+        "linux" => Ok("linux"),
+        _ => Err(format!("不支援的參考程式建置平台：{os}")),
+    }
+}
+
 fn hash(root: &Path, relative: &str, expected: &str) -> Result<(), String> {
     if !root.join(relative).is_file() {
         return Err(format!("缺少離線快照：{relative}"));
     }
-    let output = run("shasum", &["-a", "256", relative], root)?;
+    let (program, prefix) = sha256_tool(env::consts::OS)?;
+    let mut args = prefix.to_vec();
+    args.push(relative);
+    let output = run(program, &args, root)?;
     (output.split_whitespace().next() == Some(expected))
         .then_some(())
         .ok_or_else(|| format!("SHA-256 不符：{relative}"))
@@ -257,7 +277,7 @@ fn build(root: &Path, profile: Profile) -> Result<PathBuf, String> {
         root,
     )?;
     let source = destination.join(profile.source_dir);
-    run("make", &["macosx"], &source)?;
+    run("make", &[reference_make_target(env::consts::OS)?], &source)?;
     let version = run("./src/lua", &["-v"], &source)?;
     if !version.contains(&format!("Lua {}", profile.version)) {
         return Err(format!("{} 參考程式版本不符：{version}", profile.name));
@@ -443,13 +463,23 @@ fn scan_lua_symbols(root: &Path) -> Result<(), String> {
         &["-g", binary.to_str().ok_or("無法表示 binary 路徑")?],
         root,
     )?;
-    if output
-        .lines()
-        .any(|line| line.contains(" T _lua_newstate") || line.contains(" T _luaL_newstate"))
-    {
+    if contains_lua_engine_symbol(&output) {
         return Err("正式 Rust binary 定義官方 Lua engine 符號".into());
     }
     Ok(())
+}
+
+fn contains_lua_engine_symbol(output: &str) -> bool {
+    output.lines().any(|line| {
+        let mut fields = line.split_whitespace().rev();
+        let symbol = fields.next();
+        let kind = fields.next();
+        kind == Some("T")
+            && matches!(
+                symbol,
+                Some("_lua_newstate" | "_luaL_newstate" | "lua_newstate" | "luaL_newstate")
+            )
+    })
 }
 
 fn validate_csv(contents: &str) -> Result<(), String> {
@@ -757,11 +787,16 @@ fn gate() -> Result<(), String> {
         diagnostic: "xtask binary 單元測試通過".into(),
         report_path: "target/rivetlua-reports/gate-P00.json".into(),
     });
+    let (sha_program, sha_prefix) = sha256_tool(env::consts::OS)?;
     for selected in [LUA55, LUA54] {
+        let mut sha_parts = vec![sha_program];
+        sha_parts.extend_from_slice(sha_prefix);
+        sha_parts.extend([selected.source, selected.tests]);
+        let sha_command = sha_parts.join(" ");
         if let Err(error) = verify(&root, selected) {
             results.push(GateResult {
                 name: format!("sources-{}", selected.name),
-                command: format!("shasum -a 256 {} {}", selected.source, selected.tests),
+                command: sha_command.clone(),
                 exit_code: 1,
                 status: "FAIL",
                 diagnostic: error.clone(),
@@ -772,7 +807,7 @@ fn gate() -> Result<(), String> {
         }
         results.push(GateResult {
             name: format!("sources-{}", selected.name),
-            command: format!("shasum -a 256 {} {}", selected.source, selected.tests),
+            command: sha_command,
             exit_code: 0,
             status: "PASS",
             diagnostic: "SHA-256、解壓 source/tests 與授權資料完整".into(),
@@ -1482,7 +1517,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        LUA54, LUA55, MSRV, profile, supported_rustc, validate_csv, validate_p01_contract_status,
+        LUA54, LUA55, MSRV, contains_lua_engine_symbol, profile, reference_make_target,
+        sha256_tool, supported_rustc, validate_csv, validate_p01_contract_status,
         validate_p01_csv_cases, validate_pass_evidence, write_p01_case_report,
     };
     use std::process::Command;
@@ -1493,6 +1529,28 @@ mod tests {
         assert!(supported_rustc("rustc 1.98.1 (hash date)"));
         assert!(!supported_rustc("rustc 1.93.0 (hash date)"));
         assert!(!supported_rustc("rustc 1.98.1-beta.1 (hash date)"));
+    }
+    #[test]
+    fn reference_tools_are_selected_for_macos_and_linux() {
+        assert_eq!(reference_make_target("macos").unwrap(), "macosx");
+        assert_eq!(reference_make_target("linux").unwrap(), "linux");
+        assert!(reference_make_target("windows").is_err());
+        assert_eq!(
+            sha256_tool("macos").unwrap(),
+            ("shasum", &["-a", "256"][..])
+        );
+        assert_eq!(sha256_tool("linux").unwrap(), ("sha256sum", &[][..]));
+    }
+    #[test]
+    fn symbol_scan_recognizes_macho_and_elf_names() {
+        assert!(contains_lua_engine_symbol("00000000 T _lua_newstate"));
+        assert!(contains_lua_engine_symbol("00000000 T luaL_newstate"));
+        assert!(!contains_lua_engine_symbol(
+            "                 U lua_newstate"
+        ));
+        assert!(!contains_lua_engine_symbol(
+            "00000000 T lua_newstate_helper"
+        ));
     }
     #[test]
     fn profiles_are_explicit_and_distinct() {

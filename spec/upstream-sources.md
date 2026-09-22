@@ -10,3 +10,5 @@
 | `lua54` | tests | Lua 5.4.9 | https://www.lua.org/tests/lua-5.4.9-tests.tar.gz | `7d971845f545ffc09fbb3128a86b2c6524161c70d0fdf0154a16e8c00c343fca` | `vendor/lua54/tests.tar.gz`、`vendor/lua54/lua-5.4.9-tests/` | 同版本 source 快照的 Lua 授權資訊 |
 
 本次參考程式在 macOS arm64 以各原始碼包的 `make macosx` 建置。`lua55` 的 `src/lua -v` 回報 Lua 5.5.1；`lua54` 的 `src/lua -v` 回報 Lua 5.4.9。gate 在離線模式由上述 tarball 重建，不能呼叫系統 Lua 或下載其他引擎。
+
+目前 runner 依執行平台選擇上游 Makefile 目標：macOS 使用 `macosx`，Linux 使用 `linux`。雜湊工具分別使用 `shasum -a 256` 與 `sha256sum`；兩者都核對同一組固定 SHA-256。Linux 的實際通過狀態須以 CI 執行結果判定。

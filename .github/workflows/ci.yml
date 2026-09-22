@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update system Rust stable
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt
+          rustc --version
+          cargo --version
+          rustc -vV | grep -F "host: ${{ matrix.target }}"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test workspace
+        run: cargo test --locked --workspace
+
+      - name: Verify project foundation
+        run: cargo run --locked -p rivetlua-xtask -- gate P00
+
+      - name: Verify core values and numbers
+        run: cargo run --locked -p rivetlua-xtask -- gate P01
+
+      - name: Save gate reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rivetlua-gate-reports-${{ matrix.runner }}
+          path: target/rivetlua-reports/
+          if-no-files-found: ignore

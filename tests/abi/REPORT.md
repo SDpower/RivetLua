@@ -1,6 +1,6 @@
 # P00 C ABI 風險證據
 
-平台：macOS arm64。編譯器：`cc`。Rust toolchain：1.94.1。命令由 `gate P00` 在 workspace 根目錄執行，安全案例產物寫入 `target/rivetlua-abi/`。
+原始風險實驗平台：macOS arm64。編譯器：`cc`。當時 Rust toolchain：1.94.1。`gate P00` 在執行主機重新編譯並執行安全案例，產物寫入 `target/rivetlua-abi/`；各平台的實際結果須以該次 gate 報告為準。
 
 | Case | 命令與旗標 | 預期與實際控制流 | 退出碼 |
 |---|---|---|---|
