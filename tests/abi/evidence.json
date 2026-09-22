@@ -1,0 +1,7 @@
+{
+  "rust_toolchain": "1.94.1",
+  "safe_cases": ["P00-ABI-001", "P00-ABI-002"],
+  "rejected_case": "P00-ABI-003",
+  "rejected_reason": "longjmp 不得跨越持有 Rust Drop 資源的 frame",
+  "unsafe_path_executed": false
+}

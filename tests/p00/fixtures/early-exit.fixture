@@ -1,0 +1,4 @@
+complete=false
+expected_version=PROFILE
+expected_output=reference-ok
+source_sha256=PROFILE

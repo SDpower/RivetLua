@@ -1,0 +1,8 @@
+[policy]
+platform_capabilities = "由宿主注入"
+background_network = false
+telemetry = false
+
+[p00]
+compiler = "NOT_IMPLEMENTED"
+runtime = "NOT_IMPLEMENTED"

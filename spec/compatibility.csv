@@ -1,0 +1,12 @@
+feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference
+p00.workspace,lua55,docs/plane/P00.md#p00-1,xtask,P00-IND-001,PASS,
+p00.workspace,lua54,docs/plane/P00.md#p00-1,xtask,P00-IND-001,PASS,
+p00.reference,lua55,spec/upstream-sources.md,xtask,P00-REF-001,PASS,
+p00.reference,lua54,spec/upstream-sources.md,xtask,P00-REF-002,PASS,
+p00.runner,lua55,docs/plane/P00.md#p00-4,xtask,P00-RUN-001;P00-RUN-002,PASS,
+p00.runner,lua54,docs/plane/P00.md#p00-4,xtask,P00-RUN-001;P00-RUN-002,PASS,
+p01.core,lua55,docs/plane/P01.md#p01-1-to-p01-4,rivetlua-core,NUM-001;NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004,PASS,
+p01.core,lua54,docs/plane/P01.md#p01-1-to-p01-4,rivetlua-core,NUM-001;NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004,PASS,
+compiler,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,後續階段
+runtime,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,後續階段
+c-api,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,P00 只有風險證據

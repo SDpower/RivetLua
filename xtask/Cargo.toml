@@ -1,0 +1,12 @@
+[package]
+name = "rivetlua-xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RivetLua 的階段驗證工具。"
+
+[[bin]]
+name = "rivetlua-xtask"
+path = "src/main.rs"

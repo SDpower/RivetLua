@@ -1,0 +1,1 @@
+io.write("reference-ok")

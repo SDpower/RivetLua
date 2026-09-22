@@ -1,0 +1,11 @@
+[package]
+name = "rivetlua-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RivetLua 的共用契約骨架；尚未提供 Lua 語意。"
+
+[lib]
+path = "src/lib.rs"
