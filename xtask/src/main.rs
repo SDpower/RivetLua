@@ -209,6 +209,8 @@ fn verify(root: &Path, profile: Profile) -> Result<(), String> {
         "diff",
         &[
             "-qr",
+            "-x",
+            ".gitkeep",
             root.join("vendor")
                 .join(profile.name)
                 .join(profile.source_dir)
@@ -236,6 +238,8 @@ fn verify(root: &Path, profile: Profile) -> Result<(), String> {
         "diff",
         &[
             "-qr",
+            "-x",
+            ".gitkeep",
             root.join("vendor")
                 .join(profile.name)
                 .join(profile.tests_dir)
