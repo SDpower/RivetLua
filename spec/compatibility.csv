@@ -16,3 +16,5 @@ runtime,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,後續階段
 c-api,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,P00 只有風險證據
 p04.resolve,lua55,docs/plane/P04.md#p04-1-to-p04-5,rivetlua-compiler,RES-001;RES-002;RES-003;RES-004;RES-005;RES-006;RES-007;RES-ERR-001;RES-ERR-002,PASS,
 p04.resolve,lua54,docs/plane/P04.md#p04-1-to-p04-5,rivetlua-compiler,RES-001;RES-002;RES-003;RES-004;RES-005;RES-006;RES-007;RES-ERR-001;RES-ERR-002,PASS,
+p05.bytecode,lua55,docs/plane/P05.md#p05-1-to-p05-5,rivetlua-core;rivetlua-compiler,BC-001;BC-002;BC-003;BC-004;BC-005;BC-006;BC-ERR-001;BC-ERR-002,PASS,
+p05.bytecode,lua54,docs/plane/P05.md#p05-1-to-p05-5,rivetlua-core;rivetlua-compiler,BC-001;BC-002;BC-003;BC-004;BC-005;BC-006;BC-ERR-001;BC-ERR-002,PASS,

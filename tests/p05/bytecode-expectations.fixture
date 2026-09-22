@@ -1,0 +1,16 @@
+# P05 gate 子行程每次讀取；負向驗證可暫改後還原。
+profile.lua55-i64f64=lua55-i64f64
+profile.lua54-i64f64=lua54-i64f64
+BC-001.enabled=true
+BC-002.enabled=true
+BC-003.enabled=true
+BC-004.enabled=true
+BC-004.all_result=reject
+BC-005.enabled=true
+BC-006.enabled=true
+BC-ERR-001.enabled=true
+BC-ERR-001.unknown_opcode=reject
+BC-ERR-002.enabled=true
+BC-ERR-002.section_limit=1
+BC-ERR-002.register_limit=1
+BC-ERR-002.upvalue_limit=0

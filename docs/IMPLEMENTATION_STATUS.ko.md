@@ -18,12 +18,12 @@
 - [x] **Lua 어휘 분석:** [컴파일러 API](../crates/rivetlua-compiler/src/lib.rs)는 Lua 5.5와 5.4의 원본 바이트에서 토큰을 인식하고 span, 위치, 리터럴 및 제한된 진단을 보존합니다. Lua 5.5에서는 엄격한 매뉴얼 문법에 따라 `global`을 예약어로 처리합니다. 두 프로필 모두 P02 게이트를 통과했습니다.
 - [x] **Lua 구문 분석:** [컴파일러 API](../crates/rivetlua-compiler/src/lib.rs)는 P02 토큰을 소유권을 가진 AST로 파싱하고 연산자 우선순위, 괄호, 호출, 선언 및 span을 보존합니다. 두 프로필 모두 P03 게이트를 통과했습니다. 이 단계는 구문 구조만 검증합니다.
 - [x] **Lua 스코프와 이름 해석:** [컴파일러 API](../crates/rivetlua-compiler/src/lib.rs)는 binding, 중첩 upvalue, 읽기 전용 이름, 점프, 닫기 경로 및 Lua 5.5의 명시적 global 선언을 소유권을 가진 해석된 AST로 변환합니다. 두 프로필 모두 P04 게이트를 통과했습니다. 이 단계에서는 bytecode를 생성하거나 Lua를 실행하지 않습니다.
+- [x] **중간 표현과 bytecode 검증:** [컴파일러 API](../crates/rivetlua-compiler/src/lib.rs)는 해석된 AST를 형식이 지정된 레지스터 IR과 RivetLua 자체 RVLU v1 bytecode로 변환합니다. [코어 검증기](../crates/rivetlua-core/src/bytecode/codec.rs)는 `VerifiedModule`을 제공하기 전에 제한된 디코딩, operand, 제어 흐름 및 열린 결과를 검사합니다. 두 프로필 모두 P05 게이트를 통과했습니다. 이 형식은 Lua binary chunk가 아니며 아직 실행되지 않습니다.
 
 값, 숫자, 어휘 및 구문 테스트는 Rust API를 직접 호출합니다. **RivetLua는 아직 Lua 소스 코드를 실행할 수 없으며, 완전한 Lua 언어 호환성도 검증되지 않았습니다.**
 
 ## 남은 작업
 
-- [ ] 중간 표현, 레지스터 규약, 바이트코드, 검증기를 만듭니다.
 - [ ] 힙 객체, 루트, 핸들, 메모리 할당 실패를 관리합니다.
 - [ ] 제어 흐름과 대입을 실행하는 최소 가상 머신을 만듭니다.
 - [ ] 문자열과 원시 테이블 연산을 구현합니다.
@@ -56,6 +56,7 @@ cargo run --locked -p rivetlua-xtask -- gate P01
 cargo run --locked -p rivetlua-xtask -- gate P02
 cargo run --locked -p rivetlua-xtask -- gate P03
 cargo run --locked -p rivetlua-xtask -- gate P04
+cargo run --locked -p rivetlua-xtask -- gate P05
 ```
 
-`gate P00`은 프로젝트 기반을, `gate P01`은 코어 값과 숫자를, `gate P02`는 lexer를, `gate P03`은 parser를, `gate P04`는 스코프와 이름 해석 및 앞 단계 회귀를 검사합니다. 실행에 로컬 계획 문서는 필요하지 않습니다. 2026-09-22에 Rust 1.98.1로 확인한 결과, 서식 검사와 워크스페이스 테스트가 통과했고 기반·코어·어휘·구문·이름 해석 검증은 각각 22/22, 35/35, 29/29, 25/25, 23/23 항목이 통과했습니다. P04에는 각 프로필의 사례 9개가 포함됩니다. 보고서는 `target/rivetlua-reports/`에 생성되며, 이 디렉터리는 Git에 포함되지 않고 위 명령으로 다시 만들 수 있습니다. Cargo에 선언된 MSRV는 여전히 1.94.1입니다.
+`gate P00`은 프로젝트 기반을, `gate P01`은 코어 값과 숫자를, `gate P02`는 lexer를, `gate P03`은 parser를, `gate P04`는 스코프와 이름 해석을, `gate P05`는 bytecode와 앞 단계 회귀를 검사합니다. 실행에 로컬 계획 문서는 필요하지 않습니다. 2026-09-22에 Rust 1.98.1로 확인한 결과, 서식 검사와 워크스페이스 테스트가 통과했고 기반·코어·어휘·구문·이름 해석·bytecode 검증은 각각 22/22, 35/35, 29/29, 25/25, 23/23, 24/24 항목이 통과했습니다. P05에는 각 프로필의 사례 8개가 포함됩니다. 보고서는 `target/rivetlua-reports/`에 생성되며, 이 디렉터리는 Git에 포함되지 않고 위 명령으로 다시 만들 수 있습니다. Cargo에 선언된 MSRV는 여전히 1.94.1입니다.

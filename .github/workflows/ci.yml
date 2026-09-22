@@ -54,6 +54,9 @@ jobs:
       - name: Verify compiler resolver
         run: cargo run --locked -p rivetlua-xtask -- gate P04
 
+      - name: Verify compiler bytecode and verifier
+        run: cargo run --locked -p rivetlua-xtask -- gate P05
+
       - name: Save gate reports
         if: always()
         uses: actions/upload-artifact@v4
