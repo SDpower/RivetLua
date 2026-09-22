@@ -16,12 +16,12 @@
 - [x] **數值規則**：集中處理算術、向下整除、餘數、整數環繞、位元運算、轉換及精確的整數／浮點比較。測試涵蓋大整數、NaN、正負零與位移邊界。
 - [x] **錯誤與真假規則**：零除與無效操作數會回傳可檢查的核心錯誤。只有 nil 和 false 為假；`and`／`or` 保留所選操作數。[核心 API](../crates/rivetlua-core/src/lib.rs) 與 crate 外整合測試已通過。
 - [x] **Lua 詞法分析**：[編譯器 API](../crates/rivetlua-compiler/src/lib.rs) 以原始 bytes 辨識 Lua 5.5 與 5.4 的 token，保留 span、行列、literal 與受控診斷；5.5 的 `global` 採手冊嚴格語法。兩個 profile 的 P02 gate 已通過。
+- [x] **Lua 語法分析**：[編譯器 API](../crates/rivetlua-compiler/src/lib.rs) 將 P02 token 解析為擁有資料的 AST，保留運算式優先序、括號、呼叫、宣告與 span；兩個 profile 的 P03 gate 已通過。此階段只驗證語法結構。
 
-值與數值測試直接呼叫 Rust API，lexer 也透過 Rust API 讀取來源 bytes。**RivetLua 尚不能執行 Lua 原始碼，也尚未驗證完整的 Lua 語言相容性。**
+值、數值、詞法與語法測試直接呼叫 Rust API。**RivetLua 尚不能執行 Lua 原始碼，也尚未驗證完整的 Lua 語言相容性。**
 
 ## 待實作
 
-- [ ] 將語法解析為抽象語法樹。
 - [ ] 處理作用域、名稱與 Lua 版本差異。
 - [ ] 建立中介表示、暫存器慣例、bytecode 與驗證器。
 - [ ] 管理 heap 物件、root、handle 與配置失敗。
@@ -54,6 +54,7 @@ cargo test --locked --workspace
 cargo run --locked -p rivetlua-xtask -- gate P00
 cargo run --locked -p rivetlua-xtask -- gate P01
 cargo run --locked -p rivetlua-xtask -- gate P02
+cargo run --locked -p rivetlua-xtask -- gate P03
 ```
 
-`gate P00` 檢查專案基礎；`gate P01` 檢查核心值與數值；`gate P02` 檢查 lexer 並包含前階段回歸。這些命令不需要本機規劃文件。2026-09-22 使用 Rust 1.98.1 驗證：格式與工作區測試通過；基礎驗收 22/22、核心驗收 35/35、詞法驗收 29/29 通過。報告產生於 `target/rivetlua-reports/`；該目錄不納入 Git，可用上述命令重建。Cargo 宣告的 MSRV 仍為 1.94.1。
+`gate P00` 檢查專案基礎；`gate P01` 檢查核心值與數值；`gate P02` 檢查 lexer；`gate P03` 檢查 parser 並包含前階段回歸。這些命令不需要本機規劃文件。2026-09-22 使用 Rust 1.98.1 驗證：格式與工作區測試通過；基礎驗收 22/22、核心驗收 35/35、詞法驗收 29/29、語法驗收 25/25 通過。報告產生於 `target/rivetlua-reports/`；該目錄不納入 Git，可用上述命令重建。Cargo 宣告的 MSRV 仍為 1.94.1。

@@ -48,6 +48,8 @@ jobs:
 
       - name: Verify compiler lexer
         run: cargo run --locked -p rivetlua-xtask -- gate P02
+      - name: Verify compiler parser
+        run: cargo run --locked -p rivetlua-xtask -- gate P03
 
       - name: Save gate reports
         if: always()

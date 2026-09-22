@@ -537,7 +537,10 @@ fn validate_csv(contents: &str) -> Result<(), String> {
             ));
         }
         if columns[5] == "PASS" {
-            if columns[0].starts_with("p01.") || columns[0].starts_with("p02.") {
+            if columns[0].starts_with("p01.")
+                || columns[0].starts_with("p02.")
+                || columns[0].starts_with("p03.")
+            {
                 continue;
             }
             for case in columns[4].split(';') {
@@ -562,7 +565,10 @@ fn validate_pass_evidence(csv: &str, results: &[GateResult]) -> Result<(), Strin
         if columns.len() != 7 || columns[5] != "PASS" {
             continue;
         }
-        if columns[0].starts_with("p01.") || columns[0].starts_with("p02.") {
+        if columns[0].starts_with("p01.")
+            || columns[0].starts_with("p02.")
+            || columns[0].starts_with("p03.")
+        {
             continue;
         }
         for case in columns[4].split(';') {
@@ -1490,6 +1496,18 @@ const P02_CASES: [&str; 11] = [
     "LEX-ERR-003",
     "LEX-ERR-004",
 ];
+const P03_CASES: [&str; 10] = [
+    "PARSE-001",
+    "PARSE-002",
+    "PARSE-003",
+    "PARSE-004",
+    "PARSE-005",
+    "PARSE-006",
+    "PARSE-ERR-001",
+    "PARSE-ERR-002",
+    "PARSE-ERR-003",
+    "PARSE-ERR-004",
+];
 const STRICT_GLOBAL_CFLAGS: &str = "-DLUA_COMPAT_GLOBAL=0";
 
 fn write_p02_results(root: &Path, results: &[GateResult]) {
@@ -1538,6 +1556,23 @@ fn p02_result(
     }
 }
 
+fn p03_result(
+    name: impl Into<String>,
+    command: impl Into<String>,
+    exit_code: i32,
+    status: &'static str,
+    diagnostic: impl Into<String>,
+) -> GateResult {
+    GateResult {
+        name: name.into(),
+        command: command.into(),
+        exit_code,
+        status,
+        diagnostic: diagnostic.into(),
+        report_path: "target/rivetlua-reports/gate-P03.json".into(),
+    }
+}
+
 fn p02_fail(
     root: &Path,
     results: &mut Vec<GateResult>,
@@ -1571,6 +1606,32 @@ fn validate_p02_csv_cases(csv: &str) -> Result<(), String> {
         let actual: std::collections::HashSet<_> = ids.iter().copied().collect();
         if ids.iter().any(|id| id.is_empty()) || actual.len() != ids.len() || actual != expected {
             return Err(format!("{profile} P02 test_ids 不完整、重複或未知"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_p03_csv_cases(csv: &str) -> Result<(), String> {
+    let expected: std::collections::HashSet<_> = P03_CASES.into_iter().collect();
+    for profile in ["lua55", "lua54"] {
+        let rows: Vec<_> = csv
+            .lines()
+            .skip(1)
+            .filter(|line| {
+                line.starts_with(&format!("p03.parser,{profile},")) && line.contains(",PASS,")
+            })
+            .collect();
+        if rows.len() != 1 {
+            return Err(format!("{profile} P03 PASS 列數不正確"));
+        }
+        let columns: Vec<_> = rows[0].split(',').collect();
+        if columns.len() != 7 || columns[1] != profile || columns[3] != "rivetlua-compiler" {
+            return Err(format!("{profile} P03 CSV 欄位不正確"));
+        }
+        let ids: Vec<_> = columns[4].split(';').collect();
+        let actual: std::collections::HashSet<_> = ids.iter().copied().collect();
+        if ids.iter().any(|id| id.is_empty()) || actual.len() != ids.len() || actual != expected {
+            return Err(format!("{profile} P03 test_ids 不完整、重複或未知"));
         }
     }
     Ok(())
@@ -1649,6 +1710,102 @@ fn write_p02_case_report(
         .map_err(|error| error.to_string())?;
     let json = format!(
         "{{\"case_id\":\"{}\",\"requires\":\"rivetlua-compiler\",\"profile\":\"{}\",\"lua_profile\":\"{}\",\"mode\":\"lexer\",\"input\":\"{}\",\"actual\":\"{}\",\"status\":\"PASS\",\"command\":\"cargo test --locked -p rivetlua-compiler --test p02_contracts -- --nocapture --test-threads=1\",\"exit_code\":0,\"report_path\":\"{}\",\"diagnostic\":\"完整執行且契約斷言通過\"}}\n",
+        json_escape(case_id),
+        json_escape(profile),
+        json_escape(lua_profile),
+        json_escape(input),
+        json_escape(actual),
+        json_escape(&path.display().to_string())
+    );
+    fs::write(&path, json).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn p03_contracts(root: &Path, profile: &str) -> Result<Vec<(String, String, String)>, String> {
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "--locked",
+            "-p",
+            "rivetlua-compiler",
+            "--test",
+            "p03_contracts",
+            "--",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("RIVETLUA_P03_PROFILE", profile)
+        .current_dir(root)
+        .output()
+        .map_err(|error| error.to_string())?;
+    let status = output.status;
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    p03_child_status(profile, status.success(), &output)?;
+    if !status.success() {
+        return Err(format!(
+            "{profile} P03 contracts 子行程失敗（實際退出碼 {status}）：{output}"
+        ));
+    }
+    if !output.contains("test result: ok. 1 passed; 0 failed;") {
+        return Err(format!("{profile} P03 contracts 未完整執行：{output}"));
+    }
+    let records = output
+        .lines()
+        .filter_map(|line| {
+            line.find("P03_CASE\t")
+                .map(|index| &line[index + "P03_CASE\t".len()..])
+        })
+        .map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+                return Err(format!("{profile} P03_CASE 欄位不完整：{line}"));
+            }
+            Ok((
+                fields[0].to_owned(),
+                fields[1].to_owned(),
+                fields[2].to_owned(),
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_p03_records(profile, &records)?;
+    Ok(records)
+}
+fn p03_child_status(profile: &str, success: bool, output: &str) -> Result<(), String> {
+    if success {
+        Ok(())
+    } else {
+        Err(format!("{profile} P03 contracts 子行程失敗：{output}"))
+    }
+}
+fn validate_p03_records(profile: &str, records: &[(String, String, String)]) -> Result<(), String> {
+    let actual: std::collections::HashSet<_> =
+        records.iter().map(|record| record.0.as_str()).collect();
+    let expected: std::collections::HashSet<_> = P03_CASES.into_iter().collect();
+    if records.len() != P03_CASES.len() || actual.len() != records.len() || actual != expected {
+        Err(format!("{profile} P03_CASE 缺少、重複或未知"))
+    } else {
+        Ok(())
+    }
+}
+fn write_p03_case_report(
+    root: &Path,
+    case_id: &str,
+    profile: &str,
+    lua_profile: &str,
+    input: &str,
+    actual: &str,
+) -> Result<PathBuf, String> {
+    let path = root.join(format!(
+        "target/rivetlua-reports/P03-{case_id}-{lua_profile}.json"
+    ));
+    fs::create_dir_all(path.parent().ok_or("無效 P03 report 路徑")?)
+        .map_err(|error| error.to_string())?;
+    let json = format!(
+        "{{\"case_id\":\"{}\",\"requires\":\"rivetlua-compiler\",\"profile\":\"{}\",\"lua_profile\":\"{}\",\"mode\":\"parse\",\"input\":\"{}\",\"actual\":\"{}\",\"status\":\"PASS\",\"command\":\"cargo test --locked -p rivetlua-compiler --test p03_contracts -- --nocapture --test-threads=1\",\"exit_code\":0,\"report_path\":\"{}\",\"diagnostic\":\"完整執行且契約斷言通過\"}}\n",
         json_escape(case_id),
         json_escape(profile),
         json_escape(lua_profile),
@@ -1903,6 +2060,143 @@ fn p02_gate() -> Result<(), String> {
     Ok(())
 }
 
+fn write_p03_results(root: &Path, results: &[GateResult]) {
+    let path = root.join("target/rivetlua-reports/gate-P03.json");
+    let _ = fs::create_dir_all(path.parent().unwrap());
+    let status = if results.iter().all(|item| item.status == "PASS") {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    let checks=results.iter().map(|item|format!("{{\"name\":\"{}\",\"command\":\"{}\",\"exit_code\":{},\"status\":\"{}\",\"diagnostic\":\"{}\",\"report_path\":\"{}\"}}",json_escape(&item.name),json_escape(&item.command),item.exit_code,item.status,json_escape(&item.diagnostic),json_escape(&item.report_path))).collect::<Vec<_>>().join(",");
+    let _ = fs::write(
+        path,
+        format!("{{\"status\":\"{status}\",\"checks\":[{checks}]}}\n"),
+    );
+}
+
+fn p03_fail(
+    root: &Path,
+    results: &mut Vec<GateResult>,
+    name: &str,
+    command: &str,
+    error: String,
+) -> Result<(), String> {
+    results.push(p03_result(name, command, 1, "FAIL", error.clone()));
+    write_p03_results(root, results);
+    Err(error)
+}
+
+fn p03_gate() -> Result<(), String> {
+    let root = root()?;
+    let mut results = Vec::new();
+    if let Err(error) = p02_gate() {
+        results.push(p03_result(
+            "p02-before",
+            "gate P02",
+            1,
+            "FAIL",
+            error.clone(),
+        ));
+        write_p03_results(&root, &results);
+        return Err(error);
+    }
+    results.push(p03_result("p02-before", "gate P02", 0, "PASS", "P02 通過"));
+    let csv = fs::read_to_string(root.join("spec/compatibility.csv")).map_err(|e| e.to_string())?;
+    if let Err(error) = validate_p03_csv_cases(&csv) {
+        results.push(p03_result(
+            "p03-csv",
+            "validate P03 CSV",
+            1,
+            "FAIL",
+            error.clone(),
+        ));
+        write_p03_results(&root, &results);
+        return Err(error);
+    }
+    results.push(p03_result(
+        "p03-csv",
+        "validate P03 CSV",
+        0,
+        "PASS",
+        "P03 CSV 通過",
+    ));
+    for (name, arguments) in [
+        ("p03-format", vec!["fmt", "--all", "--", "--check"]),
+        (
+            "p03-parser-lib",
+            vec!["test", "--locked", "-p", "rivetlua-compiler", "--lib"],
+        ),
+        (
+            "p03-parser-contracts",
+            vec![
+                "test",
+                "--locked",
+                "-p",
+                "rivetlua-compiler",
+                "--test",
+                "parser_contracts",
+            ],
+        ),
+    ] {
+        if let Err(error) = run("cargo", &arguments, &root) {
+            results.push(p03_result(
+                name,
+                format!("cargo {}", arguments.join(" ")),
+                1,
+                "FAIL",
+                error.clone(),
+            ));
+            write_p03_results(&root, &results);
+            return Err(error);
+        }
+        results.push(p03_result(
+            name,
+            format!("cargo {}", arguments.join(" ")),
+            0,
+            "PASS",
+            "P03 檢查通過",
+        ));
+    }
+    for (profile, lua) in [("lua55-i64f64", "lua55"), ("lua54-i64f64", "lua54")] {
+        let command = "cargo test --locked -p rivetlua-compiler --test p03_contracts";
+        let records = match p03_contracts(&root, profile) {
+            Ok(records) => records,
+            Err(error) => {
+                return p03_fail(
+                    &root,
+                    &mut results,
+                    &format!("p03-contracts-{lua}"),
+                    command,
+                    error,
+                );
+            }
+        };
+        for (id, input, actual) in records {
+            let path = match write_p03_case_report(&root, &id, profile, lua, &input, &actual) {
+                Ok(path) => path,
+                Err(error) => {
+                    return p03_fail(&root, &mut results, &format!("{id}-{lua}"), command, error);
+                }
+            };
+            results.push(GateResult {
+                name: id,
+                command: "cargo test p03_contracts".into(),
+                exit_code: 0,
+                status: "PASS",
+                diagnostic: "P03 contract 通過".into(),
+                report_path: path.display().to_string(),
+            });
+        }
+    }
+    write_p03_results(&root, &results);
+    println!(
+        "PASS report={}",
+        root.join("target/rivetlua-reports/gate-P03.json").display()
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
     let result = match arguments.first().map(String::as_str) {
@@ -1923,6 +2217,7 @@ fn main() -> ExitCode {
         }
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P01") && arguments.len() == 2 => p01_gate(),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P02") && arguments.len() == 2 => p02_gate(),
+        Some("gate") if arguments.get(1).map(String::as_str) == Some("P03") && arguments.len() == 2 => p03_gate(),
         _ => Err(
             "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | gate P00|P01|P02".into(),
         ),
@@ -1948,10 +2243,11 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        LUA54, LUA55, MSRV, P02_CASES, STRICT_GLOBAL_CFLAGS, contains_lua_engine_symbol, profile,
-        reference_make_target, sha256_tool, supported_rustc, validate_csv,
-        validate_p01_contract_status, validate_p01_csv_cases, validate_p02_csv_cases,
-        validate_pass_evidence, write_p01_case_report, write_p02_case_report,
+        LUA54, LUA55, MSRV, P02_CASES, P03_CASES, STRICT_GLOBAL_CFLAGS, contains_lua_engine_symbol,
+        p03_child_status, profile, reference_make_target, sha256_tool, supported_rustc,
+        validate_csv, validate_p01_contract_status, validate_p01_csv_cases, validate_p02_csv_cases,
+        validate_p03_csv_cases, validate_p03_records, validate_pass_evidence,
+        write_p01_case_report, write_p02_case_report, write_p03_case_report,
     };
     use std::process::Command;
     #[test]
@@ -2036,6 +2332,45 @@ mod tests {
         assert!(validate_p01_csv_cases(&csv).is_ok());
     }
     #[test]
+    fn p03_case_report_is_valid_json() {
+        let root = std::env::temp_dir().join(format!("rivetlua-p03-report-{}", std::process::id()));
+        let path = write_p03_case_report(
+            &root,
+            "PARSE-001",
+            "lua55-i64f64",
+            "lua55",
+            "return -2^2",
+            "Unary { expression: Binary { span: Span { start_byte: 7, end_byte: 11 } } }",
+        )
+        .unwrap();
+        let output = std::process::Command::new("python3")
+            .args(["-c", "import json,sys; json.load(open(sys.argv[1]))"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    fn p03_records_and_child_status_reject_invalid_evidence() {
+        let records = P03_CASES
+            .iter()
+            .map(|id| (id.to_string(), "i".to_string(), "a".to_string()))
+            .collect::<Vec<_>>();
+        assert!(validate_p03_records("lua55-i64f64", &records).is_ok());
+        assert!(validate_p03_records("lua55-i64f64", &records[1..]).is_err());
+        let mut duplicate = records.clone();
+        duplicate[1].0 = duplicate[0].0.clone();
+        assert!(validate_p03_records("lua55-i64f64", &duplicate).is_err());
+        let mut unknown = records.clone();
+        unknown[0].0 = "UNKNOWN".into();
+        assert!(validate_p03_records("lua55-i64f64", &unknown).is_err());
+        assert!(p03_child_status("lua55-i64f64", false, "failed").is_err());
+    }
+    #[test]
     fn p01_csv_cases_reject_missing_num_001() {
         let ids = "NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004";
         let csv = format!(
@@ -2051,6 +2386,31 @@ mod tests {
         );
         assert!(validate_p02_csv_cases(&csv).is_ok());
         assert_eq!(STRICT_GLOBAL_CFLAGS, "-DLUA_COMPAT_GLOBAL=0");
+    }
+    #[test]
+    fn p03_csv_cases_are_complete() {
+        let ids = P03_CASES.join(";");
+        let csv = format!(
+            "feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference\np03.parser,lua55,s,rivetlua-compiler,{ids},PASS,\np03.parser,lua54,s,rivetlua-compiler,{ids},PASS,"
+        );
+        assert!(validate_p03_csv_cases(&csv).is_ok());
+    }
+    #[test]
+    fn p03_csv_cases_reject_missing_wrong_profile_or_duplicate_id() {
+        let missing = P03_CASES[1..].join(";");
+        let csv = format!(
+            "feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference\np03.parser,lua55,s,rivetlua-compiler,{missing},PASS,\np03.parser,lua54,s,rivetlua-compiler,{missing},PASS,"
+        );
+        assert!(validate_p03_csv_cases(&csv).is_err());
+        let ids = P03_CASES.join(";");
+        let wrong = format!(
+            "feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference\np03.parser,lua55-i64f64,s,rivetlua-compiler,{ids},PASS,\np03.parser,lua54,s,rivetlua-compiler,{ids},PASS,"
+        );
+        assert!(validate_p03_csv_cases(&wrong).is_err());
+        let duplicate = format!(
+            "feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference\np03.parser,lua55,s,rivetlua-compiler,{ids};PARSE-001,PASS,\np03.parser,lua54,s,rivetlua-compiler,{ids},PASS,"
+        );
+        assert!(validate_p03_csv_cases(&duplicate).is_err());
     }
     #[test]
     fn p02_csv_cases_reject_missing_or_wrong_profile_case() {

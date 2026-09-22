@@ -19,6 +19,11 @@ pub struct CompileLimits {
     pub max_token_bytes: usize,
     pub max_tokens: usize,
     pub max_lines: usize,
+    pub max_ast_nodes: usize,
+    pub max_parse_depth: usize,
+    pub max_statements: usize,
+    pub max_list_entries: usize,
+    pub max_parameters: usize,
 }
 
 impl Default for CompileLimits {
@@ -28,6 +33,11 @@ impl Default for CompileLimits {
             max_token_bytes: 64 * 1024,
             max_tokens: 100_000,
             max_lines: 100_000,
+            max_ast_nodes: 100_000,
+            max_parse_depth: 128,
+            max_statements: 50_000,
+            max_list_entries: 50_000,
+            max_parameters: 255,
         }
     }
 }
@@ -37,6 +47,7 @@ impl Default for CompileLimits {
 pub enum DiagnosticCode {
     Lex,
     CompileLimit,
+    Parse,
 }
 
 /// 不持有完整輸入的詞法診斷。

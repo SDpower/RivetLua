@@ -1,0 +1,17 @@
+# P03 gate 會在每次子行程測試時讀取本檔；負向驗證可暫改值後還原。
+profile.lua55-i64f64=lua55-i64f64
+profile.lua54-i64f64=lua54-i64f64
+PARSE-001.enabled=true
+PARSE-002.enabled=true
+PARSE-002.right_associative=true
+PARSE-003.enabled=true
+PARSE-004.enabled=true
+PARSE-004.paren_call=true
+PARSE-005.enabled=true
+PARSE-006.enabled=true
+PARSE-ERR-001.enabled=true
+PARSE-ERR-002.enabled=true
+PARSE-ERR-003.enabled=true
+PARSE-ERR-003.max_parse_depth=2
+PARSE-ERR-003.max_list_entries=1
+PARSE-ERR-004.enabled=true
