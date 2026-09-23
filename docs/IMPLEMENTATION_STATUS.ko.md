@@ -18,7 +18,7 @@
 - [x] **Lua 어휘 분석:** [컴파일러 API](../crates/rivetlua-compiler/src/lib.rs)는 Lua 5.5와 5.4의 원본 바이트에서 토큰을 인식하고 span, 위치, 리터럴 및 제한된 진단을 보존합니다. Lua 5.5에서는 엄격한 매뉴얼 문법에 따라 `global`을 예약어로 처리합니다. 두 프로필 모두 P02 게이트를 통과했습니다.
 - [x] **Lua 구문 분석:** [컴파일러 API](../crates/rivetlua-compiler/src/lib.rs)는 P02 토큰을 소유권을 가진 AST로 파싱하고 연산자 우선순위, 괄호, 호출, 선언 및 span을 보존합니다. 두 프로필 모두 P03 게이트를 통과했습니다. 이 단계는 구문 구조만 검증합니다.
 - [x] **Lua 스코프와 이름 해석:** [컴파일러 API](../crates/rivetlua-compiler/src/lib.rs)는 binding, 중첩 upvalue, 읽기 전용 이름, 점프, 닫기 경로 및 Lua 5.5의 명시적 global 선언을 소유권을 가진 해석된 AST로 변환합니다. 두 프로필 모두 P04 게이트를 통과했습니다. 이 단계에서는 bytecode를 생성하거나 Lua를 실행하지 않습니다.
-- [x] **중간 표현과 bytecode 검증:** [컴파일러 API](../crates/rivetlua-compiler/src/lib.rs)는 해석된 AST를 형식이 지정된 레지스터 IR과 RivetLua 자체 RVLU v1 bytecode로 변환합니다. [코어 검증기](../crates/rivetlua-core/src/bytecode/codec.rs)는 `VerifiedModule`을 제공하기 전에 제한된 디코딩, operand, 제어 흐름 및 열린 결과를 검사합니다. 두 프로필 모두 P05 게이트를 통과했습니다. 이 형식은 Lua binary chunk가 아니며 아직 실행되지 않습니다.
+- [x] **중간 표현과 bytecode 검증:** [컴파일러 API](../crates/rivetlua-compiler/src/lib.rs)는 해석된 AST를 형식이 지정된 레지스터 IR과 RVLU_V2 bytecode로 변환합니다. module 소유 format version, signature/vararg, ClosePath, numeric-for 전용 instruction, canonical static effects를 [코어 검증기](../crates/rivetlua-core/src/bytecode/codec.rs)가 검사하고 v1 및 미지 버전을 거부합니다. 두 프로필 모두 P05 게이트를 통과했습니다. 이 형식은 Lua binary chunk가 아니며 Lua를 실행하지 않습니다. P06+는 `NOT_IMPLEMENTED` 상태입니다.
 
 값, 숫자, 어휘 및 구문 테스트는 Rust API를 직접 호출합니다. **RivetLua는 아직 Lua 소스 코드를 실행할 수 없으며, 완전한 Lua 언어 호환성도 검증되지 않았습니다.**
 

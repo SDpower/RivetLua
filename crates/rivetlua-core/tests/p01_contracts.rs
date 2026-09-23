@@ -3,7 +3,7 @@ use std::env;
 
 use rivetlua_core::{
     CoreErrorKind, Number, ObjectRef, Value, add, bit_and, bit_not, bit_or, bit_xor, compare,
-    equal, floor_divide, modulo, number_from_value, select_and, select_or, shift_left,
+    equal, floor_divide, modulo, number_from_value, power, select_and, select_or, shift_left,
 };
 
 macro_rules! check_case {
@@ -188,6 +188,117 @@ fn num_007_bit_conversion_and_shift_boundaries() {
         shift_left(Number::Integer(1), Number::Integer(64)),
         Ok(Number::Integer(0))
     );
+}
+
+#[test]
+fn num_008_power_is_float_and_preserves_ieee_boundaries() {
+    require_profile();
+    check_case!(
+        "NUM-008",
+        "Integer(2)^Integer(3)",
+        power(Number::Integer(2), Number::Integer(3)),
+        Number::Float(8.0)
+    );
+    check_case!(
+        "NUM-008",
+        "Float(9)^Float(0.5)",
+        power(Number::Float(9.0), Number::Float(0.5)),
+        Number::Float(3.0)
+    );
+    check_power_special(
+        "Float(NaN)^Integer(1)",
+        "NaN",
+        power(Number::Float(f64::NAN), Number::Integer(1)),
+        |value| value.is_nan(),
+    );
+    check_power_special(
+        "Float(+Infinity)^Integer(2)",
+        "+Infinity",
+        power(Number::Float(f64::INFINITY), Number::Integer(2)),
+        |value| value.is_infinite() && value.is_sign_positive(),
+    );
+    check_power_special(
+        "Float(-Infinity)^Integer(3)",
+        "-Infinity",
+        power(Number::Float(f64::NEG_INFINITY), Number::Integer(3)),
+        |value| value.is_infinite() && value.is_sign_negative(),
+    );
+    check_case!(
+        "NUM-008",
+        "Integer(-2)^Integer(3)",
+        power(Number::Integer(-2), Number::Integer(3)),
+        Number::Float(-8.0)
+    );
+    check_power_special(
+        "Integer(-2)^Float(0.5)",
+        "NaN",
+        power(Number::Integer(-2), Number::Float(0.5)),
+        |value| value.is_nan(),
+    );
+    check_power_special(
+        "Float(-0)^Integer(3)",
+        "-0.0",
+        power(Number::Float(-0.0), Number::Integer(3)),
+        |value| value == 0.0 && value.is_sign_negative(),
+    );
+    check_power_special(
+        "Float(-0)^Integer(2)",
+        "+0.0",
+        power(Number::Float(-0.0), Number::Integer(2)),
+        |value| value == 0.0 && value.is_sign_positive(),
+    );
+    check_power_special(
+        "Float(-0)^Integer(-3)",
+        "-Infinity",
+        power(Number::Float(-0.0), Number::Integer(-3)),
+        |value| value.is_infinite() && value.is_sign_negative(),
+    );
+    check_power_special(
+        "Float(-0)^Integer(-2)",
+        "+Infinity",
+        power(Number::Float(-0.0), Number::Integer(-2)),
+        |value| value.is_infinite() && value.is_sign_positive(),
+    );
+    check_case!(
+        "NUM-008",
+        "number(Boolean(false))",
+        number_from_value(Value::Boolean(false)).unwrap_err().kind,
+        CoreErrorKind::NotNumeric
+    );
+}
+
+fn check_power_special(
+    operands: &str,
+    expected: &str,
+    result: Number,
+    predicate: impl FnOnce(f64) -> bool,
+) {
+    let Number::Float(value) = result else {
+        panic!("power 必須回傳 Float");
+    };
+    assert!(predicate(value), "{operands} 的結果不符");
+    let actual = classify_power_float(value);
+    assert_eq!(actual, expected, "{operands} 的實際分類不符");
+    println!(
+        "P01_CASE\tNUM-008\t{:?}\t{:?}\t{:?}",
+        operands, expected, actual
+    );
+}
+
+fn classify_power_float(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".into()
+    } else if value == f64::INFINITY {
+        "+Infinity".into()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".into()
+    } else if value == 0.0 && value.is_sign_positive() {
+        "+0.0".into()
+    } else if value == 0.0 && value.is_sign_negative() {
+        "-0.0".into()
+    } else {
+        format!("finite(bits=0x{:016x})", value.to_bits())
+    }
 }
 
 #[test]

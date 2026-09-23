@@ -80,6 +80,11 @@ pub fn divide(left: Number, right: Number) -> Number {
     Number::Float(left.as_float() / right.as_float())
 }
 
+/// Lua `^` 規則：兩個 operand 都走 `f64`，結果一律產生 Float。
+pub fn power(left: Number, right: Number) -> Number {
+    Number::Float(left.as_float().powf(right.as_float()))
+}
+
 /// Lua 向負無限的整數或浮點整除。
 pub fn floor_divide(left: Number, right: Number) -> Result<Number, CoreError> {
     match (left, right) {
@@ -247,7 +252,7 @@ mod tests {
 
     use super::{
         Number, add, bit_and, bit_not, compare, divide, equal, floor_divide, modulo, multiply,
-        negate, number_from_value, shift_left, subtract,
+        negate, number_from_value, power, shift_left, subtract,
     };
     use crate::{CoreErrorKind, Value};
 
@@ -273,6 +278,73 @@ mod tests {
         assert_eq!(
             add(Number::Integer(1), Number::Float(0.5)),
             Number::Float(1.5)
+        );
+    }
+
+    #[test]
+    fn power_always_uses_float_and_preserves_ieee_boundaries() {
+        assert_eq!(
+            power(Number::Integer(2), Number::Integer(3)),
+            Number::Float(8.0)
+        );
+        assert_eq!(
+            power(Number::Float(9.0), Number::Float(0.5)),
+            Number::Float(3.0)
+        );
+        let Number::Float(nan) = power(Number::Float(f64::NAN), Number::Integer(1)) else {
+            unreachable!();
+        };
+        assert!(nan.is_nan());
+        let Number::Float(positive_infinity) =
+            power(Number::Float(f64::INFINITY), Number::Integer(2))
+        else {
+            unreachable!();
+        };
+        assert!(positive_infinity.is_infinite() && positive_infinity.is_sign_positive());
+        let Number::Float(negative_infinity) =
+            power(Number::Float(f64::NEG_INFINITY), Number::Integer(3))
+        else {
+            unreachable!();
+        };
+        assert!(negative_infinity.is_infinite() && negative_infinity.is_sign_negative());
+        assert_eq!(
+            power(Number::Integer(-2), Number::Integer(3)),
+            Number::Float(-8.0)
+        );
+        let Number::Float(non_integer_exponent) = power(Number::Integer(-2), Number::Float(0.5))
+        else {
+            unreachable!();
+        };
+        assert!(non_integer_exponent.is_nan());
+        let Number::Float(negative_zero_odd) = power(Number::Float(-0.0), Number::Integer(3))
+        else {
+            unreachable!();
+        };
+        assert_eq!(negative_zero_odd, 0.0);
+        assert!(negative_zero_odd.is_sign_negative());
+        let Number::Float(negative_zero_even) = power(Number::Float(-0.0), Number::Integer(2))
+        else {
+            unreachable!();
+        };
+        assert_eq!(negative_zero_even, 0.0);
+        assert!(negative_zero_even.is_sign_positive());
+        let Number::Float(negative_infinite_reciprocal) =
+            power(Number::Float(-0.0), Number::Integer(-3))
+        else {
+            unreachable!();
+        };
+        assert!(
+            negative_infinite_reciprocal.is_infinite()
+                && negative_infinite_reciprocal.is_sign_negative()
+        );
+        let Number::Float(positive_infinite_reciprocal) =
+            power(Number::Float(-0.0), Number::Integer(-2))
+        else {
+            unreachable!();
+        };
+        assert!(
+            positive_infinite_reciprocal.is_infinite()
+                && positive_infinite_reciprocal.is_sign_positive()
         );
     }
 

@@ -1,7 +1,7 @@
 use rivetlua_core::Value;
 use rivetlua_core::{
     CoreErrorKind, Number, add, bit_and, bit_not, compare, equal, floor_divide, modulo,
-    number_from_value, shift_left,
+    number_from_value, power, shift_left,
 };
 use std::cmp::Ordering;
 
@@ -96,5 +96,48 @@ fn public_number_api_returns_checkable_errors() {
     assert_eq!(
         floor_divide(Number::Integer(i64::MIN), Number::Integer(-1)),
         Ok(Number::Integer(i64::MIN))
+    );
+}
+
+#[test]
+fn public_power_api_uses_f64_and_keeps_special_value_bits() {
+    assert_eq!(
+        power(Number::Integer(2), Number::Integer(3)),
+        Number::Float(8.0)
+    );
+    assert_eq!(
+        power(Number::Float(9.0), Number::Float(0.5)),
+        Number::Float(3.0)
+    );
+    let Number::Float(nan) = power(Number::Float(f64::NAN), Number::Integer(1)) else {
+        unreachable!();
+    };
+    assert!(nan.is_nan());
+    let Number::Float(negative_infinity) =
+        power(Number::Float(f64::NEG_INFINITY), Number::Integer(3))
+    else {
+        unreachable!();
+    };
+    assert!(negative_infinity.is_infinite() && negative_infinity.is_sign_negative());
+    assert_eq!(
+        power(Number::Integer(-2), Number::Integer(3)),
+        Number::Float(-8.0)
+    );
+    let Number::Float(non_integer_exponent) = power(Number::Integer(-2), Number::Float(0.5)) else {
+        unreachable!();
+    };
+    assert!(non_integer_exponent.is_nan());
+    let Number::Float(negative_zero) = power(Number::Float(-0.0), Number::Integer(3)) else {
+        unreachable!();
+    };
+    assert_eq!(negative_zero, 0.0);
+    assert!(negative_zero.is_sign_negative());
+    let Number::Float(positive_infinity) = power(Number::Float(-0.0), Number::Integer(-2)) else {
+        unreachable!();
+    };
+    assert!(positive_infinity.is_infinite() && positive_infinity.is_sign_positive());
+    assert_eq!(
+        number_from_value(Value::Boolean(false)).unwrap_err().kind,
+        CoreErrorKind::NotNumeric
     );
 }

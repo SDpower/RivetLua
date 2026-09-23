@@ -1,9 +1,9 @@
-//! RVLU v1 little-endian module codec；只做受限結構驗證，不含 VM 或 CFG/dataflow 驗證。
+//! RVLU v2 little-endian module codec；只做受限結構驗證，不含 VM 或 CFG/dataflow 驗證。
 
 use super::{
     BinaryOperation, BytecodeVersion, EnvironmentSource, FrameLayout, Instruction,
-    InstructionOffset, LuaProfile, ProtoId, RVLU_V1, Register, ResultMode, UnaryOperation,
-    UpvalueId,
+    InstructionEffects, InstructionOffset, LuaProfile, ProtoId, RVLU_V1, RVLU_V2, Register,
+    ResultMode, UnaryOperation, UpvalueId,
 };
 
 pub const RVLU_MAGIC: [u8; 4] = *b"RVLU";
@@ -120,6 +120,9 @@ pub struct BytecodePrototype {
     pub parent: Option<ProtoId>,
     pub span: BytecodeSpan,
     pub register_count: u16,
+    pub parameter_count: u16,
+    pub is_variadic: bool,
+    pub named_vararg: Option<(BytecodeBindingId, Register)>,
     pub frame: FrameLayout,
     pub global_environment: Register,
     pub global_environment_binding: BytecodeBindingId,
@@ -132,6 +135,7 @@ pub struct BytecodePrototype {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BytecodeModule {
+    pub format_version: BytecodeVersion,
     pub profile: LuaProfile,
     pub numeric_config: u8,
     pub span: BytecodeSpan,
@@ -150,6 +154,10 @@ pub struct VerifiedModule {
 }
 
 impl VerifiedModule {
+    pub fn format_version(&self) -> BytecodeVersion {
+        self.module.format_version
+    }
+
     pub fn profile(&self) -> LuaProfile {
         self.module.profile
     }
@@ -180,6 +188,9 @@ pub fn verify_module(
     expected_profile: LuaProfile,
     limits: &VerifyLimits,
 ) -> Result<VerifiedModule, BytecodeError> {
+    if module.format_version != RVLU_V2 {
+        return Err(verify(0, "RVLU v1 或未知 format version 不可驗證"));
+    }
     if module.profile != expected_profile {
         return Err(verify(0, "RVLU profile 不符"));
     }
@@ -248,7 +259,7 @@ pub fn encode_module(
     let verified = verify_module(module, expected_profile, limits)?;
     let mut writer = Writer::default();
     writer.bytes(&RVLU_MAGIC);
-    writer.u16(RVLU_V1.0);
+    writer.u16(RVLU_V2.0);
     writer.u8(profile_tag(verified.profile()));
     writer.u8(verified.module.numeric_config);
     write_span(&mut writer, verified.module.span);
@@ -281,8 +292,11 @@ pub fn decode_module(
         return Err(verify(0, "RVLU magic 不符"));
     }
     let version = BytecodeVersion(reader.u16()?);
-    if version != RVLU_V1 {
-        return Err(verify(4, "RVLU version 不支援"));
+    if version == RVLU_V1 {
+        return Err(verify(4, "RVLU v1 語意不完整，明確拒絕"));
+    }
+    if version != RVLU_V2 {
+        return Err(verify(4, "RVLU format version 不支援"));
     }
     let profile = parse_profile(reader.u8()?, 6)?;
     if profile != expected_profile {
@@ -338,6 +352,7 @@ pub fn decode_module(
     }
     verify_module(
         BytecodeModule {
+            format_version: version,
             profile,
             numeric_config,
             span,
@@ -367,6 +382,28 @@ fn validate_prototype(
         || prototype.frame.dynamic_top.0 > prototype.register_count
     {
         return Err(limit(0, "RVLU frame register 超過限制"));
+    }
+    if prototype.parameter_count >= prototype.register_count {
+        return Err(verify(0, "RVLU parameter count 超出 frame"));
+    }
+    match prototype.named_vararg {
+        Some((_binding, _register)) if !prototype.is_variadic => {
+            return Err(verify(0, "RVLU named vararg 必須標記 variadic"));
+        }
+        Some((_binding, _register)) if module.profile != LuaProfile::Lua55 => {
+            return Err(verify(0, "lua54 不可攜帶 named vararg metadata"));
+        }
+        Some((binding, register)) => {
+            if register.0 >= prototype.register_count
+                || !prototype
+                    .binding_registers
+                    .iter()
+                    .any(|(candidate, mapped)| *candidate == binding && *mapped == register)
+            {
+                return Err(verify(0, "RVLU named vararg binding/register 無效"));
+            }
+        }
+        None => {}
     }
     if prototype.constants.len() > limits.max_constants {
         return Err(limit(0, "RVLU constant 數超過限制"));
@@ -435,6 +472,7 @@ fn validate_prototype(
         }
         validate_instruction_shape(prototype, module, index, instruction)?;
     }
+    validate_numeric_for_pairs(prototype)?;
     verify_control_and_dataflow(prototype, limits)
 }
 
@@ -490,9 +528,27 @@ fn validate_close_sequences(prototype: &BytecodePrototype) -> Result<(), Bytecod
                 return Err(verify(0, "RVLU ClosePath Close 順序或連續性不符"));
             }
         }
-        index = index
+        let after_close = index
             .checked_add(path.registers.len())
             .ok_or_else(|| limit(0, "RVLU ClosePath 序列長度溢位"))?;
+        if path.kind == BytecodeExitKind::Return
+            && matches!(
+                prototype
+                    .instructions
+                    .get(after_close)
+                    .map(|entry| &entry.instruction),
+                Some(Instruction::TailCall {
+                    result_mode: ResultMode::All,
+                    ..
+                })
+            )
+        {
+            return Err(verify(
+                0,
+                "RVLU 有 pending ClosePath 的 return 不可使用 TailCall(All)",
+            ));
+        }
+        index = after_close;
     }
     Ok(())
 }
@@ -572,8 +628,14 @@ fn validate_instruction_shape(
             register(*src)?;
         }
         Instruction::BinaryOp {
-            dest, left, right, ..
+            dest,
+            op,
+            left,
+            right,
         } => {
+            if matches!(op, BinaryOperation::And | BinaryOperation::Or) {
+                return Err(verify(0, "RVLU v2 不可用 BinaryOp 表示 and/or"));
+            }
             register(*dest)?;
             register(*left)?;
             register(*right)?;
@@ -607,7 +669,14 @@ fn validate_instruction_shape(
             range(*base, *arg_count)?;
             validate_result_range(prototype, *base, *result_mode)?;
         }
-        Instruction::Vararg { base, result_mode } | Instruction::Return { base, result_mode } => {
+        Instruction::Vararg { base, result_mode } => {
+            if !prototype.is_variadic {
+                return Err(verify(0, "RVLU 非 variadic prototype 不可使用 Vararg"));
+            }
+            register(*base)?;
+            validate_result_range(prototype, *base, *result_mode)?;
+        }
+        Instruction::Return { base, result_mode } => {
             register(*base)?;
             validate_result_range(prototype, *base, *result_mode)?;
         }
@@ -616,6 +685,37 @@ fn validate_instruction_shape(
                 return Err(verify(0, "RVLU Close count 不可為零"));
             }
             range(*base, *count - 1)?;
+        }
+        Instruction::NumericForPrepare {
+            control,
+            limit,
+            step,
+            visible,
+            exit,
+        } => {
+            validate_numeric_for_registers(register, *control, *limit, *step, *visible)?;
+            require_jump_target(prototype, index, *exit)?;
+            if exit.0 as usize <= index {
+                return Err(verify(0, "RVLU NumericForPrepare exit 必須為前向 CFG edge"));
+            }
+        }
+        Instruction::NumericForNext {
+            control,
+            limit,
+            step,
+            visible,
+            target,
+            exit,
+        } => {
+            validate_numeric_for_registers(register, *control, *limit, *step, *visible)?;
+            require_jump_target(prototype, index, *target)?;
+            require_jump_target(prototype, index, *exit)?;
+            if target.0 as usize >= index || exit.0 as usize <= index {
+                return Err(verify(
+                    0,
+                    "RVLU NumericForNext 必須有後向回邊與前向 exit CFG edge",
+                ));
+            }
         }
     }
     match (&instruction.instruction, &instruction.close_path) {
@@ -630,6 +730,249 @@ fn validate_instruction_shape(
         }
         (_, Some(_)) => return Err(verify(0, "非 Close instruction 不可攜帶 ClosePath")),
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_numeric_for_registers(
+    register: impl Fn(Register) -> Result<(), BytecodeError>,
+    control: Register,
+    limit: Register,
+    step: Register,
+    visible: Register,
+) -> Result<(), BytecodeError> {
+    for value in [control, limit, step, visible] {
+        register(value)?;
+    }
+    if control == limit
+        || control == step
+        || control == visible
+        || limit == step
+        || limit == visible
+        || step == visible
+    {
+        return Err(verify(
+            0,
+            "RVLU NumericFor 控制/limit/step/可見 variable register 必須分離",
+        ));
+    }
+    Ok(())
+}
+
+/// `NumericForNext` 不能自行建立 numeric mode；它必須唯一配對同一組
+/// control registers 的 `NumericForPrepare`，並回到該 Prepare 後的 body entry。
+fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), BytecodeError> {
+    let mut prepares =
+        std::collections::BTreeMap::<(u16, u16, u16, u16), Vec<(usize, InstructionOffset)>>::new();
+    for (prepare_index, instruction) in prototype.instructions.iter().enumerate() {
+        let Instruction::NumericForPrepare {
+            control,
+            limit,
+            step,
+            visible,
+            exit,
+        } = instruction.instruction
+        else {
+            continue;
+        };
+        prepares
+            .entry((control.0, limit.0, step.0, visible.0))
+            .or_default()
+            .push((prepare_index, exit));
+    }
+
+    let mut pairs = Vec::new();
+    for (next_index, instruction) in prototype.instructions.iter().enumerate() {
+        let Instruction::NumericForNext {
+            control,
+            limit,
+            step,
+            visible,
+            target,
+            exit,
+        } = instruction.instruction
+        else {
+            continue;
+        };
+        let Some(candidates) = prepares.get(&(control.0, limit.0, step.0, visible.0)) else {
+            return Err(verify(
+                0,
+                "RVLU NumericForNext 必須唯一配對 NumericForPrepare",
+            ));
+        };
+        let [(prepare_index, prepare_exit)] = candidates.as_slice() else {
+            return Err(verify(
+                0,
+                "RVLU NumericForNext 必須唯一配對 NumericForPrepare",
+            ));
+        };
+        if *prepare_exit != exit
+            || prepare_index.checked_add(1) != Some(target.0 as usize)
+            || target.0 as usize >= next_index
+        {
+            return Err(verify(
+                0,
+                "RVLU NumericForPrepare/Next 的 body target 或 exit 不符",
+            ));
+        }
+        pairs.push((*prepare_index, next_index));
+    }
+    validate_numeric_for_body_dominance(prototype, &pairs)
+}
+
+/// 將 Prepare 的 body edge 拆成獨立 gate；gate 支配 Next 才表示每條
+/// 可達路徑都經過 Prepare 的成功分支，不能從入口或 exit 分支跳入 body。
+fn validate_numeric_for_body_dominance(
+    prototype: &BytecodePrototype,
+    pairs: &[(usize, usize)],
+) -> Result<(), BytecodeError> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let count = prototype.instructions.len();
+    let mut gates = vec![None; count];
+    let mut next_gate = count;
+    for (index, entry) in prototype.instructions.iter().enumerate() {
+        if matches!(entry.instruction, Instruction::NumericForPrepare { .. }) {
+            gates[index] = Some(next_gate);
+            next_gate += 1;
+        }
+    }
+    let mut edges = vec![Vec::new(); next_gate];
+    for (index, entry) in prototype.instructions.iter().enumerate() {
+        match &entry.instruction {
+            Instruction::Jump { target } => edges[index].push(target.0 as usize),
+            Instruction::JumpIfFalse { target, .. } => {
+                edges[index].push(target.0 as usize);
+                if index + 1 < count {
+                    edges[index].push(index + 1);
+                }
+            }
+            Instruction::NumericForPrepare { exit, .. } => {
+                edges[index].push(exit.0 as usize);
+                if let Some(gate) = gates[index] {
+                    edges[index].push(gate);
+                    edges[gate].push(index + 1);
+                }
+            }
+            Instruction::NumericForNext { target, exit, .. } => {
+                edges[index].push(target.0 as usize);
+                edges[index].push(exit.0 as usize);
+            }
+            Instruction::Return { .. } | Instruction::TailCall { .. } => {}
+            _ if index + 1 < count => edges[index].push(index + 1),
+            _ => {}
+        }
+    }
+    let mut predecessors = vec![Vec::new(); next_gate];
+    for (node, successors) in edges.iter().enumerate() {
+        for &successor in successors {
+            predecessors[successor].push(node);
+        }
+    }
+
+    let mut visited = vec![false; next_gate];
+    let mut postorder = Vec::with_capacity(next_gate);
+    let mut stack = vec![(0usize, 0usize)];
+    visited[0] = true;
+    while let Some((node, next_successor)) = stack.last_mut() {
+        if *next_successor < edges[*node].len() {
+            let successor = edges[*node][*next_successor];
+            *next_successor += 1;
+            if !visited[successor] {
+                visited[successor] = true;
+                stack.push((successor, 0));
+            }
+        } else {
+            let (finished, _) = stack.pop().expect("CFG stack 非空");
+            postorder.push(finished);
+        }
+    }
+    postorder.reverse();
+    let mut order = vec![usize::MAX; next_gate];
+    for (position, &node) in postorder.iter().enumerate() {
+        order[node] = position;
+    }
+    let mut immediate_dominator = vec![None; next_gate];
+    immediate_dominator[0] = Some(0usize);
+    let mut work_remaining = count.saturating_mul(128);
+    let mut spend_work = || {
+        work_remaining = work_remaining
+            .checked_sub(1)
+            .ok_or_else(|| limit(0, "RVLU CFG dominator 工作量超過限制"))?;
+        Ok::<(), BytecodeError>(())
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &node in postorder.iter().skip(1) {
+            let mut candidate = None;
+            for &predecessor in &predecessors[node] {
+                spend_work()?;
+                if immediate_dominator[predecessor].is_none() {
+                    continue;
+                }
+                candidate = Some(match candidate {
+                    None => predecessor,
+                    Some(current) => {
+                        let mut left = predecessor;
+                        let mut right = current;
+                        while left != right {
+                            while order[left] > order[right] {
+                                spend_work()?;
+                                left = immediate_dominator[left]
+                                    .ok_or_else(|| verify(0, "RVLU CFG dominator state 無效"))?;
+                            }
+                            while order[right] > order[left] {
+                                spend_work()?;
+                                right = immediate_dominator[right]
+                                    .ok_or_else(|| verify(0, "RVLU CFG dominator state 無效"))?;
+                            }
+                        }
+                        left
+                    }
+                });
+            }
+            if immediate_dominator[node] != candidate {
+                immediate_dominator[node] = candidate;
+                changed = true;
+            }
+        }
+    }
+
+    let mut dominator_children = vec![Vec::new(); next_gate];
+    for (node, parent) in immediate_dominator.iter().enumerate().skip(1) {
+        if let Some(parent) = parent {
+            dominator_children[*parent].push(node);
+        }
+    }
+    let mut entry = vec![0usize; next_gate];
+    let mut exit = vec![0usize; next_gate];
+    let mut tick = 0usize;
+    let mut stack = vec![(0usize, false)];
+    while let Some((node, leaving)) = stack.pop() {
+        tick += 1;
+        if leaving {
+            exit[node] = tick;
+        } else {
+            entry[node] = tick;
+            stack.push((node, true));
+            for &child in dominator_children[node].iter().rev() {
+                stack.push((child, false));
+            }
+        }
+    }
+    for &(prepare, next) in pairs {
+        if !visited[next] {
+            continue;
+        }
+        let gate = gates[prepare].ok_or_else(|| verify(0, "RVLU NumericForPrepare gate 缺失"))?;
+        if !visited[gate] || !(entry[gate] <= entry[next] && exit[next] <= exit[gate]) {
+            return Err(verify(
+                0,
+                "RVLU NumericForNext 路徑未經對應 NumericForPrepare body entry",
+            ));
+        }
     }
     Ok(())
 }
@@ -698,8 +1041,8 @@ fn verify_control_and_dataflow(
     if prototype.instructions.is_empty() {
         return Err(verify(0, "RVLU prototype 不可空且不得 fall-through"));
     }
-    if prototype.frame.initial_top != prototype.frame.dynamic_top {
-        return Err(verify(0, "RVLU frame dynamic top 初始值不符"));
+    if prototype.frame.dynamic_top.0 < prototype.frame.initial_top.0 {
+        return Err(verify(0, "RVLU frame dynamic top 不可低於 initial top"));
     }
     let count = prototype.instructions.len();
     if count > limits.max_instructions {
@@ -764,6 +1107,20 @@ fn verify_control_and_dataflow(
                 }
                 successors.push(index + 1);
             }
+            Instruction::NumericForPrepare { exit, .. } => {
+                successors.push(exit.0 as usize);
+                if index.checked_add(1).filter(|next| *next < count).is_none() {
+                    return Err(verify(
+                        0,
+                        "RVLU NumericForPrepare fall-through 到 proto 尾端",
+                    ));
+                }
+                successors.push(index + 1);
+            }
+            Instruction::NumericForNext { target, exit, .. } => {
+                successors.push(target.0 as usize);
+                successors.push(exit.0 as usize);
+            }
             Instruction::Return { .. } | Instruction::TailCall { .. } => {}
             _ => {
                 if index.checked_add(1).filter(|next| *next < count).is_none() {
@@ -822,6 +1179,16 @@ fn encode_prototype(
     write_optional_proto(&mut writer, prototype.parent);
     write_span(&mut writer, prototype.span);
     writer.u16(prototype.register_count);
+    writer.u16(prototype.parameter_count);
+    writer.u8(u8::from(prototype.is_variadic));
+    match prototype.named_vararg {
+        Some((binding, register)) => {
+            writer.u8(1);
+            write_binding(&mut writer, binding);
+            writer.u16(register.0);
+        }
+        None => writer.u8(0),
+    }
     write_frame(&mut writer, prototype.frame);
     writer.u16(prototype.global_environment.0);
     write_binding(&mut writer, prototype.global_environment_binding);
@@ -860,6 +1227,17 @@ fn decode_prototype(
     let parent = read_optional_proto(&mut reader)?;
     let span = read_span(&mut reader)?;
     let register_count = reader.u16()?;
+    let parameter_count = reader.u16()?;
+    let is_variadic = match reader.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(verify(reader.location() - 1, "RVLU vararg flag 無效")),
+    };
+    let named_vararg = match reader.u8()? {
+        0 => None,
+        1 => Some((read_binding(&mut reader)?, Register(reader.u16()?))),
+        _ => return Err(verify(reader.location() - 1, "RVLU named vararg flag 無效")),
+    };
     let frame = read_frame(&mut reader)?;
     let global_environment = Register(reader.u16()?);
     let global_environment_binding = read_binding(&mut reader)?;
@@ -886,6 +1264,9 @@ fn decode_prototype(
         parent,
         span,
         register_count,
+        parameter_count,
+        is_variadic,
+        named_vararg,
         frame,
         global_environment,
         global_environment_binding,
@@ -981,6 +1362,7 @@ fn encode_instructions(
     )?);
     for instruction in instructions {
         write_instruction(&mut writer, &instruction.instruction);
+        writer.u8(instruction.instruction.canonical_effect_flags());
         write_span(&mut writer, instruction.span);
         match &instruction.close_path {
             Some(path) => {
@@ -1003,6 +1385,21 @@ fn decode_instructions(
     let mut instructions = Vec::new();
     for _ in 0..count {
         let instruction = read_instruction(&mut reader)?;
+        let effect_offset = reader.location();
+        let encoded_effects = reader.u8()?;
+        let canonical_effects = instruction.canonical_effect_flags();
+        if encoded_effects & !InstructionEffects::KNOWN_FLAGS != 0 {
+            return Err(verify(
+                effect_offset,
+                "RVLU instruction effect flags 含未知 bit",
+            ));
+        }
+        if encoded_effects != canonical_effects {
+            return Err(verify(
+                effect_offset,
+                "RVLU instruction effect flags 與 canonical effect 不符",
+            ));
+        }
         let span = read_span(&mut reader)?;
         let close_path = match reader.u8()? {
             0 => None,
@@ -1230,6 +1627,36 @@ fn write_instruction(writer: &mut Writer, instruction: &Instruction) {
             writer.u16(base.0);
             writer.u16(*count);
         }
+        Instruction::NumericForPrepare {
+            control,
+            limit,
+            step,
+            visible,
+            exit,
+        } => {
+            writer.u8(18);
+            writer.u16(control.0);
+            writer.u16(limit.0);
+            writer.u16(step.0);
+            writer.u16(visible.0);
+            writer.u32(exit.0);
+        }
+        Instruction::NumericForNext {
+            control,
+            limit,
+            step,
+            visible,
+            target,
+            exit,
+        } => {
+            writer.u8(19);
+            writer.u16(control.0);
+            writer.u16(limit.0);
+            writer.u16(step.0);
+            writer.u16(visible.0);
+            writer.u32(target.0);
+            writer.u32(exit.0);
+        }
     }
 }
 
@@ -1312,6 +1739,21 @@ fn read_instruction(reader: &mut Reader<'_>) -> Result<Instruction, BytecodeErro
         17 => Instruction::Close {
             base: Register(reader.u16()?),
             count: reader.u16()?,
+        },
+        18 => Instruction::NumericForPrepare {
+            control: Register(reader.u16()?),
+            limit: Register(reader.u16()?),
+            step: Register(reader.u16()?),
+            visible: Register(reader.u16()?),
+            exit: InstructionOffset(reader.u32()?),
+        },
+        19 => Instruction::NumericForNext {
+            control: Register(reader.u16()?),
+            limit: Register(reader.u16()?),
+            step: Register(reader.u16()?),
+            visible: Register(reader.u16()?),
+            target: InstructionOffset(reader.u32()?),
+            exit: InstructionOffset(reader.u32()?),
         },
         _ => return Err(verify(offset, "RVLU opcode 無效")),
     })
@@ -1741,8 +2183,54 @@ fn limit(offset: usize, message: &str) -> BytecodeError {
 mod tests {
     use super::*;
 
+    fn first_instruction_offsets(bytes: &[u8]) -> (usize, usize) {
+        let mut module_reader = Reader::new(bytes);
+        module_reader.take(4).unwrap();
+        module_reader.u16().unwrap();
+        module_reader.u8().unwrap();
+        module_reader.u8().unwrap();
+        read_span(&mut module_reader).unwrap();
+        let prototypes = module_reader.section().unwrap();
+        let mut prototypes_reader = Reader::new_at(prototypes.bytes, prototypes.start);
+        prototypes_reader.u32().unwrap();
+        let record = prototypes_reader.section().unwrap();
+        let mut record_reader = Reader::new_at(record.bytes, record.start);
+        record_reader.u32().unwrap();
+        record_reader.u32().unwrap();
+        read_optional_proto(&mut record_reader).unwrap();
+        read_span(&mut record_reader).unwrap();
+        record_reader.u16().unwrap();
+        record_reader.u16().unwrap();
+        record_reader.u8().unwrap();
+        record_reader.u8().unwrap();
+        read_frame(&mut record_reader).unwrap();
+        record_reader.u16().unwrap();
+        read_binding(&mut record_reader).unwrap();
+        record_reader.section().unwrap();
+        let instructions = record_reader.section().unwrap();
+        let mut instructions_reader = Reader::new_at(instructions.bytes, instructions.start);
+        instructions_reader.u32().unwrap();
+        let instruction_offset = instructions_reader.location();
+        read_instruction(&mut instructions_reader).unwrap();
+        let effect_offset = instructions_reader.location();
+        (instruction_offset, effect_offset)
+    }
+
+    fn assert_high_count_operand_is_rejected(module: BytecodeModule, relative_offset: usize) {
+        let limits = VerifyLimits::default();
+        let encoded = encode_module(module.clone(), LuaProfile::Lua55, &limits).unwrap();
+        let mut bytes = encoded.bytes().to_vec();
+        let (instruction_offset, _) = first_instruction_offsets(&bytes);
+        bytes[instruction_offset + relative_offset..instruction_offset + relative_offset + 2]
+            .copy_from_slice(&u16::MAX.to_le_bytes());
+        let error = decode_module(&bytes, LuaProfile::Lua55, &limits)
+            .expect_err("高計數 operand 必須在驗證成功前拒絕");
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
+    }
+
     fn sample() -> BytecodeModule {
         BytecodeModule {
+            format_version: RVLU_V2,
             profile: LuaProfile::Lua55,
             numeric_config: RVLU_NUMERIC_I64_F64,
             span: BytecodeSpan {
@@ -1759,6 +2247,9 @@ mod tests {
                     end_byte: 10,
                 },
                 register_count: 2,
+                parameter_count: 0,
+                is_variadic: false,
+                named_vararg: None,
                 frame: FrameLayout {
                     register_limit: 2,
                     initial_top: Register(2),
@@ -1816,9 +2307,77 @@ mod tests {
         let limits = VerifyLimits::default();
         let encoded = encode_module(sample(), LuaProfile::Lua55, &limits).unwrap();
         assert_eq!(&encoded.bytes()[..4], &RVLU_MAGIC);
-        assert_eq!(&encoded.bytes()[4..6], &RVLU_V1.0.to_le_bytes());
+        assert_eq!(&encoded.bytes()[4..6], &RVLU_V2.0.to_le_bytes());
+        assert_eq!(encoded.verified().format_version(), RVLU_V2);
         let decoded = decode_module(encoded.bytes(), LuaProfile::Lua55, &limits).unwrap();
         assert_eq!(decoded.module(), encoded.verified().module());
+    }
+
+    #[test]
+    fn decoder_rejects_high_count_loadnil_and_call_result_operands() {
+        let mut load_nil = sample();
+        load_nil.prototypes[0].instructions[0].instruction = Instruction::LoadNil {
+            start: Register(0),
+            count: 1,
+        };
+        assert_high_count_operand_is_rejected(load_nil, 3);
+
+        let mut call_arguments = sample();
+        call_arguments.prototypes[0].instructions[0].instruction = Instruction::Call {
+            base: Register(0),
+            arg_count: 0,
+            result_mode: ResultMode::Fixed(0),
+        };
+        assert_high_count_operand_is_rejected(call_arguments.clone(), 3);
+        assert_high_count_operand_is_rejected(call_arguments, 6);
+    }
+
+    #[test]
+    fn decoder_rejects_high_count_tailcall_vararg_and_return_operands() {
+        let mut tail_call = sample();
+        tail_call.prototypes[0].instructions[0].instruction = Instruction::TailCall {
+            base: Register(0),
+            arg_count: 0,
+            result_mode: ResultMode::Fixed(0),
+        };
+        assert_high_count_operand_is_rejected(tail_call.clone(), 3);
+        assert_high_count_operand_is_rejected(tail_call, 6);
+
+        let mut vararg = sample();
+        vararg.prototypes[0].is_variadic = true;
+        vararg.prototypes[0].instructions[0].instruction = Instruction::Vararg {
+            base: Register(0),
+            result_mode: ResultMode::Fixed(1),
+        };
+        assert_high_count_operand_is_rejected(vararg, 4);
+
+        let mut return_ = sample();
+        return_.prototypes[0].instructions[0].instruction = Instruction::Return {
+            base: Register(0),
+            result_mode: ResultMode::Fixed(1),
+        };
+        assert_high_count_operand_is_rejected(return_, 4);
+    }
+
+    #[test]
+    fn decoder_accepts_canonical_effect_flags_and_rejects_unknown_or_mismatched_flags() {
+        let limits = VerifyLimits::default();
+        let encoded = encode_module(sample(), LuaProfile::Lua55, &limits).unwrap();
+        let mut bytes = encoded.bytes().to_vec();
+        let (_, effect_offset) = first_instruction_offsets(&bytes);
+        assert!(decode_module(&bytes, LuaProfile::Lua55, &limits).is_ok());
+
+        bytes[effect_offset] = InstructionEffects::KNOWN_FLAGS + 1;
+        let error = decode_module(&bytes, LuaProfile::Lua55, &limits)
+            .expect_err("未知 effect flag 必須拒絕");
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
+        assert!(error.message.contains("未知 bit"));
+
+        bytes[effect_offset] = InstructionEffects::ALLOCATES;
+        let error = decode_module(&bytes, LuaProfile::Lua55, &limits)
+            .expect_err("已知但矛盾的 effect flag 必須拒絕");
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
+        assert!(error.message.contains("canonical"));
     }
 
     #[test]
@@ -1937,6 +2496,231 @@ mod tests {
                 .code,
             BytecodeErrorCode::Verify
         );
+    }
+
+    #[test]
+    fn verifier_rejects_numeric_for_next_without_matching_prepare() {
+        let limits = VerifyLimits::default();
+        let mut malformed = sample();
+        let prototype = &mut malformed.prototypes[0];
+        prototype.register_count = 4;
+        prototype.frame.register_limit = 4;
+        prototype.frame.initial_top = Register(4);
+        prototype.frame.dynamic_top = Register(4);
+        prototype.instructions = vec![
+            BytecodeInstruction {
+                instruction: Instruction::LoadNil {
+                    start: Register(0),
+                    count: 1,
+                },
+                span: BytecodeSpan {
+                    start_byte: 0,
+                    end_byte: 1,
+                },
+                close_path: None,
+            },
+            BytecodeInstruction {
+                instruction: Instruction::NumericForNext {
+                    control: Register(0),
+                    limit: Register(1),
+                    step: Register(2),
+                    visible: Register(3),
+                    target: InstructionOffset(0),
+                    exit: InstructionOffset(2),
+                },
+                span: BytecodeSpan {
+                    start_byte: 1,
+                    end_byte: 2,
+                },
+                close_path: None,
+            },
+            BytecodeInstruction {
+                instruction: Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(0),
+                },
+                span: BytecodeSpan {
+                    start_byte: 2,
+                    end_byte: 3,
+                },
+                close_path: None,
+            },
+        ];
+        let error = verify_module(malformed, LuaProfile::Lua55, &limits)
+            .expect_err("沒有 NumericForPrepare 的 Next 必須拒絕");
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
+        assert!(error.message.contains("NumericForNext"));
+    }
+
+    #[test]
+    fn verifier_requires_numeric_for_prepare_on_every_next_path() {
+        let limits = VerifyLimits::default();
+        let mut module = sample();
+        let prototype = &mut module.prototypes[0];
+        prototype.register_count = 4;
+        prototype.frame.register_limit = 4;
+        prototype.frame.initial_top = Register(4);
+        prototype.frame.dynamic_top = Register(4);
+        prototype.instructions = vec![
+            BytecodeInstruction {
+                instruction: Instruction::Jump {
+                    target: InstructionOffset(1),
+                },
+                span: prototype.span,
+                close_path: None,
+            },
+            BytecodeInstruction {
+                instruction: Instruction::NumericForPrepare {
+                    control: Register(0),
+                    limit: Register(1),
+                    step: Register(2),
+                    visible: Register(3),
+                    exit: InstructionOffset(4),
+                },
+                span: prototype.span,
+                close_path: None,
+            },
+            BytecodeInstruction {
+                instruction: Instruction::Move {
+                    dest: Register(3),
+                    src: Register(3),
+                },
+                span: prototype.span,
+                close_path: None,
+            },
+            BytecodeInstruction {
+                instruction: Instruction::NumericForNext {
+                    control: Register(0),
+                    limit: Register(1),
+                    step: Register(2),
+                    visible: Register(3),
+                    target: InstructionOffset(2),
+                    exit: InstructionOffset(4),
+                },
+                span: prototype.span,
+                close_path: None,
+            },
+            BytecodeInstruction {
+                instruction: Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(0),
+                },
+                span: prototype.span,
+                close_path: None,
+            },
+        ];
+        verify_module(module.clone(), LuaProfile::Lua55, &limits)
+            .expect("Prepare body entry 與 Next 回邊應合法");
+        let mut exit_bypass = module.clone();
+        exit_bypass.prototypes[0].instructions[4].instruction = Instruction::Jump {
+            target: InstructionOffset(2),
+        };
+        let error = verify_module(exit_bypass, LuaProfile::Lua55, &limits)
+            .expect_err("Prepare 的 exit 分支不可回跳至 Next body");
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
+        assert!(error.message.contains("NumericForNext"));
+        module.prototypes[0].instructions[0].instruction = Instruction::Jump {
+            target: InstructionOffset(2),
+        };
+        let error = verify_module(module, LuaProfile::Lua55, &limits)
+            .expect_err("從入口跳過 Prepare 進入 Next 必須拒絕");
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
+        assert!(error.message.contains("NumericForNext"));
+    }
+
+    #[test]
+    fn verifier_and_decoder_reject_vararg_in_non_variadic_prototype() {
+        let limits = VerifyLimits::default();
+        let mut module = sample();
+        module.prototypes[0].instructions[0].instruction = Instruction::Vararg {
+            base: Register(0),
+            result_mode: ResultMode::Fixed(1),
+        };
+        let error = verify_module(module.clone(), LuaProfile::Lua55, &limits)
+            .expect_err("非 variadic prototype 不可含 Vararg");
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
+
+        module.prototypes[0].is_variadic = true;
+        let encoded = encode_module(module, LuaProfile::Lua55, &limits)
+            .expect("variadic prototype 可使用 Vararg");
+        let mut bytes = encoded.bytes().to_vec();
+        let mut module_reader = Reader::new(&bytes);
+        module_reader.take(4).unwrap();
+        module_reader.u16().unwrap();
+        module_reader.u8().unwrap();
+        module_reader.u8().unwrap();
+        read_span(&mut module_reader).unwrap();
+        let prototypes = module_reader.section().unwrap();
+        let mut prototypes_reader = Reader::new_at(prototypes.bytes, prototypes.start);
+        prototypes_reader.u32().unwrap();
+        let record = prototypes_reader.section().unwrap();
+        let mut record_reader = Reader::new_at(record.bytes, record.start);
+        record_reader.u32().unwrap();
+        record_reader.u32().unwrap();
+        read_optional_proto(&mut record_reader).unwrap();
+        read_span(&mut record_reader).unwrap();
+        record_reader.u16().unwrap();
+        record_reader.u16().unwrap();
+        let variadic_flag_offset = record_reader.location();
+        bytes[variadic_flag_offset] = 0;
+        let error = decode_module(&bytes, LuaProfile::Lua55, &limits)
+            .expect_err("decode 不可接受非 variadic prototype 的 Vararg");
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
+    }
+
+    #[test]
+    fn verifier_distinguishes_normal_close_from_pending_return_close() {
+        let limits = VerifyLimits::default();
+        let mut module = sample();
+        let prototype = &mut module.prototypes[0];
+        prototype.register_count = 3;
+        prototype.frame.register_limit = 3;
+        prototype.frame.initial_top = Register(3);
+        prototype.frame.dynamic_top = Register(3);
+        let binding = BytecodeBindingId {
+            function: 0,
+            ordinal: 1,
+        };
+        prototype.binding_registers.push((binding, Register(2)));
+        let path = BytecodeClosePath {
+            kind: BytecodeExitKind::Normal,
+            span: prototype.span,
+            from_scope: 1,
+            target_scope: Some(0),
+            bindings: vec![binding],
+            registers: vec![Register(2)],
+        };
+        prototype.close_paths.push(path.clone());
+        prototype.instructions = vec![
+            BytecodeInstruction {
+                instruction: Instruction::Close {
+                    base: Register(2),
+                    count: 1,
+                },
+                span: prototype.span,
+                close_path: Some(path),
+            },
+            BytecodeInstruction {
+                instruction: Instruction::TailCall {
+                    base: Register(0),
+                    arg_count: 0,
+                    result_mode: ResultMode::All,
+                },
+                span: prototype.span,
+                close_path: None,
+            },
+        ];
+        verify_module(module.clone(), LuaProfile::Lua55, &limits)
+            .expect("正常區塊 Close 後的 TailCall 應合法");
+        module.prototypes[0].close_paths[0].kind = BytecodeExitKind::Return;
+        module.prototypes[0].instructions[0]
+            .close_path
+            .as_mut()
+            .unwrap()
+            .kind = BytecodeExitKind::Return;
+        let error = verify_module(module, LuaProfile::Lua55, &limits)
+            .expect_err("pending Return ClosePath 不可接 TailCall");
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
     }
 
     #[test]
@@ -2070,7 +2854,7 @@ mod tests {
     fn rvlu_rejects_header_section_and_limit_failures_without_panic() {
         let limits = VerifyLimits::default();
         let encoded = encode_module(sample(), LuaProfile::Lua55, &limits).unwrap();
-        for (offset, value) in [(0, 0xff), (4, 2), (6, 1), (7, 0)] {
+        for (offset, value) in [(0, 0xff), (4, 3), (6, 1), (7, 0)] {
             let mut bytes = encoded.bytes().to_vec();
             bytes[offset] = value;
             assert_eq!(
@@ -2080,6 +2864,14 @@ mod tests {
                 BytecodeErrorCode::Verify
             );
         }
+        let mut v1 = encoded.bytes().to_vec();
+        v1[4..6].copy_from_slice(&RVLU_V1.0.to_le_bytes());
+        assert_eq!(
+            decode_module(&v1, LuaProfile::Lua55, &limits)
+                .expect_err("RVLU v1 必須明確拒絕")
+                .code,
+            BytecodeErrorCode::Verify
+        );
         let mut oversized_section = encoded.bytes().to_vec();
         oversized_section[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(

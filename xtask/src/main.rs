@@ -1085,7 +1085,7 @@ fn gate() -> Result<(), String> {
     Ok(())
 }
 
-const P01_CASES: [(&str, &str); 14] = [
+const P01_CASES: [(&str, &str); 15] = [
     ("NUM-001", "num_001_floor_division"),
     ("NUM-002", "num_002_negative_modulo"),
     ("NUM-003", "num_003_negative_divisor_modulo"),
@@ -1093,6 +1093,10 @@ const P01_CASES: [(&str, &str); 14] = [
     ("NUM-005", "num_005_large_integer_float_comparison_is_exact"),
     ("NUM-006", "num_006_minimum_integer_boundaries_do_not_panic"),
     ("NUM-007", "num_007_bit_conversion_and_shift_boundaries"),
+    (
+        "NUM-008",
+        "num_008_power_is_float_and_preserves_ieee_boundaries",
+    ),
     ("VAL-001", "val_001_and_keeps_selected_operand"),
     ("VAL-002", "val_002_or_keeps_truthy_object_operand"),
     ("VAL-003", "val_003_only_nil_and_false_are_falsey"),
@@ -1355,7 +1359,7 @@ fn p01_gate() -> Result<(), String> {
         "validate spec/compatibility.csv",
         0,
         "PASS",
-        "兩個 profile 的 14 個 P01 case 均完整追溯",
+        "兩個 profile 的 15 個 P01 case 均完整追溯",
     ));
     let fmt_command = "cargo fmt --all -- --check";
     if let Err(error) = run("cargo", &["fmt", "--all", "--", "--check"], &root) {
@@ -1512,7 +1516,7 @@ const P03_CASES: [&str; 10] = [
     "PARSE-ERR-003",
     "PARSE-ERR-004",
 ];
-const P04_CASES: [&str; 9] = [
+const P04_CASES: [&str; 10] = [
     "RES-001",
     "RES-002",
     "RES-003",
@@ -1520,16 +1524,21 @@ const P04_CASES: [&str; 9] = [
     "RES-005",
     "RES-006",
     "RES-007",
+    "RES-008",
     "RES-ERR-001",
     "RES-ERR-002",
 ];
-const P05_CASES: [&str; 8] = [
+const P05_CASES: [&str; 12] = [
     "BC-001",
     "BC-002",
     "BC-003",
     "BC-004",
     "BC-005",
     "BC-006",
+    "BC-007",
+    "BC-008",
+    "BC-009",
+    "BC-010",
     "BC-ERR-001",
     "BC-ERR-002",
 ];
@@ -1747,6 +1756,141 @@ fn validate_p05_csv_cases(csv: &str) -> Result<(), String> {
         let actual: std::collections::HashSet<_> = ids.iter().copied().collect();
         if ids.iter().any(|id| id.is_empty()) || actual.len() != ids.len() || actual != expected {
             return Err(format!("{profile} P05 test_ids 不完整、重複或未知"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_phase_dependency_graph(csv: &str) -> Result<(), String> {
+    const EXPECTED_EDGES: [(&str, &str, &str, &str); 32] = [
+        ("DA-01", "P01", "P06", "P01"),
+        ("DA-01A", "P06", "P07", "P06"),
+        ("DA-02", "P06", "P07", "P06"),
+        ("DA-03", "P05", "P07", "P05"),
+        ("DA-04", "P05", "P07", "P05"),
+        ("DA-05", "P05", "P07", "P05"),
+        ("DA-06", "P05", "P08", "P05"),
+        ("DA-07", "P05", "P08", "P05"),
+        ("DA-08", "P08", "P10", "P08"),
+        ("DA-09", "P05", "P09", "P05"),
+        ("DA-10", "P09", "P10", "P09"),
+        ("DA-11", "P05", "P11", "P05"),
+        ("DA-12", "P05", "P10", "P05"),
+        ("DA-13", "P10", "P11", "P10"),
+        ("DA-14", "P04", "P05", "P05"),
+        ("DA-15", "P11", "P12", "P11"),
+        ("DA-16", "P05", "P12", "P12"),
+        ("DA-17", "P05", "P06", "P05"),
+        ("DA-18", "P05", "P20", "P05"),
+        ("DA-19", "P12", "P13", "P13"),
+        ("DA-20", "P05", "P14", "P14"),
+        ("DA-21", "P14", "P16", "P14"),
+        ("DA-22", "P14", "P15", "P15"),
+        ("DA-23", "P14", "P16", "P16"),
+        ("DA-24", "P16", "P17", "P17"),
+        ("DA-25", "P16", "P18", "P18"),
+        ("DA-26", "P05", "P19", "P19"),
+        ("DA-27", "P05", "P20", "P20"),
+        ("DA-28", "P05", "P21", "P21"),
+        ("DA-29", "P05", "P22", "P22"),
+        ("DA-30", "P05", "P23", "P23"),
+        ("DA-31", "P05", "P24", "P24"),
+    ];
+    let mut rows = std::collections::HashSet::new();
+    let mut stages = std::collections::HashSet::new();
+    let mut critical = std::collections::HashSet::new();
+    for (line_number, line) in csv.lines().enumerate().skip(1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let columns: Vec<_> = line.split(',').collect();
+        if columns.len() != 6 || columns.iter().any(|column| column.is_empty()) {
+            return Err(format!(
+                "phase-dependencies.csv 第 {} 列欄位不完整",
+                line_number + 1
+            ));
+        }
+        let (id, producer, consumer, _interface, status, earliest_gate) = (
+            columns[0], columns[1], columns[2], columns[3], columns[4], columns[5],
+        );
+        if !rows.insert(id) {
+            return Err(format!("phase-dependencies.csv 有重複 id：{id}"));
+        }
+        match EXPECTED_EDGES
+            .iter()
+            .find(|(expected_id, _, _, _)| *expected_id == id)
+        {
+            Some((_, expected_producer, expected_consumer, expected_gate)) => {
+                if *expected_producer != producer || *expected_consumer != consumer {
+                    return Err(format!(
+                        "phase-dependencies.csv {id} owner edge 不符合核准契約：{producer}→{consumer}"
+                    ));
+                }
+                if *expected_gate != earliest_gate {
+                    return Err(format!(
+                        "phase-dependencies.csv {id} earliest_gate 不符合核准契約：{earliest_gate}"
+                    ));
+                }
+            }
+            None => {
+                return Err(format!(
+                    "phase-dependencies.csv {id} owner edge 不符合核准契約：{producer}→{consumer}"
+                ));
+            }
+        }
+        if !matches!(status, "IMPLEMENTED" | "CONTRACTED") {
+            return Err(format!(
+                "phase-dependencies.csv {id} 含未解 status：{status}"
+            ));
+        }
+        let parse_stage = |value: &str| {
+            value
+                .strip_prefix('P')
+                .and_then(|number| number.parse::<u8>().ok())
+                .filter(|number| *number <= 24)
+        };
+        let producer_stage = parse_stage(producer)
+            .ok_or_else(|| format!("phase-dependencies.csv {id} producer 非 phase：{producer}"))?;
+        let consumer_stage = parse_stage(consumer)
+            .ok_or_else(|| format!("phase-dependencies.csv {id} consumer 非 phase：{consumer}"))?;
+        if producer_stage >= consumer_stage {
+            return Err(format!(
+                "phase-dependencies.csv {id} 有 cycle 或逆向 owner edge"
+            ));
+        }
+        stages.insert(consumer_stage);
+        critical.insert((id, producer, consumer));
+    }
+    if rows.len() != 32
+        || !(1..=31).all(|number| {
+            let id = format!("DA-{number:02}");
+            rows.contains(id.as_str())
+        })
+    {
+        return Err("phase-dependencies.csv 必須完整覆蓋 DA-01～DA-31".into());
+    }
+    if !rows.contains("DA-01A") {
+        return Err("phase-dependencies.csv 缺 P06 ObjectRef identity bridge edge".into());
+    }
+    if !(6..=24).all(|stage| stages.contains(&stage)) {
+        return Err("phase-dependencies.csv 未完整覆蓋 P06～P24 consumer".into());
+    }
+    for edge in [
+        ("DA-01", "P01", "P06"),
+        ("DA-01A", "P06", "P07"),
+        ("DA-14", "P04", "P05"),
+        ("DA-04", "P05", "P07"),
+        ("DA-09", "P05", "P09"),
+        ("DA-18", "P05", "P20"),
+        ("DA-20", "P05", "P14"),
+        ("DA-30", "P05", "P23"),
+        ("DA-31", "P05", "P24"),
+    ] {
+        if !critical.contains(&edge) {
+            return Err(format!(
+                "phase-dependencies.csv 缺關鍵 edge {}→{}",
+                edge.1, edge.2
+            ));
         }
     }
     Ok(())
@@ -2470,7 +2614,7 @@ fn p04_gate() -> Result<(), String> {
         "validate P04 CSV",
         0,
         "PASS",
-        "兩個 profile 的 9 個 P04 case 均完整追溯",
+        "兩個 profile 的 10 個 P04 case 均完整追溯",
     ));
     for (name, arguments) in [
         ("p04-format", vec!["fmt", "--all", "--", "--check"]),
@@ -2704,7 +2848,36 @@ fn p05_gate() -> Result<(), String> {
         "validate P05 CSV",
         0,
         "PASS",
-        "兩個 profile 的 8 個 P05 case 均完整追溯",
+        "兩個 profile 的全部 P05 case 均完整追溯",
+    ));
+    let graph_command = "validate spec/phase-dependencies.csv";
+    let graph = match fs::read_to_string(root.join("spec/phase-dependencies.csv")) {
+        Ok(graph) => graph,
+        Err(error) => {
+            return p05_fail(
+                &root,
+                &mut results,
+                "p05-dependency-graph",
+                graph_command,
+                error.to_string(),
+            );
+        }
+    };
+    if let Err(error) = validate_phase_dependency_graph(&graph) {
+        return p05_fail(
+            &root,
+            &mut results,
+            "p05-dependency-graph",
+            graph_command,
+            error,
+        );
+    }
+    results.push(p05_result(
+        "p05-dependency-graph",
+        graph_command,
+        0,
+        "PASS",
+        "32 條 dependency edge 覆蓋 31 筆 DA、無 CONFLICT、無 cycle，且 critical owner edge 存在",
     ));
     for (name, arguments) in [
         ("p05-format", vec!["fmt", "--all", "--", "--check"]),
@@ -2835,8 +3008,8 @@ mod tests {
         validate_p01_contract_status, validate_p01_csv_cases, validate_p02_csv_cases,
         validate_p03_csv_cases, validate_p03_records, validate_p04_csv_cases, validate_p04_records,
         validate_p05_csv_cases, validate_p05_records, validate_pass_evidence,
-        write_p01_case_report, write_p02_case_report, write_p03_case_report, write_p04_case_report,
-        write_p05_case_report,
+        validate_phase_dependency_graph, write_p01_case_report, write_p02_case_report,
+        write_p03_case_report, write_p04_case_report, write_p05_case_report,
     };
     use std::process::Command;
     #[test]
@@ -2915,7 +3088,7 @@ mod tests {
     }
     #[test]
     fn p01_csv_cases_are_complete() {
-        let ids = "NUM-001;NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004";
+        let ids = "NUM-001;NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;NUM-008;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004";
         let csv = format!(
             "feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference\np01.core,lua55,s,m,{ids},PASS,\np01.core,lua54,s,m,{ids},PASS,"
         );
@@ -2962,7 +3135,7 @@ mod tests {
     }
     #[test]
     fn p01_csv_cases_reject_missing_num_001() {
-        let ids = "NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004";
+        let ids = "NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;NUM-008;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004";
         let csv = format!(
             "feature_id,lua_profile,spec_reference,implementation_module,test_ids,status,known_difference\np01.core,lua55,s,m,{ids},PASS,\np01.core,lua54,s,m,{ids},PASS,"
         );
@@ -3103,6 +3276,39 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn phase_dependency_graph_is_complete_and_rejects_missing_owner_or_conflict() {
+        let graph = include_str!("../../spec/phase-dependencies.csv");
+        assert!(validate_phase_dependency_graph(graph).is_ok());
+        assert!(
+            validate_phase_dependency_graph(&graph.replacen(
+                "DA-18,P05,P20,InstructionEffects canonical RVLU_V2 flags,IMPLEMENTED,P05",
+                "DA-18,P05,P20,InstructionEffects canonical RVLU_V2 flags,IMPLEMENTED,P06",
+                1,
+            ))
+            .is_err(),
+            "DA-18 必須拒絕錯置 earliest_gate"
+        );
+        assert!(
+            validate_phase_dependency_graph(&graph.replacen("DA-08,P08,P10", "DA-08,P09,P10", 1),)
+                .is_err(),
+            "DA-08 必須拒絕錯置 producer"
+        );
+        assert!(
+            validate_phase_dependency_graph(&graph.replacen("DA-19,P12,P13", "DA-19,P11,P13", 1),)
+                .is_err(),
+            "非 critical edge 也必須拒絕錯置 producer"
+        );
+        assert!(
+            validate_phase_dependency_graph(&graph.replacen("DA-01,P01,P06", "DA-01,P06,P01", 1),)
+                .is_err()
+        );
+        assert!(
+            validate_phase_dependency_graph(&graph.replacen("IMPLEMENTED", "CONFLICT", 1)).is_err()
+        );
+        assert!(validate_phase_dependency_graph(&graph.replacen("DA-14", "DA-99", 1)).is_err());
     }
 
     #[test]

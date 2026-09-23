@@ -18,7 +18,7 @@
 - [x] **Lua の字句解析：** [コンパイラ API](../crates/rivetlua-compiler/src/lib.rs) は Lua 5.5 と 5.4 の生バイト列からトークンを認識し、span、位置、リテラル、制限付き診断を保持します。Lua 5.5 の `global` はマニュアルに従う厳格な文法で予約語として扱います。両プロファイルの P02 ゲートが合格しています。
 - [x] **Lua の構文解析：** [コンパイラ API](../crates/rivetlua-compiler/src/lib.rs) は P02 のトークンを所有権のある AST に解析し、演算子の優先順位、括弧、呼び出し、宣言、span を保持します。両プロファイルの P03 ゲートが合格しています。この段階では構文構造のみを検証します。
 - [x] **Lua のスコープと名前解決：** [コンパイラ API](../crates/rivetlua-compiler/src/lib.rs) は binding、入れ子の upvalue、読み取り専用の名前、ジャンプ、クローズ経路、および Lua 5.5 の明示的な global 宣言を所有権のある解決済み AST に変換します。両プロファイルの P04 ゲートが合格しています。この段階では bytecode の生成や Lua の実行は行いません。
-- [x] **中間表現と bytecode の検証：** [コンパイラ API](../crates/rivetlua-compiler/src/lib.rs) は解決済み AST を型付きレジスタ IR と RivetLua 独自の RVLU v1 bytecode に変換します。[コア検証器](../crates/rivetlua-core/src/bytecode/codec.rs) は `VerifiedModule` を公開する前に、制限付きデコード、operand、制御フロー、開放結果を検査します。両プロファイルの P05 ゲートが合格しています。この形式は Lua binary chunk ではなく、まだ実行もされません。
+- [x] **中間表現と bytecode の検証：** [コンパイラ API](../crates/rivetlua-compiler/src/lib.rs) は解決済み AST を型付きレジスタ IR と RVLU_V2 bytecode に変換します。module 所有 format version、signature/vararg、ClosePath、numeric-for 専用 instruction、canonical static effects を[コア検証器](../crates/rivetlua-core/src/bytecode/codec.rs)が検査し、v1 と未知版を拒否します。両プロファイルの P05 ゲートが合格しています。これは Lua binary chunk ではなく Lua を実行しません。P06+ は `NOT_IMPLEMENTED` のままです。
 
 値、数値、字句解析、構文解析のテストは Rust API を直接呼び出します。**RivetLua はまだ Lua ソースコードを実行できず、Lua 言語との完全な互換性も検証されていません。**
 

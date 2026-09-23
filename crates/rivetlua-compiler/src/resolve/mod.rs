@@ -31,6 +31,7 @@ pub enum BindingKind {
     Parameter,
     NumericFor,
     GenericFor,
+    GenericForClose,
     LocalFunction,
     VarargTable,
     Environment,
@@ -111,6 +112,16 @@ pub struct ResolvedLocalName {
     pub binding: BindingId,
     pub name: Vec<u8>,
     pub attribute: Option<Attribute>,
+    pub span: Span,
+}
+
+/// generic-for 第四個 evaluation value 的隱藏待關閉 binding。
+///
+/// 此 binding 不會加入 Lua 名稱查找表；P05 必須直接消費此 owned metadata，
+/// 不能由 AST 或來源重新推導。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedGenericForClose {
+    pub binding: BindingId,
     pub span: Span,
 }
 
@@ -229,7 +240,9 @@ pub enum ResolvedStmt {
     GenericFor {
         names: Vec<ResolvedLocalName>,
         values: Vec<ResolvedExpr>,
+        closing: ResolvedGenericForClose,
         body: ResolvedBlock,
+        close_path: ClosePath,
         span: Span,
     },
     Function {
@@ -602,7 +615,7 @@ impl<'a> Resolver<'a> {
                     attribute: name.attribute.clone(),
                     span: name.span,
                 };
-                let body = self.resolve_function_body(body)?;
+                let body = self.resolve_function_body(body, None)?;
                 Ok(ResolvedStmt::LocalFunction {
                     name: resolved_name,
                     body,
@@ -757,7 +770,7 @@ impl<'a> Resolver<'a> {
             } => Ok(ResolvedStmt::Function {
                 name: self.resolve_assignment_target(name)?,
                 method: method.clone(),
-                body: self.resolve_function_body(body)?,
+                body: self.resolve_function_body(body, method.as_ref())?,
                 span: *span,
             }),
             Stmt::Global { declaration, span } => self.resolve_global(declaration, *span),
@@ -831,7 +844,7 @@ impl<'a> Resolver<'a> {
                 self.set_explicit_global_mode(true);
                 let binding =
                     self.declare_binding(name.clone(), *span, None, BindingKind::Global, false)?;
-                let body = self.resolve_function_body(body)?;
+                let body = self.resolve_function_body(body, None)?;
                 Ok(ResolvedStmt::Global {
                     declaration: ResolvedGlobalDeclaration::Function {
                         binding,
@@ -924,7 +937,7 @@ impl<'a> Resolver<'a> {
                 span: *span,
             }),
             Expr::Function { body, span } => Ok(ResolvedExpr::Function {
-                body: self.resolve_function_body(body)?,
+                body: self.resolve_function_body(body, None)?,
                 span: *span,
             }),
             Expr::TableConstructor { fields, span } => {
@@ -1108,12 +1121,21 @@ impl<'a> Resolver<'a> {
         body: &Block,
         span: Span,
     ) -> Result<ResolvedStmt, Diagnostic> {
+        let closing_span = values.get(3).map(Expr::span).unwrap_or(span);
         let values = self.resolve_expression_list(values, span)?;
         self.ensure_list(names.len(), span)?;
-        self.ensure_binding_capacity(names.len(), span)?;
+        let binding_count = names
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| self.limit(span, "generic-for binding 數超過編譯限制"))?;
+        self.ensure_binding_capacity(binding_count, span)?;
         let target = self.current_scope();
         self.enter_scope(span)?;
         let result = (|| {
+            let closing = ResolvedGenericForClose {
+                binding: self.declare_generic_for_close(closing_span)?,
+                span: closing_span,
+            };
             let mut resolved_names = Vec::new();
             resolved_names
                 .try_reserve(names.len())
@@ -1136,10 +1158,13 @@ impl<'a> Resolver<'a> {
             self.loops.push(target);
             let body = self.resolve_nested_block(body);
             self.loops.pop();
+            let body = body?;
             Ok(ResolvedStmt::GenericFor {
                 names: resolved_names,
                 values,
-                body: body?,
+                closing,
+                close_path: self.close_path(ExitKind::Normal, Some(target), span),
+                body,
                 span,
             })
         })();
@@ -1157,6 +1182,7 @@ impl<'a> Resolver<'a> {
     fn resolve_function_body(
         &mut self,
         body: &FunctionBody,
+        method: Option<&MethodName>,
     ) -> Result<ResolvedFunctionBody, Diagnostic> {
         let function = FunctionId(self.next_function);
         self.next_function = self
@@ -1190,11 +1216,35 @@ impl<'a> Resolver<'a> {
         };
         child.enter_scope(body.span)?;
         child.ensure_list(body.parameters.len(), body.span)?;
-        child.ensure_binding_capacity(body.parameters.len(), body.span)?;
+        let parameter_count = body
+            .parameters
+            .len()
+            .checked_add(usize::from(method.is_some()))
+            .ok_or_else(|| child.limit(body.span, "參數超過編譯限制"))?;
+        if parameter_count > child.limits.max_parameters {
+            return Err(child.limit(body.span, "參數超過編譯限制"));
+        }
+        child.ensure_binding_capacity(parameter_count, body.span)?;
         let mut parameters = Vec::new();
         parameters
-            .try_reserve(body.parameters.len())
+            .try_reserve(parameter_count)
             .map_err(|_| child.limit(body.span, "parameter 配置超過編譯限制"))?;
+        if let Some(method) = method {
+            let name = b"self".to_vec();
+            let binding = child.declare_binding(
+                name.clone(),
+                method.colon_span,
+                None,
+                BindingKind::Parameter,
+                false,
+            )?;
+            parameters.push(ResolvedLocalName {
+                binding,
+                name,
+                attribute: None,
+                span: method.colon_span,
+            });
+        }
         for parameter in &body.parameters {
             let binding = child.declare_binding(
                 parameter.name.clone(),
@@ -1322,6 +1372,26 @@ impl<'a> Resolver<'a> {
             scope.close_bindings.push(id);
         }
         Ok(id)
+    }
+
+    fn declare_generic_for_close(&mut self, span: Span) -> Result<BindingId, Diagnostic> {
+        let scope_depth = self.scopes.len().saturating_sub(1);
+        let binding = self.allocate_binding(
+            b"<generic-for-close>".to_vec(),
+            span,
+            None,
+            BindingKind::GenericForClose,
+            true,
+            Some(span),
+            scope_depth,
+        )?;
+        // 隱藏 binding 僅是 close-path metadata，絕不能被 Lua 名稱查找或指派取得。
+        self.scopes
+            .last_mut()
+            .expect("generic-for scope 已建立")
+            .close_bindings
+            .push(binding);
+        Ok(binding)
     }
 
     fn declare_implicit_global(

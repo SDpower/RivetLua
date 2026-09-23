@@ -1,6 +1,6 @@
 use rivetlua_compiler::{
-    BindingKind, CompileLimits, DiagnosticCode, ExitKind, LanguageProfile, ResolvedExpr,
-    ResolvedName, ResolvedStmt, lex, parse, resolve,
+    BindingKind, CompileLimits, DiagnosticCode, ExitKind, Expr, LanguageProfile, ResolvedExpr,
+    ResolvedName, ResolvedStmt, Stmt, lex, parse, resolve,
 };
 
 fn parsed(
@@ -167,8 +167,8 @@ fn public_resolver_exposes_full_owned_p03_mirror_schema() {
     use rivetlua_compiler::{
         Attribute, BinaryOp, BindingId, BindingKind, ClosePath, ExitKind, FieldSeparator,
         FunctionId, MethodName, ResolvedBlock, ResolvedExpr, ResolvedFunctionBody,
-        ResolvedGlobalDeclaration, ResolvedIfClause, ResolvedLocalName, ResolvedStmt,
-        ResolvedTableField, ResolvedVararg, ScopeId, Span, UnaryOp, UpvalueSource,
+        ResolvedGenericForClose, ResolvedGlobalDeclaration, ResolvedIfClause, ResolvedLocalName,
+        ResolvedStmt, ResolvedTableField, ResolvedVararg, ScopeId, Span, UnaryOp, UpvalueSource,
     };
 
     let span = Span {
@@ -246,7 +246,15 @@ fn public_resolver_exposes_full_owned_p03_mirror_schema() {
         ResolvedStmt::GenericFor {
             names: vec![local.clone()],
             values: vec![expression],
+            closing: ResolvedGenericForClose { binding, span },
             body: block.clone(),
+            close_path: ClosePath {
+                kind: ExitKind::Normal,
+                span,
+                from_scope: ScopeId(3),
+                target_scope: Some(ScopeId(1)),
+                bindings: vec![binding],
+            },
             span,
         },
         ResolvedStmt::Global {
@@ -410,6 +418,7 @@ fn public_resolver_exposes_full_owned_p03_mirror_schema() {
             span,
         },
         BindingKind::GenericFor,
+        BindingKind::GenericForClose,
         ExitKind::Normal,
         ExitKind::Return,
         ExitKind::Error,
@@ -1297,6 +1306,167 @@ fn public_resolver_keeps_remaining_expression_function_and_table_shapes() {
 }
 
 #[test]
+fn public_resolver_binds_method_self_and_forwards_nested_capture() {
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        let input = b"local t={}; function t:m() return self end; function t:n(x, ...) local function f() local function g() return self end return g end return self,x,... end";
+        let (module, chunk) = parsed(input, profile);
+        let Stmt::Function { body: syntax, .. } = &module.root.statements[2] else {
+            panic!("方法語法必須保留")
+        };
+        assert!(syntax.parameters.is_empty(), "P03 AST 不加入隱含參數");
+        let resolved = resolve(&module, &chunk, profile, &CompileLimits::default()).unwrap();
+        let ResolvedStmt::Function { body: zero, .. } = &resolved.root.statements[2] else {
+            panic!("零個明寫參數的方法必須存在")
+        };
+        assert_eq!(zero.parameters.len(), 1);
+        assert_eq!(zero.parameters[0].name, b"self");
+        let zero_self = zero.parameters[0].binding;
+        assert!(matches!(
+            zero.body.statements.as_slice(),
+            [ResolvedStmt::Return { values, .. }]
+                if matches!(values.as_slice(), [ResolvedExpr::Name { resolution: ResolvedName::Local(binding), .. }] if *binding == zero_self)
+        ));
+
+        let ResolvedStmt::Function { body: method, .. } = &resolved.root.statements[4] else {
+            panic!("多個參數的方法必須存在")
+        };
+        assert_eq!(method.parameters.len(), 2);
+        assert_eq!(method.parameters[0].name, b"self");
+        assert_eq!(method.parameters[1].name, b"x");
+        assert!(method.vararg.is_some());
+        let method_self = method.parameters[0].binding;
+        let method_x = method.parameters[1].binding;
+        let metadata = resolved
+            .functions
+            .iter()
+            .find(|function| function.id == method.function)
+            .unwrap();
+        assert!(metadata.bindings.iter().any(|binding| {
+            binding.id == method_self && binding.kind == BindingKind::Parameter
+        }));
+        let ResolvedStmt::LocalFunction { body: middle, .. } = &method.body.statements[0] else {
+            panic!("中間 closure 必須存在")
+        };
+        let ResolvedStmt::LocalFunction { body: inner, .. } = &middle.body.statements[0] else {
+            panic!("內層 closure 必須存在")
+        };
+        let middle_meta = resolved
+            .functions
+            .iter()
+            .find(|function| function.id == middle.function)
+            .unwrap();
+        let inner_meta = resolved
+            .functions
+            .iter()
+            .find(|function| function.id == inner.function)
+            .unwrap();
+        let middle_self = middle_meta
+            .upvalues
+            .iter()
+            .position(|source| matches!(
+                source,
+                rivetlua_compiler::UpvalueSource::ParentLocal(binding) if *binding == method_self
+            ))
+            .expect("中間 closure 必須捕捉方法 self");
+        assert!(inner_meta.upvalues.iter().any(|source| matches!(
+            source,
+            rivetlua_compiler::UpvalueSource::ParentUpvalue(id) if id.0 as usize == middle_self
+        )));
+        assert!(matches!(
+            inner.body.statements.as_slice(),
+            [ResolvedStmt::Return { values, .. }]
+                if matches!(values.as_slice(), [ResolvedExpr::Name { resolution: ResolvedName::Upvalue(_), .. }])
+        ));
+        assert!(matches!(
+            method.body.statements.last(),
+            Some(ResolvedStmt::Return { values, .. })
+                if matches!(values.as_slice(), [
+                    ResolvedExpr::Name { resolution: ResolvedName::Local(first), .. },
+                    ResolvedExpr::Name { resolution: ResolvedName::Local(second), .. },
+                    ResolvedExpr::Vararg { .. }
+                ] if *first == method_self && *second == method_x)
+        ));
+
+        let (module, chunk) = parsed(b"local t={}; function t.m() return self end", profile);
+        let dotted = resolve(&module, &chunk, profile, &CompileLimits::default()).unwrap();
+        let ResolvedStmt::Function { body, .. } = &dotted.root.statements[2] else {
+            panic!("普通 dotted 函式必須存在")
+        };
+        assert!(body.parameters.is_empty());
+        assert!(matches!(
+            body.body.statements.as_slice(),
+            [ResolvedStmt::Return { values, .. }]
+                if matches!(values.as_slice(), [ResolvedExpr::Name { resolution, .. }]
+                    if !matches!(resolution, ResolvedName::Local(_)))
+        ));
+    }
+}
+
+#[test]
+fn public_resolver_counts_method_self_in_parameter_and_binding_limits() {
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        let one = CompileLimits {
+            max_parameters: 1,
+            max_bindings_per_function: 1,
+            ..CompileLimits::default()
+        };
+        let (module, chunk) = parsed(b"function _ENV:m() return self end", profile);
+        let resolved = resolve(&module, &chunk, profile, &one).unwrap();
+        assert!(matches!(
+            resolved.root.statements.as_slice(),
+            [ResolvedStmt::Function { body, .. }] if body.parameters.len() == 1
+        ));
+
+        let (module, chunk) = parsed(b"function _ENV:m(x) return x end", profile);
+        assert_eq!(
+            resolve(&module, &chunk, profile, &one).unwrap_err().code,
+            DiagnosticCode::CompileLimit
+        );
+        let binding_limit = CompileLimits {
+            max_parameters: 2,
+            max_bindings_per_function: 1,
+            ..CompileLimits::default()
+        };
+        assert_eq!(
+            resolve(&module, &chunk, profile, &binding_limit)
+                .unwrap_err()
+                .code,
+            DiagnosticCode::CompileLimit
+        );
+        let (module, chunk) = parsed(b"function _ENV:m() return self end", profile);
+        let zero_parameters = CompileLimits {
+            max_parameters: 0,
+            ..CompileLimits::default()
+        };
+        assert_eq!(
+            resolve(&module, &chunk, profile, &zero_parameters)
+                .unwrap_err()
+                .code,
+            DiagnosticCode::CompileLimit
+        );
+
+        for (explicit_count, accepted) in [(254, true), (255, false)] {
+            let parameters = (0..explicit_count)
+                .map(|index| format!("p{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let input = format!("function _ENV:m({parameters}) return self end");
+            let (module, chunk) = parsed(input.as_bytes(), profile);
+            let result = resolve(&module, &chunk, profile, &CompileLimits::default());
+            if accepted {
+                let resolved = result.unwrap();
+                assert!(matches!(
+                    resolved.root.statements.as_slice(),
+                    [ResolvedStmt::Function { body, .. }] if body.parameters.len() == 255
+                ));
+            } else {
+                assert_eq!(result.unwrap_err().code, DiagnosticCode::CompileLimit);
+            }
+        }
+    }
+}
+
+#[test]
 fn public_resolver_keeps_if_repeat_generic_for_and_named_vararg_metadata() {
     for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
         let (module, chunk) = parsed(
@@ -1384,4 +1554,117 @@ fn public_resolver_keeps_if_repeat_generic_for_and_named_vararg_metadata() {
         DiagnosticCode::Resolve,
         "named vararg table 是 readonly binding"
     );
+}
+
+#[test]
+fn public_resolver_keeps_generic_for_closing_binding_and_all_exit_paths() {
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        let input = b"for k in iter, state, control, closing do local inner <close>; break end\nfor k in iter, state, control, closing do local inner <close>; return k end\nfor k in iter, state, control, closing do local inner <close>; goto done end\n::done::\nfor k in iter, state, control, closing do local inner <close> end\nfor k in iter do end";
+        let (module, chunk) = parsed(input, profile);
+        let source_spans: Vec<_> = module
+            .root
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                Stmt::GenericFor { values, span, .. } => {
+                    Some((values.get(3).map(Expr::span), *span))
+                }
+                _ => None,
+            })
+            .collect();
+        let resolved = resolve(&module, &chunk, profile, &CompileLimits::default()).unwrap();
+        let generic_fors: Vec<_> = resolved
+            .root
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                ResolvedStmt::GenericFor {
+                    names,
+                    values,
+                    closing,
+                    body,
+                    close_path,
+                    ..
+                } => Some((names, values, closing, body, close_path)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(generic_fors.len(), 5);
+
+        for ((names, values, closing, body, close_path), (fourth_span, for_span)) in
+            generic_fors.iter().zip(source_spans.iter())
+        {
+            let close_meta = resolved.functions[0]
+                .bindings
+                .iter()
+                .find(|binding| binding.id == closing.binding)
+                .expect("generic-for closing binding 必須存在");
+            assert_eq!(close_meta.kind, BindingKind::GenericForClose);
+            assert!(close_meta.readonly);
+            assert_eq!(close_meta.close_marker, Some(closing.span));
+            assert_eq!(close_meta.name, b"<generic-for-close>");
+            assert!(names.iter().all(|name| name.binding != closing.binding));
+            assert_eq!(close_path.kind, ExitKind::Normal);
+            assert_eq!(close_path.bindings, vec![closing.binding]);
+            assert!(!body.normal_close_path.bindings.contains(&closing.binding));
+            match fourth_span {
+                Some(span) => {
+                    assert_eq!(values.len(), 4);
+                    assert_eq!(closing.span, *span);
+                }
+                None => {
+                    assert_eq!(values.len(), 1);
+                    assert_eq!(closing.span, *for_span);
+                }
+            }
+        }
+
+        for (index, exit_kind) in [ExitKind::Break, ExitKind::Return, ExitKind::Goto]
+            .into_iter()
+            .enumerate()
+        {
+            let (_, _, closing, body, _) = generic_fors[index];
+            let inner = body
+                .statements
+                .iter()
+                .find_map(|statement| match statement {
+                    ResolvedStmt::Local { bindings, .. } => bindings.first().copied(),
+                    _ => None,
+                })
+                .expect("generic-for body 的 close local 必須存在");
+            let exit_path = body
+                .statements
+                .iter()
+                .find_map(|statement| match statement {
+                    ResolvedStmt::Break { close_path, .. }
+                    | ResolvedStmt::Return { close_path, .. }
+                    | ResolvedStmt::Goto { close_path, .. } => Some(close_path),
+                    _ => None,
+                })
+                .expect("generic-for 的顯式出口必須存在");
+            assert_eq!(exit_path.kind, exit_kind);
+            assert_eq!(exit_path.bindings, vec![inner, closing.binding]);
+            assert_eq!(body.normal_close_path.bindings, vec![inner]);
+            assert_eq!(body.error_close_path.kind, ExitKind::Error);
+            assert_eq!(body.error_close_path.bindings, vec![inner, closing.binding]);
+        }
+
+        let (_, _, closing, body, close_path) = generic_fors[3];
+        let inner = body
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                ResolvedStmt::Local { bindings, .. } => bindings.first().copied(),
+                _ => None,
+            })
+            .expect("normal generic-for body 的 close local 必須存在");
+        assert_eq!(close_path.bindings, vec![closing.binding]);
+        assert_eq!(body.normal_close_path.bindings, vec![inner]);
+        assert_eq!(body.error_close_path.bindings, vec![inner, closing.binding]);
+
+        let (_, _, closing, body, close_path) = generic_fors[4];
+        assert_eq!(close_path.bindings, vec![closing.binding]);
+        assert!(body.normal_close_path.bindings.is_empty());
+        assert_eq!(body.error_close_path.bindings, vec![closing.binding]);
+    }
 }

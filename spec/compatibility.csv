@@ -5,8 +5,8 @@ p00.reference,lua55,spec/upstream-sources.md,xtask,P00-REF-001,PASS,
 p00.reference,lua54,spec/upstream-sources.md,xtask,P00-REF-002,PASS,
 p00.runner,lua55,docs/plane/P00.md#p00-4,xtask,P00-RUN-001;P00-RUN-002,PASS,
 p00.runner,lua54,docs/plane/P00.md#p00-4,xtask,P00-RUN-001;P00-RUN-002,PASS,
-p01.core,lua55,docs/plane/P01.md#p01-1-to-p01-4,rivetlua-core,NUM-001;NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004,PASS,
-p01.core,lua54,docs/plane/P01.md#p01-1-to-p01-4,rivetlua-core,NUM-001;NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004,PASS,
+p01.core,lua55,docs/plane/P01.md#p01-1-to-p01-4,rivetlua-core,NUM-001;NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;NUM-008;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004,PASS,
+p01.core,lua54,docs/plane/P01.md#p01-1-to-p01-4,rivetlua-core,NUM-001;NUM-002;NUM-003;NUM-004;NUM-005;NUM-006;NUM-007;NUM-008;VAL-001;VAL-002;VAL-003;ERR-001;ERR-002;ERR-003;ERR-004,PASS,
 p02.lexer,lua55,docs/plane/P02.md#p02-1-to-p02-5,rivetlua-compiler,LEX-001;LEX-002;LEX-003;LEX-004;LEX-005;LEX-006;LEX-LONG-001;LEX-ERR-001;LEX-ERR-002;LEX-ERR-003;LEX-ERR-004,PASS,
 p02.lexer,lua54,docs/plane/P02.md#p02-1-to-p02-5,rivetlua-compiler,LEX-001;LEX-002;LEX-003;LEX-004;LEX-005;LEX-006;LEX-LONG-001;LEX-ERR-001;LEX-ERR-002;LEX-ERR-003;LEX-ERR-004,PASS,
 p03.parser,lua55,docs/plane/P03.md#p03-1-to-p03-5,rivetlua-compiler,PARSE-001;PARSE-002;PARSE-003;PARSE-004;PARSE-005;PARSE-006;PARSE-ERR-001;PARSE-ERR-002;PARSE-ERR-003;PARSE-ERR-004,PASS,
@@ -14,7 +14,7 @@ p03.parser,lua54,docs/plane/P03.md#p03-1-to-p03-5,rivetlua-compiler,PARSE-001;PA
 compiler,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,後續階段
 runtime,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,後續階段
 c-api,common,docs/plane/P00.md,NOT_IMPLEMENTED,,NOT_IMPLEMENTED,P00 只有風險證據
-p04.resolve,lua55,docs/plane/P04.md#p04-1-to-p04-5,rivetlua-compiler,RES-001;RES-002;RES-003;RES-004;RES-005;RES-006;RES-007;RES-ERR-001;RES-ERR-002,PASS,
-p04.resolve,lua54,docs/plane/P04.md#p04-1-to-p04-5,rivetlua-compiler,RES-001;RES-002;RES-003;RES-004;RES-005;RES-006;RES-007;RES-ERR-001;RES-ERR-002,PASS,
-p05.bytecode,lua55,docs/plane/P05.md#p05-1-to-p05-5,rivetlua-core;rivetlua-compiler,BC-001;BC-002;BC-003;BC-004;BC-005;BC-006;BC-ERR-001;BC-ERR-002,PASS,
-p05.bytecode,lua54,docs/plane/P05.md#p05-1-to-p05-5,rivetlua-core;rivetlua-compiler,BC-001;BC-002;BC-003;BC-004;BC-005;BC-006;BC-ERR-001;BC-ERR-002,PASS,
+p04.resolve,lua55,docs/plane/P04.md#p04-1-to-p04-5,rivetlua-compiler,RES-001;RES-002;RES-003;RES-004;RES-005;RES-006;RES-007;RES-008;RES-ERR-001;RES-ERR-002,PASS,
+p04.resolve,lua54,docs/plane/P04.md#p04-1-to-p04-5,rivetlua-compiler,RES-001;RES-002;RES-003;RES-004;RES-005;RES-006;RES-007;RES-008;RES-ERR-001;RES-ERR-002,PASS,
+p05.bytecode,lua55,docs/plane/P05.md#p05-rvlu-v2,rivetlua-core;rivetlua-compiler,BC-001;BC-002;BC-003;BC-004;BC-005;BC-006;BC-007;BC-008;BC-009;BC-010;BC-ERR-001;BC-ERR-002,PASS,
+p05.bytecode,lua54,docs/plane/P05.md#p05-rvlu-v2,rivetlua-core;rivetlua-compiler,BC-001;BC-002;BC-003;BC-004;BC-005;BC-006;BC-007;BC-008;BC-009;BC-010;BC-ERR-001;BC-ERR-002,PASS,

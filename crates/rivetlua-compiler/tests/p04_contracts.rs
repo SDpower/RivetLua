@@ -1,6 +1,6 @@
 use rivetlua_compiler::{
-    CompileLimits, DiagnosticCode, LanguageProfile, ResolvedExpr, ResolvedName, ResolvedStmt, lex,
-    parse, resolve,
+    BindingKind, CompileLimits, DiagnosticCode, ExitKind, LanguageProfile, ResolvedExpr,
+    ResolvedName, ResolvedStmt, lex, parse, resolve,
 };
 use std::{env, fs, path::PathBuf};
 
@@ -168,6 +168,106 @@ fn p04_contract_cases_for_one_profile() {
         matches!(module.root.statements.as_slice(), [ResolvedStmt::Return { values, .. }] if matches!(values.as_slice(), [ResolvedExpr::Name { resolution, .. }] if matches!(resolution, ResolvedName::Global(_)) == (profile == LanguageProfile::Lua55)))
     );
     record("RES-007", input, &module);
+
+    let input = b"for k in iter, state, control, closing do local inner <close>; break end\nfor k in iter, state, control, closing do local inner <close>; return k end\nfor k in iter, state, control, closing do local inner <close>; goto done end\n::done::\nfor k in iter, state, control, closing do local inner <close> end\nfor k in iter do end";
+    let module = resolved(input, profile, &limits);
+    let generic_fors: Vec<_> = module
+        .root
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            ResolvedStmt::GenericFor {
+                names,
+                values,
+                closing,
+                body,
+                close_path,
+                ..
+            } => Some((names, values, closing, body, close_path)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(generic_fors.len(), 5);
+    let hidden_binding_and_span =
+        generic_fors
+            .iter()
+            .enumerate()
+            .all(|(index, (names, values, closing, _, close_path))| {
+                let metadata = module.functions[0]
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.id == closing.binding);
+                let expected_values = if index == 4 { 1 } else { 4 };
+                metadata.is_some_and(|binding| {
+                    binding.kind == BindingKind::GenericForClose
+                        && binding.readonly
+                        && binding.close_marker == Some(closing.span)
+                        && binding.name == b"<generic-for-close>"
+                }) && names.iter().all(|name| name.binding != closing.binding)
+                    && values.len() == expected_values
+                    && close_path.kind == ExitKind::Normal
+                    && close_path.bindings == vec![closing.binding]
+            });
+    assert_eq!(
+        hidden_binding_and_span,
+        expected_bool("RES-008.hidden_binding_and_span")
+    );
+
+    let explicit_exits_and_backedge = [ExitKind::Break, ExitKind::Return, ExitKind::Goto]
+        .into_iter()
+        .enumerate()
+        .all(|(index, exit_kind)| {
+            let (_, _, closing, body, _) = generic_fors[index];
+            let inner = body
+                .statements
+                .iter()
+                .find_map(|statement| match statement {
+                    ResolvedStmt::Local { bindings, .. } => bindings.first().copied(),
+                    _ => None,
+                });
+            let exit_path = body
+                .statements
+                .iter()
+                .find_map(|statement| match statement {
+                    ResolvedStmt::Break { close_path, .. }
+                    | ResolvedStmt::Return { close_path, .. }
+                    | ResolvedStmt::Goto { close_path, .. } => Some(close_path),
+                    _ => None,
+                });
+            inner.zip(exit_path).is_some_and(|(inner, exit_path)| {
+                exit_path.kind == exit_kind
+                    && exit_path.bindings == vec![inner, closing.binding]
+                    && body.normal_close_path.bindings == vec![inner]
+                    && body.error_close_path.kind == ExitKind::Error
+                    && body.error_close_path.bindings == vec![inner, closing.binding]
+            })
+        });
+    assert_eq!(
+        explicit_exits_and_backedge,
+        expected_bool("RES-008.explicit_exits_and_backedge")
+    );
+
+    let (_, _, normal_closing, normal_body, _) = generic_fors[3];
+    let normal_inner = normal_body
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            ResolvedStmt::Local { bindings, .. } => bindings.first().copied(),
+            _ => None,
+        });
+    let (_, missing_values, missing_closing, missing_body, _) = generic_fors[4];
+    let normal_and_missing = normal_inner.is_some_and(|inner| {
+        normal_body.normal_close_path.bindings == vec![inner]
+            && normal_body.error_close_path.bindings == vec![inner, normal_closing.binding]
+            && missing_values.len() == 1
+            && missing_body.normal_close_path.bindings.is_empty()
+            && missing_body.error_close_path.bindings == vec![missing_closing.binding]
+    });
+    assert_eq!(
+        normal_and_missing,
+        expected_bool("RES-008.normal_and_missing_nil")
+    );
+    record("RES-008", input, &module);
 
     let input = b"break";
     let error = resolve_error(input, profile, &limits);

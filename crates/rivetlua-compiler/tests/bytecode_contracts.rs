@@ -48,6 +48,60 @@ fn public_ir_lowers_binary_return_with_typed_operands_and_span() {
 }
 
 #[test]
+fn public_ir_method_signature_matches_receiver_call_position() {
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        for (input, parameters, arguments, variadic) in [
+            (
+                b"local t={}; function t:m() return self end; return t:m()".as_slice(),
+                1,
+                1,
+                false,
+            ),
+            (
+                b"local t={}; function t:m(x,y,...) return self,x,y end; return t:m(1,2,3)"
+                    .as_slice(),
+                3,
+                4,
+                true,
+            ),
+        ] {
+            let ir = lower(&resolved(input, profile), &IrLimits::default()).unwrap();
+            let method = ir.prototype_for(FunctionId(1)).unwrap();
+            assert_eq!(method.parameter_count, parameters);
+            assert_eq!(method.is_variadic, variadic);
+            let root = ir.prototype_for(FunctionId(0)).unwrap();
+            let index = root
+                .instructions
+                .iter()
+                .position(|entry| matches!(entry.instruction, Instruction::TailCall { .. }))
+                .expect("方法呼叫必須產生 tail call");
+            let Instruction::TailCall {
+                base, arg_count, ..
+            } = root.instructions[index].instruction
+            else {
+                unreachable!()
+            };
+            assert_eq!(arg_count, arguments);
+            assert!(matches!(
+                root.instructions[index - usize::from(arguments) - 1].instruction,
+                Instruction::Move { dest, .. } if dest == base
+            ));
+            assert!(matches!(
+                root.instructions[index - usize::from(arguments)].instruction,
+                Instruction::Move { dest, .. } if dest == Register(base.0 + 1)
+            ));
+        }
+
+        let ir = lower(
+            &resolved(b"local t={}; function t.m(x) return x end", profile),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(ir.prototype_for(FunctionId(1)).unwrap().parameter_count, 1);
+    }
+}
+
+#[test]
 fn public_ir_keeps_function_ids_upvalues_and_close_path_metadata() {
     for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
         let resolved_functions = resolved(
@@ -178,6 +232,8 @@ fn jump_target(instruction: &Instruction) -> Option<usize> {
         Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } => {
             Some(target.0 as usize)
         }
+        Instruction::NumericForPrepare { exit, .. } => Some(exit.0 as usize),
+        Instruction::NumericForNext { target, .. } => Some(target.0 as usize),
         _ => None,
     }
 }
@@ -186,6 +242,8 @@ fn assert_real_jump_targets(root: &rivetlua_compiler::IrPrototype) {
     for (index, instruction) in root.instructions.iter().enumerate() {
         let target = match instruction.instruction {
             Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } => target,
+            Instruction::NumericForPrepare { exit: target, .. }
+            | Instruction::NumericForNext { target, .. } => target,
             _ => continue,
         };
         assert!(
@@ -226,7 +284,10 @@ fn public_ir_builds_real_cfg_edges_for_control_flow_and_labels() {
             assert!(
                 root.instructions.iter().any(|instruction| matches!(
                     instruction.instruction,
-                    Instruction::Jump { .. } | Instruction::JumpIfFalse { .. }
+                    Instruction::Jump { .. }
+                        | Instruction::JumpIfFalse { .. }
+                        | Instruction::NumericForPrepare { .. }
+                        | Instruction::NumericForNext { .. }
                 )),
                 "{name} 必須產生 CFG edge"
             );
@@ -419,25 +480,30 @@ fn public_ir_preserves_repeat_numeric_and_generic_for_lowering_semantics() {
         let numeric_root = numeric.prototype_for(FunctionId(0)).unwrap();
         assert!(numeric_root.instructions.iter().any(|instruction| matches!(
             instruction.instruction,
-            Instruction::BinaryOp {
-                op: BinaryOperation::Less,
+            Instruction::NumericForPrepare {
+                control,
+                limit,
+                step,
+                visible,
                 ..
-            }
+            } if control != limit && control != step && control != visible
+                && limit != step && limit != visible && step != visible
         )));
         assert!(numeric_root.instructions.iter().any(|instruction| matches!(
             instruction.instruction,
-            Instruction::BinaryOp {
-                op: BinaryOperation::GreaterEqual,
-                ..
-            }
+            Instruction::NumericForNext { .. }
         )));
-        assert!(numeric_root.instructions.iter().any(|instruction| matches!(
-            instruction.instruction,
-            Instruction::BinaryOp {
-                op: BinaryOperation::LessEqual,
-                ..
-            }
-        )));
+        assert!(
+            !numeric_root.instructions.iter().any(|instruction| matches!(
+                instruction.instruction,
+                Instruction::BinaryOp {
+                    op: BinaryOperation::Less
+                        | BinaryOperation::GreaterEqual
+                        | BinaryOperation::LessEqual,
+                    ..
+                }
+            ))
+        );
         assert_eq!(
             numeric_root
                 .instructions
@@ -524,7 +590,7 @@ fn public_ir_generic_for_terminates_only_on_nil_and_evaluates_extra_values() {
     for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
         let ir = lower(
             &resolved(
-                b"local iter,state,control,side; for k in iter,state,control,side() do end",
+                b"local iter,state,control,closing,side; for k in iter,state,control,closing,side() do end",
                 profile,
             ),
             &IrLimits::default(),
@@ -582,6 +648,377 @@ fn public_ir_generic_for_terminates_only_on_nil_and_evaluates_extra_values() {
             root.instructions[generic_call + 3].instruction,
             Instruction::JumpIfFalse { condition, .. } if condition == comparison
         ));
+    }
+}
+
+#[test]
+fn public_ir_generic_for_moves_fourth_value_to_p04_closing_and_closes_it() {
+    for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
+        let resolved_module = resolved(b"local f; for k in f() do end; return 0", profile);
+        let closing_binding = resolved_module
+            .root
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                rivetlua_compiler::ResolvedStmt::GenericFor { closing, .. } => {
+                    Some(closing.binding)
+                }
+                _ => None,
+            })
+            .expect("P04 generic-for 必須提供 hidden closing binding");
+        let ir = lower(&resolved_module, &IrLimits::default()).unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let closing_register = root
+            .binding_registers
+            .iter()
+            .find_map(|(binding, register)| (*binding == closing_binding).then_some(*register))
+            .expect("P05 必須為 P04 closing binding 配置 register");
+        let (initial_call_index, initial_base) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| match entry.instruction {
+                Instruction::Call {
+                    base,
+                    arg_count: 0,
+                    result_mode: ResultMode::Fixed(4),
+                } => Some((index, base)),
+                _ => None,
+            })
+            .expect("for k in f() 的 initial Call 必須固定調整為四值");
+        let fourth = Register(initial_base.0 + 3);
+        let closing_move_index = root.instructions[initial_call_index + 1..]
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.instruction,
+                    Instruction::Move { dest, src } if dest == closing_register && src == fourth
+                )
+            })
+            .map(|offset| initial_call_index + 1 + offset)
+            .expect("initial Call 的第四值必須 Move 到 P04 hidden closing register");
+        let normal_path = root
+            .close_paths
+            .iter()
+            .find(|path| path.kind == ExitKind::Normal && path.bindings.contains(&closing_binding))
+            .expect("generic-for normal ClosePath 必須攜帶 closing binding");
+        assert!(normal_path.registers.contains(&closing_register));
+        assert!(
+            root.instructions[closing_move_index + 1..]
+                .iter()
+                .any(|entry| matches!(
+                    entry.instruction,
+                    Instruction::Close { base, count: 1 } if base == closing_register
+                ) && entry
+                    .close_path
+                    .as_ref()
+                    .is_some_and(|path| path.kind == ExitKind::Normal
+                        && path.registers.contains(&closing_register)))
+        );
+
+        let missing_resolved = resolved(b"local iter; for k in iter do end; return 0", profile);
+        let missing_closing = missing_resolved
+            .root
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                rivetlua_compiler::ResolvedStmt::GenericFor { closing, .. } => {
+                    Some(closing.binding)
+                }
+                _ => None,
+            })
+            .expect("缺第四值的 generic-for 仍必有 P04 closing binding");
+        let missing_ir = lower(&missing_resolved, &IrLimits::default()).unwrap();
+        let missing_root = missing_ir.prototype_for(FunctionId(0)).unwrap();
+        let missing_register = missing_root
+            .binding_registers
+            .iter()
+            .find_map(|(binding, register)| (*binding == missing_closing).then_some(*register))
+            .expect("缺第四值時 P05 仍必配置 closing register");
+        let nil_source = missing_root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| match entry.instruction {
+                Instruction::Move { dest, src } if dest == missing_register => Some((index, src)),
+                _ => None,
+            })
+            .expect("缺第四值時必須寫入 closing register");
+        assert!(
+            missing_root.instructions[..nil_source.0]
+                .iter()
+                .any(|entry| matches!(
+                    entry.instruction,
+                    Instruction::LoadNil { start, count: 1 } if start == nil_source.1
+                ))
+        );
+    }
+}
+
+#[test]
+fn public_ir_generic_for_break_skips_normal_closing_path() {
+    for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
+        let resolved_module = resolved(
+            b"local iter,state,control,closing; for k in iter,state,control,closing do break end; return 0",
+            profile,
+        );
+        let closing_binding = resolved_module
+            .root
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                rivetlua_compiler::ResolvedStmt::GenericFor {
+                    closing,
+                    body,
+                    close_path,
+                    ..
+                } => {
+                    assert_eq!(close_path.kind, ExitKind::Normal);
+                    assert!(close_path.bindings.contains(&closing.binding));
+                    let break_path = body
+                        .statements
+                        .iter()
+                        .find_map(|statement| match statement {
+                            rivetlua_compiler::ResolvedStmt::Break { close_path, .. } => {
+                                Some(close_path)
+                            }
+                            _ => None,
+                        })
+                        .expect("generic-for body 必須包含 break");
+                    assert_eq!(break_path.kind, ExitKind::Break);
+                    assert!(break_path.bindings.contains(&closing.binding));
+                    Some(closing.binding)
+                }
+                _ => None,
+            })
+            .expect("P04 generic-for 必須有 hidden closing binding");
+
+        let ir = lower(&resolved_module, &IrLimits::default()).unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let close_indices = |kind| {
+            root.instructions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    (matches!(entry.instruction, Instruction::Close { count: 1, .. })
+                        && entry.close_path.as_ref().is_some_and(|path| {
+                            path.kind == kind && path.bindings.contains(&closing_binding)
+                        }))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>()
+        };
+        let break_closes = close_indices(ExitKind::Break);
+        let normal_closes = close_indices(ExitKind::Normal);
+        assert_eq!(break_closes.len(), 1, "break 應只關閉 hidden binding 一次");
+        assert_eq!(
+            normal_closes.len(),
+            1,
+            "nil 正常結束應只關閉 hidden binding 一次"
+        );
+        let break_close = break_closes[0];
+        let normal_close = normal_closes[0];
+        assert!(break_close < normal_close);
+
+        let break_target = match root.instructions[break_close + 1].instruction {
+            Instruction::Jump { target } => target.0 as usize,
+            _ => panic!("Break ClosePath 後必須跳出 generic-for"),
+        };
+        let nil_target = root
+            .instructions
+            .iter()
+            .find_map(|entry| match entry.instruction {
+                Instruction::JumpIfFalse { target, .. } => Some(target.0 as usize),
+                _ => None,
+            })
+            .expect("iterator 回傳 nil 時必須跳到正常結束路徑");
+        assert_eq!(
+            nil_target + 1,
+            normal_close,
+            "nil 分支必須跳到緊接 Normal ClosePath 的 CFG 錨點"
+        );
+        assert!(matches!(
+            root.instructions[nil_target].instruction,
+            Instruction::LoadNil { count: 1, .. }
+        ));
+        assert!(
+            normal_close < break_target,
+            "break 必須跳過 Normal ClosePath"
+        );
+        assert_real_jump_targets(root);
+        rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default())
+            .expect("generic-for break 的 RVLU_V2 必須通過 verifier");
+    }
+}
+
+#[test]
+fn public_ir_adjusts_final_open_values_for_assignment_and_generic_for() {
+    for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
+        let ir = lower(
+            &resolved(
+                b"local f,a,b,c; a,b,c=f(1,2,3,4); a,b=(f(1,2,3,4)); for k in f(1,2,3,4) do end; return a",
+                profile,
+            ),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let fixed_results = root
+            .instructions
+            .iter()
+            .filter_map(|entry| match entry.instruction {
+                Instruction::Call {
+                    arg_count: 4,
+                    result_mode: ResultMode::Fixed(count),
+                    ..
+                } => Some(count),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            fixed_results.windows(3).any(|counts| counts == [3, 1, 4]),
+            "a,b,c=f() 必須取三值；(f()) 必須限為一值；generic-for f() 必須調整為四值（含 closing）：{fixed_results:?}"
+        );
+        assert!(
+            root.instructions
+                .iter()
+                .any(|entry| matches!(entry.instruction, Instruction::LoadNil { count: 1, .. })),
+            "a,b=(f()) 的第二個目標必須補 Nil"
+        );
+        rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default())
+            .expect("多值調整後的 RVLU_V2 必須通過 verifier");
+
+        let vararg_ir = lower(
+            &resolved(
+                b"local function g(...) local a,b,c=...; for k in ... do end; return a end; return g",
+                profile,
+            ),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let child = vararg_ir.prototype_for(FunctionId(1)).unwrap();
+        let vararg_results = child
+            .instructions
+            .iter()
+            .filter_map(|entry| match entry.instruction {
+                Instruction::Vararg {
+                    result_mode: ResultMode::Fixed(count),
+                    ..
+                } => Some(count),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            vararg_results.windows(2).any(|counts| counts == [3, 4]),
+            "最後 Vararg 必須按 assignment 三值與 generic-for 四值調整：{vararg_results:?}"
+        );
+    }
+}
+
+#[test]
+fn public_ir_snapshots_table_assignment_targets_before_rhs_and_commit() {
+    for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
+        let ir = lower(
+            &resolved(b"local i,t; i,t[i]=i+1,20; return i", profile),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let (set_index, table_snapshot, key_snapshot) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| match entry.instruction {
+                Instruction::SetTable { table, key, .. } => Some((index, table, key)),
+                _ => None,
+            })
+            .expect("i,t[i] assignment 必須產生 SetTable");
+        let (table_snapshot_index, table_binding) = root.instructions[..set_index]
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| match entry.instruction {
+                Instruction::Move { dest, src } if dest == table_snapshot => Some((index, src)),
+                _ => None,
+            })
+            .expect("table target 必須有 RHS 前 snapshot Move");
+        let (key_snapshot_index, i_binding) = root.instructions[..set_index]
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| match entry.instruction {
+                Instruction::Move { dest, src } if dest == key_snapshot => Some((index, src)),
+                _ => None,
+            })
+            .expect("key target 必須有 RHS 前 snapshot Move");
+        let i_write = root.instructions[key_snapshot_index + 1..set_index]
+            .iter()
+            .position(|entry| matches!(entry.instruction, Instruction::Move { dest, .. } if dest == i_binding))
+            .map(|offset| key_snapshot_index + 1 + offset)
+            .expect("第一筆 assignment 必須在 SetTable 前寫入 i");
+        assert_ne!(table_snapshot, table_binding);
+        assert_ne!(key_snapshot, i_binding);
+        assert!(table_snapshot_index < key_snapshot_index);
+        assert!(key_snapshot_index < i_write && i_write < set_index);
+
+        let call_ir = lower(
+            &resolved(
+                b"local t,k; local function f() t={}; k=2; return {},20 end; t[k],k=f(); return t",
+                profile,
+            ),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let root = call_ir.prototype_for(FunctionId(0)).unwrap();
+        let (set_index, table_snapshot, key_snapshot) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| match entry.instruction {
+                Instruction::SetTable { table, key, .. } => Some((index, table, key)),
+                _ => None,
+            })
+            .expect("Call RHS case 必須產生 SetTable");
+        let call_index = root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| {
+                matches!(
+                    entry.instruction,
+                    Instruction::Call {
+                        arg_count: 0,
+                        result_mode: ResultMode::Fixed(2),
+                        ..
+                    }
+                )
+                .then_some(index)
+            })
+            .expect("RHS f() 必須以兩個固定結果呼叫");
+        let table_snapshot_index = root.instructions[..call_index]
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| {
+                matches!(
+                    entry.instruction,
+                    Instruction::Move { dest, .. } if dest == table_snapshot
+                )
+                .then_some(index)
+            })
+            .expect("RHS Call 前必須固定 table");
+        let key_snapshot_index = root.instructions[..call_index]
+            .iter()
+            .enumerate()
+            .find_map(|(index, entry)| {
+                matches!(
+                    entry.instruction,
+                    Instruction::Move { dest, .. } if dest == key_snapshot
+                )
+                .then_some(index)
+            })
+            .expect("RHS Call 前必須固定 key");
+        assert!(table_snapshot_index < call_index);
+        assert!(key_snapshot_index < call_index && call_index < set_index);
+        rivetlua_compiler::emit(&call_ir, &rivetlua_compiler::VerifyLimits::default())
+            .expect("snapshot assignment RVLU_V2 必須通過 verifier");
     }
 }
 
@@ -911,7 +1348,7 @@ fn public_ir_frames_keep_verified_environment_source_chains() {
 }
 
 #[test]
-fn public_rvlu_v1_roundtrips_two_profiles_through_verified_module() {
+fn public_rvlu_v2_roundtrips_two_profiles_through_verified_module() {
     for (profile, bytecode_profile) in [
         (LanguageProfile::Lua55, LuaProfile::Lua55),
         (LanguageProfile::Lua54, LuaProfile::Lua54),
@@ -945,7 +1382,7 @@ fn public_rvlu_rejects_untrusted_headers_lengths_and_profiles() {
         let ir = lower(&resolved(b"return 1+2", profile), &IrLimits::default()).unwrap();
         let encoded =
             rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default()).unwrap();
-        for (offset, value) in [(0, 0xff), (4, 2), (7, 0)] {
+        for (offset, value) in [(0, 0xff), (4, 3), (7, 0)] {
             let mut bytes = encoded.bytes().to_vec();
             bytes[offset] = value;
             let error = rivetlua_compiler::decode_module(
@@ -1009,6 +1446,50 @@ fn public_rvlu_verifies_two_profile_control_flow_closure_and_close_paths() {
             rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default())
                 .expect("compiler IR 必須通過同一完整 verifier");
         }
+    }
+}
+
+#[test]
+fn public_ir_pending_close_return_uses_call_close_return_not_tailcall() {
+    for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
+        let ir = lower(
+            &resolved(b"local f; do local a <close> = {}; return f() end", profile),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let call = root
+            .instructions
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.instruction,
+                    Instruction::Call {
+                        result_mode: ResultMode::All,
+                        ..
+                    }
+                )
+            })
+            .expect("pending-close return 必須保留 Call(All)");
+        let close = root.instructions[call + 1..]
+            .iter()
+            .position(|entry| matches!(entry.instruction, Instruction::Close { .. }))
+            .map(|offset| call + 1 + offset)
+            .expect("pending-close return 必須接 Close");
+        assert!(matches!(
+            root.instructions[close + 1].instruction,
+            Instruction::Return {
+                result_mode: ResultMode::All,
+                ..
+            }
+        ));
+        assert!(
+            !root.instructions[call..=close]
+                .iter()
+                .any(|entry| matches!(entry.instruction, Instruction::TailCall { .. }))
+        );
+        rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default())
+            .expect("Call(All) → Close → Return(All) 必須通過 verifier");
     }
 }
 
