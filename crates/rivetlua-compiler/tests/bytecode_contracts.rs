@@ -1530,6 +1530,116 @@ fn public_rvlu_verifier_rejects_untrusted_candidate_operands_and_cfg() {
 }
 
 #[test]
+fn public_codegen_finishes_reachable_fallthrough_with_empty_return() {
+    for (profile, bytecode_profile) in [
+        (LanguageProfile::Lua55, LuaProfile::Lua55),
+        (LanguageProfile::Lua54, LuaProfile::Lua54),
+    ] {
+        for input in [
+            b"while true do end".as_slice(),
+            b"".as_slice(),
+            b"local x=1".as_slice(),
+            b"local function f() local x=1 end".as_slice(),
+        ] {
+            let ir = lower(&resolved(input, profile), &IrLimits::default()).unwrap();
+            for prototype in &ir.prototypes {
+                assert!(
+                    matches!(
+                        prototype
+                            .instructions
+                            .last()
+                            .map(|entry| &entry.instruction),
+                        Some(Instruction::Return {
+                            result_mode: ResultMode::Fixed(0),
+                            ..
+                        })
+                    ),
+                    "函式正常落尾須回傳零個結果：{input:?}"
+                );
+            }
+            let first = rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default())
+                .expect("正常落尾的 compiler 產物須通過 verifier");
+            let repeated = lower(&resolved(input, profile), &IrLimits::default()).unwrap();
+            let second =
+                rivetlua_compiler::emit(&repeated, &rivetlua_compiler::VerifyLimits::default())
+                    .unwrap();
+            assert_eq!(first.bytes(), second.bytes());
+            assert_eq!(first.verified().profile(), bytecode_profile);
+        }
+
+        let ir = lower(
+            &resolved(b"do local x <close> end", profile),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        assert!(matches!(
+            root.instructions[root.instructions.len() - 2].instruction,
+            Instruction::Close { .. }
+        ));
+        assert!(matches!(
+            root.instructions.last().map(|entry| &entry.instruction),
+            Some(Instruction::Return {
+                result_mode: ResultMode::Fixed(0),
+                ..
+            })
+        ));
+        rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default()).unwrap();
+
+        for (input, terminal) in [
+            (b"return 7".as_slice(), "return"),
+            (b"local f; return f()".as_slice(), "tailcall"),
+        ] {
+            let ir = lower(&resolved(input, profile), &IrLimits::default()).unwrap();
+            let root = ir.prototype_for(FunctionId(0)).unwrap();
+            assert!(match terminal {
+                "return" => matches!(
+                    root.instructions.last().map(|entry| &entry.instruction),
+                    Some(Instruction::Return {
+                        result_mode: ResultMode::Fixed(1),
+                        ..
+                    })
+                ),
+                "tailcall" => matches!(
+                    root.instructions.last().map(|entry| &entry.instruction),
+                    Some(Instruction::TailCall { .. })
+                ),
+                _ => unreachable!(),
+            });
+            rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default()).unwrap();
+        }
+
+        let ir = lower(
+            &resolved(b"::loop:: goto loop", profile),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        assert!(matches!(
+            root.instructions.last().map(|entry| &entry.instruction),
+            Some(Instruction::Jump { .. })
+        ));
+        rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default()).unwrap();
+
+        let ir = lower(&resolved(b"local x=1", profile), &IrLimits::default()).unwrap();
+        let encoded =
+            rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default()).unwrap();
+        let mut malformed = encoded.verified().module().clone();
+        malformed.prototypes[0].instructions.pop();
+        assert_eq!(
+            rivetlua_compiler::verify_module(
+                malformed,
+                bytecode_profile,
+                &rivetlua_compiler::VerifyLimits::default(),
+            )
+            .expect_err("手工移除 terminal Return 後，可達落尾須拒絕")
+            .code,
+            rivetlua_compiler::BytecodeErrorCode::Verify
+        );
+    }
+}
+
+#[test]
 fn public_rvlu_verifier_rejects_reordered_compiler_close_sequence() {
     let ir = lower(
         &resolved(

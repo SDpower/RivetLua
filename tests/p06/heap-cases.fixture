@@ -1,0 +1,10 @@
+profile|lua55-i64f64|lua55
+profile|lua54-i64f64|lua54
+case|HEAP-001|VM-A handle 在 VM-B read 與 clone
+case|HEAP-002|撤銷 handle root、回收 slot，再以新 generation 配置
+case|HEAP-003|HostHandle 持有物件並跨越 32 次強制收集配置
+case|HEAP-004|每次配置後強制收集，六類 root、新物件邊與 12 次配置
+case|HEAP-005|配額為 0、等於既有 committed，及不足以建立 HostHandle
+case|HEAP-006|登錄再移除 stack、registry、global、temporary、coroutine、host 六類 root
+case|HEAP-007|將 slot generation 設為 u64::MAX 後回收並配置替代物件
+case|HEAP-008|ChildReserve 或 quota 失敗時嘗試跨配置邊界修改物件圖

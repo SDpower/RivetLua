@@ -1,0 +1,14 @@
+[package]
+name = "rivetlua-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RivetLua 的純 Rust VM 與 heap。"
+
+[dependencies]
+rivetlua-core = { path = "../rivetlua-core" }
+
+[dev-dependencies]
+rivetlua-compiler = { path = "../rivetlua-compiler" }

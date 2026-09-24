@@ -57,6 +57,12 @@ jobs:
       - name: Verify compiler bytecode and verifier
         run: cargo run --locked -p rivetlua-xtask -- gate P05
 
+      - name: Verify runtime heap and handles
+        run: cargo run --locked -p rivetlua-xtask -- gate P06
+
+      - name: Verify minimal virtual machine
+        run: cargo run --locked -p rivetlua-xtask -- gate P07
+
       - name: Save gate reports
         if: always()
         uses: actions/upload-artifact@v4

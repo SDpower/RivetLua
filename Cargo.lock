@@ -14,5 +14,13 @@ name = "rivetlua-core"
 version = "0.0.0"
 
 [[package]]
+name = "rivetlua-runtime"
+version = "0.0.0"
+dependencies = [
+ "rivetlua-compiler",
+ "rivetlua-core",
+]
+
+[[package]]
 name = "rivetlua-xtask"
 version = "0.0.0"

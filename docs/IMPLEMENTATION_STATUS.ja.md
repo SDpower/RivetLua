@@ -2,7 +2,7 @@
 
 [English](IMPLEMENTATION_STATUS.md) | [繁體中文](IMPLEMENTATION_STATUS.zh-TW.md) | [한국어](IMPLEMENTATION_STATUS.ko.md) | 日本語
 
-更新日：2026-09-22。このページでは、リポジトリに実装済みの機能と今後の作業を区別します。チェック済みの項目は記載した範囲のテストに合格したことを示します。未チェックの項目はまだ実装されていません。仕様書やテスト資料が存在するだけでは、対応する実行機能が完成したことにはなりません。
+更新日：2026-09-25。このページでは、リポジトリに実装済みの機能と今後の作業を区別します。チェック済みの項目は記載した範囲のテストに合格したことを示します。未チェックの項目はまだ実装されていません。仕様書やテスト資料が存在するだけでは、対応する実行機能が完成したことにはなりません。
 
 ## 実装・検証済み
 
@@ -18,14 +18,14 @@
 - [x] **Lua の字句解析：** [コンパイラ API](../crates/rivetlua-compiler/src/lib.rs) は Lua 5.5 と 5.4 の生バイト列からトークンを認識し、span、位置、リテラル、制限付き診断を保持します。Lua 5.5 の `global` はマニュアルに従う厳格な文法で予約語として扱います。両プロファイルの P02 ゲートが合格しています。
 - [x] **Lua の構文解析：** [コンパイラ API](../crates/rivetlua-compiler/src/lib.rs) は P02 のトークンを所有権のある AST に解析し、演算子の優先順位、括弧、呼び出し、宣言、span を保持します。両プロファイルの P03 ゲートが合格しています。この段階では構文構造のみを検証します。
 - [x] **Lua のスコープと名前解決：** [コンパイラ API](../crates/rivetlua-compiler/src/lib.rs) は binding、入れ子の upvalue、読み取り専用の名前、ジャンプ、クローズ経路、および Lua 5.5 の明示的な global 宣言を所有権のある解決済み AST に変換します。両プロファイルの P04 ゲートが合格しています。この段階では bytecode の生成や Lua の実行は行いません。
-- [x] **中間表現と bytecode の検証：** [コンパイラ API](../crates/rivetlua-compiler/src/lib.rs) は解決済み AST を型付きレジスタ IR と RVLU_V2 bytecode に変換します。module 所有 format version、signature/vararg、ClosePath、numeric-for 専用 instruction、canonical static effects を[コア検証器](../crates/rivetlua-core/src/bytecode/codec.rs)が検査し、v1 と未知版を拒否します。両プロファイルの P05 ゲートが合格しています。これは Lua binary chunk ではなく Lua を実行しません。P06+ は `NOT_IMPLEMENTED` のままです。
+- [x] **中間表現と bytecode の検証：** [コンパイラ API](../crates/rivetlua-compiler/src/lib.rs) は解決済み AST を型付きレジスタ IR と RVLU_V2 bytecode に変換します。module 所有 format version、signature/vararg、ClosePath、numeric-for 専用 instruction、canonical static effects を[コア検証器](../crates/rivetlua-core/src/bytecode/codec.rs)が検査し、v1 と未知版を拒否します。両プロファイルの P05 ゲートが合格しています。これは Lua binary chunk ではありません。
+- [x] **Heap、root、host handle、割り当て失敗：** [runtime crate](../crates/rivetlua-runtime/src/lib.rs) は安定したオブジェクト ID、6 種類の root、RAII host handle、割り当て計上、失敗時のロールバック、実際に回収する mark/sweep を提供します。P06 のローカル gate は 29/29 項目を通過し、各 profile で HEAP ケースを 8 件ずつ実行しました。gate は P01 と P05 も再実行します。この段階では bytecode や Lua ソースを実行しません。
+- [x] **最小 VM：** runtime は検証済み RVLU_V2 module のみを受け付け、P07 対象の数値演算、local 代入、条件分岐、ループ、numeric-for、fuel 制限、終端状態を実行します。未対応 instruction と constant は明示的に拒否します。P07 のローカル gate は 30/30 項目に合格し、20 件の一意な VM ケース報告（各 profile 10 件）を生成しました。VM-005/007 は正確な入力 `while true do end` をコンパイルして検証済み module を VM に渡します。compiler codegen は関数の fallthrough 経路に暗黙の終端 `Return(Fixed(0))` を追加し、fuel 枯渇と終端状態の検査は compiler 生成 module を使います。
 
-値、数値、字句解析、構文解析のテストは Rust API を直接呼び出します。**RivetLua はまだ Lua ソースコードを実行できず、Lua 言語との完全な互換性も検証されていません。**
+値、数値、字句解析、構文解析のテストは Rust API を直接呼び出します。**RivetLua は現在 P07 が対応する Lua のサブセットのみを実行し、言語全体との互換性は未検証です。**
 
 ## 今後の作業
 
-- [ ] ヒープ上のオブジェクト、ルート、ハンドル、割り当て失敗を管理します。
-- [ ] 制御フローと代入を実行する最小限の仮想マシンを作ります。
 - [ ] 文字列と raw table 操作を実装します。
 - [ ] 関数、クロージャ、複数戻り値、末尾呼び出しを実装します。
 - [ ] メタテーブルと関連操作を実装します。
@@ -57,6 +57,8 @@ cargo run --locked -p rivetlua-xtask -- gate P02
 cargo run --locked -p rivetlua-xtask -- gate P03
 cargo run --locked -p rivetlua-xtask -- gate P04
 cargo run --locked -p rivetlua-xtask -- gate P05
+cargo run --locked -p rivetlua-xtask -- gate P06
+cargo run --locked -p rivetlua-xtask -- gate P07
 ```
 
-`gate P00` はプロジェクトの基盤を、`gate P01` はコアの値と数値を、`gate P02` は lexer を、`gate P03` は parser を、`gate P04` はスコープと名前解決を、`gate P05` は bytecode と前段階の回帰を検査します。実行時にローカルの計画書は不要です。2026-09-22 に Rust 1.98.1 で検証した結果、書式検査とワークスペースのテストが成功し、基盤・コア・字句解析・構文解析・名前解決・bytecode の検証はそれぞれ 22/22、35/35、29/29、25/25、23/23、24/24 が合格しました。P05 には両プロファイルで各 8 ケースが含まれます。レポートは `target/rivetlua-reports/` に生成されます。このディレクトリは Git に含まれず、上記のコマンドで再作成できます。Cargo が宣言する MSRV は引き続き 1.94.1 です。
+`gate P00` はプロジェクトの基盤を、`gate P01` はコアの値と数値を、`gate P02` は lexer を、`gate P03` は parser を、`gate P04` はスコープと名前解決を、`gate P05` は bytecode と前段階の回帰を、`gate P06` は heap/handle 契約と P01/P05 の回帰を、`gate P07` は最小 VM と P01/P05/P06 の回帰を検査します。実行時にローカルの計画書は不要です。2026-09-22 に Rust 1.98.1 で検証した結果、書式検査とワークスペースのテストが成功し、基盤・コア・字句解析・構文解析・名前解決・bytecode の検証はそれぞれ 22/22、35/35、29/29、25/25、23/23、24/24 が合格しました。P05 には両プロファイルで各 8 ケースが含まれます。2026-09-24 の Rust 1.98.1 による P06 gate は 29/29 項目を通過しました。16 件の一意なケース報告（各 profile 8 件）、runtime unit 17 件、profile ごとの crate 外契約テスト 19 件、profile ごとに doctest 2 件（うち 1 件は compile-fail）を含みます。P07 ローカル gate は 30/30 項目に合格し、20 件の一意なケース報告（各 profile 10 件）、runtime unit 48 件、profile ごとの crate 外契約テスト 27 件を実行しました。VM-005/007 は正確な入力 `while true do end` をコンパイルして検証済み module を VM に渡し、compiler codegen は関数の fallthrough 経路に暗黙の終端 `Return(Fixed(0))` を追加します。xtask CLI では P07 のケース欠落、重複、誤った profile、破損 fixture、P01 prerequisite の失敗を検証しました。各失敗は非ゼロ終了と解析可能な FAIL JSON を出力しました。変更した fixture は `cmp -s` で復元を確認し、注入の前後で作業ツリー状態が同一でした。これはローカル検証の記録であり、リモート GitHub CI の実行を示すものではありません。レポートは `target/rivetlua-reports/` に生成され、Git に含まれず、上記のコマンドで再作成できます。Cargo が宣言する MSRV は引き続き 1.94.1 です。

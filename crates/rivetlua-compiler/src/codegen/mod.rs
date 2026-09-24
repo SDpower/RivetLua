@@ -436,13 +436,30 @@ impl<'a> Builder<'a> {
         })
     }
 
-    fn finish(self) -> Result<IrPrototype, IrError> {
+    fn finish(mut self) -> Result<IrPrototype, IrError> {
         if !self.label_frames.is_empty() || !self.pending_gotos.is_empty() || !self.loops.is_empty()
         {
             return Err(invalid(
                 self.span,
                 "CFG lowering 有未完成的 control-flow patch",
             ));
+        }
+        if !matches!(
+            self.instructions.last().map(|entry| &entry.instruction),
+            Some(
+                Instruction::Return { .. }
+                    | Instruction::TailCall { .. }
+                    | Instruction::Jump { .. }
+            )
+        ) {
+            self.emit(
+                Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(0),
+                },
+                self.span,
+                None,
+            )?;
         }
         self.validate_environment_source()?;
         self.validate_open_results()?;

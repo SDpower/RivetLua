@@ -2,7 +2,7 @@
 
 [English](IMPLEMENTATION_STATUS.md) | 繁體中文 | [한국어](IMPLEMENTATION_STATUS.ko.md) | [日本語](IMPLEMENTATION_STATUS.ja.md)
 
-更新日期：2026-09-22。本頁列出專案中已實作與待實作的功能。勾選代表所述範圍已通過測試；未勾選代表尚未實作。規格文件或測試資料存在，不代表對應的執行功能已完成。
+更新日期：2026-09-25。本頁列出專案中已實作與待實作的功能。勾選代表所述範圍已通過測試；未勾選代表尚未實作。規格文件或測試資料存在，不代表對應的執行功能已完成。
 
 ## 已實作並驗收
 
@@ -18,14 +18,14 @@
 - [x] **Lua 詞法分析**：[編譯器 API](../crates/rivetlua-compiler/src/lib.rs) 以原始 bytes 辨識 Lua 5.5 與 5.4 的 token，保留 span、行列、literal 與受控診斷；5.5 的 `global` 採手冊嚴格語法。兩個 profile 的 P02 gate 已通過。
 - [x] **Lua 語法分析**：[編譯器 API](../crates/rivetlua-compiler/src/lib.rs) 將 P02 token 解析為擁有資料的 AST，保留運算式優先序、括號、呼叫、宣告與 span；兩個 profile 的 P03 gate 已通過。此階段只驗證語法結構。
 - [x] **Lua 作用域與名稱解析**：[編譯器 API](../crates/rivetlua-compiler/src/lib.rs) 將 binding、巢狀 upvalue、唯讀名稱、跳轉、關閉路徑及 Lua 5.5 明確全域宣告解析為擁有資料的 AST；兩個 profile 的 P04 gate 已通過。此階段不產生 bytecode，也不執行 Lua。
-- [x] **中介表示與 bytecode 驗證**：[編譯器 API](../crates/rivetlua-compiler/src/lib.rs) 將 resolved AST 降為具型別的暫存器 IR 與 RVLU_V2 bytecode。module 自帶格式版本、signature/vararg、ClosePath、numeric-for 專用指令與 canonical static effects，均由[核心驗證器](../crates/rivetlua-core/src/bytecode/codec.rs)檢查；v1 與未知版明確拒絕。兩個 profile 的 P05 gate 已通過。此格式不是 Lua binary chunk，也**不能執行 Lua**；P06+ 仍為 `NOT_IMPLEMENTED`。
+- [x] **中介表示與 bytecode 驗證**：[編譯器 API](../crates/rivetlua-compiler/src/lib.rs) 將 resolved AST 降為具型別的暫存器 IR 與 RVLU_V2 bytecode。module 自帶格式版本、signature/vararg、ClosePath、numeric-for 專用指令與 canonical static effects，均由[核心驗證器](../crates/rivetlua-core/src/bytecode/codec.rs)檢查；v1 與未知版明確拒絕。兩個 profile 的 P05 gate 已通過。此格式不是 Lua binary chunk。
+- [x] **Heap、root、宿主 handle 與配置失敗**：[runtime crate](../crates/rivetlua-runtime/src/lib.rs) 提供穩定物件身分、六類 root、RAII 宿主 handle、額度計帳、失敗回復及可實際回收物件的 mark/sweep。P06 本機 gate 29 項檢查通過，兩個 profile 各有八個 HEAP 案例；gate 會重跑 P01 與 P05。此階段不執行 bytecode 或 Lua 原始碼。
+- [x] **最小虛擬機**：runtime 僅接受已驗證 RVLU_V2 module，並執行 P07 支援的數值、local 指派、條件、迴圈、numeric-for、fuel 限制與終結狀態；未支援的指令與常數會明確拒絕。P07 本機 gate 30/30 項檢查通過，產生 20 份唯一 VM 案例報告（每個 profile 十份）。VM-005/007 編譯精確來源 `while true do end`、輸出已驗證 module，再把 compiler 產物交給 VM 執行。compiler codegen 會在函式可落尾時補上隱式終端 `Return(Fixed(0))`；fuel 耗盡與終結狀態斷言都使用這份 compiler 產物。
 
-值、數值、詞法與語法測試直接呼叫 Rust API。**RivetLua 尚不能執行 Lua 原始碼，也尚未驗證完整的 Lua 語言相容性。**
+值、數值、詞法與語法測試直接呼叫 Rust API。**RivetLua 目前只執行 P07 支援的 Lua 子集；完整語言相容性尚未驗證。**
 
 ## 待實作
 
-- [ ] 管理 heap 物件、root、handle 與配置失敗。
-- [ ] 建立能執行控制流程與指派的最小虛擬機。
 - [ ] 實作字串與原始 table 操作。
 - [ ] 實作函式、閉包、多重回傳與尾呼叫。
 - [ ] 實作 metatable 及相關操作。
@@ -57,6 +57,8 @@ cargo run --locked -p rivetlua-xtask -- gate P02
 cargo run --locked -p rivetlua-xtask -- gate P03
 cargo run --locked -p rivetlua-xtask -- gate P04
 cargo run --locked -p rivetlua-xtask -- gate P05
+cargo run --locked -p rivetlua-xtask -- gate P06
+cargo run --locked -p rivetlua-xtask -- gate P07
 ```
 
-`gate P00` 檢查專案基礎；`gate P01` 檢查核心值與數值；`gate P02` 檢查 lexer；`gate P03` 檢查 parser；`gate P04` 檢查作用域與名稱解析；`gate P05` 檢查 bytecode 並包含前階段回歸。這些命令不需要本機規劃文件。2026-09-22 使用 Rust 1.98.1 驗證：格式與工作區測試通過；基礎、核心、詞法、語法、解析與 bytecode 驗收分別為 22/22、35/35、29/29、25/25、23/23、24/24，P05 兩個 profile 各包含八個案例。報告產生於 `target/rivetlua-reports/`；該目錄不納入 Git，可用上述命令重建。Cargo 宣告的 MSRV 仍為 1.94.1。
+`gate P00` 檢查專案基礎；`gate P01` 檢查核心值與數值；`gate P02` 檢查 lexer；`gate P03` 檢查 parser；`gate P04` 檢查作用域與名稱解析；`gate P05` 檢查 bytecode 並重跑前階段；`gate P06` 檢查 heap 與 handle 契約並重跑 P01/P05；`gate P07` 檢查最小 VM 並重跑 P01/P05/P06。這些命令不需要本機規劃文件。2026-09-22 使用 Rust 1.98.1 驗證：格式與工作區測試通過；基礎、核心、詞法、語法、解析與 bytecode 驗收分別為 22/22、35/35、29/29、25/25、23/23、24/24，P05 兩個 profile 各包含八個案例。2026-09-24 使用 Rust 1.98.1 執行 P06 gate，29/29 項檢查通過，含 16 份唯一案例報告（每個 profile 八份）、runtime unit 17 項、每個 profile 19 項 crate 外契約測試，以及每個 profile 各兩個 doctest（其中一個為 compile-fail）。P07 本機 gate 30/30 項檢查通過，產生 20 份唯一案例報告（每個 profile 十份）、runtime unit 48 項，以及每個 profile 27 項 crate 外契約測試。VM-005/007 現在會編譯精確輸入 `while true do end`、輸出已驗證 RVLU_V2 module，並執行 compiler 產物；compiler codegen 會在函式可落尾時補上隱式終端 `Return(Fixed(0))`。xtask CLI 驗證 P07 缺案例、重複案例、錯誤 profile、損壞 fixture 與 P01 前置失敗；每次均非零退出並產生可解析 FAIL JSON。修改過的 fixture 均以 `cmp -s` 核對還原，注入前後工作區狀態相同。這是本機驗證紀錄，不代表遠端 GitHub CI 已執行。報告產生於 `target/rivetlua-reports/`；該目錄不納入 Git，可用上述命令重建。Cargo 宣告的 MSRV 仍為 1.94.1。
