@@ -8,6 +8,7 @@
 - Agent selection, delegation, and coordination are responsibilities of the primary agent. An implementation agent must not delegate further unless the primary agent explicitly instructs it. Agents execute the agreed task; they do not re-plan it, expand its scope, or make unauthorized architectural decisions.
 - This file is written in English at the user's direction. User-facing replies, code comments, and commit messages should otherwise be in Traditional Chinese. Project documentation under `docs/` should be in Traditional Chinese. Commit only when the user explicitly requests it.
 - Do not create files in the project root unless the user explicitly requests them. Preserve unrelated existing changes and avoid unrelated refactoring, dependency upgrades, toolchain changes, or repository-wide formatting.
+- Do not use computer-control or UI automation tools to operate the user's desktop, native applications, or browser, including `cua_repl`. Browse Pilot is the sole permitted exception for browser operations and must follow its skill instructions. Repository work may still use shell commands, APIs, and normal file tools.
 
 ## Project Purpose and Sources of Truth
 
