@@ -2,7 +2,7 @@
 
 [English](IMPLEMENTATION_STATUS.md) | 繁體中文 | [한국어](IMPLEMENTATION_STATUS.ko.md) | [日本語](IMPLEMENTATION_STATUS.ja.md)
 
-更新日期：2026-09-28。本頁列出專案中已實作與待實作的功能。勾選代表所述範圍已通過測試；未勾選代表尚未實作。規格文件或測試資料存在，不代表對應的執行功能已完成。
+更新日期：2026-09-29。本頁列出專案中已實作與待實作的功能。勾選代表所述範圍已通過測試；未勾選代表尚未實作。規格文件或測試資料存在，不代表對應的執行功能已完成。
 
 ## 已實作並驗收
 
@@ -74,4 +74,11 @@ cargo run --locked -p rivetlua-xtask -- gate P11
 
 - 上一節記錄的 workspace 498 passed／0 failed（xtask unit 51/51、CLI 23/23、P11 contracts 48/48）是 review 修正前的快照，已由本節結果取代。修正保留動態尾呼叫 open 多重結果 producer／consumer 相鄰，並在引數求值後關閉 caller upvalue；讓 Builtin 可作 metamethod，沿一般 protected 與 coroutine 路徑分派；P00～P11 報告加入確定性 `source_digest`，P08～P11 在啟動 runtime child 前拒絕缺少、格式錯誤或過期的前置證據。
 - 文件修改前，`DEVELOPER_DIR=/Library/Developer/CommandLineTools cargo test --locked --workspace -- --test-threads=1` 通過：26 個摘要共 509 passed、0 failed；xtask unit 52/52、CLI 24/24、P11 contracts 50/50。核心修復檢查亦通過：compiler unit 16/16、runtime unit 131/131；每個 profile 的 P05 7/7、P09 11/11、P10 19/19、P11 50/50。格式檢查與 `git diff --check` 通過。
-- 文件修改前，P00～P11 gates 依序通過，checks 為 22/37/29/25/25/33/29/30/33/29/26/366；P08～P11 產生 24/24/20/32 份唯一 PASS 案例報告。當時 12 份報告共用 `source_digest` `6b94e337b2ee097266b505ea5e01f3064620f2aaa41586b0a13fdef5df2a4670`。此 digest 涵蓋公開狀態文件，因此本次編修會使舊 digest 失效。最終報告須由定稿來源重建並比對 `source_digest`；最終驗收結果以主代理驗收紀錄為準。遠端 GitHub CI 未執行；P12 GC 擴充、P13 一般標準函式庫／模組載入及完整 Lua 相容性仍待後續。
+- 文件修改前，P00～P11 gates 依序通過，checks 為 22/37/29/25/25/33/29/30/33/29/26/366；P08～P11 產生 24/24/20/32 份唯一 PASS 案例報告。當時 12 份報告共用 `source_digest` `6b94e337b2ee097266b505ea5e01f3064620f2aaa41586b0a13fdef5df2a4670`。此 digest 涵蓋公開狀態文件，因此本次編修會使舊 digest 失效。最終報告須由定稿來源重建並比對 `source_digest`；最終驗收結果以主代理驗收紀錄為準。這是 2026-09-28 當時的本機驗收紀錄；較新的遠端 CI 結果見下節。P12 GC 擴充、P13 一般標準函式庫／模組載入及完整 Lua 相容性仍待後續。
+
+## GitHub Actions 最終驗收（2026-09-29）
+
+- [GitHub Actions run 36444257299](https://github.com/SDpower/RivetLua/actions/runs/36444257299) 對提交 `badd790cb2d3839c7c105fc1ed084bb859e2818e` 全數通過。三個 matrix job（macOS 15 aarch64、Ubuntu 24.04 x86_64、Ubuntu 24.04 ARM aarch64）均通過格式檢查、`cargo test --locked --workspace`、P00～P11 共 12 個 gate 步驟及 gate report artifact 上傳；每個 job 均有 report artifact。
+- P08 TAB 案例 24/24、P09 CALL 案例 24/24、P10 META 案例 20/20、P11 ERR/COR/CLOSE 案例 32/32 均通過。
+- 上方 2026-09-28「遠端 CI 尚未執行」的敘述是當時本機驗收的歷史快照，現由本節較新的 CI 結果更新。本節所記錄的文件修訂晚於提交 `badd790` 的 CI，未納入該次驗收。公開狀態文件會納入 `source_digest`；該次 CI 的 digest 不能作為這些後續修訂的證據，修訂後來源的 digest 須另行產生並核對。
+- P12 GC 擴充、P13 一般標準函式庫與模組載入，以及完整 Lua 相容性仍未完成。

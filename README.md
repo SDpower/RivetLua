@@ -8,7 +8,7 @@ It has no dependency on a parent project, account, database, model service, syst
 
 ## Current status
 
-The project has a Rust workspace, official Lua reference snapshots and a test runner, plus Rust APIs for core values, numbers, and errors. The Rust SDK and Lua execution engine are not implemented yet. Lua source execution and language compatibility have not been verified.
+RivetLua can compile and execute the Lua subset verified through P11. The P08–P11 acceptance cases pass for the Lua 5.5 and Lua 5.4 profiles. Full Lua compatibility and the public Rust SDK are not complete.
 
 See the [implementation status checklist](docs/IMPLEMENTATION_STATUS.md) for implemented features, remaining work, and verification commands.
 

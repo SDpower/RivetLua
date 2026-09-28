@@ -8,7 +8,7 @@ RivetLua 是處於早期開發階段的獨立開源專案，目標是以純 Rust
 
 ## 目前狀態
 
-專案已有 Rust 工作區、官方 Lua 對照資料、測試執行器，以及處理核心值、數值與錯誤的 Rust API。Rust SDK 與 Lua 執行引擎尚未實作；尚不能執行 Lua 原始碼，也尚未驗證語言相容性。
+RivetLua 已可編譯並執行經 P11 驗收的 Lua 子集；P08～P11 驗收案例在 Lua 5.5 與 Lua 5.4 兩個 profile 均通過。完整 Lua 相容性及公開 Rust SDK 尚未完成。
 
 已實作功能、待辦事項與驗證命令見[實作狀態清單](docs/IMPLEMENTATION_STATUS.zh-TW.md)。
 

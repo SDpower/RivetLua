@@ -8,7 +8,7 @@ RivetLua는 다른 애플리케이션에 내장할 수 있는 순수 Rust 기반
 
 ## 현재 상태
 
-Rust 워크스페이스, 공식 Lua 참조 자료, 테스트 실행기, 코어 값·숫자·오류를 처리하는 Rust API가 구현되어 있습니다. Rust SDK와 Lua 실행 엔진은 아직 구현되지 않았습니다. Lua 소스 실행과 언어 호환성은 검증되지 않았습니다.
+RivetLua는 P11까지 검증된 Lua 하위 집합을 컴파일하고 실행할 수 있습니다. P08～P11 수락 사례는 Lua 5.5 및 Lua 5.4 두 profile에서 통과했습니다. Lua 전체 호환성과 공개 Rust SDK는 아직 완성되지 않았습니다.
 
 구현된 기능, 남은 작업, 검증 명령은 [구현 현황 목록](docs/IMPLEMENTATION_STATUS.ko.md)을 참고하세요.
 
