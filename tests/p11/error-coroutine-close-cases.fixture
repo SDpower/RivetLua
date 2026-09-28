@@ -1,0 +1,34 @@
+profile|lua55-i64f64|lua55
+case|lua55-i64f64|ERR-001|protected-error|err_case_001_original_table_and_nested_boundary|P11_STAGE:err_case_001|identity=preserved;nested=nearest;host_root=owned|原 table identity、nearest boundary 與宿主 handle 根生命週期
+case|lua55-i64f64|ERR-002|protected-error|err_case_002_xpcall_handler_reentry_and_abort|P11_STAGE:err_case_002|handler_reentry=3;handler_limit=32;abort=bypassed|xpcall handler 再入、界限與 Aborted bypass
+case|lua55-i64f64|ERR-003|abort|err_case_003_pcall_fuel_abort_remains_host_terminal|P11_STAGE:err_case_003|abort=host;terminal=true|fuel abort 保留宿主 terminal 狀態
+case|lua55-i64f64|ERR-004|protected-close|err_case_004_protected_close_receives_original_error|P11_STAGE:err_case_004_close|error=original;order=LIFO|protected boundary 的原 error 與 close 順序
+case|lua55-i64f64|ERR-005|close-error|err_case_005_close_failure_continues_and_replaces_error|P11_STAGE:err_case_005|continued=LIFO;error=identity|close handler 失敗後繼續並保留新 error identity
+case|lua55-i64f64|COR-001|yield-resume|cor_case_001_yield_resumes_without_replaying_side_effect|P11_STAGE:cor_case_001|side_effect=1|yield/resume continuation 不重播副作用
+case|lua55-i64f64|COR-002|nested-state|cor_case_002_nested_resume_reports_normal_parent|P11_STAGE:cor_case_002|parent=normal|巢狀 resume 時 parent state 為 normal
+case|lua55-i64f64|COR-003|dead-resume|cor_case_003_dead_resume_is_lua_failure_without_replay|P11_STAGE:cor_case_003|dead_replay=0|Dead coroutine resume 為 Lua failure 且不重播
+case|lua55-i64f64|COR-004|yield-error|cor_case_004_main_yield_is_catchable_lua_error|P11_STAGE:cor_case_004|main_yield=LuaError|main thread yield 回受控 LuaError
+case|lua55-i64f64|COR-005|coroutine-close|cor_case_005_close_suspended_error_and_invalid_state|P11_STAGE:cor_case_005|suspended+error=closed|close suspended 與 errored coroutine
+case|lua55-i64f64|COR-006|coroutine-wrap|cor_case_006_wrap_unwraps_results_and_closes_on_error|P11_STAGE:cor_case_006|wrap=unboxed+close_error|wrap 結果展開並傳播 close error
+case|lua55-i64f64|CLOSE-001|generic-for|close_case_001_generic_for_normal_and_break_close_once|P11_CASE:CLOSE-001|normal:close-once,break:close-once|generic-for 正常結束與 break 各關閉一次
+case|lua55-i64f64|CLOSE-002|generic-for-error|close_case_002_generic_for_protected_error_passes_original_value|P11_CASE:CLOSE-002|protected-false;error-identity=preserved;close-count=1|generic-for 的在途 error 傳給 close handler
+case|lua55-i64f64|CLOSE-003|scope-exit|close_case_003_return_and_goto_close_before_transfer|P11_CASE:CLOSE-003|return:closed-once,goto:closed-once|return 與 goto 前各完成一次 scope close
+case|lua55-i64f64|CLOSE-004|close-gc-reentry|close_case_004_reentrant_close_and_xpcall_handler_survive_gc|P11_STAGE:close_case_004|reentry=once;gc=forced|forced GC 下 close 與 xpcall reentry
+case|lua55-i64f64|CLOSE-005|close-abort|close_case_005_coroutine_hard_abort_is_not_close_or_resume_tuple|P11_STAGE:close_case_005|abort=host;close=unpromised|hard abort 是 terminal 且不保證 Lua close
+profile|lua54-i64f64|lua54
+case|lua54-i64f64|ERR-001|protected-error|err_case_001_original_table_and_nested_boundary|P11_STAGE:err_case_001|identity=preserved;nested=nearest;host_root=owned|原 table identity、nearest boundary 與宿主 handle 根生命週期
+case|lua54-i64f64|ERR-002|protected-error|err_case_002_xpcall_handler_reentry_and_abort|P11_STAGE:err_case_002|handler_reentry=3;handler_limit=32;abort=bypassed|xpcall handler 再入、界限與 Aborted bypass
+case|lua54-i64f64|ERR-003|abort|err_case_003_pcall_fuel_abort_remains_host_terminal|P11_STAGE:err_case_003|abort=host;terminal=true|fuel abort 保留宿主 terminal 狀態
+case|lua54-i64f64|ERR-004|protected-close|err_case_004_protected_close_receives_original_error|P11_STAGE:err_case_004_close|error=original;order=LIFO|protected boundary 的原 error 與 close 順序
+case|lua54-i64f64|ERR-005|close-error|err_case_005_close_failure_continues_and_replaces_error|P11_STAGE:err_case_005|continued=LIFO;error=identity|close handler 失敗後繼續並保留新 error identity
+case|lua54-i64f64|COR-001|yield-resume|cor_case_001_yield_resumes_without_replaying_side_effect|P11_STAGE:cor_case_001|side_effect=1|yield/resume continuation 不重播副作用
+case|lua54-i64f64|COR-002|nested-state|cor_case_002_nested_resume_reports_normal_parent|P11_STAGE:cor_case_002|parent=normal|巢狀 resume 時 parent state 為 normal
+case|lua54-i64f64|COR-003|dead-resume|cor_case_003_dead_resume_is_lua_failure_without_replay|P11_STAGE:cor_case_003|dead_replay=0|Dead coroutine resume 為 Lua failure 且不重播
+case|lua54-i64f64|COR-004|yield-error|cor_case_004_main_yield_is_catchable_lua_error|P11_STAGE:cor_case_004|main_yield=LuaError|main thread yield 回受控 LuaError
+case|lua54-i64f64|COR-005|coroutine-close|cor_case_005_close_suspended_error_and_invalid_state|P11_STAGE:cor_case_005|suspended+error=closed|close suspended 與 errored coroutine
+case|lua54-i64f64|COR-006|coroutine-wrap|cor_case_006_wrap_unwraps_results_and_closes_on_error|P11_STAGE:cor_case_006|wrap=unboxed+close_error|wrap 結果展開並傳播 close error
+case|lua54-i64f64|CLOSE-001|generic-for|close_case_001_generic_for_normal_and_break_close_once|P11_CASE:CLOSE-001|normal:close-once,break:close-once|generic-for 正常結束與 break 各關閉一次
+case|lua54-i64f64|CLOSE-002|generic-for-error|close_case_002_generic_for_protected_error_passes_original_value|P11_CASE:CLOSE-002|protected-false;error-identity=preserved;close-count=1|generic-for 的在途 error 傳給 close handler
+case|lua54-i64f64|CLOSE-003|scope-exit|close_case_003_return_and_goto_close_before_transfer|P11_CASE:CLOSE-003|return:closed-once,goto:closed-once|return 與 goto 前各完成一次 scope close
+case|lua54-i64f64|CLOSE-004|close-gc-reentry|close_case_004_reentrant_close_and_xpcall_handler_survive_gc|P11_STAGE:close_case_004|reentry=once;gc=forced|forced GC 下 close 與 xpcall reentry
+case|lua54-i64f64|CLOSE-005|close-abort|close_case_005_coroutine_hard_abort_is_not_close_or_resume_tuple|P11_STAGE:close_case_005|abort=host;close=unpromised|hard abort 是 terminal 且不保證 Lua close

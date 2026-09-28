@@ -1,72 +1,95 @@
-# RivetLua 專案指引
+# RivetLua Project Guidance
 
-## 適用範圍與全域規則
+## Scope and Instruction Priority
 
-- 本文件補充 Global AGENTS.md，適用於 RivetLua 專案。全域的繁體中文、提交限制、範圍控制、計畫順序、進度回報、相依工作及最終驗證規則繼續適用。
-- 僅就實作代理的允許名單與選擇優先順序，本文件取代全域「只能使用 plan_implementer 或 complex_implementer」及「明顯複雜工作直接交給 complex_implementer」的限制；RivetLua 依下列三代理分工執行。
-- 分拆、選擇、呼叫及協調代理的規則只適用於主代理。實作子代理不得遞迴委派，除非主代理明確指定；三者都是執行者，不自行重新規劃、擴大範圍或改變未授權的架構。
-- 本文件不固定主代理模型、不修改全域代理設定，也不授權建立其他根目錄檔案。文件與程式註解使用繁體中文，提交仍須使用者明確要求。
+- This file supplements the applicable global guidance for work in RivetLua. Higher-priority system, developer, and user instructions continue to take precedence; this file does not override them.
+- For this project, the following project-specific workflow rules take precedence over conflicting general workflow guidance: the permitted implementation-agent roles and their selection; one delegation for a bounded sequence of already-defined steps; a complete initial brief followed by incremental updates; evidence-based reuse of valid verification results; and concise intermediate reports.
+- This file does not prescribe the primary agent's model or change global agent settings.
+- Agent selection, delegation, and coordination are responsibilities of the primary agent. An implementation agent must not delegate further unless the primary agent explicitly instructs it. Agents execute the agreed task; they do not re-plan it, expand its scope, or make unauthorized architectural decisions.
+- This file is written in English at the user's direction. User-facing replies, code comments, and commit messages should otherwise be in Traditional Chinese. Project documentation under `docs/` should be in Traditional Chinese. Commit only when the user explicitly requests it.
+- Do not create files in the project root unless the user explicitly requests them. Preserve unrelated existing changes and avoid unrelated refactoring, dependency upgrades, toolchain changes, or repository-wide formatting.
 
-## 專案定位與規格來源
+## Project Purpose and Sources of Truth
 
-- RivetLua 是獨立、通用、可嵌入的純 Rust Lua 編譯器與 VM；不得把特定上層應用或語言智慧系統的需求變成核心必要依賴。
-- 不得以外部 Lua runtime、C 實作包裝或 FFI 轉接代替核心編譯器與 VM。既有計畫授權的對外嵌入介面、綁定或測試用參考直譯器不因此被禁止。
-- 目標 Lua 版本、相容範圍、既定架構及驗證指令，以使用者確認的計畫與專案規格為準；只查核本次任務必要的文件、程式碼、測試及建置設定。
-- 不得假定 Lua 版本、crate 名稱、目錄結構、GC 演算法、stack 表示或 bytecode 格式。語言行為、bytecode 格式與 C API/ABI 的相容承諾須分別確認，不互相推定。
-- 程式碼與測試是現況證據，不自動等於規格；出現矛盾時回報主代理，不能藉由修改測試重新定義需求。
+- RivetLua is an independent, general-purpose, embeddable Lua compiler and VM implemented in pure Rust. Do not make requirements of a particular host application or language intelligence system core dependencies.
+- Do not replace the core compiler or VM with an external Lua runtime, a C implementation wrapper, or an FFI adapter. This does not prohibit embedding APIs, bindings, or a reference interpreter for tests when authorized by the established plan.
+- Use the user-approved plan and project specifications for the target Lua version, compatibility scope, architecture, and verification commands. Inspect only the documentation, code, tests, and build configuration needed for the current task.
+- Do not assume the Lua version, crate names, directory layout, GC algorithm, stack representation, or bytecode format. Confirm language behavior, bytecode compatibility, and C API/ABI compatibility separately; none implies the others.
+- Existing code and tests are evidence of current behavior, not automatically the specification. Report conflicts to the primary agent; do not redefine requirements by changing tests.
 
-## 實作代理分工
+## Implementation-Agent Roles
 
-| 代理 | 適用工作 | 選擇規則 |
+| Agent | Suitable work | Selection rule |
 | --- | --- | --- |
-| `plan_implementer` | 已拆分、模式明確、可局部驗收的一般實作、測試與文件 | 預設選擇；不因專案是編譯器就全面升級 |
-| `complex_implementer` | 不屬於下列 VM 核心語意範圍，但需深入推理的通用複雜工作 | 例如具高耦合的建置、工具或測試基礎設施；依實際風險判定 |
-| `vm_core_implementer` | 必須共同推理 compiler、bytecode、closure/upvalue、frame/stack、coroutine、GC 等核心契約、狀態或生命週期的複雜實作 | 符合核心複雜度時優先於 complex_implementer，直接委派，不先讓一般代理失敗 |
+| `plan_implementer` | Bounded general implementation, tests, or documentation with established patterns and local acceptance criteria | Default choice; do not escalate solely because the project is a compiler. |
+| `complex_implementer` | Deeply coupled general work outside VM-core semantics, such as high-risk build, tooling, or test infrastructure | Choose based on actual reasoning complexity and regression risk. |
+| `vm_core_implementer` | Complex work requiring joint reasoning about compiler, bytecode, closures/upvalues, frames/stacks, coroutines, GC, or related core contracts, state, or lifecycles | Prefer directly when the task meets this description; do not first try a less suitable agent. |
 
-- 依實際語意耦合、推理難度與回歸風險分派；不是只看關鍵字、程式語言、檔案數量，也不要求任務同時涉及上述全部子系統。
-- 例如，依既定規格補一個 closure 測試可用 plan_implementer；修改 upvalue 關閉並連動 frame 退出、錯誤清理或 GC 可達性，使用 vm_core_implementer。
-- 維持主代理的架構決策責任。缺少需求、驗收條件或設計決策時先處理阻塞，不以更強模型取代規格，不要求子代理猜測。
-- 同一個有界核心任務連同必要測試及連動修正，交給一個 vm_core_implementer 負責；不把不可分割的核心契約拆給不同代理各自實作，也不額外派 complex_implementer 重做同一份工作。
-- 若指定代理未載入或不可用，回報阻塞與實際錯誤，不默默替換代理、降低配置或改由主代理繞過委派。
+- Choose based on semantic coupling, reasoning demands, and regression risk, not keywords, programming language, or file count. A task need not involve every listed subsystem to qualify as VM-core work.
+- For example, adding a closure test to an established specification can use `plan_implementer`; changing upvalue closing together with frame exit, error cleanup, or GC reachability belongs with `vm_core_implementer`.
+- The primary agent retains architectural decision-making. Resolve missing requirements, acceptance criteria, or design decisions as blockers; do not ask an agent to guess or use a stronger model as a substitute for a specification.
+- Keep an indivisible VM-core contract and its necessary tests and related fixes with one `vm_core_implementer`. Do not split that contract across agents or assign another agent to duplicate the same work.
+- If a required agent is unavailable, report the actual error and blocker. Do not silently substitute an agent, reduce the required configuration, or bypass delegation by doing the implementation in the primary agent.
 
-## 委派與範圍
+## Planning, Delegation, and Scope
 
-- 主代理先完整閱讀本次來源計畫，按原順序向使用者列出步驟，再拆成具體、可驗收的工作；不得擅自跳過、重排或合併計畫步驟。
-- 每次委派須提供：代理名稱與簡短理由、計畫來源及步驟、目標、允許修改的檔案或符號、必要唯讀參考範圍、前置條件、驗收條件、驗證指令與回報格式。
-- 核心任務另附相關的 Lua 版本或規格來源、既定設計、必須維持的不變條件，以及允許修改或必須保留的跨層介面；無關項目不強制補齊。
-- 任務簡報應自足，包含相關計畫內容與必要前後文；不要只丟步驟編號，也不要要求每個子代理重讀全專案。
-- 授權修改範圍須涵蓋本次必要的連動與測試，但不得用「整個 repository 都可改」代替分析。超出讀取或修改邊界時，子代理先回報最小必要範圍。
-- 主代理可以釐清既定範圍內的局部細節；凡涉及改變使用者核准的範圍、驗收、架構或計畫順序，仍須取得使用者確認。
+- Read the complete source plan before implementation. State its steps to the user in their original order, then perform them in that order. Do not skip, reorder, or merge plan steps without user authorization.
+- Split work into bounded, independently reviewable tasks before delegating. Do not delegate an entire unsplit project plan in one call. A bounded task may contain multiple consecutive plan steps when their dependencies, scope, implementation direction, and acceptance criteria are already defined.
+- A delegation brief must identify the selected agent and reason, plan source and steps, objective, allowed files or symbols, necessary read-only references, prerequisites, acceptance criteria, verification commands, and report format. For core work, also include the relevant Lua version or specification, established design, invariants, and cross-layer interfaces to preserve.
+- Make the initial brief self-contained and limited to relevant context; do not require an agent to reread the whole repository. For follow-up work in the same agent thread, provide only new goals, changed conditions, and necessary state. A new agent or controlled handoff needs a self-contained brief.
+- A single agent may execute a fully specified bounded sequence in one delegation, following every plan step in order and recording each step's outcome. This does not permit skipping, reordering, or combining plan steps, nor does it mean delegating the whole unsplit plan. Do not require a new delegation for every step. Pause only at a required approval point, a specification conflict, a proposed change to scope, architecture, acceptance criteria, or plan order, or a blocker that prevents safe progress.
+- Provide concise progress updates that state completed steps, key results, and what comes next; report blockers with the specific decision or information needed. Recording progress for each step does not require a separate tool or agent call per step.
+- The authorized write scope must include necessary related changes and tests, but must not default to the whole repository. If work requires reading or editing outside the agreed boundary, the agent must first report the smallest necessary expansion and wait for direction.
+- The primary agent may resolve local details within the approved scope. Changes to the user's approved scope, acceptance criteria, architecture, or plan order require user authorization.
 
-## 相依、平行與交接
+## Dependencies, Parallel Work, and Handoffs
 
-- 延續全域規則：有順序依賴、共享輸出、耦合契約或重疊檔案／符號的工作，使用同一代理 thread 逐步執行；TDD 的測試先行與依賴該測試的實作不可平行。
-- 在開始一組必須同 thread 執行的有界相依步驟前，依其中最困難的必要步驟選擇代理；仍須逐步委派，不把整份未拆分計畫一次交出。
-- 只有無順序依賴、無共享輸出、無耦合契約變更且無重疊修改範圍的工作可以平行。即使位於不同檔案，只要共同改變核心契約，也不能獨立平行實作。
-- 一個有界任務可以只呼叫一個代理；沒有最低代理數，也不要求三種代理都出場。
-- 需要更換代理類型時採全域受控交接：主代理等候或停止原代理、確認它不再寫入、檢查 diff 與驗證狀態，再移交剩餘工作及唯一修改權責；保持原計畫順序與驗收條件。
-- 平行工作全部回報後，主代理檢查合併 diff、整合變更、處理跨任務衝突並執行整體驗證。
+- Keep work with ordering dependencies, shared outputs, coupled contracts, or overlapping files or symbols in one agent thread. Test-first TDD and implementation that depends on its result must remain sequential in the same thread.
+- Before delegating a dependent sequence, select an agent suited to its most demanding required step. Execute the steps in order within that thread while preserving each step's result.
+- Parallelize only tasks without ordering dependencies, shared outputs, coupled contract changes, or overlapping write scope. Different files alone do not make core-contract work independent.
+- One bounded task may use one agent. There is no minimum number of agents and no requirement to use every role.
+- For an agent-type change in a dependent sequence, use a controlled handoff: wait for or stop the current agent, confirm it has stopped writing, inspect its diff and verification results, then transfer the remaining work and exclusive write ownership. Keep the original plan order and acceptance criteria. Record why the handoff is needed.
+- After parallel work completes, the primary agent must inspect the combined diff, integrate changes, resolve conflicts, and complete any remaining overall acceptance checks.
 
-## 核心品質與驗證
+## Core Quality and Verification
 
-- 保留既有且不相關的修改；不順手重構、升級依賴、更換工具鏈或全專案格式化。
-- 涉及核心變更時，實作代理先列出本次適用的契約、不變條件與狀態轉移，再追蹤相關正常路徑、錯誤清理及必要的跨層交互；不自動擴大成全系統稽核。
-- 不得藉由停用 GC、洩漏記憶體、保留本應回收的物件、弱化斷言或測試，以及掩蓋錯誤來通過驗收。新增或擴張 unsafe 必須有明確授權、安全理由與驗證依據。
-- 先確認相關基線；修 bug 建立最小重現與回歸測試，新功能建立規格對應測試。預期輸出與錯誤行為必須可核驗。
-- **Basic tests**：本次功能的正常路徑、邊界、錯誤行為與最小回歸案例。
-- **Complete tests**：依任務驗收範圍覆蓋相關跨模組交互、狀態轉移、生命週期、Lua 相容行為及回歸。範圍由計畫明確指定，不自動代表每一步都跑完整 workspace，也不得自行省略明定的完整測試。
-- 驗證指令、工作目錄、測試目標及必要 feature／平台設定須從現有計畫與建置環境確認；不得猜測不存在的 crate、測試名稱、工具鏈或支援平台。
-- 差分測試、GC 壓力測試、Miri、sanitizer 等僅在相關且已具備或明確授權的條件下使用；必要設施不足時回報限制，不自行安裝或擴大工具鏈。
-- 逐項記錄實際指令、測試識別或數量、結果與執行時的程式碼狀態。零測試匹配不是通過；只有編譯成功不是測試通過；未執行、受阻及失敗分別列示。
-- 修改程式碼後，不沿用舊結果宣稱新版本通過。沒有新證據時避免重複高成本驗證與盲目重試，但不得用節省額度省略指定驗收。
-- 實作代理負責本任務完整實作、局部 diff 自查及驗證；主代理的最終整合不能取代這些責任。
+- For core changes, the implementation agent must identify the applicable contracts, invariants, and state transitions, then trace relevant normal paths, error cleanup, and necessary cross-layer interactions. Do not turn a bounded task into a full-system audit without cause.
+- Do not pass acceptance by disabling GC, leaking memory, retaining objects that should be collectible, weakening assertions or tests, or hiding errors. Any addition or expansion of `unsafe` requires explicit authorization, a safety rationale, and supporting verification.
+- Establish the smallest relevant baseline before changing code. For a bug fix, create or identify a minimal reproducer and regression test; for a feature, add tests tied to the specification. Expected output and error behavior must be checkable. Inspect coherent, verifiable units as they become ready; do not run a full test suite after every edit.
+- Documentation-only changes require content and diff review; do not run runtime tests automatically for them. Run the checks specified by the plan and any other verification justified by the changed behavior and risk.
+- **Basic tests** cover the feature's normal path, boundaries, error behavior, and minimal regression cases.
+- **Complete tests** cover the relevant cross-module interactions, state transitions, lifecycles, Lua compatibility behavior, and regressions within the task's acceptance scope. The plan defines that scope. Do not assume Complete tests mean the full workspace at every step, and do not omit explicitly required complete verification.
+- Confirm verification commands, working directory, test targets, features, and platform settings from the plan and build environment. Do not guess crate names, test names, toolchains, or supported platforms.
+- Differential tests, GC stress tests, Miri, and sanitizers are appropriate only when relevant and already available or explicitly authorized. If required facilities are unavailable, report the limitation; do not install tools or expand the toolchain on your own.
+- Keep one concise verification record with the actual command, relevant environment or configuration, target or test count, outcome, and code state tested. Distinguish passed, failed, not run, and blocked checks. Zero matching tests is not a pass; compilation alone is not a test pass.
+- A verification result applies only to the tested code, dependencies, test content, build settings, and relevant environment. If a later change affects any of them, rerun the affected checks. Reuse a result when evidence shows those inputs remain unchanged, and state the basis. If impact cannot be determined reliably, broaden verification. Never use an old result to claim that affected later changes passed.
+- The implementation agent owns complete task-level implementation, local diff review, and required verification. The primary agent owns final review of the integrated diff and coverage, and must complete plan-required overall acceptance. It may rely on an agent's result when that result covers the same final relevant state; it should verify integration changes, cross-task interactions, and uncovered acceptance criteria. Do not rerun a check solely because a different agent ran it.
+- Do not repeat expensive verification or retry blindly when no new evidence justifies it. Do not omit required acceptance checks to save time or tokens.
 
-## 交付格式
+## Tool-Call and Context Efficiency
 
-除非委派另訂格式，每次實作回報包含：
+- Each tool or agent call must have a clear purpose: obtain missing evidence, complete a bounded change, test a specific assumption, verify a required condition, or resolve a blocker. When sufficient evidence is available, proceed without calls that add no decision-relevant information.
+- Batch independent read-only searches and queries. Keep dependent operations, approval points, and shared or potentially conflicting writes sequential. Do not trade away error diagnosis or operational safety to reduce call count.
+- Define the question and scope before reading. Prefer targeted search and relevant excerpts; read a complete plan or small file when full context is needed. Avoid broad directory dumps and oversized outputs that do not support the next decision.
+- Do not reread unchanged content that remains available in context. Recheck only the part that may have changed; reread when context is missing, the file changed, or the evidence is insufficient.
+- Request only enough output to support the next decision. Retain essential diagnostics for failures and concise result/count information for successful checks; avoid returning unrelated search results, entire logs, or whole files by default.
+- After an initial self-contained brief, make same-thread follow-ups incremental. Use completion notifications or reasonable waits for long-running work instead of frequent status polling, while following higher-priority progress-update requirements.
+- Once authorized changes, diff review, and required acceptance checks are complete and no issue remains unresolved, deliver the result. Do not add exploration, review, or reruns without a concrete purpose.
+- Optimize total task cost, including reading, calls, output, waiting, and rework. Do not impose hard call or token limits, and do not save tokens by weakening acceptance, hiding failures, or skipping required verification.
 
-1. 狀態：完成待驗收／部分完成／阻塞，以及對應計畫步驟。
-2. 實際修改的檔案、符號與摘要。
-3. 相關契約、不變條件與跨模組交互；非核心任務只列適用項目。
-4. 驗收與 Basic tests／Complete tests 的實際指令、結果、測試識別或數量，以及執行時的程式碼狀態。
-5. 未完成或未執行事項、阻塞、剩餘風險，以及需要主代理決策的最小事項。
+## Keeping Agent Guidance Current
+
+- When the primary agent updates this `AGENTS.md`, it must notify affected agents already working and mention the update in subsequent delegations.
+- A newly started agent must read the latest applicable `AGENTS.md`. An existing agent that receives an update notice must reread it once and follow the updated guidance. Do not assume that editing the file automatically refreshes an existing agent's instructions.
+- If the file has not changed, do not reread it for every follow-up. Follow the applicable higher-priority instructions if the file conflicts with them.
+
+## Delivery Format
+
+- Keep intermediate reports concise: completed plan step(s), key result, next step, or the specific blocker.
+- Final implementation reports must state:
+  1. Status (`complete pending review`, `partially complete`, or `blocked`) and the plan steps covered.
+  2. Changed files and symbols, with a short summary.
+  3. Applicable contracts, invariants, and cross-module interactions; include only relevant items for non-core work.
+  4. Actual acceptance and Basic/Complete verification commands, results, test identifiers or counts, and the code state tested.
+  5. Incomplete or unrun work, blockers, residual risks, and the smallest decision needed from the primary agent.
+- State explicitly when there are no incomplete items, blockers, or known residual risks. Reports must distinguish checks that passed, failed, were not run, or were blocked.

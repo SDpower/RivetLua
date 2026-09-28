@@ -2,7 +2,7 @@
 
 use crate::ir::{IrClosePath, IrConstant, IrInstruction, IrModule, IrPrototype, IrUpvalue};
 use crate::{
-    BinaryOp, BindingId, BindingKind, ClosePath, FunctionId, LanguageProfile, Literal,
+    BinaryOp, BindingId, BindingKind, ClosePath, ExitKind, FunctionId, LanguageProfile, Literal,
     ResolvedBlock, ResolvedExpr, ResolvedFunction, ResolvedFunctionBody, ResolvedGlobalDeclaration,
     ResolvedModule, ResolvedName, ResolvedStmt, ResolvedTableField, ScopeId, Span, UnaryOp,
     UpvalueSource,
@@ -98,7 +98,7 @@ pub fn lower(module: &ResolvedModule, limits: &IrLimits) -> Result<IrModule, IrE
             function_body,
         )?;
         builder.lower_block(body)?;
-        prototypes.push(builder.finish()?);
+        prototypes.push(builder.finish(body)?);
     }
     Ok(IrModule {
         profile,
@@ -436,7 +436,7 @@ impl<'a> Builder<'a> {
         })
     }
 
-    fn finish(mut self) -> Result<IrPrototype, IrError> {
+    fn finish(mut self, body: &ResolvedBlock) -> Result<IrPrototype, IrError> {
         if !self.label_frames.is_empty() || !self.pending_gotos.is_empty() || !self.loops.is_empty()
         {
             return Err(invalid(
@@ -452,6 +452,18 @@ impl<'a> Builder<'a> {
                     | Instruction::Jump { .. }
             )
         ) {
+            if !body.error_close_path.bindings.is_empty() {
+                // 函式 root 的隱含返回沿用 resolver 已確認的退出 binding 清單。
+                let path = ClosePath {
+                    kind: ExitKind::Normal,
+                    span: body.span,
+                    from_scope: body.scope,
+                    target_scope: None,
+                    bindings: body.error_close_path.bindings.clone(),
+                    exited_bindings: body.error_close_path.exited_bindings.clone(),
+                };
+                self.emit_close(&path)?;
+            }
             self.emit(
                 Instruction::Return {
                     base: Register(0),
@@ -599,19 +611,51 @@ impl<'a> Builder<'a> {
 
     fn validate_open_results(&self) -> Result<(), IrError> {
         for (index, instruction) in self.instructions.iter().enumerate() {
-            let is_open = matches!(
-                instruction.instruction,
+            if let Instruction::Call {
+                base,
+                arg_count: u16::MAX,
+                ..
+            }
+            | Instruction::TailCall {
+                base,
+                arg_count: u16::MAX,
+                ..
+            } = instruction.instruction
+            {
+                let producer = index.checked_sub(1).and_then(|previous| {
+                    match self.instructions[previous].instruction {
+                        Instruction::Call {
+                            base,
+                            result_mode: ResultMode::All,
+                            ..
+                        }
+                        | Instruction::Vararg {
+                            base,
+                            result_mode: ResultMode::All,
+                        } => Some(base),
+                        _ => None,
+                    }
+                });
+                if !producer.is_some_and(|producer| producer.0 > base.0) {
+                    return Err(invalid(
+                        instruction.span,
+                        "動態 call 引數缺少相鄰的 open producer",
+                    ));
+                }
+            }
+            let producer_base = match instruction.instruction {
                 Instruction::Call {
-                    result_mode: ResultMode::All,
-                    ..
-                } | Instruction::Vararg {
+                    base,
                     result_mode: ResultMode::All,
                     ..
                 }
-            );
-            if !is_open {
-                continue;
-            }
+                | Instruction::Vararg {
+                    base,
+                    result_mode: ResultMode::All,
+                    ..
+                } => base,
+                _ => continue,
+            };
             let mut next = index + 1;
             while matches!(
                 self.instructions.get(next).map(|entry| &entry.instruction),
@@ -619,13 +663,22 @@ impl<'a> Builder<'a> {
             ) {
                 next += 1;
             }
-            if !matches!(
+            let open_return = matches!(
                 self.instructions.get(next).map(|entry| &entry.instruction),
                 Some(Instruction::Return {
+                    base,
                     result_mode: ResultMode::All,
                     ..
-                })
-            ) {
+                }) if base.0 <= producer_base.0
+            );
+            let dynamic_call = next == index + 1
+                && matches!(
+                    self.instructions.get(next).map(|entry| &entry.instruction),
+                    Some(Instruction::Call { base, arg_count: u16::MAX, .. }
+                        | Instruction::TailCall { base, arg_count: u16::MAX, .. })
+                        if base.0 < producer_base.0
+                );
+            if !open_return && !dynamic_call {
                 return Err(invalid(
                     instruction.span,
                     "ResultMode::All 未立即流向 open return consumer",
@@ -917,6 +970,7 @@ impl<'a> Builder<'a> {
     }
 
     fn emit_close(&mut self, path: &ClosePath) -> Result<(), IrError> {
+        self.emit_upvalue_close(path)?;
         if path.bindings.is_empty() {
             return Ok(());
         }
@@ -948,6 +1002,46 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    fn close_declaration_marker(
+        &self,
+        binding: BindingId,
+        register: Register,
+        span: Span,
+        scope: ScopeId,
+    ) -> IrClosePath {
+        IrClosePath {
+            kind: ExitKind::Normal,
+            span,
+            from_scope: scope,
+            target_scope: Some(scope),
+            bindings: vec![binding],
+            registers: vec![register],
+        }
+    }
+
+    fn emit_upvalue_close(&mut self, path: &ClosePath) -> Result<(), IrError> {
+        for binding in &path.exited_bindings {
+            let captured = self.functions.iter().any(|child| {
+                child.parent == Some(self.function.id)
+                    && child.upvalues.iter().any(|source| {
+                        matches!(source, UpvalueSource::ParentLocal(local) if local == binding)
+                    })
+            });
+            if captured {
+                let register = self.binding_register(*binding, path.span)?;
+                self.emit(
+                    Instruction::Close {
+                        base: register,
+                        count: 0,
+                    },
+                    path.span,
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn lower_statement(&mut self, statement: &ResolvedStmt) -> Result<(), IrError> {
         match statement {
             ResolvedStmt::Empty { .. } => Ok(()),
@@ -967,7 +1061,21 @@ impl<'a> Builder<'a> {
                 for (index, binding) in bindings.iter().enumerate() {
                     let dest = self.binding_register(*binding, *span)?;
                     let src = register_offset(base, index, *span)?;
-                    self.emit(Instruction::Move { dest, src }, *span, None)?;
+                    let close_path = self
+                        .function
+                        .bindings
+                        .iter()
+                        .find(|candidate| candidate.id == *binding)
+                        .and_then(|candidate| candidate.close_marker)
+                        .map(|_| {
+                            self.close_declaration_marker(
+                                *binding,
+                                dest,
+                                *span,
+                                self.label_frames.last().expect("local scope 已建立").scope,
+                            )
+                        });
+                    self.emit(Instruction::Move { dest, src }, *span, close_path)?;
                 }
                 Ok(())
             }
@@ -1197,7 +1305,12 @@ impl<'a> Builder<'a> {
                         src: closing_source,
                     },
                     closing.span,
-                    None,
+                    Some(self.close_declaration_marker(
+                        closing.binding,
+                        closing_register,
+                        closing.span,
+                        close_path.from_scope,
+                    )),
                 )?;
                 let state_source = register_offset(initial_base, 1, *span)?;
                 let state = self.allocate(*span)?;
@@ -1558,6 +1671,10 @@ impl<'a> Builder<'a> {
     ) -> Result<(), IrError> {
         let (base, arg_count) = self.prepare_open_call(expression, span)?;
         if close_path.bindings.is_empty() {
+            // 動態末引數的 open producer 必須緊鄰 TailCall；VM 在交接前關閉 upvalue。
+            if arg_count != u16::MAX {
+                self.emit_upvalue_close(close_path)?;
+            }
             self.mark_dynamic_top(base);
             self.emit(
                 Instruction::TailCall {
@@ -1618,8 +1735,7 @@ impl<'a> Builder<'a> {
                 callee, arguments, ..
             } => {
                 let callee = self.lower_expr(callee)?;
-                let arguments = self.lower_argument_registers(arguments)?;
-                self.prepare_call_registers(callee, &arguments, span)
+                self.lower_call_inputs(callee, &[], arguments, None, span)
             }
             ResolvedExpr::MethodCall {
                 receiver,
@@ -1639,24 +1755,72 @@ impl<'a> Builder<'a> {
                     span,
                     None,
                 )?;
-                let mut values = Vec::with_capacity(arguments.len() + 1);
-                values.push(receiver);
-                values.extend(self.lower_argument_registers(arguments)?);
-                self.prepare_call_registers(callee, &values, span)
+                self.lower_call_inputs(callee, &[receiver], arguments, None, span)
             }
             _ => Err(invalid(span, "只有 Call 可作 call statement 或 tail call")),
         }
     }
 
-    fn lower_argument_registers(
+    fn lower_call_inputs(
         &mut self,
+        callee: Register,
+        leading: &[Register],
         arguments: &[ResolvedExpr],
-    ) -> Result<Vec<Register>, IrError> {
-        let mut values = Vec::with_capacity(arguments.len());
-        for argument in arguments {
+        fixed_base: Option<Register>,
+        span: Span,
+    ) -> Result<(Register, u16), IrError> {
+        let last_open = arguments
+            .last()
+            .filter(|last| self.is_open_expression(last));
+        let fixed_count = arguments.len() - usize::from(last_open.is_some());
+        let mut values = Vec::with_capacity(leading.len().saturating_add(fixed_count));
+        values.extend_from_slice(leading);
+        for argument in &arguments[..fixed_count] {
             values.push(self.lower_expr(argument)?);
         }
-        Ok(values)
+        let Some(last) = last_open else {
+            return match fixed_base {
+                Some(base) => Ok((base, self.move_call_inputs_at(base, callee, &values, span)?)),
+                None => self.prepare_call_registers(callee, &values, span),
+            };
+        };
+        let slots = values
+            .len()
+            .checked_add(2)
+            .ok_or_else(|| limit(span, "動態 call 引數 register 數超過 IR 限制"))?;
+        let base = match fixed_base {
+            Some(base) => {
+                let end = usize::from(base.0)
+                    .checked_add(slots)
+                    .ok_or_else(|| limit(span, "動態 call 引數 register 數超過 IR 限制"))?;
+                while usize::from(self.next_register) < end {
+                    self.allocate(span)?;
+                }
+                base
+            }
+            None => self.reserve_registers(slots, span)?,
+        };
+        self.emit(
+            Instruction::Move {
+                dest: base,
+                src: callee,
+            },
+            span,
+            None,
+        )?;
+        for (index, source) in values.iter().enumerate() {
+            self.emit(
+                Instruction::Move {
+                    dest: register_offset(base, index + 1, span)?,
+                    src: *source,
+                },
+                span,
+                None,
+            )?;
+        }
+        let producer_base = register_offset(base, values.len() + 1, span)?;
+        self.lower_open_expression_at(last, producer_base, ResultMode::All, span)?;
+        Ok((base, u16::MAX))
     }
 
     fn prepare_call_registers(
@@ -1701,8 +1865,8 @@ impl<'a> Builder<'a> {
                 callee, arguments, ..
             } => {
                 let callee = self.lower_expr(callee)?;
-                let arguments = self.lower_argument_registers(arguments)?;
-                let arg_count = self.move_call_inputs_at(base, callee, &arguments, span)?;
+                let (_, arg_count) =
+                    self.lower_call_inputs(callee, &[], arguments, Some(base), span)?;
                 self.mark_dynamic_top(base);
                 self.emit(
                     Instruction::Call {
@@ -1732,10 +1896,8 @@ impl<'a> Builder<'a> {
                     span,
                     None,
                 )?;
-                let mut values = Vec::with_capacity(arguments.len() + 1);
-                values.push(receiver);
-                values.extend(self.lower_argument_registers(arguments)?);
-                let arg_count = self.move_call_inputs_at(base, callee, &values, span)?;
+                let (_, arg_count) =
+                    self.lower_call_inputs(callee, &[receiver], arguments, Some(base), span)?;
                 self.mark_dynamic_top(base);
                 self.emit(
                     Instruction::Call {
@@ -2356,7 +2518,127 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(builder.finish().is_err());
+        assert!(builder.finish(&resolved.root).is_err());
+    }
+
+    #[test]
+    fn p09_3_prefix_open_return_builder_checks_base_direction() {
+        let limits = CompileLimits::default();
+        let chunk = lex(b"", LanguageProfile::Lua55, &limits).unwrap();
+        let module = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&module, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let mappings = vec![(FunctionId(0), ProtoId(0))];
+        let ir_limits = IrLimits::default();
+        let mut builder = Builder::new(
+            &resolved.functions[0],
+            ProtoId(0),
+            None,
+            resolved.span,
+            &ir_limits,
+            &mappings,
+            &resolved.functions,
+            None,
+        )
+        .unwrap();
+        builder
+            .emit(
+                Instruction::Call {
+                    base: Register(0),
+                    arg_count: 0,
+                    result_mode: ResultMode::All,
+                },
+                resolved.span,
+                None,
+            )
+            .unwrap();
+        builder
+            .emit(
+                Instruction::Return {
+                    base: Register(1),
+                    result_mode: ResultMode::All,
+                },
+                resolved.span,
+                None,
+            )
+            .unwrap();
+        assert!(builder.validate_open_results().is_err());
+        builder.instructions[1].instruction = Instruction::Return {
+            base: Register(0),
+            result_mode: ResultMode::All,
+        };
+        assert!(builder.validate_open_results().is_ok());
+        builder.instructions[0].instruction = Instruction::Call {
+            base: Register(1),
+            arg_count: 0,
+            result_mode: ResultMode::All,
+        };
+        assert!(builder.validate_open_results().is_ok());
+    }
+
+    #[test]
+    fn p09_3_dynamic_call_arguments_producer_keeps_last_open() {
+        let source = b"local f=function(...) return ... end; local g=function() return 1,2 end; local a,b=f(9,g()); return a,b";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let root = &ir.prototypes[0];
+        assert!(root.instructions.windows(2).any(|window| {
+            matches!(window[0].instruction, Instruction::Call { base: producer, result_mode: ResultMode::All, .. }
+                if matches!(window[1].instruction, Instruction::Call { base, arg_count: u16::MAX, .. } if producer.0 > base.0))
+        }));
+
+        let nested = b"local f=function(...) return ... end; local g=function(...) return ... end; local h=function() return 1,2 end; return f(g(h()))";
+        let chunk = lex(nested, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let encoded = emit(&ir, &rivetlua_core::VerifyLimits::default());
+        assert!(encoded.is_ok(), "{encoded:?}");
+    }
+
+    #[test]
+    fn p09_3_dynamic_call_arguments_builder_rejects_orphan_sentinel() {
+        let limits = CompileLimits::default();
+        let chunk = lex(b"", LanguageProfile::Lua55, &limits).unwrap();
+        let module = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&module, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let mappings = vec![(FunctionId(0), ProtoId(0))];
+        let ir_limits = IrLimits::default();
+        let mut builder = Builder::new(
+            &resolved.functions[0],
+            ProtoId(0),
+            None,
+            resolved.span,
+            &ir_limits,
+            &mappings,
+            &resolved.functions,
+            None,
+        )
+        .unwrap();
+        builder
+            .emit(
+                Instruction::Call {
+                    base: Register(0),
+                    arg_count: u16::MAX,
+                    result_mode: ResultMode::Fixed(0),
+                },
+                resolved.span,
+                None,
+            )
+            .unwrap();
+        builder
+            .emit(
+                Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(0),
+                },
+                resolved.span,
+                None,
+            )
+            .unwrap();
+        assert!(builder.validate_open_results().is_err());
     }
 
     #[test]
@@ -2378,6 +2660,57 @@ mod tests {
                     }
                 ))
         );
+    }
+
+    #[test]
+    fn p09_2_scope_close_emits_captured_local_before_outer_frame_return() {
+        let source = b"local f; do local x=7; f=function() return x end end; return f";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let root = &ir.prototypes[0];
+        let close = root.instructions.iter().position(|entry| {
+            matches!(entry.instruction, Instruction::Close { count: 0, .. })
+                && entry.close_path.is_none()
+        });
+        let ret = root
+            .instructions
+            .iter()
+            .position(|entry| matches!(entry.instruction, Instruction::Return { .. }))
+            .unwrap();
+        assert!(close.is_some_and(|index| index < ret));
+    }
+
+    #[test]
+    fn review_dynamic_tail_with_captured_local_keeps_producer_adjacent() {
+        let source = b"local function outer() local x=1; local h=function() return x end; local function g() x=9; return 2,nil end; local function f(...) return h(),... end; return f(g()) end; return outer()";
+        for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
+            let limits = CompileLimits::default();
+            let chunk = lex(source, profile, &limits).unwrap();
+            let parsed = parse(&chunk, profile, &limits).unwrap();
+            let resolved = resolve(&parsed, &chunk, profile, &limits).unwrap();
+            let ir = lower(&resolved, &IrLimits::default()).unwrap();
+            assert!(ir.prototypes.iter().any(|prototype| {
+                prototype.instructions.windows(2).any(|pair| {
+                    matches!(
+                        pair[0].instruction,
+                        Instruction::Call {
+                            result_mode: ResultMode::All,
+                            ..
+                        }
+                    ) && matches!(
+                        pair[1].instruction,
+                        Instruction::TailCall {
+                            arg_count: u16::MAX,
+                            result_mode: ResultMode::All,
+                            ..
+                        }
+                    )
+                })
+            }));
+        }
     }
 }
 

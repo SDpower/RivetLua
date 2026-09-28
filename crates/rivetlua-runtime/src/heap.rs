@@ -2,12 +2,18 @@
 
 use core::mem::size_of;
 
-use rivetlua_core::{Generation, ObjectId, ObjectRef, SlotId, Value, VmId};
+use rivetlua_core::{Generation, ObjectId, ObjectRef, SlotId, Value, VerifiedModule, VmId};
 
 use crate::alloc::{
     AllocationLedger, FailPoint, LedgerSnapshot, Reservation, checked_bytes, reserve_vec,
 };
+use crate::closure::Closure;
+use crate::coroutine::{Coroutine, CoroutineState, ThreadContext};
+use crate::errors::Builtin;
 use crate::roots::{RootId, RootKind, RootLease, RootSet};
+use crate::string::ByteString;
+use crate::table::Table;
+use crate::upvalue::{Upvalue, UpvalueState};
 
 /// 公開的 slot 狀態，不暴露 heap 配置或可變借用。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +21,19 @@ pub enum SlotState {
     Occupied,
     Free,
     Retired,
+}
+
+/// Heap 物件 payload 的分類；不改變 `Value::Object` 身分。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectKind {
+    Value,
+    ByteString,
+    Table,
+    Closure,
+    Builtin,
+    Coroutine,
+    Upvalue,
+    Module,
 }
 
 /// VM 邊界的可檢查結果。P06 後續步驟補上配置計帳。
@@ -27,6 +46,9 @@ pub enum VmError {
     WrongVm,
     StaleObject,
     StaleRoot,
+    WrongObjectType,
+    NilTableKey,
+    NaNTableKey,
     ArithmeticOverflow,
     LedgerInvariant,
     InjectedFailure(FailPoint),
@@ -42,6 +64,9 @@ impl VmError {
             Self::WrongVm => "E_WRONG_VM",
             Self::StaleObject => "E_STALE_HANDLE",
             Self::StaleRoot => "E_STALE_ROOT",
+            Self::WrongObjectType => "E_WRONG_OBJECT_TYPE",
+            Self::NilTableKey => "E_TABLE_KEY_NIL",
+            Self::NaNTableKey => "E_TABLE_KEY_NAN",
             Self::ArithmeticOverflow => "E_ALLOCATION_FAILED",
             Self::LedgerInvariant => "E_ALLOCATION_FAILED",
             Self::InjectedFailure(_) => "E_ALLOCATION_FAILED",
@@ -50,8 +75,19 @@ impl VmError {
 }
 
 struct HeapObject {
-    value: Value,
+    payload: HeapPayload,
     children: Vec<ObjectRef>,
+}
+
+enum HeapPayload {
+    Value(Value),
+    ByteString(ByteString),
+    Table(Table),
+    Closure(Closure),
+    Builtin(Builtin),
+    Coroutine(Coroutine),
+    Upvalue(Upvalue),
+    Module(VerifiedModule),
 }
 
 impl HeapObject {
@@ -59,8 +95,21 @@ impl HeapObject {
         &self,
         mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
     ) -> Result<(), VmError> {
-        if let Value::Object(child) = self.value {
-            visit(child)?;
+        match &self.payload {
+            HeapPayload::Value(Value::Object(child)) => visit(*child)?,
+            HeapPayload::Table(table) => table.trace_children(&mut visit)?,
+            HeapPayload::Closure(closure) => closure.trace_children(&mut visit)?,
+            HeapPayload::Builtin(Builtin::CoroutineWrapped(coroutine)) => visit(*coroutine)?,
+            HeapPayload::Coroutine(coroutine) => coroutine.trace_children(&mut visit)?,
+            HeapPayload::Upvalue(upvalue) => match upvalue.state() {
+                UpvalueState::Closed(Value::Object(child)) => visit(child)?,
+                UpvalueState::Open {
+                    coroutine: Some(child),
+                    ..
+                } => visit(child)?,
+                _ => {}
+            },
+            _ => {}
         }
         for &child in &self.children {
             visit(child)?;
@@ -167,6 +216,248 @@ impl Vm {
         if let Value::Object(child) = value {
             self.checked_slot(child)?;
         }
+        self.allocate_payload(HeapPayload::Value(value))
+    }
+
+    /// 建立完整內容的 byte string；失敗時 payload 與帳本票據均丟棄。
+    pub fn allocate_byte_string(&mut self, bytes: &[u8]) -> Result<ObjectRef, VmError> {
+        let (string, ticket) = ByteString::try_from_bytes(&self.ledger, bytes)?;
+        let reference = self.allocate_payload(HeapPayload::ByteString(string))?;
+        ticket.commit()?;
+        Ok(reference)
+    }
+
+    /// 複製期間保護來源；建立新 payload 時也沿用配置器的短期 root。
+    pub fn clone_byte_string(&mut self, source: ObjectRef) -> Result<ObjectRef, VmError> {
+        let root = self.add_root(RootKind::Temporary, source)?;
+        let result = (|| {
+            let (string, ticket) = self.with_byte_string(source, |string| {
+                ByteString::try_from_bytes(&self.ledger, string.as_bytes())
+            })??;
+            let reference = self.allocate_payload(HeapPayload::ByteString(string))?;
+            ticket.commit()?;
+            Ok(reference)
+        })();
+        let removed = self.remove_root(root);
+        removed?;
+        result
+    }
+
+    pub fn allocate_table(&mut self) -> Result<ObjectRef, VmError> {
+        self.allocate_table_with_capacity(0, 0)
+    }
+
+    /// 將本階段唯一三個內建入口安裝至宿主提供的環境。
+    pub fn install_error_builtins(&mut self, environment: ObjectRef) -> Result<(), VmError> {
+        if self.object_kind(environment)? != ObjectKind::Table {
+            return Err(VmError::WrongObjectType);
+        }
+        let env_root = self.add_root(RootKind::Temporary, environment)?;
+        let result = (|| {
+            for (name, builtin) in [
+                (b"error".as_slice(), Builtin::Error),
+                (b"pcall".as_slice(), Builtin::PCall),
+                (b"xpcall".as_slice(), Builtin::XPCall),
+            ] {
+                self.install_one_builtin(environment, name, builtin)?;
+            }
+            Ok(())
+        })();
+        self.remove_root(env_root)?;
+        result
+    }
+
+    /// 安裝本階段必要的 coroutine 入口。
+    pub fn install_coroutine_builtins(&mut self, environment: ObjectRef) -> Result<(), VmError> {
+        if self.object_kind(environment)? != ObjectKind::Table {
+            return Err(VmError::WrongObjectType);
+        }
+        let env_root = self.add_root(RootKind::Temporary, environment)?;
+        let result = (|| {
+            let table = self.allocate_table()?;
+            let table_root = self.add_root(RootKind::Temporary, table)?;
+            let installed = (|| {
+                for (name, builtin) in [
+                    (b"create".as_slice(), Builtin::CoroutineCreate),
+                    (b"resume".as_slice(), Builtin::CoroutineResume),
+                    (b"yield".as_slice(), Builtin::CoroutineYield),
+                    (b"status".as_slice(), Builtin::CoroutineStatus),
+                    (b"close".as_slice(), Builtin::CoroutineClose),
+                    (b"wrap".as_slice(), Builtin::CoroutineWrap),
+                ] {
+                    self.install_one_builtin(table, name, builtin)?;
+                }
+                let key = self.allocate_byte_string(b"coroutine")?;
+                let key_root = self.add_root(RootKind::Temporary, key)?;
+                let result = self.raw_set(environment, Value::Object(key), Value::Object(table));
+                self.remove_root(key_root)?;
+                result
+            })();
+            self.remove_root(table_root)?;
+            installed
+        })();
+        self.remove_root(env_root)?;
+        result
+    }
+
+    fn install_one_builtin(
+        &mut self,
+        environment: ObjectRef,
+        name: &[u8],
+        builtin: Builtin,
+    ) -> Result<(), VmError> {
+        let key = self.allocate_byte_string(name)?;
+        let key_root = match self.add_root(RootKind::Temporary, key) {
+            Ok(root) => root,
+            Err(error) => {
+                self.reclaim(key)?;
+                return Err(error);
+            }
+        };
+        let result = (|| {
+            let value = self.allocate_payload(HeapPayload::Builtin(builtin))?;
+            let value_root = match self.add_root(RootKind::Temporary, value) {
+                Ok(root) => root,
+                Err(error) => {
+                    self.reclaim(value)?;
+                    return Err(error);
+                }
+            };
+            let inserted = self.raw_set(environment, Value::Object(key), Value::Object(value));
+            self.remove_root(value_root)?;
+            if inserted.is_err() {
+                self.reclaim(value)?;
+            }
+            inserted
+        })();
+        self.remove_root(key_root)?;
+        if result.is_err() {
+            self.reclaim(key)?;
+        }
+        result
+    }
+
+    pub(crate) fn builtin(&self, object: ObjectRef) -> Result<Builtin, VmError> {
+        let Slot::Occupied { object: entry, .. } = self.checked_slot(object)? else {
+            return Err(VmError::StaleObject);
+        };
+        match &entry[0].payload {
+            HeapPayload::Builtin(builtin) => Ok(*builtin),
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    pub(crate) fn allocate_coroutine(&mut self, entry: Value) -> Result<ObjectRef, VmError> {
+        if let Value::Object(object) = entry {
+            self.checked_slot(object)?;
+        }
+        self.allocate_payload(HeapPayload::Coroutine(Coroutine::new(entry)))
+    }
+
+    pub(crate) fn allocate_coroutine_wrapper(
+        &mut self,
+        coroutine: ObjectRef,
+    ) -> Result<ObjectRef, VmError> {
+        self.with_coroutine(coroutine, |_| ())?;
+        self.allocate_payload(HeapPayload::Builtin(Builtin::CoroutineWrapped(coroutine)))
+    }
+
+    pub(crate) fn with_coroutine<R>(
+        &self,
+        object: ObjectRef,
+        f: impl FnOnce(&Coroutine) -> R,
+    ) -> Result<R, VmError> {
+        let Slot::Occupied { object: entry, .. } = self.checked_slot(object)? else {
+            return Err(VmError::StaleObject);
+        };
+        match &entry[0].payload {
+            HeapPayload::Coroutine(co) => Ok(f(co)),
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    pub(crate) fn with_coroutine_mut<R>(
+        &mut self,
+        object: ObjectRef,
+        f: impl FnOnce(&mut Coroutine) -> R,
+    ) -> Result<R, VmError> {
+        let id = object.identity().ok_or(VmError::StaleObject)?;
+        self.checked_slot(object)?;
+        let Slot::Occupied { object: entry, .. } = &mut self.slots[id.slot.index()] else {
+            return Err(VmError::StaleObject);
+        };
+        match &mut entry[0].payload {
+            HeapPayload::Coroutine(co) => Ok(f(co)),
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    pub(crate) fn coroutine_state(&self, object: ObjectRef) -> Result<CoroutineState, VmError> {
+        self.with_coroutine(object, |co| co.state)
+    }
+
+    pub(crate) fn take_coroutine_context(
+        &mut self,
+        object: ObjectRef,
+    ) -> Result<Option<ThreadContext>, VmError> {
+        self.with_coroutine_mut(object, |co| co.context.take())
+    }
+
+    pub(crate) fn coroutine_stack_read(
+        &self,
+        object: ObjectRef,
+        slot: usize,
+    ) -> Result<Option<Value>, VmError> {
+        self.with_coroutine(object, |co| {
+            co.context
+                .as_ref()
+                .and_then(|context| context.read_slot(slot))
+        })
+    }
+
+    pub(crate) fn coroutine_stack_write(
+        &mut self,
+        object: ObjectRef,
+        slot: usize,
+        value: Value,
+    ) -> Result<bool, VmError> {
+        if let Value::Object(child) = value {
+            self.checked_slot(child)?;
+        }
+        self.with_coroutine_mut(object, |co| {
+            co.context
+                .as_mut()
+                .is_some_and(|context| context.write_parked_slot(slot, value))
+        })
+    }
+
+    pub(crate) fn allocate_closure(&mut self, closure: Closure) -> Result<ObjectRef, VmError> {
+        self.allocate_payload(HeapPayload::Closure(closure))
+    }
+
+    pub(crate) fn allocate_upvalue(&mut self, upvalue: Upvalue) -> Result<ObjectRef, VmError> {
+        self.allocate_payload(HeapPayload::Upvalue(upvalue))
+    }
+
+    pub(crate) fn allocate_module(&mut self, module: VerifiedModule) -> Result<ObjectRef, VmError> {
+        self.allocate_payload(HeapPayload::Module(module))
+    }
+
+    /// 預留空 array 與 hash bucket；兩者成功且 heap 物件建成後才提交帳額。
+    pub fn allocate_table_with_capacity(
+        &mut self,
+        array_capacity: usize,
+        hash_capacity: usize,
+    ) -> Result<ObjectRef, VmError> {
+        let (table, array_ticket, hash_ticket) =
+            Table::try_new(&self.ledger, array_capacity, hash_capacity)?;
+        let reference = self.allocate_payload(HeapPayload::Table(table))?;
+        array_ticket.commit()?;
+        hash_ticket.commit()?;
+        Ok(reference)
+    }
+
+    fn allocate_payload(&mut self, payload: HeapPayload) -> Result<ObjectRef, VmError> {
         let free = self
             .slots
             .iter()
@@ -186,7 +477,7 @@ impl Vm {
         let object_ticket = reserve_vec(&self.ledger, &mut object, 1, FailPoint::ObjectReserve)?;
         self.ledger.checkpoint(FailPoint::ObjectInitialize)?;
         object.push(HeapObject {
-            value,
+            payload,
             children: Vec::new(),
         });
 
@@ -365,6 +656,22 @@ impl Vm {
         self.with_value(object, |value| *value)
     }
 
+    pub fn object_kind(&self, object: ObjectRef) -> Result<ObjectKind, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(object)? else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        Ok(match object[0].payload {
+            HeapPayload::Value(_) => ObjectKind::Value,
+            HeapPayload::ByteString(_) => ObjectKind::ByteString,
+            HeapPayload::Table(_) => ObjectKind::Table,
+            HeapPayload::Closure(_) => ObjectKind::Closure,
+            HeapPayload::Builtin(_) => ObjectKind::Builtin,
+            HeapPayload::Coroutine(_) => ObjectKind::Coroutine,
+            HeapPayload::Upvalue(_) => ObjectKind::Upvalue,
+            HeapPayload::Module(_) => ObjectKind::Module,
+        })
+    }
+
     /// 借用僅限此回呼；呼叫者不能持有 heap 的可變借用。
     ///
     /// ```
@@ -393,7 +700,125 @@ impl Vm {
         let Slot::Occupied { object, .. } = self.checked_slot(object)? else {
             unreachable!("checked_slot 只回傳 occupied")
         };
-        Ok(f(&object[0].value))
+        match &object[0].payload {
+            HeapPayload::Value(value) => Ok(f(value)),
+            HeapPayload::ByteString(_)
+            | HeapPayload::Table(_)
+            | HeapPayload::Closure(_)
+            | HeapPayload::Builtin(_)
+            | HeapPayload::Coroutine(_)
+            | HeapPayload::Upvalue(_)
+            | HeapPayload::Module(_) => Err(VmError::WrongObjectType),
+        }
+    }
+
+    /// 借用 byte string 僅限回呼期間；回呼不能跨越 VM 可變配置。
+    pub fn with_byte_string<R>(
+        &self,
+        object: ObjectRef,
+        f: impl FnOnce(&ByteString) -> R,
+    ) -> Result<R, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(object)? else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        match &object[0].payload {
+            HeapPayload::ByteString(string) => Ok(f(string)),
+            HeapPayload::Value(_)
+            | HeapPayload::Table(_)
+            | HeapPayload::Closure(_)
+            | HeapPayload::Builtin(_)
+            | HeapPayload::Coroutine(_)
+            | HeapPayload::Upvalue(_)
+            | HeapPayload::Module(_) => Err(VmError::WrongObjectType),
+        }
+    }
+
+    pub fn with_table<R>(
+        &self,
+        object: ObjectRef,
+        f: impl FnOnce(&Table) -> R,
+    ) -> Result<R, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(object)? else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        match &object[0].payload {
+            HeapPayload::Table(table) => Ok(f(table)),
+            HeapPayload::Value(_)
+            | HeapPayload::ByteString(_)
+            | HeapPayload::Closure(_)
+            | HeapPayload::Builtin(_)
+            | HeapPayload::Coroutine(_)
+            | HeapPayload::Upvalue(_)
+            | HeapPayload::Module(_) => Err(VmError::WrongObjectType),
+        }
+    }
+
+    pub fn with_closure<R>(
+        &self,
+        object: ObjectRef,
+        f: impl FnOnce(&Closure) -> R,
+    ) -> Result<R, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(object)? else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        match &object[0].payload {
+            HeapPayload::Closure(closure) => Ok(f(closure)),
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    pub(crate) fn module(&self, reference: ObjectRef) -> Result<&VerifiedModule, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(reference)? else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        match &object[0].payload {
+            HeapPayload::Module(module) => Ok(module),
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    pub(crate) fn upvalue_state(&self, reference: ObjectRef) -> Result<UpvalueState, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(reference)? else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        match &object[0].payload {
+            HeapPayload::Upvalue(upvalue) => Ok(upvalue.state()),
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    pub(crate) fn with_upvalue_mut<R>(
+        &mut self,
+        reference: ObjectRef,
+        f: impl FnOnce(&mut Upvalue) -> R,
+    ) -> Result<R, VmError> {
+        let id = reference.identity().ok_or(VmError::StaleObject)?;
+        self.checked_slot(reference)?;
+        let Slot::Occupied { object, .. } = &mut self.slots[id.slot.index()] else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        match &mut object[0].payload {
+            HeapPayload::Upvalue(upvalue) => Ok(f(upvalue)),
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    /// table 內部短借用；回呼只使用帳本，不能重入 VM 或觸發 GC。
+    pub(crate) fn with_table_mut<R>(
+        &mut self,
+        reference: ObjectRef,
+        f: impl FnOnce(&mut Table, &AllocationLedger) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        let id = reference.identity().ok_or(VmError::StaleObject)?;
+        self.checked_slot(reference)?;
+        let ledger = self.ledger.clone();
+        let Slot::Occupied { object, .. } = &mut self.slots[id.slot.index()] else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        match &mut object[0].payload {
+            HeapPayload::Table(table) => f(table, &ledger),
+            _ => Err(VmError::WrongObjectType),
+        }
     }
 
     /// P06-2 收集器將接管回收時機；本步只在 crate 內提供 slot 轉移。
@@ -404,8 +829,19 @@ impl Vm {
         };
         let object_bytes = size_of::<HeapObject>();
         let child_bytes = checked_bytes(stored[0].children.len(), size_of::<ObjectRef>())?;
+        let payload_bytes = match &stored[0].payload {
+            HeapPayload::ByteString(string) => string.len(),
+            HeapPayload::Value(_) => 0,
+            HeapPayload::Table(table) => table.charge_bytes()?,
+            HeapPayload::Closure(_)
+            | HeapPayload::Builtin(_)
+            | HeapPayload::Coroutine(_)
+            | HeapPayload::Upvalue(_)
+            | HeapPayload::Module(_) => 0,
+        };
         let refund = object_bytes
             .checked_add(child_bytes)
+            .and_then(|total| total.checked_add(payload_bytes))
             .ok_or(VmError::ArithmeticOverflow)?;
         self.ledger.refund(refund)?;
         let slot = &mut self.slots[id.slot.index()];

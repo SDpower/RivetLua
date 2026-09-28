@@ -7,7 +7,26 @@ use rivetlua_core::{
     LuaProfile, ProtoId, RVLU_NUMERIC_I64_F64, RVLU_V1, RVLU_V2, Register, ResultMode, Value,
     VerifyLimits, verify_module,
 };
-use rivetlua_runtime::{FailPoint, RunOutcome, RuntimeErrorKind, Vm, VmError};
+use rivetlua_runtime::{FailPoint, LuaError, RunOutcome, RuntimeErrorKind, Vm, VmError};
+
+fn release_implicit_error(vm: &mut Vm, error: LuaError) {
+    let Value::Object(message) = error.value else {
+        panic!("隱含 LuaError 須保留 byte string 值")
+    };
+    assert_eq!(
+        vm.with_byte_string(message, |string| string.as_bytes().to_vec()),
+        Ok(error.diagnostic_id.as_bytes().to_vec())
+    );
+    assert_eq!(vm.roots().total_count(), 1);
+    drop(error);
+    assert_eq!(vm.roots().total_count(), 0);
+    assert!(vm.collect().unwrap() >= 1);
+    assert_eq!(vm.object_kind(message), Err(VmError::StaleObject));
+    let stable = vm.ledger_snapshot();
+    assert_eq!(stable.reserved, 0);
+    assert_eq!(vm.collect().unwrap(), 0);
+    assert_eq!(vm.ledger_snapshot(), stable);
+}
 
 fn profile_name(profile: LanguageProfile) -> &'static str {
     match profile {
@@ -169,20 +188,12 @@ fn conditional_jump_uses_lua_truthiness() {
 }
 
 #[test]
-fn unsupported_instructions_and_string_constant_are_rejected() {
-    for instruction in [
-        Instruction::Call {
-            base: Register(0),
-            arg_count: 0,
-            result_mode: ResultMode::Fixed(1),
-        },
-        Instruction::GetTable {
-            dest: Register(0),
-            table: Register(0),
-            key: Register(1),
-        },
-    ] {
-        let opcode = instruction.opcode();
+fn call_error_and_name_constant_bytes_are_checked() {
+    for instruction in [Instruction::Call {
+        base: Register(0),
+        arg_count: 0,
+        result_mode: ResultMode::Fixed(1),
+    }] {
         let verified = verify_module(
             candidate(
                 vec![
@@ -199,10 +210,14 @@ fn unsupported_instructions_and_string_constant_are_rejected() {
         )
         .unwrap();
         let mut vm = Vm::new().unwrap();
-        assert_eq!(
-            vm.load(verified).err().unwrap().kind,
-            RuntimeErrorKind::UnsupportedInstruction(opcode)
-        );
+        let mut execution = vm.load(verified).unwrap();
+        let RunOutcome::LuaError(error) = execution.run().unwrap() else {
+            panic!("nil 呼叫須是受控 LuaError")
+        };
+        assert_eq!(error.kind, RuntimeErrorKind::NotCallable);
+        assert_eq!(error.diagnostic_id, "E_CALL_NON_FUNCTION");
+        drop(execution);
+        release_implicit_error(&mut vm, error);
     }
     let verified = verify_module(
         candidate(
@@ -216,17 +231,24 @@ fn unsupported_instructions_and_string_constant_are_rejected() {
                     result_mode: ResultMode::Fixed(1),
                 },
             ],
-            vec![BytecodeConstant::String(b"hello".to_vec())],
+            vec![BytecodeConstant::Name(b"hello".to_vec())],
         ),
         LuaProfile::Lua55,
         &VerifyLimits::default(),
     )
     .unwrap();
     let mut vm = Vm::new().unwrap();
-    assert_eq!(
-        vm.load(verified).err().unwrap().kind,
-        RuntimeErrorKind::UnsupportedConstant
-    );
+    let mut execution = vm.load(verified).unwrap();
+    let RunOutcome::Returned(values) = execution.run().unwrap() else {
+        panic!("Name 常數須可作 byte string 回傳")
+    };
+    drop(execution);
+    let [Value::Object(object)] = values.as_slice() else {
+        panic!("Name 常數須是 heap byte string")
+    };
+    vm.with_byte_string(*object, |string| assert_eq!(string.as_bytes(), b"hello"))
+        .unwrap();
+    assert_eq!(vm.roots().total_count(), 0);
 }
 
 #[test]
@@ -278,7 +300,7 @@ fn execution_is_tied_to_its_original_vm() {
 }
 
 #[test]
-fn closure_opcode_is_rejected_after_successful_verification() {
+fn closure_opcode_creates_verified_nocapture_payload() {
     let mut module = candidate(
         vec![
             Instruction::Closure {
@@ -317,12 +339,31 @@ fn closure_opcode_is_rejected_after_successful_verification() {
     module.prototypes.push(child);
     let verified = verify_module(module, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
     let mut vm = Vm::new().unwrap();
-    let error = vm.load(verified).err().unwrap();
+    let mut execution = vm.load(verified).unwrap();
+    let RunOutcome::Returned(values) = execution.run().unwrap() else {
+        panic!("無捕捉 Closure 須正常建立")
+    };
+    drop(execution);
+    let [Value::Object(closure)] = values.as_slice() else {
+        panic!("Closure 須使用 heap ObjectId")
+    };
     assert_eq!(
-        error.kind,
-        RuntimeErrorKind::UnsupportedInstruction(rivetlua_core::Opcode::Closure)
+        vm.object_kind(*closure),
+        Ok(rivetlua_runtime::ObjectKind::Closure)
     );
-    assert_eq!(error.diagnostic_id, "E_VM_OPCODE_UNSUPPORTED");
+    assert_eq!(
+        vm.with_closure(*closure, |payload| payload.prototype()),
+        Ok(ProtoId(1))
+    );
+    assert_eq!(
+        vm.canonical_key(Value::Object(*closure))
+            .unwrap()
+            .unwrap()
+            .class(),
+        rivetlua_runtime::CanonicalKeyClass::Object
+    );
+    assert_eq!(vm.roots().total_count(), 0);
+    assert_eq!(vm.collect().unwrap(), 2);
 }
 
 #[test]
@@ -544,7 +585,6 @@ fn vm010_compiler_reports_later_error_after_local_assignment() {
         let input = b"local a=10; a=20; return a//0";
         let verified = compiled(input, profile);
         let mut vm = Vm::new().unwrap();
-        let before = vm.ledger_snapshot();
         let mut execution = vm.load(verified).unwrap();
         let outcome = execution.run().unwrap();
         let RunOutcome::LuaError(error) = outcome else {
@@ -561,16 +601,17 @@ fn vm010_compiler_reports_later_error_after_local_assignment() {
         );
         let fuel = execution.fuel_remaining();
         let pc = execution.pc();
+        let error_kind = error.kind;
+        let diagnostic_id = error.diagnostic_id;
         drop(execution);
-        assert_eq!(vm.roots().total_count(), 0);
-        assert_eq!(vm.ledger_snapshot(), before);
+        release_implicit_error(&mut vm, error);
         record_case(
             profile,
             "VM-010",
             "local a=10; a=20; return a//0",
             &format!(
                 "LuaError({:?}); diagnostic_id={}; fuel_remaining={fuel}; pc={pc}; roots_after_drop=0",
-                error.kind, error.diagnostic_id
+                error_kind, diagnostic_id
             ),
         );
     }
@@ -623,7 +664,6 @@ fn vm006_numeric_for_zero_step_is_lua_error() {
         let input = "local s=0; for i=1,3,0 do s=s+1 end; return s";
         let verified = compiled(input.as_bytes(), profile);
         let mut vm = Vm::new().unwrap();
-        let before = vm.ledger_snapshot();
         let mut execution = vm.load(verified).unwrap();
         let Ok(RunOutcome::LuaError(error)) = execution.run() else {
             panic!("numeric for 的零 step 必須形成 LuaError")
@@ -636,17 +676,19 @@ fn vm006_numeric_for_zero_step_is_lua_error() {
         );
         let fuel = execution.fuel_remaining();
         let pc = execution.pc();
+        let error_kind = error.kind;
+        let diagnostic_id = error.diagnostic_id;
         drop(execution);
+        release_implicit_error(&mut vm, error);
         let roots = vm.roots().total_count();
         assert_eq!(roots, 0);
-        assert_eq!(vm.ledger_snapshot(), before);
         record_case(
             profile,
             "VM-006",
             input,
             &format!(
                 "LuaError({:?}); diagnostic_id={}; fuel_remaining={fuel}; pc={pc}; body_not_executed=true; roots_after_drop={roots}",
-                error.kind, error.diagnostic_id
+                error_kind, diagnostic_id
             ),
         );
     }
@@ -745,15 +787,13 @@ fn numeric_for_float_and_non_numeric_paths_are_checked() {
         );
         let verified = compiled(b"for i=true,3,1 do end; return 0", profile);
         let mut vm = Vm::new().unwrap();
-        let before = vm.ledger_snapshot();
         let mut execution = vm.load(verified).unwrap();
         let Ok(RunOutcome::LuaError(error)) = execution.run() else {
             panic!("非數值 numeric for 初值須形成 LuaError")
         };
         assert_eq!(error.diagnostic_id, "E_NOT_NUMERIC");
         drop(execution);
-        assert_eq!(vm.roots().total_count(), 0);
-        assert_eq!(vm.ledger_snapshot(), before);
+        release_implicit_error(&mut vm, error);
     }
 }
 
@@ -910,16 +950,17 @@ fn vm007_aborted_execution_rejects_run_and_refuel() {
 }
 
 #[test]
-fn assignment_table_target_remains_unsupported() {
+fn nil_table_assignment_is_lua_error_after_verification() {
     for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
-        let verified = compiled(b"local t,i; i,t[i]=i+1,20; return i", profile);
+        let verified = compiled(b"local t=nil; t[1]=20; return 1", profile);
         let mut vm = Vm::new().unwrap();
-        assert_eq!(
-            vm.load(verified).err().unwrap().kind,
-            RuntimeErrorKind::UnsupportedInstruction(rivetlua_core::Opcode::SetTable)
-        );
-        assert_eq!(vm.roots().total_count(), 0);
-        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        let mut execution = vm.load(verified).unwrap();
+        let RunOutcome::LuaError(error) = execution.run().unwrap() else {
+            panic!("nil table 寫入須是受控 LuaError")
+        };
+        assert_eq!(error.kind, RuntimeErrorKind::Heap(VmError::WrongObjectType));
+        drop(execution);
+        release_implicit_error(&mut vm, error);
     }
 }
 
@@ -979,7 +1020,7 @@ fn compiler_zero_float_is_truthy_and_nil_is_false() {
 }
 
 #[test]
-fn verified_open_return_needs_unsupported_call_producer() {
+fn verified_open_return_nil_call_is_lua_error() {
     let verified = verify_module(
         candidate(
             vec![
@@ -1000,8 +1041,11 @@ fn verified_open_return_needs_unsupported_call_producer() {
     )
     .unwrap();
     let mut vm = Vm::new().unwrap();
-    assert_eq!(
-        vm.load(verified).err().unwrap().kind,
-        RuntimeErrorKind::UnsupportedInstruction(rivetlua_core::Opcode::Call)
-    );
+    let mut execution = vm.load(verified).unwrap();
+    let RunOutcome::LuaError(error) = execution.run().unwrap() else {
+        panic!("open return 的 nil call 須是 LuaError")
+    };
+    assert_eq!(error.kind, RuntimeErrorKind::NotCallable);
+    drop(execution);
+    release_implicit_error(&mut vm, error);
 }

@@ -3,22 +3,338 @@
 #![forbid(unsafe_code)]
 
 mod alloc;
+mod call;
+mod closure;
+mod coroutine;
+mod errors;
 mod handle;
 mod heap;
+mod metamethod;
+mod pending_op;
 mod roots;
+mod string;
+mod table;
+mod unwind;
+mod upvalue;
 mod vm;
 
 pub use alloc::{AllocationLedger, FailPoint, LedgerSnapshot};
+pub use call::PendingCloseSnapshot;
+pub use closure::Closure;
+pub use coroutine::CoroutineState;
+pub use errors::LuaError;
 pub use handle::HostHandle;
-pub use heap::{SlotState, Vm, VmError};
+pub use heap::{ObjectKind, SlotState, Vm, VmError};
+pub use metamethod::MetamethodEvent;
 pub use rivetlua_core::{Generation, ObjectId, SlotId, VmId};
 pub use roots::{RootId, RootKind, RootSet};
+pub use string::ByteString;
+pub use table::{CanonicalKey, CanonicalKeyClass, Table};
+pub use upvalue::{Upvalue, UpvalueState};
 pub use vm::{AbortReason, Execution, RunOutcome, RuntimeError, RuntimeErrorKind};
 
 #[cfg(test)]
 mod tests {
     use super::{Generation, ObjectId, SlotId, SlotState, Vm, VmError};
     use rivetlua_core::{ObjectRef, Value};
+
+    #[test]
+    fn p11_2_coroutine_installer_provides_traceable_table() {
+        let mut vm = Vm::new().unwrap();
+        let env = vm.allocate_table().unwrap();
+        let env_root = super::HostHandle::<Value>::new(&mut vm, env).unwrap();
+        vm.install_coroutine_builtins(env).unwrap();
+        let key = vm.allocate_byte_string(b"coroutine").unwrap();
+        let Value::Object(table) = vm.raw_get(env, Value::Object(key)).unwrap() else {
+            panic!("coroutine table 應安裝到環境")
+        };
+        assert_eq!(vm.object_kind(table), Ok(super::ObjectKind::Table));
+        drop(env_root);
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(table), Err(VmError::StaleObject));
+    }
+
+    #[test]
+    fn p11_2_native_builtin_body_executes_without_lua_frame() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+        use rivetlua_core::VerifyLimits;
+        let source = b"local co=coroutine.create(coroutine.status); local ok,s=coroutine.resume(co,co); return ok,s,coroutine.status(co)";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let module = emit(&ir, &VerifyLimits::default())
+            .unwrap()
+            .verified()
+            .clone();
+        let mut vm = Vm::new().unwrap();
+        let env = vm.allocate_table().unwrap();
+        let _root = super::HostHandle::<Value>::new(&mut vm, env).unwrap();
+        vm.install_coroutine_builtins(env).unwrap();
+        let outcome = vm
+            .load_with_environment(module, Value::Object(env))
+            .unwrap()
+            .run()
+            .unwrap();
+        let super::RunOutcome::Returned(values) = outcome else {
+            panic!("native builtin 應執行")
+        };
+        assert_eq!(values[0], Value::Boolean(true));
+        for (index, expected) in [(1, b"running".as_slice()), (2, b"dead")] {
+            let Value::Object(object) = values[index] else {
+                panic!("狀態須是 byte string")
+            };
+            assert_eq!(
+                vm.with_byte_string(object, |s| s.as_bytes().to_vec()),
+                Ok(expected.to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn p11_2_native_protected_body_preserves_multiple_results() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+        use rivetlua_core::VerifyLimits;
+        let source = b"local co=coroutine.create(pcall); return coroutine.resume(co,function() return 2,3 end)";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let module = emit(&ir, &VerifyLimits::default())
+            .unwrap()
+            .verified()
+            .clone();
+        let mut vm = Vm::new().unwrap();
+        let env = vm.allocate_table().unwrap();
+        let _root = super::HostHandle::<Value>::new(&mut vm, env).unwrap();
+        vm.install_error_builtins(env).unwrap();
+        vm.install_coroutine_builtins(env).unwrap();
+        let outcome = vm
+            .load_with_environment(module, Value::Object(env))
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            super::RunOutcome::Returned(vec![
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Integer(2),
+                Value::Integer(3)
+            ])
+        );
+    }
+
+    #[test]
+    fn p11_2_native_resume_missing_target_is_lua_failure() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+        use rivetlua_core::VerifyLimits;
+        let source = b"local co=coroutine.create(coroutine.resume); local ok,message=coroutine.resume(co); return ok,coroutine.status(co)";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let module = emit(&ir, &VerifyLimits::default())
+            .unwrap()
+            .verified()
+            .clone();
+        let mut vm = Vm::new().unwrap();
+        let env = vm.allocate_table().unwrap();
+        let _root = super::HostHandle::<Value>::new(&mut vm, env).unwrap();
+        vm.install_coroutine_builtins(env).unwrap();
+        let outcome = vm
+            .load_with_environment(module, Value::Object(env))
+            .unwrap()
+            .run()
+            .unwrap();
+        let super::RunOutcome::Returned(values) = outcome else {
+            panic!("invalid native resume 應是 Lua 結果")
+        };
+        assert_eq!(values[0], Value::Boolean(false));
+        let Value::Object(status) = values[1] else {
+            panic!("狀態須是字串")
+        };
+        assert_eq!(
+            vm.with_byte_string(status, |s| s.as_bytes().to_vec()),
+            Ok(b"dead".to_vec())
+        );
+    }
+
+    #[test]
+    fn p11_2_native_pcall_builtin_error_preserves_original_value() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+        use rivetlua_core::VerifyLimits;
+        let source = b"local co=coroutine.create(pcall); return coroutine.resume(co,error,9)";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let module = emit(&ir, &VerifyLimits::default())
+            .unwrap()
+            .verified()
+            .clone();
+        let mut vm = Vm::new().unwrap();
+        let env = vm.allocate_table().unwrap();
+        let _root = super::HostHandle::<Value>::new(&mut vm, env).unwrap();
+        vm.install_error_builtins(env).unwrap();
+        vm.install_coroutine_builtins(env).unwrap();
+        let outcome = vm
+            .load_with_environment(module, Value::Object(env))
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            super::RunOutcome::Returned(vec![
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::Integer(9)
+            ])
+        );
+    }
+
+    #[test]
+    fn p11_2_native_xpcall_invalid_target_runs_handler() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+        use rivetlua_core::VerifyLimits;
+        let source = b"local t={}; local co=coroutine.create(xpcall); local a,b,c=coroutine.resume(co,nil,function(v) return t end); return a,b,c==t";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let module = emit(&ir, &VerifyLimits::default())
+            .unwrap()
+            .verified()
+            .clone();
+        let mut vm = Vm::new().unwrap();
+        let env = vm.allocate_table().unwrap();
+        let _root = super::HostHandle::<Value>::new(&mut vm, env).unwrap();
+        vm.install_error_builtins(env).unwrap();
+        vm.install_coroutine_builtins(env).unwrap();
+        let outcome = vm
+            .load_with_environment(module, Value::Object(env))
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            super::RunOutcome::Returned(vec![
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::Boolean(true)
+            ])
+        );
+    }
+
+    #[test]
+    fn p11_2_coroutine_installer_failure_keeps_environment_atomic() {
+        let mut vm = Vm::new().unwrap();
+        let env = vm.allocate_table().unwrap();
+        let env_root = super::HostHandle::<Value>::new(&mut vm, env).unwrap();
+        let roots_before = vm.roots().total_count();
+        vm.inject_failure_once(super::FailPoint::ObjectInitialize);
+        assert_eq!(
+            vm.install_coroutine_builtins(env),
+            Err(VmError::InjectedFailure(super::FailPoint::ObjectInitialize))
+        );
+        assert_eq!(vm.roots().total_count(), roots_before);
+        let key = vm.allocate_byte_string(b"coroutine").unwrap();
+        assert_eq!(vm.raw_get(env, Value::Object(key)), Ok(Value::Nil));
+        vm.collect().unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        vm.install_coroutine_builtins(env).unwrap();
+        drop(env_root);
+        vm.collect().unwrap();
+        assert_eq!(vm.roots().total_count(), 0);
+    }
+
+    #[test]
+    fn p11_2_coroutine_installer_partial_private_table_is_reclaimed() {
+        let mut vm = Vm::new().unwrap();
+        let env = vm.allocate_table().unwrap();
+        let env_root = super::HostHandle::<Value>::new(&mut vm, env).unwrap();
+        let roots_before = vm.roots().total_count();
+        vm.inject_failure_once(super::FailPoint::TableInsert);
+        assert_eq!(
+            vm.install_coroutine_builtins(env),
+            Err(VmError::InjectedFailure(super::FailPoint::TableInsert))
+        );
+        assert_eq!(vm.roots().total_count(), roots_before);
+        let key = vm.allocate_byte_string(b"coroutine").unwrap();
+        assert_eq!(vm.raw_get(env, Value::Object(key)), Ok(Value::Nil));
+        assert!(vm.collect().unwrap() >= 1);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        drop(env_root);
+        vm.collect().unwrap();
+        assert_eq!(vm.roots().total_count(), 0);
+    }
+
+    #[test]
+    fn p11_2_body_error_parks_thread_until_coroutine_reclaimed() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+        use rivetlua_core::VerifyLimits;
+        let source = b"local t={}; local co=coroutine.create(function() local x=t; error(t) end); local ok,e=coroutine.resume(co); return co,t,e,ok";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let module = emit(&ir, &VerifyLimits::default())
+            .unwrap()
+            .verified()
+            .clone();
+        let mut vm = Vm::new().unwrap();
+        let env = vm.allocate_table().unwrap();
+        let env_root = super::HostHandle::<Value>::new(&mut vm, env).unwrap();
+        vm.install_error_builtins(env).unwrap();
+        vm.install_coroutine_builtins(env).unwrap();
+        let outcome = vm
+            .load_with_environment(module, Value::Object(env))
+            .unwrap()
+            .run()
+            .unwrap();
+        let super::RunOutcome::Returned(values) = outcome else {
+            panic!("body error 應回傳 resume tuple")
+        };
+        let (Value::Object(co), Value::Object(table)) = (values[0], values[1]) else {
+            panic!("須回傳 thread 與原 table")
+        };
+        assert_eq!(values[2], Value::Object(table));
+        assert_eq!(values[3], Value::Boolean(false));
+        let co_root = super::HostHandle::<Value>::new(&mut vm, co).unwrap();
+        let (state, pending, error) = vm
+            .with_coroutine(co, |co| (co.state, co.context.is_some(), co.error))
+            .unwrap();
+        assert_eq!(state, super::CoroutineState::Dead);
+        assert!(pending);
+        assert_eq!(error, Some(Value::Object(table)));
+        drop(env_root);
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(table), Ok(super::ObjectKind::Table));
+        drop(co_root);
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(co), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(table), Err(VmError::StaleObject));
+        assert_eq!(vm.roots().total_count(), 0);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
 
     fn record_case(case_id: &str, input: &str, actual: &str) {
         let Ok(profile) = std::env::var("RIVETLUA_P06_PROFILE") else {

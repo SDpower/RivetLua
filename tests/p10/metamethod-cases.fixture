@@ -1,0 +1,22 @@
+profile|lua55-i64f64|lua55
+profile|lua54-i64f64|lua54
+case|lua55-i64f64|META-001|runtime|return t.x where raw x=false|Returned([Boolean(false)])|raw false bypasses __index
+case|lua55-i64f64|META-002|runtime|return t.x where __index returns 7|Returned([Integer(7)])|PendingOp fills missing lookup result
+case|lua55-i64f64|META-003|raw-runtime|raw_set(t,x,7) with __newindex installed|Returned([Integer(7)])|raw write bypasses __newindex
+case|lua55-i64f64|META-004|runtime|return t(3,4) where __call adds arguments|Returned([Integer(7), Integer(7)])|original table precedes call arguments
+case|lua55-i64f64|META-005|runtime-error|return t.missing through self __index chain|LuaError(E_METATABLE_CHAIN_LIMIT)|cycle ends with controlled LuaError
+case|lua55-i64f64|META-006|runtime-gc|return t.missing where __index allocates and writes|Returned([Integer(8)])|PendingOp values survive collection at each allocation
+case|lua55-i64f64|META-007|runtime-error|return t.missing where __index raises|LuaError(E_WRONG_OBJECT_TYPE)|LuaError reaches execution boundary
+case|lua55-i64f64|META-008|runtime|run add band len concat lt le eq events|Returned([Integer(41),Integer(41),Integer(41),Integer(41),Boolean(true),Boolean(true),Boolean(true)])|all seven operator events return expected values
+case|lua55-i64f64|META-009|runtime-nested|return t.missing through nested Lua function|Returned([Integer(5)])|nested PendingOps resume in frame order
+case|lua55-i64f64|META-010|runtime-cleanup|return t.missing across return error abort and chain limit|Terminated(return=clean;error=clean;aborted=clean;chain=clean)|all terminal paths release roots once
+case|lua54-i64f64|META-001|runtime|return t.x where raw x=false|Returned([Boolean(false)])|raw false bypasses __index
+case|lua54-i64f64|META-002|runtime|return t.x where __index returns 7|Returned([Integer(7)])|PendingOp fills missing lookup result
+case|lua54-i64f64|META-003|raw-runtime|raw_set(t,x,7) with __newindex installed|Returned([Integer(7)])|raw write bypasses __newindex
+case|lua54-i64f64|META-004|runtime|return t(3,4) where __call adds arguments|Returned([Integer(7), Integer(7)])|original table precedes call arguments
+case|lua54-i64f64|META-005|runtime-error|return t.missing through self __index chain|LuaError(E_METATABLE_CHAIN_LIMIT)|cycle ends with controlled LuaError
+case|lua54-i64f64|META-006|runtime-gc|return t.missing where __index allocates and writes|Returned([Integer(8)])|PendingOp values survive collection at each allocation
+case|lua54-i64f64|META-007|runtime-error|return t.missing where __index raises|LuaError(E_WRONG_OBJECT_TYPE)|LuaError reaches execution boundary
+case|lua54-i64f64|META-008|runtime|run add band len concat lt le eq events|Returned([Integer(41),Integer(41),Integer(41),Integer(41),Boolean(true),Boolean(true),Boolean(true)])|all seven operator events return expected values
+case|lua54-i64f64|META-009|runtime-nested|return t.missing through nested Lua function|Returned([Integer(5)])|nested PendingOps resume in frame order
+case|lua54-i64f64|META-010|runtime-cleanup|return t.missing across return error abort and chain limit|Terminated(return=clean;error=clean;aborted=clean;chain=clean)|all terminal paths release roots once

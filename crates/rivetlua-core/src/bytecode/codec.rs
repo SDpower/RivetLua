@@ -472,6 +472,7 @@ fn validate_prototype(
         }
         validate_instruction_shape(prototype, module, index, instruction)?;
     }
+    validate_close_declaration_markers(prototype)?;
     validate_numeric_for_pairs(prototype)?;
     verify_control_and_dataflow(prototype, limits)
 }
@@ -576,6 +577,37 @@ fn validate_close_path(
     Ok(())
 }
 
+fn validate_close_declaration_markers(prototype: &BytecodePrototype) -> Result<(), BytecodeError> {
+    let mut declared = Vec::new();
+    for entry in &prototype.instructions {
+        let (Instruction::Move { dest, .. }, Some(path)) = (&entry.instruction, &entry.close_path)
+        else {
+            continue;
+        };
+        let binding = path.bindings[0];
+        if declared.contains(&binding) {
+            return Err(verify(0, "RVLU close binding 宣告 marker 重複"));
+        }
+        if !prototype.close_paths.iter().any(|exit| {
+            exit.bindings
+                .iter()
+                .zip(&exit.registers)
+                .any(|(candidate, register)| *candidate == binding && *register == *dest)
+        }) {
+            return Err(verify(0, "RVLU close binding 宣告 marker 無對應出口"));
+        }
+        declared.push(binding);
+    }
+    for path in &prototype.close_paths {
+        for binding in &path.bindings {
+            if !declared.contains(binding) {
+                return Err(verify(0, "RVLU close binding 缺少宣告 marker"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_instruction_shape(
     prototype: &BytecodePrototype,
     module: &BytecodeModule,
@@ -666,7 +698,11 @@ fn validate_instruction_shape(
             result_mode,
         } => {
             // 函式位於 base，最後一個引數位於 base + arg_count。
-            range(*base, *arg_count)?;
+            if *arg_count == u16::MAX {
+                register(*base)?;
+            } else {
+                range(*base, *arg_count)?;
+            }
             validate_result_range(prototype, *base, *result_mode)?;
         }
         Instruction::Vararg { base, result_mode } => {
@@ -682,9 +718,26 @@ fn validate_instruction_shape(
         }
         Instruction::Close { base, count } => {
             if *count == 0 {
-                return Err(verify(0, "RVLU Close count 不可為零"));
+                register(*base)?;
+                let captured = prototype.binding_registers.iter().any(|(binding, mapped)| {
+                    *mapped == *base
+                        && module.prototypes.iter().any(|child| {
+                            child.parent == Some(prototype.id)
+                                && child.upvalues.iter().any(|upvalue| {
+                                    matches!(
+                                        upvalue.source,
+                                        BytecodeUpvalueSource::ParentLocal(local)
+                                            if local == *binding
+                                    )
+                                })
+                        })
+                });
+                if !captured {
+                    return Err(verify(0, "RVLU scope Close 未對應直接 child capture"));
+                }
+            } else {
+                range(*base, *count - 1)?;
             }
-            range(*base, *count - 1)?;
         }
         Instruction::NumericForPrepare {
             control,
@@ -719,9 +772,24 @@ fn validate_instruction_shape(
         }
     }
     match (&instruction.instruction, &instruction.close_path) {
+        (Instruction::Move { dest, .. }, Some(path)) => {
+            validate_close_path(prototype, path)?;
+            if path.kind != BytecodeExitKind::Normal
+                || path.target_scope != Some(path.from_scope)
+                || path.bindings.len() != 1
+                || path.registers != [*dest]
+                || path.span != instruction.span
+            {
+                return Err(verify(0, "RVLU close binding 宣告 marker 無效"));
+            }
+        }
+        (Instruction::Close { count: 0, .. }, None) => {}
         (Instruction::Close { base, count: 1 }, Some(path)) => {
             validate_close_path(prototype, path)?;
-            if !prototype.close_paths.contains(path) || !path.registers.contains(base) {
+            if path.target_scope == Some(path.from_scope)
+                || !prototype.close_paths.contains(path)
+                || !path.registers.contains(base)
+            {
                 return Err(verify(0, "RVLU Close 缺少對應 ClosePath"));
             }
         }
@@ -1057,6 +1125,42 @@ fn verify_control_and_dataflow(
             return Err(verify(0, "RVLU CFG worklist state 遺失"));
         };
         let instruction = &prototype.instructions[index].instruction;
+        let dynamic_consumer = matches!(
+            instruction,
+            Instruction::Call {
+                arg_count: u16::MAX,
+                ..
+            } | Instruction::TailCall {
+                arg_count: u16::MAX,
+                ..
+            }
+        );
+        if dynamic_consumer {
+            let Some(producer) = open else {
+                return Err(verify(0, "RVLU 動態 call 引數缺少 open producer"));
+            };
+            let immediate = index.checked_sub(1).and_then(|previous| {
+                match &prototype.instructions[previous].instruction {
+                    Instruction::Call {
+                        base,
+                        result_mode: ResultMode::All,
+                        ..
+                    }
+                    | Instruction::Vararg {
+                        base,
+                        result_mode: ResultMode::All,
+                    } => Some(*base),
+                    _ => None,
+                }
+            });
+            let outer_base = match instruction {
+                Instruction::Call { base, .. } | Instruction::TailCall { base, .. } => *base,
+                _ => return Err(verify(0, "RVLU 動態 call consumer 類型無效")),
+            };
+            if immediate != Some(producer) || producer.0 <= outer_base.0 {
+                return Err(verify(0, "RVLU 動態 call 引數 producer 順序或 base 無效"));
+            }
+        }
         if open.is_some()
             && !matches!(
                 instruction,
@@ -1066,6 +1170,7 @@ fn verify_control_and_dataflow(
                         ..
                     }
             )
+            && !dynamic_consumer
         {
             return Err(verify(0, "RVLU open result 未立即流向 Return(All)"));
         }
@@ -1079,12 +1184,16 @@ fn verify_control_and_dataflow(
                 base,
                 result_mode: ResultMode::All,
             } => Some(*base),
+            Instruction::Call {
+                arg_count: u16::MAX,
+                ..
+            } => None,
             Instruction::Return {
                 base,
                 result_mode: ResultMode::All,
             } => {
-                if open != Some(*base) {
-                    return Err(verify(0, "RVLU Return(All) 缺少相同 open result"));
+                if !open.is_some_and(|producer| base.0 <= producer.0) {
+                    return Err(verify(0, "RVLU Return(All) 缺少可涵蓋的 open result"));
                 }
                 None
             }
@@ -2473,6 +2582,286 @@ mod tests {
     }
 
     #[test]
+    fn p09_3_prefix_open_return_verifier_accepts_forward_bases_and_rejects_reverse() {
+        let limits = VerifyLimits::default();
+        for variadic in [false, true] {
+            for prefix in 0..=2u16 {
+                let mut module = sample();
+                let prototype = &mut module.prototypes[0];
+                prototype.is_variadic = variadic;
+                prototype.register_count = 4;
+                prototype.frame.register_limit = 8;
+                prototype.frame.initial_top = Register(4);
+                prototype.frame.dynamic_top = Register(4);
+                let mut instructions = Vec::new();
+                for register in 0..prefix {
+                    instructions.push(Instruction::LoadConst {
+                        dest: Register(register),
+                        constant: super::super::ConstId(0),
+                    });
+                }
+                instructions.push(if variadic {
+                    Instruction::Vararg {
+                        base: Register(prefix),
+                        result_mode: ResultMode::All,
+                    }
+                } else {
+                    Instruction::Call {
+                        base: Register(prefix),
+                        arg_count: 0,
+                        result_mode: ResultMode::All,
+                    }
+                });
+                instructions.push(Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::All,
+                });
+                prototype.instructions = instructions
+                    .into_iter()
+                    .map(|instruction| BytecodeInstruction {
+                        instruction,
+                        span: prototype.span,
+                        close_path: None,
+                    })
+                    .collect();
+                verify_module(module.clone(), LuaProfile::Lua55, &limits)
+                    .expect("前綴 register 與末位 open result 必須可返回");
+                let last = module.prototypes[0].instructions.last_mut().unwrap();
+                last.instruction = Instruction::Return {
+                    base: Register(prefix + 1),
+                    result_mode: ResultMode::All,
+                };
+                assert_eq!(
+                    verify_module(module, LuaProfile::Lua55, &limits)
+                        .expect_err("Return(All) base 越過 producer 必須拒絕")
+                        .code,
+                    BytecodeErrorCode::Verify
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn p09_3_prefix_open_return_rejects_absent_or_bypassed_producer() {
+        let limits = VerifyLimits::default();
+        let mut absent = sample();
+        absent.prototypes[0].instructions[1].instruction = Instruction::Return {
+            base: Register(0),
+            result_mode: ResultMode::All,
+        };
+        assert_eq!(
+            verify_module(absent, LuaProfile::Lua55, &limits)
+                .expect_err("沒有 open producer 不可 Return(All)")
+                .code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut bypassed = sample();
+        let prototype = &mut bypassed.prototypes[0];
+        prototype.instructions = [
+            Instruction::JumpIfFalse {
+                condition: Register(0),
+                target: InstructionOffset(2),
+            },
+            Instruction::Call {
+                base: Register(1),
+                arg_count: 0,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::All,
+            },
+        ]
+        .into_iter()
+        .map(|instruction| BytecodeInstruction {
+            instruction,
+            span: prototype.span,
+            close_path: None,
+        })
+        .collect();
+        assert_eq!(
+            verify_module(bypassed, LuaProfile::Lua55, &limits)
+                .expect_err("CFG 不能繞過 open producer")
+                .code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut out_of_frame = sample();
+        out_of_frame.prototypes[0].instructions[0].instruction = Instruction::Call {
+            base: Register(1),
+            arg_count: 0,
+            result_mode: ResultMode::All,
+        };
+        out_of_frame.prototypes[0].instructions[1].instruction = Instruction::Return {
+            base: Register(2),
+            result_mode: ResultMode::All,
+        };
+        assert_eq!(
+            verify_module(out_of_frame, LuaProfile::Lua55, &limits)
+                .expect_err("Return prefix 越過 frame 必須拒絕")
+                .code,
+            BytecodeErrorCode::Verify
+        );
+    }
+
+    #[test]
+    fn p09_3_dynamic_call_arguments_require_immediate_open_producer() {
+        let limits = VerifyLimits::default();
+        let mut valid = sample();
+        let prototype = &mut valid.prototypes[0];
+        prototype.instructions = [
+            Instruction::Call {
+                base: Register(1),
+                arg_count: 0,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Call {
+                base: Register(0),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::Fixed(1),
+            },
+            Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(1),
+            },
+        ]
+        .into_iter()
+        .map(|instruction| BytecodeInstruction {
+            instruction,
+            span: prototype.span,
+            close_path: None,
+        })
+        .collect();
+        verify_module(valid.clone(), LuaProfile::Lua55, &limits)
+            .expect("open Call(All) 須可直接供 sentinel Call 消費");
+
+        let mut no_open = valid.clone();
+        no_open.prototypes[0].instructions.remove(0);
+        assert!(verify_module(no_open, LuaProfile::Lua55, &limits).is_err());
+
+        let mut wrong_base = valid.clone();
+        wrong_base.prototypes[0].instructions[0].instruction = Instruction::Call {
+            base: Register(0),
+            arg_count: 0,
+            result_mode: ResultMode::All,
+        };
+        assert!(verify_module(wrong_base, LuaProfile::Lua55, &limits).is_err());
+
+        let mut interrupted = valid;
+        let span = interrupted.prototypes[0].span;
+        interrupted.prototypes[0].instructions.insert(
+            1,
+            BytecodeInstruction {
+                instruction: Instruction::Move {
+                    dest: Register(0),
+                    src: Register(0),
+                },
+                span,
+                close_path: None,
+            },
+        );
+        assert!(verify_module(interrupted, LuaProfile::Lua55, &limits).is_err());
+    }
+
+    #[test]
+    fn p09_3_dynamic_call_arguments_vararg_tail_nested_and_cfg_edges() {
+        let limits = VerifyLimits::default();
+        assert!(limits.max_registers < u16::MAX);
+        let mut variadic = sample();
+        let prototype = &mut variadic.prototypes[0];
+        prototype.is_variadic = true;
+        prototype.instructions = [
+            Instruction::Vararg {
+                base: Register(1),
+                result_mode: ResultMode::All,
+            },
+            Instruction::TailCall {
+                base: Register(0),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::All,
+            },
+        ]
+        .into_iter()
+        .map(|instruction| BytecodeInstruction {
+            instruction,
+            span: prototype.span,
+            close_path: None,
+        })
+        .collect();
+        verify_module(variadic, LuaProfile::Lua55, &limits)
+            .expect("Vararg(All) 可直接供 TailCall sentinel 消費");
+
+        let mut nested = sample();
+        let prototype = &mut nested.prototypes[0];
+        prototype.register_count = 3;
+        prototype.frame.register_limit = 3;
+        prototype.frame.initial_top = Register(3);
+        prototype.frame.dynamic_top = Register(3);
+        prototype.instructions = [
+            Instruction::Call {
+                base: Register(2),
+                arg_count: 0,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Call {
+                base: Register(1),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Call {
+                base: Register(0),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::Fixed(1),
+            },
+            Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(1),
+            },
+        ]
+        .into_iter()
+        .map(|instruction| BytecodeInstruction {
+            instruction,
+            span: prototype.span,
+            close_path: None,
+        })
+        .collect();
+        verify_module(nested, LuaProfile::Lua55, &limits)
+            .expect("多層 sentinel Call 須依序消費 open result");
+
+        let mut bypass = sample();
+        let prototype = &mut bypass.prototypes[0];
+        prototype.instructions = [
+            Instruction::JumpIfFalse {
+                condition: Register(0),
+                target: InstructionOffset(2),
+            },
+            Instruction::Call {
+                base: Register(1),
+                arg_count: 0,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Call {
+                base: Register(0),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::Fixed(0),
+            },
+            Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            },
+        ]
+        .into_iter()
+        .map(|instruction| BytecodeInstruction {
+            instruction,
+            span: prototype.span,
+            close_path: None,
+        })
+        .collect();
+        assert!(verify_module(bypass, LuaProfile::Lua55, &limits).is_err());
+    }
+
+    #[test]
     fn verifier_accepts_last_register_zero_arg_call_and_rejects_true_overflow() {
         let limits = VerifyLimits::default();
         let mut last_register = sample();
@@ -2693,6 +3082,21 @@ mod tests {
         prototype.close_paths.push(path.clone());
         prototype.instructions = vec![
             BytecodeInstruction {
+                instruction: Instruction::Move {
+                    dest: Register(2),
+                    src: Register(0),
+                },
+                span: prototype.span,
+                close_path: Some(BytecodeClosePath {
+                    kind: BytecodeExitKind::Normal,
+                    span: prototype.span,
+                    from_scope: 1,
+                    target_scope: Some(1),
+                    bindings: vec![binding],
+                    registers: vec![Register(2)],
+                }),
+            },
+            BytecodeInstruction {
                 instruction: Instruction::Close {
                     base: Register(2),
                     count: 1,
@@ -2713,7 +3117,7 @@ mod tests {
         verify_module(module.clone(), LuaProfile::Lua55, &limits)
             .expect("正常區塊 Close 後的 TailCall 應合法");
         module.prototypes[0].close_paths[0].kind = BytecodeExitKind::Return;
-        module.prototypes[0].instructions[0]
+        module.prototypes[0].instructions[1]
             .close_path
             .as_mut()
             .unwrap()
@@ -2721,6 +3125,111 @@ mod tests {
         let error = verify_module(module, LuaProfile::Lua55, &limits)
             .expect_err("pending Return ClosePath 不可接 TailCall");
         assert_eq!(error.code, BytecodeErrorCode::Verify);
+    }
+
+    #[test]
+    fn p11_3_close_declaration_marker_requires_unique_verified_binding() {
+        let limits = VerifyLimits::default();
+        let mut module = sample();
+        let prototype = &mut module.prototypes[0];
+        prototype.register_count = 3;
+        prototype.frame.register_limit = 3;
+        prototype.frame.initial_top = Register(3);
+        prototype.frame.dynamic_top = Register(3);
+        let binding = BytecodeBindingId {
+            function: 0,
+            ordinal: 1,
+        };
+        prototype.binding_registers.push((binding, Register(2)));
+        let marker = BytecodeClosePath {
+            kind: BytecodeExitKind::Normal,
+            span: prototype.span,
+            from_scope: 1,
+            target_scope: Some(1),
+            bindings: vec![binding],
+            registers: vec![Register(2)],
+        };
+        let exit = BytecodeClosePath {
+            target_scope: Some(0),
+            ..marker.clone()
+        };
+        prototype.close_paths.push(exit.clone());
+        prototype.instructions = vec![
+            BytecodeInstruction {
+                instruction: Instruction::Move {
+                    dest: Register(2),
+                    src: Register(0),
+                },
+                span: prototype.span,
+                close_path: Some(marker.clone()),
+            },
+            BytecodeInstruction {
+                instruction: Instruction::Close {
+                    base: Register(2),
+                    count: 1,
+                },
+                span: prototype.span,
+                close_path: Some(exit),
+            },
+            BytecodeInstruction {
+                instruction: Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(1),
+                },
+                span: prototype.span,
+                close_path: None,
+            },
+        ];
+        verify_module(module.clone(), LuaProfile::Lua55, &limits)
+            .expect("合法宣告 marker 與出口 ClosePath 必須驗證");
+        let encoded = encode_module(module.clone(), LuaProfile::Lua55, &limits).unwrap();
+        decode_module(encoded.bytes(), LuaProfile::Lua55, &limits)
+            .expect("V2 宣告 marker 必須往返解碼");
+
+        let mut missing = module.clone();
+        missing.prototypes[0].instructions[0].close_path = None;
+        assert!(verify_module(missing, LuaProfile::Lua55, &limits).is_err());
+
+        let mut duplicate = module.clone();
+        let duplicate_marker = duplicate.prototypes[0].instructions[0].clone();
+        duplicate.prototypes[0]
+            .instructions
+            .insert(1, duplicate_marker);
+        assert!(verify_module(duplicate, LuaProfile::Lua55, &limits).is_err());
+
+        let mut wrong_register = module.clone();
+        wrong_register.prototypes[0].instructions[0].instruction = Instruction::Move {
+            dest: Register(0),
+            src: Register(0),
+        };
+        assert!(verify_module(wrong_register, LuaProfile::Lua55, &limits).is_err());
+
+        let mut wrong_scope = module.clone();
+        wrong_scope.prototypes[0].instructions[0]
+            .close_path
+            .as_mut()
+            .unwrap()
+            .target_scope = Some(2);
+        assert!(verify_module(wrong_scope, LuaProfile::Lua55, &limits).is_err());
+
+        let mut wrong_span = module.clone();
+        wrong_span.prototypes[0].instructions[0]
+            .close_path
+            .as_mut()
+            .unwrap()
+            .span = BytecodeSpan {
+            start_byte: 0,
+            end_byte: 8,
+        };
+        assert!(verify_module(wrong_span, LuaProfile::Lua55, &limits).is_err());
+
+        let mut forged = module;
+        forged.prototypes[0].instructions[0]
+            .close_path
+            .as_mut()
+            .unwrap()
+            .bindings[0] = forged.prototypes[0].global_environment_binding;
+        assert!(verify_module(forged, LuaProfile::Lua55, &limits).is_err());
     }
 
     #[test]
@@ -2779,6 +3288,100 @@ mod tests {
             },
         ];
         assert!(verify_module(module, LuaProfile::Lua55, &limits).is_err());
+    }
+
+    #[test]
+    fn p09_2_scope_close_requires_direct_child_capture_and_no_close_path() {
+        let limits = VerifyLimits::default();
+        let mut module = sample();
+        let binding = BytecodeBindingId {
+            function: 0,
+            ordinal: 1,
+        };
+        let parent = &mut module.prototypes[0];
+        parent.register_count = 3;
+        parent.frame.register_limit = 3;
+        parent.frame.initial_top = Register(3);
+        parent.frame.dynamic_top = Register(3);
+        parent.binding_registers.push((binding, Register(2)));
+        parent.instructions.insert(
+            1,
+            BytecodeInstruction {
+                instruction: Instruction::Close {
+                    base: Register(2),
+                    count: 0,
+                },
+                span: parent.span,
+                close_path: None,
+            },
+        );
+        let mut child = parent.clone();
+        child.id = ProtoId(1);
+        child.function = 1;
+        child.parent = Some(ProtoId(0));
+        child.frame.environment_source = EnvironmentSource::ParentFrame {
+            parent: ProtoId(0),
+            register: Register(1),
+        };
+        child.upvalues = vec![BytecodeUpvalue {
+            id: UpvalueId(0),
+            source: BytecodeUpvalueSource::ParentLocal(binding),
+        }];
+        child.instructions.remove(1);
+        module.function_prototypes.push((1, ProtoId(1)));
+        module.prototypes.push(child);
+        verify_module(module.clone(), LuaProfile::Lua55, &limits).unwrap();
+        let encoded = encode_module(module.clone(), LuaProfile::Lua55, &limits).unwrap();
+        decode_module(encoded.bytes(), LuaProfile::Lua55, &limits).unwrap();
+
+        let mut wrong_register = module.clone();
+        wrong_register.prototypes[0].instructions[1].instruction = Instruction::Close {
+            base: Register(1),
+            count: 0,
+        };
+        assert_eq!(
+            verify_module(wrong_register, LuaProfile::Lua55, &limits)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut unrelated_child = module.clone();
+        unrelated_child.prototypes[1].upvalues.clear();
+        assert_eq!(
+            verify_module(unrelated_child, LuaProfile::Lua55, &limits)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut with_path = module.clone();
+        with_path.prototypes[0].instructions[1].close_path = Some(BytecodeClosePath {
+            kind: BytecodeExitKind::Normal,
+            span: with_path.span,
+            from_scope: 1,
+            target_scope: Some(0),
+            bindings: vec![binding],
+            registers: vec![Register(2)],
+        });
+        assert_eq!(
+            verify_module(with_path, LuaProfile::Lua55, &limits)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut no_path_count_one = module;
+        no_path_count_one.prototypes[0].instructions[1].instruction = Instruction::Close {
+            base: Register(2),
+            count: 1,
+        };
+        assert_eq!(
+            verify_module(no_path_count_one, LuaProfile::Lua55, &limits)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::Verify
+        );
     }
 
     #[test]

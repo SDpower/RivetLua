@@ -105,6 +105,7 @@ pub struct ClosePath {
     pub from_scope: ScopeId,
     pub target_scope: Option<ScopeId>,
     pub bindings: Vec<BindingId>,
+    pub exited_bindings: Vec<BindingId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -474,6 +475,7 @@ struct Resolver<'a> {
 struct ScopeFrame {
     id: ScopeId,
     bindings: HashMap<Vec<u8>, BindingId>,
+    local_bindings: Vec<BindingId>,
     close_bindings: Vec<BindingId>,
     labels: HashMap<Vec<u8>, LabelInfo>,
     declaration_spans: Vec<Span>,
@@ -513,6 +515,7 @@ impl<'a> Resolver<'a> {
         self.scopes.push(ScopeFrame {
             id,
             bindings: HashMap::new(),
+            local_bindings: Vec::new(),
             close_bindings: Vec::new(),
             labels: HashMap::new(),
             declaration_spans: Vec::new(),
@@ -1368,6 +1371,9 @@ impl<'a> Resolver<'a> {
         )?;
         let scope = self.scopes.last_mut().expect("root scope 已建立");
         scope.bindings.insert(name, id);
+        if !matches!(kind, BindingKind::Environment | BindingKind::Global) {
+            scope.local_bindings.push(id);
+        }
         if close_marker.is_some() {
             scope.close_bindings.push(id);
         }
@@ -1386,11 +1392,9 @@ impl<'a> Resolver<'a> {
             scope_depth,
         )?;
         // 隱藏 binding 僅是 close-path metadata，絕不能被 Lua 名稱查找或指派取得。
-        self.scopes
-            .last_mut()
-            .expect("generic-for scope 已建立")
-            .close_bindings
-            .push(binding);
+        let scope = self.scopes.last_mut().expect("generic-for scope 已建立");
+        scope.local_bindings.push(binding);
+        scope.close_bindings.push(binding);
         Ok(binding)
     }
 
@@ -1785,11 +1789,13 @@ impl<'a> Resolver<'a> {
 
     fn close_path(&self, kind: ExitKind, target_scope: Option<ScopeId>, span: Span) -> ClosePath {
         let mut bindings = Vec::new();
+        let mut exited_bindings = Vec::new();
         for scope in self.scopes.iter().rev() {
             if Some(scope.id) == target_scope {
                 break;
             }
             bindings.extend(scope.close_bindings.iter().rev().copied());
+            exited_bindings.extend(scope.local_bindings.iter().rev().copied());
         }
         ClosePath {
             kind,
@@ -1797,6 +1803,7 @@ impl<'a> Resolver<'a> {
             from_scope: self.current_scope(),
             target_scope,
             bindings,
+            exited_bindings,
         }
     }
 
@@ -1847,7 +1854,7 @@ fn diagnostic(token: Option<&Token>, code: DiagnosticCode, message: &'static str
 
 #[cfg(test)]
 mod tests {
-    use super::resolve;
+    use super::{ResolvedStmt, resolve};
     use crate::{CompileLimits, DiagnosticCode, LanguageProfile, lex, parse};
 
     #[test]
@@ -1861,5 +1868,42 @@ mod tests {
                 .code,
             DiagnosticCode::Resolve
         );
+    }
+
+    #[test]
+    fn p09_2_scope_close_keeps_same_scope_shadow_binding_ids() {
+        let source = b"local f; do local x=1; local x=2; f=function() return x end end; return f";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let module = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let body = module
+            .root
+            .statements
+            .iter()
+            .find_map(|statement| {
+                if let ResolvedStmt::Do { body, .. } = statement {
+                    Some(body)
+                } else {
+                    None
+                }
+            })
+            .expect("do scope 須存在");
+        let locals = body
+            .statements
+            .iter()
+            .filter_map(|statement| {
+                if let ResolvedStmt::Local { bindings, .. } = statement {
+                    Some(bindings[0])
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(locals.len(), 2);
+        let (first, second) = (locals[0], locals[1]);
+        assert_ne!(first, second);
+        assert_eq!(body.normal_close_path.exited_bindings, vec![second, first]);
+        assert!(body.normal_close_path.bindings.is_empty());
     }
 }

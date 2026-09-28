@@ -12,6 +12,13 @@ pub enum FailPoint {
     SlotReserve,
     ObjectReserve,
     ObjectInitialize,
+    StringBytesReserve,
+    TableArrayReserve,
+    TableHashReserve,
+    TableInsert,
+    TableArrayGrow,
+    TableHashGrow,
+    TableRehash,
     RootReserve,
     HostLease,
     ChildReserve,
@@ -19,7 +26,10 @@ pub enum FailPoint {
     WorkReserve,
     FrameRegistersReserve,
     FrameRootsReserve,
+    CallFrameReserve,
     ReturnReserve,
+    ClosureCapturesReserve,
+    OpenUpvaluesReserve,
 }
 
 /// 邏輯額度快照；不將 Rust allocator 呼叫次數或 RSS 當作額度依據。

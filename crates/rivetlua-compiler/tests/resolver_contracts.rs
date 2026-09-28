@@ -199,6 +199,7 @@ fn public_resolver_exposes_full_owned_p03_mirror_schema() {
             from_scope: ScopeId(3),
             target_scope: Some(ScopeId(1)),
             bindings: vec![binding],
+            exited_bindings: vec![binding],
         },
         error_close_path: ClosePath {
             kind: ExitKind::Error,
@@ -206,6 +207,7 @@ fn public_resolver_exposes_full_owned_p03_mirror_schema() {
             from_scope: ScopeId(3),
             target_scope: None,
             bindings: vec![binding],
+            exited_bindings: vec![binding],
         },
     };
     let body = ResolvedFunctionBody {
@@ -254,6 +256,7 @@ fn public_resolver_exposes_full_owned_p03_mirror_schema() {
                 from_scope: ScopeId(3),
                 target_scope: Some(ScopeId(1)),
                 bindings: vec![binding],
+                exited_bindings: vec![binding],
             },
             span,
         },
@@ -335,6 +338,7 @@ fn public_resolver_exposes_full_owned_p03_mirror_schema() {
         from_scope: ScopeId(3),
         target_scope: Some(ScopeId(2)),
         bindings: vec![binding],
+        exited_bindings: vec![binding],
     };
     let _all_stmt_variants = (
         ResolvedStmt::Empty { span },
@@ -360,6 +364,7 @@ fn public_resolver_exposes_full_owned_p03_mirror_schema() {
                 from_scope: ScopeId(3),
                 target_scope: Some(ScopeId(1)),
                 bindings: vec![binding],
+                exited_bindings: vec![binding],
             },
             span,
         },

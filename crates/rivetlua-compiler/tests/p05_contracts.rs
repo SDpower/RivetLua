@@ -1,7 +1,7 @@
 use rivetlua_compiler::{
-    BytecodeErrorCode, CompileLimits, ConstId, Instruction, IrLimits, LanguageProfile, LuaProfile,
-    RVLU_V1, RVLU_V2, Register, ResultMode, VerifyLimits, decode_module, emit, lex, lower, parse,
-    resolve, verify_module,
+    BytecodeErrorCode, BytecodeExitKind, CompileLimits, ConstId, Instruction, IrLimits,
+    LanguageProfile, LuaProfile, RVLU_V1, RVLU_V2, Register, ResultMode, VerifyLimits,
+    decode_module, emit, lex, lower, parse, resolve, verify_module,
 };
 use std::{env, fs, path::PathBuf};
 
@@ -68,6 +68,300 @@ fn ir(input: &[u8], profile: LanguageProfile) -> rivetlua_compiler::IrModule {
 
 fn encoded(input: &[u8], profile: LanguageProfile) -> rivetlua_compiler::EncodedModule {
     emit(&ir(input, profile), &VerifyLimits::default()).unwrap()
+}
+
+#[test]
+fn p11_3_close_declaration_marker_roundtrips() {
+    let (profile, bytecode_profile, _) = selected_profile();
+    for source in [
+        b"do local x <close> = nil end".as_slice(),
+        b"for k in f,nil,nil,nil do break end".as_slice(),
+    ] {
+        let output = encoded(source, profile);
+        let root = &output.verified().module().prototypes[0];
+        let markers: Vec<_> = root
+            .instructions
+            .iter()
+            .filter_map(|entry| match (&entry.instruction, &entry.close_path) {
+                (Instruction::Move { dest, .. }, Some(path)) => Some((*dest, entry.span, path)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers.len(), 1, "每個 close binding 恰一宣告 marker");
+        let (dest, span, marker) = markers[0];
+        assert_eq!(marker.kind, BytecodeExitKind::Normal);
+        assert_eq!(marker.target_scope, Some(marker.from_scope));
+        assert_eq!(marker.span, span);
+        assert_eq!(marker.registers, vec![dest]);
+        assert_eq!(marker.bindings.len(), 1);
+        assert!(root.close_paths.iter().any(|exit| {
+            exit.bindings.contains(&marker.bindings[0]) && exit.registers.contains(&dest)
+        }));
+        assert!(!root.close_paths.contains(marker));
+        let decoded = decode_module(output.bytes(), bytecode_profile, &VerifyLimits::default())
+            .expect("含宣告 marker 的 RVLU_V2 模組須可解碼");
+        assert_eq!(
+            decoded.module().prototypes[0].instructions,
+            root.instructions
+        );
+    }
+}
+
+#[test]
+fn p11_3_function_implicit_return_closes_root_binding() {
+    let (profile, bytecode_profile, _) = selected_profile();
+    let source = b"local function f() local x <close> = nil; error(9) end; return f";
+    let lowered = ir(source, profile);
+    let child = &lowered.prototypes[1];
+    let marker = child
+        .instructions
+        .iter()
+        .find_map(|entry| {
+            matches!(entry.instruction, Instruction::Move { .. })
+                .then_some(entry.close_path.as_ref())
+                .flatten()
+        })
+        .expect("函式 root close binding 應有宣告 marker");
+    let binding = marker.bindings[0];
+    let register = marker.registers[0];
+    let exit = child
+        .close_paths
+        .iter()
+        .find(|path| {
+            path.kind == rivetlua_compiler::ExitKind::Normal
+                && path.target_scope.is_none()
+                && path.bindings == [binding]
+                && path.registers == [register]
+        })
+        .expect("隱含 return 前須有 Normal ClosePath");
+    assert!(child.instructions.windows(2).any(|pair| {
+        matches!(pair[0].instruction, Instruction::Close { base, count: 1 } if base == register)
+            && pair[0].close_path.as_ref() == Some(exit)
+            && matches!(pair[1].instruction, Instruction::Return { .. })
+    }));
+    let output = emit(&lowered, &VerifyLimits::default()).unwrap();
+    decode_module(output.bytes(), bytecode_profile, &VerifyLimits::default()).unwrap();
+
+    let mut missing = output.verified().module().clone();
+    missing.prototypes[1].close_paths.clear();
+    assert!(verify_module(missing, bytecode_profile, &VerifyLimits::default()).is_err());
+    let mut wrong = output.verified().module().clone();
+    let entry = wrong.prototypes[1]
+        .instructions
+        .iter_mut()
+        .find(|entry| {
+            matches!(entry.instruction, Instruction::Move { .. }) && entry.close_path.is_some()
+        })
+        .unwrap();
+    entry.close_path.as_mut().unwrap().target_scope = None;
+    assert!(verify_module(wrong, bytecode_profile, &VerifyLimits::default()).is_err());
+
+    for ordinary in [
+        b"local function f() return 7 end; return f".as_slice(),
+        b"local function f() local x <close> = nil; return 7 end; return f".as_slice(),
+    ] {
+        let output = encoded(ordinary, profile);
+        decode_module(output.bytes(), bytecode_profile, &VerifyLimits::default()).unwrap();
+    }
+}
+
+#[test]
+fn p09_2_scope_close_producer_preserves_exit_and_tail_paths() {
+    let (profile, bytecode_profile, _) = selected_profile();
+    for source in [
+        b"local f; while true do local x=7; f=function() return x end; break end; return f"
+            .as_slice(),
+        b"local f; do local x=7; f=function() return x end; goto L end ::L:: return f".as_slice(),
+    ] {
+        let output = encoded(source, profile);
+        let root = &output.verified().module().prototypes[0];
+        assert!(root.instructions.windows(2).any(|window| {
+            matches!(window[0].instruction, Instruction::Close { count: 0, .. })
+                && window[0].close_path.is_none()
+                && matches!(window[1].instruction, Instruction::Jump { .. })
+        }));
+        decode_module(output.bytes(), bytecode_profile, &VerifyLimits::default()).unwrap();
+    }
+
+    let output = encoded(
+        b"do local x=7; local f=function() return x end; return f end",
+        profile,
+    );
+    let root = &output.verified().module().prototypes[0];
+    assert!(root.instructions.windows(2).any(|window| {
+        matches!(window[0].instruction, Instruction::Close { count: 0, .. })
+            && matches!(window[1].instruction, Instruction::Return { .. })
+    }));
+
+    let output = encoded(
+        b"local f=function() return 7 end; do local x=7; local g=function() return x end; return f() end",
+        profile,
+    );
+    let root = &output.verified().module().prototypes[0];
+    assert!(root.instructions.windows(2).any(|window| {
+        matches!(window[0].instruction, Instruction::Close { count: 0, .. })
+            && matches!(window[1].instruction, Instruction::TailCall { .. })
+    }));
+
+    let output = encoded(
+        b"local f; do local x=7; local c <close> = {}; f=function() return x end end; return f",
+        profile,
+    );
+    let root = &output.verified().module().prototypes[0];
+    assert!(root.instructions.windows(2).any(|window| {
+        matches!(window[0].instruction, Instruction::Close { count: 0, .. })
+            && window[0].close_path.is_none()
+            && matches!(window[1].instruction, Instruction::Close { count: 1, .. })
+            && window[1].close_path.is_some()
+    }));
+}
+
+#[test]
+fn p09_3_prefix_open_return_contract() {
+    let (profile, bytecode_profile, selected) = selected_profile();
+    for (case, source, prefix) in [
+        (
+            "call-one",
+            b"local f=function() return 1,2,3 end; return 9,f()".as_slice(),
+            1,
+        ),
+        (
+            "call-two",
+            b"local f=function() return 1,2,3 end; return 9,8,f()".as_slice(),
+            2,
+        ),
+        (
+            "vararg-one",
+            b"local f=function(a,...) return a,... end; local x,y,z=f(7,nil,9); return x,y,z"
+                .as_slice(),
+            1,
+        ),
+        (
+            "close-one",
+            b"local f=function() return 1,2 end; local c <close> = {}; return 9,f()"
+                .as_slice(),
+            1,
+        ),
+        (
+            "scope-close-one",
+            b"local f=function() return 1,2 end; do local x=9; local g=function() return x end; return x,f() end"
+                .as_slice(),
+            1,
+        ),
+    ] {
+        let output = encoded(source, profile);
+        assert_eq!(output.verified().format_version(), RVLU_V2);
+        decode_module(output.bytes(), bytecode_profile, &VerifyLimits::default()).unwrap();
+        assert!(output.verified().module().prototypes.iter().any(|prototype| {
+            prototype.instructions.iter().enumerate().any(|(index, entry)| {
+                let producer = match entry.instruction {
+                    Instruction::Call {
+                        base,
+                        result_mode: ResultMode::All,
+                        ..
+                    }
+                    | Instruction::Vararg {
+                        base,
+                        result_mode: ResultMode::All,
+                    } => base,
+                    _ => return false,
+                };
+                let next = prototype.instructions[index + 1..]
+                    .iter()
+                    .find(|next| !matches!(next.instruction, Instruction::Close { .. }));
+                matches!(next.map(|next| &next.instruction), Some(Instruction::Return { base, result_mode: ResultMode::All }) if producer.0 - base.0 == prefix)
+            })
+        }), "{case}: 前綴與 open producer base 差須保持");
+        println!("P09_CASE\tPREFIX-OPEN-{case}\t{selected}\tstatus=PASS");
+    }
+}
+
+#[test]
+fn p09_3_dynamic_call_arguments_contract() {
+    let (profile, bytecode_profile, selected) = selected_profile();
+    for (case, source, expect_vararg, expect_tail) in [
+        (
+            "call",
+            b"local f=function(...) return ... end; local g=function() return 1,2 end; local a,b=f(9,g()); return a,b".as_slice(),
+            false,
+            false,
+        ),
+        (
+            "vararg",
+            b"local f=function(...) return ... end; local w=function(...) local a,b=f(...); return a,b end; local x,y=w(1,2); return x,y".as_slice(),
+            true,
+            false,
+        ),
+        (
+            "method",
+            b"local t={m=function(self,...) return ... end}; local g=function() return 1,2 end; local a,b=t:m(g()); return a,b".as_slice(),
+            false,
+            false,
+        ),
+        (
+            "statement",
+            b"local f=function(...) end; local g=function() return 1,2 end; f(g()); return 7".as_slice(),
+            false,
+            false,
+        ),
+        (
+            "tail",
+            b"local f=function(...) return ... end; local g=function() return 1,2 end; return f(g())".as_slice(),
+            false,
+            true,
+        ),
+    ] {
+        let output = encoded(source, profile);
+        decode_module(output.bytes(), bytecode_profile, &VerifyLimits::default()).unwrap();
+        assert!(output.verified().module().prototypes.iter().any(|prototype| {
+            prototype.instructions.windows(2).any(|window| {
+                let producer = match window[0].instruction {
+                    Instruction::Call { base, result_mode: ResultMode::All, .. } if !expect_vararg => base,
+                    Instruction::Vararg { base, result_mode: ResultMode::All } if expect_vararg => base,
+                    _ => return false,
+                };
+                match window[1].instruction {
+                    Instruction::Call { base, arg_count: u16::MAX, .. } if !expect_tail => producer.0 > base.0,
+                    Instruction::TailCall { base, arg_count: u16::MAX, .. } if expect_tail => producer.0 > base.0,
+                    _ => false,
+                }
+            })
+        }), "{case}");
+        println!("P09_CASE\tDYNAMIC-CALL-ARGUMENTS-{case}\t{selected}\tstatus=PASS");
+    }
+}
+
+#[test]
+fn review_tail_dynamic_arguments_keep_open_producer_adjacent() {
+    let (profile, bytecode_profile, _) = selected_profile();
+    for (case, source) in [
+        ("call", b"local function outer() local x=1; local h=function() return x end; local function g() x=9; return 2,nil end; local function f(...) return h(),... end; return f(g()) end; return outer()".as_slice()),
+        ("vararg", b"local function outer(...) local x=1; local h=function() return x end; local function f(...) return h(),... end; return f(...) end; return outer(2,nil)".as_slice()),
+        ("method", b"local function outer() local x=1; local h=function() return x end; local t={f=function(self,...) return h(),... end}; local function g() x=9; return 2,nil end; return t:f(g()) end; return outer()".as_slice()),
+    ] {
+        let output = encoded(source, profile);
+        decode_module(output.bytes(), bytecode_profile, &VerifyLimits::default()).unwrap();
+        assert!(
+            output
+                .verified()
+                .module()
+                .prototypes
+                .iter()
+                .any(|prototype| {
+                    prototype.instructions.windows(2).any(|pair| {
+                        matches!(
+                            pair[0].instruction,
+                            Instruction::Call { result_mode: ResultMode::All, .. }
+                                | Instruction::Vararg { result_mode: ResultMode::All, .. }
+                        ) && matches!(
+                            pair[1].instruction,
+                            Instruction::TailCall { arg_count: u16::MAX, result_mode: ResultMode::All, .. }
+                        )
+                    })
+                }),
+            "{case}"
+        );
+    }
 }
 
 fn first_root_opcode_offset(bytes: &[u8]) -> usize {

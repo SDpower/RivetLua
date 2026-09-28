@@ -1,0 +1,14 @@
+profile|lua55-i64f64|lua55
+profile|lua54-i64f64|lua54
+case|TAB-001|compiler-vm|return #"\0A"|Returned(2)|byte string length counts bytes
+case|TAB-002|compiler-vm|local t={}; t[1]=7; return t[1.0]|Returned(Integer(7))|integer-valued float key canonicalizes to integer
+case|TAB-003|compiler-vm|local t={x=false}; return t.x|Returned(Boolean(false))|false is present rather than absent
+case|TAB-004|raw-api|raw_set(Nil,1)|NilTableKey|nil write key is rejected without mutation
+case|TAB-005|raw-api|raw_set(Float(NaN),1)|NaNTableKey|NaN write key is rejected without mutation
+case|TAB-006|compiler-vm|local t={x=1}; t.x=nil; return t.x|Returned(Nil)|nil value removes the field
+case|TAB-007|compiler-vm|local t={}; t[1]=7; t[3]=9; return #t|valid_border|hole table result satisfies border predicate
+case|TAB-008|runtime-contract|forced_gc_vm_stack_and_table_fields|stack_2_live_then_removed_5_table_1|key and value tracing with collection
+case|TAB-009|runtime-contract|rehash_failpoint,quota,overflow,init,string_reserve|fields_and_ledger_unchanged|failed growth preserves fields and accounting
+case|TAB-010|runtime-internal|internal_raw_traversal|five_fields_each_once|two insertion orders produce the same field set
+case|TAB-011|raw-api|raw_get(Nil)|Nil|nil read key is absent without mutation
+case|TAB-012|raw-api|raw_get(Float(NaN))|Nil|NaN read key is absent without mutation

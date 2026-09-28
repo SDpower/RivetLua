@@ -63,6 +63,18 @@ jobs:
       - name: Verify minimal virtual machine
         run: cargo run --locked -p rivetlua-xtask -- gate P07
 
+      - name: Verify byte strings and raw tables
+        run: cargo run --locked -p rivetlua-xtask -- gate P08
+
+      - name: Verify functions and closures
+        run: cargo run --locked -p rivetlua-xtask -- gate P09
+
+      - name: Verify metatables and pending operations
+        run: cargo run --locked -p rivetlua-xtask -- gate P10
+
+      - name: Verify errors, coroutines, and close values
+        run: cargo run --locked -p rivetlua-xtask -- gate P11
+
       - name: Save gate reports
         if: always()
         uses: actions/upload-artifact@v4

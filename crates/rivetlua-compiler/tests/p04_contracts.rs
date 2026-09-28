@@ -72,6 +72,182 @@ fn resolve_error(
 }
 
 #[test]
+fn p09_2_scope_close_exit_paths_keep_captured_binding_ids() {
+    let (profile, _) = selected_profile();
+    let limits = CompileLimits::default();
+    let source = b"local f; do local x=7; f=function() return x end end; return f";
+    let module = resolved(source, profile, &limits);
+    let body = module
+        .root
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::Do { body, .. } = statement {
+                Some(body)
+            } else {
+                None
+            }
+        })
+        .expect("do scope 須存在");
+    let binding = body
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::Local { bindings, .. } = statement {
+                Some(bindings[0])
+            } else {
+                None
+            }
+        })
+        .expect("captured local 須存在");
+    assert!(body.normal_close_path.exited_bindings.contains(&binding));
+
+    let source =
+        b"local f; while true do local x=7; f=function() return x end; break end; return f";
+    let module = resolved(source, profile, &limits);
+    let body = module
+        .root
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::While { body, .. } = statement {
+                Some(body)
+            } else {
+                None
+            }
+        })
+        .expect("while scope 須存在");
+    let binding = body
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::Local { bindings, .. } = statement {
+                Some(bindings[0])
+            } else {
+                None
+            }
+        })
+        .expect("break 前 local 須存在");
+    let close_path = body
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::Break { close_path, .. } = statement {
+                Some(close_path)
+            } else {
+                None
+            }
+        })
+        .expect("break 須存在");
+    assert_eq!(close_path.kind, ExitKind::Break);
+    assert!(close_path.exited_bindings.contains(&binding));
+
+    let source = b"local f; do local x=7; f=function() return x end; goto L end ::L:: return f";
+    let module = resolved(source, profile, &limits);
+    let body = module
+        .root
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::Do { body, .. } = statement {
+                Some(body)
+            } else {
+                None
+            }
+        })
+        .expect("goto scope 須存在");
+    let binding = body
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::Local { bindings, .. } = statement {
+                Some(bindings[0])
+            } else {
+                None
+            }
+        })
+        .expect("goto 前 local 須存在");
+    let close_path = body
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::Goto { close_path, .. } = statement {
+                Some(close_path)
+            } else {
+                None
+            }
+        })
+        .expect("goto 須存在");
+    assert_eq!(close_path.kind, ExitKind::Goto);
+    assert!(close_path.exited_bindings.contains(&binding));
+
+    let source = b"do local x=7; local f=function() return x end; return f end";
+    let module = resolved(source, profile, &limits);
+    let body = module
+        .root
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::Do { body, .. } = statement {
+                Some(body)
+            } else {
+                None
+            }
+        })
+        .expect("return scope 須存在");
+    let binding = body
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::Local { bindings, .. } = statement {
+                Some(bindings[0])
+            } else {
+                None
+            }
+        })
+        .expect("return 前 local 須存在");
+    let close_path = body
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::Return { close_path, .. } = statement {
+                Some(close_path)
+            } else {
+                None
+            }
+        })
+        .expect("return 須存在");
+    assert_eq!(close_path.kind, ExitKind::Return);
+    assert!(close_path.exited_bindings.contains(&binding));
+
+    let module = resolved(
+        b"for k in iter, state, control, closing do break end",
+        profile,
+        &limits,
+    );
+    let (name, hidden, close_path) = module
+        .root
+        .statements
+        .iter()
+        .find_map(|statement| {
+            if let ResolvedStmt::GenericFor {
+                names,
+                closing,
+                close_path,
+                ..
+            } = statement
+            {
+                Some((names[0].binding, closing.binding, close_path))
+            } else {
+                None
+            }
+        })
+        .expect("generic-for scope 須存在");
+    assert!(close_path.exited_bindings.contains(&name));
+    assert!(close_path.exited_bindings.contains(&hidden));
+}
+
+#[test]
 fn p04_contract_cases_for_one_profile() {
     let (profile, full_profile) = selected_profile();
     assert_eq!(expected(&format!("profile.{full_profile}")), full_profile);
