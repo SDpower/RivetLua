@@ -10,9 +10,9 @@ fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
 }
 
-fn stamp_prerequisite_reports_for_negative_test(root: &Path, through: &str) {
-    let script = r#"import hashlib,json,os,pathlib,subprocess,sys
-root=pathlib.Path(sys.argv[1]); last=int(sys.argv[2][1:]); cwd=os.fsencode(root)
+fn current_source_digest(root: &Path) -> String {
+    let script = r#"import hashlib,os,subprocess,sys
+root=sys.argv[1]; cwd=os.fsencode(root)
 paths=sorted(set(filter(None,subprocess.check_output(['git','ls-files','--cached','--others','--exclude-standard','-z'],cwd=root).split(b'\0'))))
 h=hashlib.sha256(); h.update(b'RivetLua-source-digest-v1\0')
 for name in paths:
@@ -25,19 +25,94 @@ for name in paths:
         data=open(path,'rb').read(); h.update(b'F'); h.update(len(data).to_bytes(8,'big')); h.update(data)
     elif os.path.isdir(path): h.update(b'D')
     else: h.update(b'O')
+print(h.hexdigest())
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "測試來源 digest 計算失敗：{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn ensure_prerequisite_reports(root: &Path, through: &str) {
+    let report_dir = root.join("target/rivetlua-reports");
+    fs::create_dir_all(&report_dir).unwrap();
+    let digest = current_source_digest(root);
+    let script = r#"import json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); last=int(sys.argv[2][1:]); digest=sys.argv[3]
+for phase in range(last+1):
+    path=root/'target/rivetlua-reports'/f'gate-P{phase:02}.json'
+    try: report=json.loads(path.read_bytes())
+    except (OSError,ValueError,UnicodeError): report=None
+    checks=report.get('checks') if isinstance(report,dict) else None
+    valid=(isinstance(report,dict) and report.get('status')=='PASS'
+           and report.get('source_digest')==digest
+           and isinstance(checks,list) and bool(checks))
+    if valid:
+        valid=all(isinstance(check,dict)
+                  and isinstance(check.get('name'),str) and check['name'].strip()
+                  and isinstance(check.get('command'),str) and check['command'].strip()
+                  and type(check.get('exit_code')) is int and check['exit_code']==0
+                  and check.get('status')=='PASS'
+                  and isinstance(check.get('diagnostic'),str) and check['diagnostic'].strip()
+                  and isinstance(check.get('report_path'),str) and check['report_path'].strip()
+                  for check in checks)
+    if valid and phase==7:
+        valid=all(sum(check['name']==name for check in checks)==1 for name in
+                  ('p01-before','p05-before','p06-before','p00-p06-before'))
+    if not valid: print(f'P{phase:02}')
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(root)
+        .arg(through)
+        .arg(&digest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "前置 gate 報告檢查失敗：{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for phase in String::from_utf8(output.stdout).unwrap().lines() {
+        let gate = Command::new(BIN)
+            .current_dir(root)
+            .args(["gate", phase])
+            .output()
+            .unwrap();
+        assert!(
+            gate.status.success(),
+            "重建 {phase} 前置 gate 失敗：stdout={} stderr={}",
+            String::from_utf8_lossy(&gate.stdout),
+            String::from_utf8_lossy(&gate.stderr)
+        );
+    }
+}
+
+fn stamp_prerequisite_reports_for_negative_test(root: &Path, through: &str) {
+    let digest = current_source_digest(root);
+    let script = r#"import json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); last=int(sys.argv[2][1:]); digest=sys.argv[3]
 for phase in range(last+1):
     path=root/'target/rivetlua-reports'/f'gate-P{phase:02}.json'
     if not path.exists(): continue
     try: report=json.loads(path.read_bytes())
     except (ValueError,UnicodeError): continue
     if not isinstance(report,dict) or report.get('status')!='PASS': continue
-    report['source_digest']=h.hexdigest()
+    report['source_digest']=digest
     path.write_text(json.dumps(report,ensure_ascii=False,separators=(',',':'))+'\n',encoding='utf-8')
 "#;
     let output = Command::new("python3")
         .args(["-c", script])
         .arg(root)
         .arg(through)
+        .arg(&digest)
         .output()
         .unwrap();
     assert!(
@@ -1072,6 +1147,7 @@ fn p07_failed_p01_prerequisite_writes_fail_json_and_restores_fixture() {
 fn p08_invalid_fixture_csv_and_prerequisites_fail_then_full_gate_passes() {
     let _guard = CLI_TEST_LOCK.lock().unwrap();
     let root = workspace_root();
+    ensure_prerequisite_reports(root, "P06");
     let p07_rebuild = Command::new(BIN)
         .current_dir(root)
         .args(["gate", "P07"])
@@ -1278,6 +1354,7 @@ assert len(glob.glob(os.path.join(os.path.dirname(sys.argv[1]),'P08-TAB-*.json')
 fn p09_gate_failure_writes_parseable_fail_aggregate() {
     let _guard = CLI_TEST_LOCK.lock().unwrap();
     let root = workspace_root();
+    ensure_prerequisite_reports(root, "P08");
     let status_original = git_status_snapshot(root);
     let report_path = root.join("target/rivetlua-reports/gate-P09.json");
     let previous_report = RestoreBytes::new(report_path.clone());
@@ -1329,6 +1406,7 @@ fn p09_gate_failure_writes_parseable_fail_aggregate() {
 fn p09_invalid_inputs_prerequisites_and_child_fail_then_full_gate_passes() {
     let _guard = CLI_TEST_LOCK.lock().unwrap();
     let root = workspace_root();
+    ensure_prerequisite_reports(root, "P08");
     let status_original = git_status_snapshot(root);
     let report_dir = root.join("target/rivetlua-reports");
     let report_path = report_dir.join("gate-P09.json");
@@ -1506,6 +1584,7 @@ assert all(any(check['name']==name and check['status']=='PASS' for check in repo
 fn p10_gate_fail_fast_writes_json_and_clears_stale_cases() {
     let _guard = CLI_TEST_LOCK.lock().unwrap();
     let root = workspace_root();
+    ensure_prerequisite_reports(root, "P09");
     let status_original = git_status_snapshot(root);
     let report_dir = root.join("target/rivetlua-reports");
     let report_path = report_dir.join("gate-P10.json");
@@ -1555,6 +1634,7 @@ fn p10_gate_fail_fast_writes_json_and_clears_stale_cases() {
 fn p10_prerequisites_fixture_and_csv_fail_fast_restore_bytes() {
     let _guard = CLI_TEST_LOCK.lock().unwrap();
     let root = workspace_root();
+    ensure_prerequisite_reports(root, "P09");
     let status_original = git_status_snapshot(root);
     let report_dir = root.join("target/rivetlua-reports");
     let report_path = report_dir.join("gate-P10.json");
@@ -1693,6 +1773,7 @@ fn p10_prerequisites_fixture_and_csv_fail_fast_restore_bytes() {
 fn p10_runtime_child_and_marker_failures_write_fail_aggregates() {
     let _guard = CLI_TEST_LOCK.lock().unwrap();
     let root = workspace_root();
+    ensure_prerequisite_reports(root, "P09");
     let status_original = git_status_snapshot(root);
     let report_dir = root.join("target/rivetlua-reports");
     let report_path = report_dir.join("gate-P10.json");
@@ -1746,6 +1827,7 @@ fn p10_and_p11_reject_stale_or_invalid_source_digest_before_child() {
     let root = workspace_root();
     let original_status = git_status_snapshot(root);
     let report_dir = root.join("target/rivetlua-reports");
+    fs::create_dir_all(&report_dir).unwrap();
     let _restore_reports = (0..=11)
         .map(|phase| RestoreBytes::new(report_dir.join(format!("gate-P{phase:02}.json"))))
         .collect::<Vec<_>>();
@@ -1853,6 +1935,7 @@ fn p10_and_p11_reject_stale_or_invalid_source_digest_before_child() {
 fn p11_gate_rejects_invalid_prerequisites_inputs_and_child_evidence() {
     let _guard = CLI_TEST_LOCK.lock().unwrap();
     let root = workspace_root();
+    ensure_prerequisite_reports(root, "P10");
     let status_original = git_status_snapshot(root);
     let report_dir = root.join("target/rivetlua-reports");
     let report_path = report_dir.join("gate-P11.json");
@@ -2204,6 +2287,7 @@ fn p11_sha256_from_bytes(bytes: &[u8]) -> String {
 fn p11_gate_produces_all_formal_case_reports() {
     let _guard = CLI_TEST_LOCK.lock().unwrap();
     let root = workspace_root();
+    ensure_prerequisite_reports(root, "P10");
     let report_dir = root.join("target/rivetlua-reports");
     let report_path = report_dir.join("gate-P11.json");
     let _previous_cases = RestoreP11Cases::new(&report_dir);
