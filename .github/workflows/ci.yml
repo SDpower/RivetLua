@@ -75,6 +75,12 @@ jobs:
       - name: Verify errors, coroutines, and close values
         run: cargo run --locked -p rivetlua-xtask -- gate P11
 
+      - name: Verify full GC, weak references, and allocation failures
+        run: cargo run --locked -p rivetlua-xtask -- gate P12
+
+      - name: Verify standard libraries and module loading
+        run: cargo run --locked -p rivetlua-xtask -- gate P13
+
       - name: Save gate reports
         if: always()
         uses: actions/upload-artifact@v4

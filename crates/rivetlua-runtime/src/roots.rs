@@ -122,7 +122,7 @@ impl RootSet {
         ledger.checkpoint(FailPoint::RootReserve)?;
         self.entries
             .try_reserve_exact(1)
-            .map_err(|_| VmError::AllocationFailed)?;
+            .map_err(|_| ticket.rust_reserve_failure())?;
         ticket.commit()?;
         self.next_sequence += 1;
         self.entries.push(RootEntry {
@@ -154,7 +154,7 @@ impl RootSet {
         ledger.checkpoint(FailPoint::RootReserve)?;
         self.entries
             .try_reserve_exact(1)
-            .map_err(|_| VmError::AllocationFailed)?;
+            .map_err(|_| ticket.rust_reserve_failure())?;
         ledger.checkpoint(FailPoint::HostLease)?;
         let lease = RootLease::new(ledger, charge);
         ticket.commit()?;
@@ -202,6 +202,16 @@ impl RootSet {
         self.entries.retain(RootEntry::is_active);
     }
 
+    pub(crate) fn release_all_on_vm_drop(&mut self, ledger: &AllocationLedger) {
+        for entry in self.entries.drain(..) {
+            if let Some(lease) = entry.lease {
+                lease.deactivate();
+            } else {
+                ledger.refund_on_drop(entry.charge);
+            }
+        }
+    }
+
     pub fn count(&self, kind: RootKind) -> usize {
         self.entries
             .iter()
@@ -224,13 +234,35 @@ impl RootSet {
         }
     }
 
+    pub fn visit_labeled(&self, mut f: impl FnMut(RootKind, RootId, ObjectRef)) {
+        for entry in &self.entries {
+            if entry.is_active() {
+                f(entry.kind, entry.id, entry.object);
+            }
+        }
+    }
+
+    pub(crate) fn active_object(&self, id: RootId) -> Option<ObjectRef> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id && entry.is_active())
+            .map(|entry| entry.object)
+    }
+
     pub(crate) fn try_visit_all(
         &self,
         mut f: impl FnMut(ObjectRef) -> Result<(), VmError>,
     ) -> Result<(), VmError> {
+        self.try_visit_labeled(|_, _, object| f(object))
+    }
+
+    pub(crate) fn try_visit_labeled(
+        &self,
+        mut f: impl FnMut(RootKind, RootId, ObjectRef) -> Result<(), VmError>,
+    ) -> Result<(), VmError> {
         for entry in &self.entries {
             if entry.is_active() {
-                f(entry.object)?;
+                f(entry.kind, entry.id, entry.object)?;
             }
         }
         Ok(())

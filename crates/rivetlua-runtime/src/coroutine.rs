@@ -6,6 +6,7 @@ use crate::alloc::AllocationLedger;
 use crate::call::CallFrame;
 use crate::errors::ProtectedBoundary;
 use crate::pending_op::PendingStack;
+use crate::stdlib::debug::DebugHook;
 use crate::unwind::CloseUnwind;
 use crate::vm::{NativeCompletion, RuntimeError};
 use crate::{RootId, RootKind, Vm, VmError};
@@ -178,6 +179,7 @@ pub(crate) struct Coroutine {
     pub(crate) native_yielded: bool,
     pub(crate) native: Option<NativeCompletion>,
     pub(crate) native_bridge: Option<ObjectRef>,
+    pub(crate) debug_hook: Option<DebugHook>,
 }
 
 impl Coroutine {
@@ -191,6 +193,7 @@ impl Coroutine {
             native_yielded: false,
             native: None,
             native_bridge: None,
+            debug_hook: None,
         }
     }
 
@@ -207,24 +210,17 @@ impl Coroutine {
         if let Some(object) = self.native_bridge {
             visit(object)?;
         }
+        if let Some(hook) = self.debug_hook {
+            visit(hook.function)?;
+        }
         if let Some(context) = &self.context {
             context.trace_children(&mut visit)?;
         }
         if let Some(context) = &self.unwind_context {
             context.trace_children(&mut visit)?;
         }
-        if let Some(
-            NativeCompletion::XPCallBody {
-                handler: Value::Object(object),
-                ..
-            }
-            | NativeCompletion::XPCallHandler {
-                handler: Value::Object(object),
-                ..
-            },
-        ) = self.native
-        {
-            visit(object)?;
+        if let Some(native) = self.native {
+            crate::gc::trace::trace_native(native, &mut visit)?;
         }
         Ok(())
     }

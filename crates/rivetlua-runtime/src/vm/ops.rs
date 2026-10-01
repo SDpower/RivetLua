@@ -145,6 +145,21 @@ fn format_lua_float(
     Ok(())
 }
 
+pub(super) fn basic_number_bytes(
+    value: Value,
+    profile: LuaProfile,
+) -> Result<([u8; 128], usize), RuntimeError> {
+    let mut number = NumberBytes::new();
+    match value {
+        Value::Integer(value) => {
+            write!(number, "{value}").map_err(|_| VmError::ArithmeticOverflow)?;
+        }
+        Value::Float(value) => format_lua_float(&mut number, value, profile)?,
+        _ => return Err(RuntimeError::new(RuntimeErrorKind::BasicArgument)),
+    }
+    Ok((number.bytes, number.len))
+}
+
 fn concat_piece_len(
     vm: &Vm,
     profile: LuaProfile,
@@ -260,6 +275,11 @@ pub(super) fn length(vm: &Vm, operand: Value) -> Result<Value, RuntimeError> {
         | ObjectKind::Coroutine
         | ObjectKind::Upvalue
         | ObjectKind::Module => {
+            return Err(RuntimeError::new(
+                RuntimeErrorKind::UnsupportedUnaryOperation(UnaryOperation::Length),
+            ));
+        }
+        ObjectKind::File => {
             return Err(RuntimeError::new(
                 RuntimeErrorKind::UnsupportedUnaryOperation(UnaryOperation::Length),
             ));

@@ -95,6 +95,87 @@ for phase in range(last+1):
     }
 }
 
+fn ensure_p12_prerequisite_reports(root: &Path) {
+    let report_dir = root.join("target/rivetlua-reports");
+    fs::create_dir_all(&report_dir).unwrap();
+    let digest = current_source_digest(root);
+    let script = r#"import json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); last=11; digest=sys.argv[2]
+for phase in range(last+1):
+    path=root/'target/rivetlua-reports'/f'gate-P{phase:02}.json'
+    try: report=json.loads(path.read_bytes())
+    except (OSError,ValueError,UnicodeError): report=None
+    checks=report.get('checks') if isinstance(report,dict) else None
+    valid=(isinstance(report,dict) and report.get('status')=='PASS'
+           and report.get('source_digest')==digest
+           and isinstance(checks,list) and bool(checks))
+    if valid:
+        valid=all(isinstance(check,dict)
+                  and isinstance(check.get('name'),str) and check['name'].strip()
+                  and isinstance(check.get('command'),str) and check['command'].strip()
+                  and type(check.get('exit_code')) is int
+                  and check.get('status')=='PASS'
+                  and isinstance(check.get('diagnostic'),str) and check['diagnostic'].strip()
+                  and isinstance(check.get('report_path'),str) and check['report_path'].strip()
+                  for check in checks)
+    if valid and phase==7:
+        valid=all(sum(check['name']==name for check in checks)==1 for name in
+                  ('p01-before','p05-before','p06-before','p00-p06-before'))
+    if not valid: print(f'P{phase:02}')
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(root)
+        .arg(&digest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "P12 prerequisite report scan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stale: std::collections::HashSet<_> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    for phase in 0..=11 {
+        let name = format!("P{phase:02}");
+        let log_path = report_dir.join(format!("p12-prerequisite-{name}.log"));
+        if !stale.contains(&name) {
+            fs::write(
+                log_path,
+                format!("reused fresh PASS report; source_digest={digest}\n"),
+            )
+            .unwrap();
+            continue;
+        }
+        let command = format!("{} gate {name}", BIN);
+        let output = Command::new(BIN)
+            .current_dir(root)
+            .args(["gate", &name])
+            .output()
+            .unwrap();
+        let exit_code = output.status.code().unwrap_or(1);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        fs::write(
+            &log_path,
+            format!(
+                "command={command}\nexit_code={exit_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n"
+            ),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "重建 {name} 前置 gate 失敗，log={}：stdout={} stderr={}",
+            log_path.display(),
+            stdout,
+            stderr
+        );
+    }
+}
+
 fn stamp_prerequisite_reports_for_negative_test(root: &Path, through: &str) {
     let digest = current_source_digest(root);
     let script = r#"import json,pathlib,sys
@@ -2323,4 +2404,1198 @@ fn p11_gate_produces_all_formal_case_reports() {
         "P11 PASS aggregate 欄位無效：{}",
         String::from_utf8_lossy(&checked.stderr)
     );
+}
+
+fn assert_no_p12_case_reports(report_dir: &Path) {
+    for entry in fs::read_dir(report_dir).unwrap().flatten() {
+        assert!(
+            !entry.file_name().to_string_lossy().starts_with("P12-"),
+            "P12 failure retained a stale case report: {}",
+            entry.path().display()
+        );
+    }
+}
+
+struct RestoreP12Cases {
+    report_dir: PathBuf,
+    reports: Vec<(PathBuf, Vec<u8>)>,
+}
+
+impl RestoreP12Cases {
+    fn new(report_dir: &Path) -> Self {
+        let reports = fs::read_dir(report_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("P12-"))
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| (entry.path(), fs::read(entry.path()).unwrap()))
+            .collect();
+        Self {
+            report_dir: report_dir.to_path_buf(),
+            reports,
+        }
+    }
+}
+
+impl Drop for RestoreP12Cases {
+    fn drop(&mut self) {
+        let preserved: std::collections::HashSet<_> =
+            self.reports.iter().map(|(path, _)| path.clone()).collect();
+        for entry in fs::read_dir(&self.report_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if entry.file_name().to_string_lossy().starts_with("P12-")
+                && !preserved.contains(&entry.path())
+            {
+                if entry.path().is_dir() {
+                    fs::remove_dir_all(entry.path()).unwrap();
+                } else {
+                    fs::remove_file(entry.path()).unwrap();
+                }
+            }
+        }
+        for (path, contents) in &self.reports {
+            fs::write(path, contents).unwrap();
+        }
+    }
+}
+
+struct RestoreP12Prerequisites {
+    reports: Vec<(PathBuf, Vec<u8>)>,
+}
+
+impl RestoreP12Prerequisites {
+    fn new(report_dir: &Path) -> Self {
+        let reports = (0..=11)
+            .map(|phase| report_dir.join(format!("gate-P{phase:02}.json")))
+            .filter(|path| path.exists())
+            .map(|path| (path.clone(), fs::read(path).unwrap()))
+            .collect();
+        Self { reports }
+    }
+}
+
+impl Drop for RestoreP12Prerequisites {
+    fn drop(&mut self) {
+        for (path, contents) in &self.reports {
+            fs::write(path, contents).unwrap();
+        }
+    }
+}
+
+fn make_p12_fake_cargo(directory: &Path) -> PathBuf {
+    fs::create_dir_all(directory).unwrap();
+    let fake = directory.join("cargo");
+    fs::write(
+        &fake,
+        r##"#!/usr/bin/env python3
+import os, pathlib, sys
+scenario = os.environ.get('RIVETLUA_P12_FAKE', 'valid')
+log = os.environ.get('RIVETLUA_P12_CHILD_LOG')
+args = sys.argv[1:]
+is_lib = '--lib' in args
+is_reentry = any('p12_5_reentrant_gc_is_rejected_without_losing_queue' in arg for arg in args)
+profile = os.environ.get('RIVETLUA_P12_PROFILE', '')
+if log:
+    if is_lib:
+        label = 'reentry' if is_reentry else 'unit'
+    elif '--test' in args:
+        label = profile + ':' + args[args.index('--test') + 2]
+    else:
+        label = 'filter:' + args[args.index('rivetlua-runtime') + 1]
+    with open(log, 'a', encoding='utf-8') as stream:
+        stream.write(label + '\n')
+if is_lib and is_reentry:
+    if scenario == 'reentry-fail':
+        print('test result: FAILED. 0 passed; 1 failed')
+        raise SystemExit(101)
+    print('test vm::tests::p12_5_reentrant_gc_is_rejected_without_losing_queue ... ok')
+    print('test result: ok. 1 passed; 0 failed; 176 filtered out; finished in 0.00s')
+    raise SystemExit(0)
+if is_lib:
+    count = 0 if scenario == 'unit-zero' else 46
+    print(f'test result: ok. {count} passed; 0 failed; {177-count} filtered out; finished in 0.00s')
+    raise SystemExit(1 if scenario == 'unit-fail' else 0)
+if '--test' not in args:
+    if scenario == 'filter-fail' and args[args.index('rivetlua-runtime') + 1] == 'gc':
+        print('filter child failed')
+        raise SystemExit(2)
+    count = 0 if scenario == 'filter-zero' else 2
+    print(f'test result: ok. {count} passed; 0 failed; 100 filtered out; finished in 0.00s')
+    raise SystemExit(0)
+if scenario == 'case-fail':
+    print('formal child failed')
+    print('test result: FAILED. 0 passed; 1 failed')
+    raise SystemExit(101)
+test_name = args[args.index('--test') + 2]
+fixture = pathlib.Path('tests/p12/gc-cases.fixture').read_text(encoding='utf-8').splitlines()
+fields = next(line.split('|') for line in fixture if line.startswith('case|') and line.split('|')[1] == profile and line.split('|')[4] == test_name)
+case_id, marker, actual = fields[2], fields[5], fields[6]
+count = 0 if scenario == 'case-zero' else (2 if scenario == 'case-extra' else 1)
+print(f'test result: ok. {count} passed; 0 failed; {100-count} filtered out; finished in 0.00s')
+if scenario == 'missing-marker':
+    raise SystemExit(0)
+if scenario == 'unknown-marker':
+    case_id = 'GC-UNKNOWN'
+if scenario == 'wrong-actual':
+    actual = 'wrong=actual'
+if scenario == 'cross-profile':
+    profile = 'lua54-i64f64' if profile == 'lua55-i64f64' else 'lua55-i64f64'
+line = f'P12_CASE\t{case_id}\t{profile}\tstatus=PASS;actual={actual};diagnostic=asserted-by-fake-formal-case'
+if scenario == 'report-write-fail':
+    pathlib.Path('target/rivetlua-reports/P12-GC-001-lua55.json').mkdir(parents=True, exist_ok=True)
+print(line)
+if scenario == 'duplicate-marker':
+    print(line)
+"##,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    fake
+}
+
+fn assert_p12_gate_failure(
+    root: &Path,
+    report_dir: &Path,
+    report_path: &Path,
+    fake_cargo_dir: &Path,
+    scenario: &str,
+    child_log: &Path,
+    expected_check: &str,
+    expected_diagnostic: &str,
+    expect_child: bool,
+) -> String {
+    stamp_prerequisite_reports_for_negative_test(root, "P11");
+    fs::write(
+        report_dir.join("P12-GC-001-lua55.json"),
+        b"{\"status\":\"PASS\"}\n",
+    )
+    .unwrap();
+    let fake_path = std::env::join_paths(
+        std::iter::once(fake_cargo_dir.to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let output = Command::new(BIN)
+        .current_dir(root)
+        .env("PATH", fake_path)
+        .env("RIVETLUA_P12_FAKE", scenario)
+        .env("RIVETLUA_P12_CHILD_LOG", child_log)
+        .args(["gate", "P12"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "P12 negative scenario {scenario} unexpectedly passed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_gate_report_is_json(report_path);
+    assert_no_p12_case_reports(report_dir);
+    let checked = Command::new("python3")
+        .args([
+            "-c",
+            "import json,re,sys; r=json.load(open(sys.argv[1])); assert r['status']=='FAIL'; assert re.fullmatch('[0-9a-f]{64}',r.get('source_digest','')); assert isinstance(r.get('checks'),list) and r['checks']; required={'name','command','exit_code','status','diagnostic','report_path'}; assert all(required <= c.keys() for c in r['checks']); assert any(c['status']=='FAIL' and isinstance(c['exit_code'],int) and c['exit_code'] != 0 and c['command'] and c['diagnostic'] and c['report_path'] for c in r['checks'])",
+        ])
+        .arg(report_path)
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "P12 FAIL JSON schema invalid: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let report = fs::read_to_string(report_path).unwrap();
+    assert!(
+        report.contains(expected_check),
+        "{scenario}: missing check {expected_check}"
+    );
+    assert!(
+        report.contains(expected_diagnostic),
+        "{scenario}: missing diagnostic {expected_diagnostic}"
+    );
+    if expect_child {
+        assert!(
+            child_log.exists(),
+            "{scenario} did not invoke fake child commands"
+        );
+        let children = fs::read_to_string(child_log).unwrap();
+        assert!(
+            children.contains("unit"),
+            "{scenario}: missing runtime unit command: {children}"
+        );
+        for filter in [
+            "gc",
+            "weak",
+            "ephemeron",
+            "finalizer",
+            "allocation_failure",
+            "vm_lifecycle",
+        ] {
+            assert!(
+                children.contains(&format!("filter:{filter}")),
+                "{scenario}: missing filter {filter}: {children}"
+            );
+        }
+        assert!(
+            children.contains("reentry"),
+            "{scenario}: missing GC-009 reentry unit: {children}"
+        );
+    } else if scenario == "valid" {
+        assert!(
+            !child_log.exists(),
+            "{scenario} unexpectedly started a child command"
+        );
+    }
+    report
+}
+
+#[test]
+fn p12_fake_reentry_failure_matches_exact_module_filter() {
+    let fake_dir =
+        std::env::temp_dir().join(format!("rivetlua-p12-fake-reentry-{}", std::process::id()));
+    let fake_cargo = make_p12_fake_cargo(&fake_dir);
+    let child_log = fake_dir.join("child.log");
+    let output = Command::new(fake_cargo)
+        .env("RIVETLUA_P12_FAKE", "reentry-fail")
+        .env("RIVETLUA_P12_CHILD_LOG", &child_log)
+        .args([
+            "test",
+            "--locked",
+            "-p",
+            "rivetlua-runtime",
+            "--lib",
+            "vm::tests::p12_5_reentrant_gc_is_rejected_without_losing_queue",
+            "--",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(101));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("test result: FAILED"));
+    assert_eq!(fs::read_to_string(child_log).unwrap(), "reentry\n");
+    fs::remove_dir_all(fake_dir).unwrap();
+}
+
+#[test]
+fn p12_gate_produces_twenty_unique_formal_case_reports() {
+    let _guard = CLI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = workspace_root();
+    ensure_p12_prerequisite_reports(root);
+    let report_dir = root.join("target/rivetlua-reports");
+    let report_path = report_dir.join("gate-P12.json");
+    let _previous_cases = RestoreP12Cases::new(&report_dir);
+    let _previous_aggregate = RestoreBytes::new(report_path.clone());
+    let _previous_prerequisites = RestoreP12Prerequisites::new(&report_dir);
+    stamp_prerequisite_reports_for_negative_test(root, "P11");
+    let output = Command::new(BIN)
+        .current_dir(root)
+        .args(["gate", "P12"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "P12 gate 應產生 20 份 formal case：stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let names: std::collections::HashSet<_> = fs::read_dir(&report_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("P12-GC-"))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 20, "P12 必須有恰好 20 份 unique case JSON");
+    let checked = Command::new("python3")
+        .args([
+            "-c",
+            "import json,re,pathlib,sys; p=pathlib.Path(sys.argv[1]); r=json.loads(p.read_text()); assert r['status']=='PASS'; assert re.fullmatch('[0-9a-f]{64}',r['source_digest']); assert isinstance(r.get('checks'),list) and all(c.get('status')=='PASS' and c.get('exit_code')==0 for c in r['checks']); cases=[c for c in r['checks'] if c['name'].startswith('GC-')]; assert len(cases)==20 and len({c['name'] for c in cases})==20; assert sum(c['name']=='p12-reentry-unit' and 'exact runtime unit vm::tests::p12_5_reentrant_gc_is_rejected_without_losing_queue' in c['diagnostic'] for c in r['checks'])==1; reports=list(p.parent.glob('P12-GC-*.json')); assert len(reports)==20; assert all(json.loads(x.read_text())['status']=='PASS' and json.loads(x.read_text())['source_digest']==r['source_digest'] for x in reports)",
+        ])
+        .arg(&report_path)
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "P12 PASS aggregate invalid: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    for profile in ["lua55", "lua54"] {
+        let report =
+            fs::read_to_string(report_dir.join(format!("P12-GC-009-{profile}.json"))).unwrap();
+        assert!(report.contains("composite evidence: gc_case_009 yield/error assertions plus exact runtime unit vm::tests::p12_5_reentrant_gc_is_rejected_without_losing_queue PASS"));
+        assert!(report.contains("the formal case itself does not execute GC reentry"));
+    }
+}
+
+#[test]
+fn p12_gate_rejects_invalid_fixture_csv_and_child_evidence() {
+    let _guard = CLI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = workspace_root();
+    ensure_p12_prerequisite_reports(root);
+    let report_dir = root.join("target/rivetlua-reports");
+    let report_path = report_dir.join("gate-P12.json");
+    let _previous_cases = RestoreP12Cases::new(&report_dir);
+    let _previous_aggregate = RestoreBytes::new(report_path.clone());
+    let _previous_prerequisites = RestoreP12Prerequisites::new(&report_dir);
+    let fixture_path = root.join("tests/p12/gc-cases.fixture");
+    let csv_path = root.join("spec/compatibility.csv");
+    let fixture_original = fs::read(&fixture_path).unwrap();
+    let csv_original = fs::read(&csv_path).unwrap();
+    let _restore_fixture = RestoreBytes::new(fixture_path.clone());
+    let _restore_csv = RestoreBytes::new(csv_path.clone());
+    let fixture_text = String::from_utf8(fixture_original.clone()).unwrap();
+    let csv_text = String::from_utf8(csv_original.clone()).unwrap();
+    let status_original = git_status_snapshot(root);
+    let fake_dir = std::env::temp_dir().join(format!("rivetlua-p12-cli-{}", std::process::id()));
+    let fake_cargo = make_p12_fake_cargo(&fake_dir);
+    let fake_cargo_dir = fake_cargo.parent().unwrap();
+    let child_log = fake_dir.join("child.log");
+
+    let p11_path = report_dir.join("gate-P11.json");
+    let p11_original = fs::read(&p11_path).unwrap();
+    let digest = current_source_digest(root);
+    let stale_p11 = String::from_utf8(p11_original.clone())
+        .unwrap()
+        .replace(&digest, &format!("{}", "0".repeat(64)));
+    assert_ne!(stale_p11.as_bytes(), p11_original.as_slice());
+    fs::write(&p11_path, stale_p11).unwrap();
+    fs::write(
+        report_dir.join("P12-GC-001-lua55.json"),
+        b"{\"status\":\"PASS\"}\n",
+    )
+    .unwrap();
+    let no_child_path = std::env::join_paths(
+        std::iter::once(fake_cargo_dir.to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let stale_output = Command::new(BIN)
+        .current_dir(root)
+        .env("PATH", no_child_path)
+        .env("RIVETLUA_P12_FAKE", "valid")
+        .env("RIVETLUA_P12_CHILD_LOG", &child_log)
+        .args(["gate", "P12"])
+        .output()
+        .unwrap();
+    assert!(
+        !stale_output.status.success(),
+        "P12 accepted stale P11 digest"
+    );
+    assert_gate_report_is_json(&report_path);
+    assert_no_p12_case_reports(&report_dir);
+    assert!(
+        !child_log.exists(),
+        "stale prerequisite started a runtime child"
+    );
+    assert!(
+        fs::read_to_string(&report_path)
+            .unwrap()
+            .contains("source_digest 已過期")
+    );
+    fs::write(&p11_path, &p11_original).unwrap();
+
+    let p11_saved = fs::read(&p11_path).unwrap();
+    fs::remove_file(&p11_path).unwrap();
+    let missing_p11_output = Command::new(BIN)
+        .current_dir(root)
+        .env(
+            "PATH",
+            std::env::join_paths(
+                std::iter::once(fake_cargo_dir.to_path_buf())
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        )
+        .env("RIVETLUA_P12_FAKE", "valid")
+        .env("RIVETLUA_P12_CHILD_LOG", &child_log)
+        .args(["gate", "P12"])
+        .output()
+        .unwrap();
+    assert!(
+        !missing_p11_output.status.success(),
+        "P12 accepted missing P11 report"
+    );
+    assert_gate_report_is_json(&report_path);
+    assert_no_p12_case_reports(&report_dir);
+    assert!(
+        !child_log.exists(),
+        "missing prerequisite started a runtime child"
+    );
+    assert!(
+        fs::read_to_string(&report_path)
+            .unwrap()
+            .contains("缺少 P11 前置 gate 報告")
+    );
+    fs::write(&p11_path, p11_saved).unwrap();
+
+    let gc001 = fixture_text
+        .lines()
+        .find(|line| line.starts_with("case|lua55-i64f64|GC-001|"))
+        .unwrap()
+        .to_owned();
+    let missing_gc001 = fixture_text
+        .lines()
+        .filter(|line| !line.starts_with("case|lua55-i64f64|GC-001|"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let fixture_mutations = [
+        missing_gc001,
+        format!("{fixture_text}{gc001}\n"),
+        fixture_text.replace("profile|lua54-i64f64|lua54\n", ""),
+        fixture_text.replacen("case|lua55-i64f64|GC-001|", "case|lua54-i64f64|GC-001|", 1),
+        fixture_text.replacen(
+            "case|lua55-i64f64|GC-001|",
+            "case|lua55-i64f64|GC-UNKNOWN|",
+            1,
+        ),
+        fixture_text.replacen(
+            "case|lua55-i64f64|GC-001|",
+            "broken|lua55-i64f64|GC-001|",
+            1,
+        ),
+    ];
+    for mutation in fixture_mutations {
+        let before_csv = p11_sha256(&csv_path);
+        let before_status = git_status_snapshot(root);
+        fs::write(&fixture_path, mutation.as_bytes()).unwrap();
+        let _ = fs::remove_file(&child_log);
+        let report = assert_p12_gate_failure(
+            root,
+            &report_dir,
+            &report_path,
+            fake_cargo_dir,
+            "valid",
+            &child_log,
+            "p12-fixture",
+            "fixture",
+            false,
+        );
+        assert!(report.contains("p12-fixture"));
+        fs::write(&fixture_path, &fixture_original).unwrap();
+        assert_eq!(
+            p11_sha256(&fixture_path),
+            p11_sha256_from_bytes(&fixture_original)
+        );
+        assert_eq!(p11_sha256(&csv_path), before_csv);
+        assert_eq!(git_status_snapshot(root), before_status);
+    }
+    fs::remove_file(&fixture_path).unwrap();
+    let _ = fs::remove_file(&child_log);
+    let missing_fixture = assert_p12_gate_failure(
+        root,
+        &report_dir,
+        &report_path,
+        fake_cargo_dir,
+        "valid",
+        &child_log,
+        "p12-fixture",
+        "No such file",
+        false,
+    );
+    assert!(missing_fixture.contains("p12-fixture"));
+    fs::write(&fixture_path, &fixture_original).unwrap();
+
+    let row55 = csv_text
+        .lines()
+        .find(|line| line.starts_with("p12.gc-complete,lua55,"))
+        .unwrap()
+        .to_owned();
+    let no_p12_rows = csv_text
+        .lines()
+        .filter(|line| !line.starts_with("p12."))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let csv_mutations = [
+        csv_text.replacen(&row55, row55.trim_end_matches(','), 1),
+        no_p12_rows,
+        csv_text.replace("p12.gc-complete,lua55,", "p12.other,lua55,"),
+        csv_text.replace("p12.gc-complete,lua54,", "p12.gc-complete,common,"),
+        format!("{csv_text}{row55}\n"),
+    ];
+    for mutation in csv_mutations {
+        let before_fixture = p11_sha256(&fixture_path);
+        let before_status = git_status_snapshot(root);
+        fs::write(&csv_path, mutation.as_bytes()).unwrap();
+        let _ = fs::remove_file(&child_log);
+        let report = assert_p12_gate_failure(
+            root,
+            &report_dir,
+            &report_path,
+            fake_cargo_dir,
+            "valid",
+            &child_log,
+            "p12-csv",
+            "CSV",
+            false,
+        );
+        assert!(report.contains("p12-csv"));
+        fs::write(&csv_path, &csv_original).unwrap();
+        assert_eq!(p11_sha256(&fixture_path), before_fixture);
+        assert_eq!(p11_sha256(&csv_path), p11_sha256_from_bytes(&csv_original));
+        assert_eq!(git_status_snapshot(root), before_status);
+    }
+    fs::remove_file(&csv_path).unwrap();
+    let _ = fs::remove_file(&child_log);
+    let missing_csv = assert_p12_gate_failure(
+        root,
+        &report_dir,
+        &report_path,
+        fake_cargo_dir,
+        "valid",
+        &child_log,
+        "p12-csv",
+        "No such file",
+        false,
+    );
+    assert!(missing_csv.contains("p12-csv"));
+    fs::write(&csv_path, &csv_original).unwrap();
+
+    for (scenario, expected_check, expected_diagnostic, child) in [
+        ("unit-fail", "p12-runtime-unit", "實際 exit=1", false),
+        ("unit-zero", "p12-runtime-unit", "匹配非零", false),
+        ("filter-fail", "p12-filter-gc", "實際 exit=2", false),
+        (
+            "filter-zero",
+            "p12-filter-gc",
+            "必須至少匹配一個測試",
+            false,
+        ),
+        ("reentry-fail", "p12-reentry-unit", "實際 exit=101", false),
+        ("case-fail", "GC-001-lua55", "實際 exit=101", true),
+        ("case-zero", "GC-001-lua55", "精確通過 1 個測試", true),
+        ("case-extra", "GC-001-lua55", "精確通過 1 個測試", true),
+        ("missing-marker", "GC-001-lua55", "marker 數錯誤", true),
+        ("duplicate-marker", "GC-001-lua55", "marker 數錯誤", true),
+        ("unknown-marker", "GC-001-lua55", "未知 formal marker", true),
+        ("cross-profile", "GC-001-lua55", "profile 錯誤", true),
+        ("wrong-actual", "GC-001-lua55", "實際結果不符", true),
+        (
+            "report-write-fail",
+            "GC-001-lua55",
+            "寫入 P12 case report 失敗",
+            true,
+        ),
+    ] {
+        let _ = fs::remove_file(&child_log);
+        let before_fixture = p11_sha256(&fixture_path);
+        let before_csv = p11_sha256(&csv_path);
+        let report = assert_p12_gate_failure(
+            root,
+            &report_dir,
+            &report_path,
+            fake_cargo_dir,
+            scenario,
+            &child_log,
+            expected_check,
+            expected_diagnostic,
+            child,
+        );
+        assert!(report.contains("\"status\":\"FAIL\""));
+        assert_eq!(
+            p11_sha256(&fixture_path),
+            before_fixture,
+            "{scenario} fixture byte drift"
+        );
+        assert_eq!(
+            p11_sha256(&csv_path),
+            before_csv,
+            "{scenario} CSV byte drift"
+        );
+        assert_eq!(
+            git_status_snapshot(root),
+            status_original,
+            "{scenario} Git status drift"
+        );
+    }
+    fs::remove_dir_all(fake_dir).unwrap();
+}
+
+struct RestoreP13State {
+    report_dir: PathBuf,
+    preserved_p13: std::collections::HashSet<PathBuf>,
+    paths: Vec<RestoreBytes>,
+}
+
+impl RestoreP13State {
+    fn new(root: &Path) -> Self {
+        let report_dir = root.join("target/rivetlua-reports");
+        fs::create_dir_all(&report_dir).unwrap();
+        let preserved_p13: std::collections::HashSet<_> = fs::read_dir(&report_dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("P13-"))
+            })
+            .collect();
+        let mut paths = Vec::new();
+        for number in 0..=13 {
+            paths.push(RestoreBytes::new(
+                report_dir.join(format!("gate-P{number:02}.json")),
+            ));
+        }
+        for number in 1..=10 {
+            for profile in ["lua55", "lua54"] {
+                paths.push(RestoreBytes::new(
+                    report_dir.join(format!("P12-GC-{number:03}-{profile}.json")),
+                ));
+            }
+        }
+        for path in &preserved_p13 {
+            if path.is_file() {
+                paths.push(RestoreBytes::new(path.clone()));
+            }
+        }
+        paths.push(RestoreBytes::new(root.join("target/gate-P13-fail.json")));
+        paths.push(RestoreBytes::new(root.join("tests/p13/lib-cases.fixture")));
+        paths.push(RestoreBytes::new(root.join("spec/compatibility.csv")));
+        Self {
+            report_dir,
+            preserved_p13,
+            paths,
+        }
+    }
+}
+
+impl Drop for RestoreP13State {
+    fn drop(&mut self) {
+        for entry in fs::read_dir(&self.report_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with("P13-")
+                && !self.preserved_p13.contains(&path)
+            {
+                if path.is_dir() {
+                    fs::remove_dir_all(path).unwrap();
+                } else {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+        }
+    }
+}
+
+fn stamp_p13_prerequisites(root: &Path) {
+    let digest = current_source_digest(root);
+    let script = r#"import json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); digest=sys.argv[2]
+reports=root/'target/rivetlua-reports'; reports.mkdir(parents=True,exist_ok=True)
+def check(name):
+    return dict(name=name,command='synthetic P13 CLI protocol prerequisite',exit_code=0,status='PASS',diagnostic='isolated CLI fixture',report_path='target/rivetlua-reports/fixture.json')
+expected_failures={
+    'P00-SUP-001': ('rivetlua-xtask runner --profile lua55 --case P00-SUP-001','target/rivetlua-reports/P00-SUP-001-lua55.json'),
+    'P00-REF-003': ('rivetlua-xtask runner --profile lua55 --case P00-REF-003','target/rivetlua-reports/P00-REF-003-lua55.json'),
+    'P00-RUN-003': ('rivetlua-xtask runner --profile lua55 --case P00-RUN-003','target/rivetlua-reports/P00-RUN-003-lua55.json'),
+    'P00-RUN-004': ('rivetlua-xtask runner --profile lua55 --case P00-RUN-004','target/rivetlua-reports/P00-RUN-004-lua55.json'),
+    'P00-ABI-004': ('abi_evidence_check tests/abi/fixtures/incomplete-evidence.json','tests/abi/fixtures/incomplete-evidence.json'),
+    'P00-ABI-005': ('abi_evidence_check tests/abi/fixtures/unsafe-accepted.md','tests/abi/fixtures/unsafe-accepted.md'),
+}
+for number in range(13):
+    checks=[check('smoke')]
+    if number in (0,11):
+        for name,(command,path) in expected_failures.items():
+            item=check(('P00-' if number==11 else '')+name)
+            item.update(command=command,report_path=path,exit_code=1)
+            checks.append(item)
+    if number in (3,11):
+        for case_id in ('PARSE-001','PARSE-002','PARSE-003','PARSE-004','PARSE-005','PARSE-006',
+                        'PARSE-ERR-001','PARSE-ERR-002','PARSE-ERR-003','PARSE-ERR-004'):
+            for profile in ('lua55','lua54'):
+                item=check(('P03-' if number==11 else '')+case_id)
+                item.update(command='cargo test p03_contracts',
+                            report_path=str(reports/f'P03-{case_id}-{profile}.json'))
+                checks.append(item)
+    if number==5:
+        checks += [check(x) for x in ('p05-dependency-graph','p05-core-bytecode','p05-bytecode-contracts')]
+        checks += [check(f'BC-{case:03}-{profile}') for case in range(1,11) for profile in ('lua55','lua54')]
+    if number==7:
+        checks += [check(x) for x in ('p01-before','p05-before','p06-before','p00-p06-before')]
+    if number==12:
+        checks += [check(x) for x in ('p12-runtime-unit','p12-reentry-unit')]
+        checks += [check(f'p12-filter-{name}') for name in ('gc','weak','ephemeron','finalizer','allocation_failure','vm_lifecycle')]
+        checks += [check(f'GC-{case:03}-{profile}') for case in range(1,11) for profile in ('lua55','lua54')]
+    (reports/f'gate-P{number:02}.json').write_text(json.dumps(dict(status='PASS',source_digest=digest,checks=checks))+'\n')
+fixture=(root/'tests/p12/gc-cases.fixture').read_text().splitlines()
+for line in fixture:
+    fields=line.split('|')
+    if fields[0]!='case': continue
+    _,fullprofile,case_id,mode,input_name,marker,expected,note=fields
+    lua_profile=fullprofile.split('-')[0]
+    report=dict(case_id=case_id,profile=fullprofile,lua_profile=lua_profile,mode=mode,input=input_name,
+                expected=expected,actual=expected,status='PASS',exit_code=0,source_digest=digest,
+                diagnostic=note,command='synthetic P13 CLI protocol prerequisite')
+    (reports/f'P12-{case_id}-{lua_profile}.json').write_text(json.dumps(report)+'\n')
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(root)
+        .arg(&digest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "P13 CLI prerequisite setup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn make_p13_fake_cargo(directory: &Path) -> PathBuf {
+    fs::create_dir_all(directory).unwrap();
+    let fake = directory.join("cargo");
+    fs::write(&fake, r##"#!/usr/bin/env python3
+import os,pathlib,sys
+args=sys.argv[1:]
+scenario=os.environ.get('RIVETLUA_P13_FAKE','valid')
+log=os.environ.get('RIVETLUA_P13_CHILD_LOG')
+profile=os.environ.get('RIVETLUA_P13_PROFILE','')
+name=args[args.index('--test')+2] if '--test' in args else 'unit'
+if log:
+    with open(log,'a') as stream: stream.write(f'{profile}:{name}\n')
+if '--lib' in args:
+    if scenario=='unit-fail':
+        print('test result: FAILED. 0 passed; 1 failed; 0 ignored')
+        raise SystemExit(101)
+    count=0 if scenario=='unit-zero' else 3
+    print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 10 filtered out')
+    raise SystemExit(0)
+fixture=pathlib.Path('tests/p13/lib-cases.fixture').read_text().splitlines()
+fields=next(line.split('|') for line in fixture if line.startswith('case|') and line.split('|')[1]==profile and line.split('|')[4]==name)
+case_id,actual=fields[2],fields[6]
+first=profile=='lua55-i64f64' and case_id=='LIB-001'
+last=profile=='lua54-i64f64' and case_id=='LIB-014'
+if scenario=='case-child-fail' and first:
+    print('test result: FAILED. 0 passed; 1 failed; 0 ignored')
+    raise SystemExit(101)
+count=0 if scenario=='case-zero' and first else 2 if scenario=='case-two' and first else 1
+ignored=1 if scenario=='case-ignored' and first else 0
+if scenario=='marker-unknown' and first: case_id='LIB-999'
+if scenario=='marker-profile' and first: profile='lua54-i64f64'
+if scenario=='marker-wrong-actual' and first: actual='int:7,int:2'
+marker=f'P13_CASE\t{case_id}\t{profile}\tstatus=PASS;actual={actual};diagnostic=asserted-by-fake\tcapability=host=deny\tfuel=initial=20,remaining=1\tallocation=reserved=0\tresource=roots=5'
+if scenario=='marker-malformed' and first: marker=marker.replace('\tfuel=initial=20,remaining=1','')
+if not (scenario=='marker-missing' and first): print(marker)
+if scenario=='marker-duplicate' and first: print(marker)
+print(f'test result: ok. {count} passed; 0 failed; {ignored} ignored; 13 filtered out')
+reports=pathlib.Path('target/rivetlua-reports')
+if scenario=='report-write-fail' and first:
+    target=reports/'P13-LIB-001-lua55.json'; target.mkdir(exist_ok=True)
+    (target/'block').write_text('preserve until test cleanup')
+if scenario=='aggregate-write-fail' and last:
+    target=reports/'gate-P13.json'; target.mkdir(exist_ok=True)
+    (target/'block').write_text('preserve until test cleanup')
+"##).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    fake
+}
+
+fn run_p13_fake(
+    root: &Path,
+    fake_dir: &Path,
+    scenario: &str,
+    child_log: &Path,
+) -> std::process::Output {
+    let path = std::env::join_paths(
+        std::iter::once(fake_dir.to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    Command::new(BIN)
+        .current_dir(root)
+        .env("PATH", path)
+        .env("RIVETLUA_P13_FAKE", scenario)
+        .env("RIVETLUA_P13_CHILD_LOG", child_log)
+        .args(["gate", "P13"])
+        .output()
+        .unwrap()
+}
+
+fn assert_p13_json(path: &Path, status: &str, digest: &str) {
+    let script = r#"import json,pathlib,re,sys
+p=pathlib.Path(sys.argv[1]); expected=sys.argv[2]; digest=sys.argv[3]
+r=json.loads(p.read_text())
+assert r['status']==expected
+assert r['source_digest']==digest and re.fullmatch(r'[0-9a-f]{64}',digest)
+assert isinstance(r['checks'],list) and r['checks']
+assert all({'name','command','exit_code','status','diagnostic','report_path'}<=c.keys() for c in r['checks'])
+assert all(isinstance(c['exit_code'],int) and c['command'] and c['report_path'] for c in r['checks'])
+assert any(c['status']=='FAIL' and c['exit_code']!=0 and c['diagnostic'] for c in r['checks']) if expected=='FAIL' else all(c['status']=='PASS' and c['exit_code']==0 for c in r['checks'])
+cases=r['case_reports']
+assert isinstance(cases,list)
+if expected=='PASS':
+    assert len(cases)==28 and len({(c['case_id'],c['lua_profile']) for c in cases})==28
+else: assert not cases
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(path)
+        .arg(status)
+        .arg(digest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "P13 {status} JSON invalid {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_no_p13_case_files(report_dir: &Path) {
+    for entry in fs::read_dir(report_dir).unwrap().map(Result::unwrap) {
+        if entry.file_name().to_string_lossy().starts_with("P13-") {
+            assert!(
+                !entry.path().is_file(),
+                "P13 FAIL retained case file {}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
+#[test]
+fn p13_gate_fake_protocol_and_fail_closed_matrix() {
+    let _guard = CLI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = workspace_root();
+    let initial_status = git_status_snapshot(root);
+    let restore = RestoreP13State::new(root);
+    let original_paths = restore
+        .paths
+        .iter()
+        .map(|item| (item.path.clone(), item.contents.clone()))
+        .collect::<Vec<_>>();
+    let report_dir = root.join("target/rivetlua-reports");
+    let fixture_path = root.join("tests/p13/lib-cases.fixture");
+    let csv_path = root.join("spec/compatibility.csv");
+    let fixture = fs::read(&fixture_path).unwrap();
+    let csv = fs::read(&csv_path).unwrap();
+    let fake_dir = std::env::temp_dir().join(format!("rivetlua-p13-cli-{}", std::process::id()));
+    let _fake = make_p13_fake_cargo(&fake_dir);
+    let child_log = fake_dir.join("child.log");
+
+    stamp_p13_prerequisites(root);
+    let digest = current_source_digest(root);
+    let positive = run_p13_fake(root, &fake_dir, "valid", &child_log);
+    assert!(
+        positive.status.success(),
+        "P13 fake protocol PASS failed: {}",
+        String::from_utf8_lossy(&positive.stderr)
+    );
+    assert_p13_json(&report_dir.join("gate-P13.json"), "PASS", &digest);
+    let case_files = fs::read_dir(&report_dir)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("P13-"))
+        .count();
+    assert_eq!(case_files, 28);
+    let check = Command::new("python3").args(["-c", "import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); c=json.loads(p.read_text()); assert c['status']=='PASS' and c['case_id']=='LIB-006' and c['lua_profile']=='lua54' and c['expected']=='size:StringArgument,budget:Heap(AllocationFailed)' and c['actual']==c['expected'] and all(c[k] for k in ('capability_policy','fuel_trace','allocation_trace','resource_trace','source_digest'))"]).arg(report_dir.join("P13-LIB-006-lua54.json")).output().unwrap();
+    assert!(
+        check.status.success(),
+        "P13 case schema invalid: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert!(fs::read_to_string(&child_log).unwrap().lines().count() == 29);
+
+    for number in 0..=12 {
+        let phase = format!("P{number:02}");
+        for mutation in ["missing", "fail", "invalid", "stale"] {
+            stamp_p13_prerequisites(root);
+            let path = report_dir.join(format!("gate-{phase}.json"));
+            match mutation {
+                "missing" => fs::remove_file(&path).unwrap(),
+                "fail" => fs::write(&path, b"{\"status\":\"FAIL\"}\n").unwrap(),
+                "invalid" => fs::write(&path, b"{").unwrap(),
+                "stale" => {
+                    let body = fs::read_to_string(&path).unwrap();
+                    fs::write(&path, body.replace(&digest, &"0".repeat(64))).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let _ = fs::remove_file(&child_log);
+            let output = run_p13_fake(root, &fake_dir, "valid", &child_log);
+            assert!(
+                !output.status.success(),
+                "{phase}/{mutation} prerequisite passed"
+            );
+            assert_p13_json(&report_dir.join("gate-P13.json"), "FAIL", &digest);
+            assert_no_p13_case_files(&report_dir);
+            assert!(!child_log.exists(), "{phase}/{mutation} started child");
+        }
+    }
+    for (phase, field, value) in [
+        ("P00", "name", "P00-SUP-999"),
+        ("P00", "exit_code", "0"),
+        ("P00", "exit_code", "2"),
+        ("P00", "command", "wrong command"),
+        ("P00", "report_path", "wrong/report.json"),
+        ("P11", "name", "P00-P00-SUP-999"),
+        ("P02", "wrong_phase", "P00-SUP-001"),
+    ] {
+        stamp_p13_prerequisites(root);
+        let path = report_dir.join(format!("gate-{phase}.json"));
+        let script = r#"import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); field=sys.argv[2]; value=sys.argv[3]
+r=json.loads(p.read_text())
+if field=='wrong_phase':
+    c=r['checks'][0]; c['name']=value; c['exit_code']=1
+else:
+    c=next(c for c in r['checks'] if c['exit_code']==1)
+    c[field]=int(value) if field=='exit_code' else value
+p.write_text(json.dumps(r)+'\n')
+"#;
+        let mutation = Command::new("python3")
+            .args(["-c", script])
+            .arg(&path)
+            .args([field, value])
+            .output()
+            .unwrap();
+        assert!(
+            mutation.status.success(),
+            "failed to mutate {phase}/{field}: {}",
+            String::from_utf8_lossy(&mutation.stderr)
+        );
+        let _ = fs::remove_file(&child_log);
+        let output = run_p13_fake(root, &fake_dir, "valid", &child_log);
+        assert!(
+            !output.status.success(),
+            "{phase}/{field} exception mutation passed"
+        );
+        assert_p13_json(&report_dir.join("gate-P13.json"), "FAIL", &digest);
+        assert_no_p13_case_files(&report_dir);
+        assert!(!child_log.exists(), "{phase}/{field} started child");
+    }
+    for phase in ["P03", "P11"] {
+        for mutation in [
+            "duplicate_profile",
+            "missing_profile",
+            "wrong_profile",
+            "wrong_path",
+            "wrong_root",
+            "wrong_command",
+            "unknown_id",
+        ] {
+            stamp_p13_prerequisites(root);
+            let path = report_dir.join(format!("gate-{phase}.json"));
+            let script = r#"import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); phase=sys.argv[2]; mutation=sys.argv[3]
+r=json.loads(p.read_text()); name=('P03-' if phase=='P11' else '')+'PARSE-001'
+cases=[c for c in r['checks'] if c['name']==name]
+assert len(cases)==2
+left=next(c for c in cases if c['report_path'].endswith('-lua55.json'))
+right=next(c for c in cases if c['report_path'].endswith('-lua54.json'))
+if mutation=='duplicate_profile': right['report_path']=left['report_path']
+elif mutation=='missing_profile': r['checks'].remove(right)
+elif mutation=='wrong_profile': right['report_path']=right['report_path'].replace('-lua54.json','-lua53.json')
+elif mutation=='wrong_path': right['report_path']=right['report_path'].replace('PARSE-001','PARSE-002')
+elif mutation=='wrong_root': right['report_path']='/tmp/rivetlua-p13-wrong-root/P03-PARSE-001-lua54.json'
+elif mutation=='wrong_command': right['command']='cargo test wrong'
+elif mutation=='unknown_id': right['name']=('P03-' if phase=='P11' else '')+'PARSE-UNKNOWN'
+else: raise AssertionError(mutation)
+p.write_text(json.dumps(r)+'\n')
+"#;
+            let injected = Command::new("python3")
+                .args(["-c", script])
+                .arg(&path)
+                .args([phase, mutation])
+                .output()
+                .unwrap();
+            assert!(
+                injected.status.success(),
+                "{phase}/{mutation} 注入失敗：{}",
+                String::from_utf8_lossy(&injected.stderr)
+            );
+            let _ = fs::remove_file(&child_log);
+            let output = run_p13_fake(root, &fake_dir, "valid", &child_log);
+            assert!(
+                !output.status.success(),
+                "{phase}/{mutation} 前置異常意外通過"
+            );
+            assert_p13_json(&report_dir.join("gate-P13.json"), "FAIL", &digest);
+            assert_no_p13_case_files(&report_dir);
+            assert!(!child_log.exists(), "{phase}/{mutation} 啟動了 child");
+            assert_eq!(fs::read(&fixture_path).unwrap(), fixture);
+            assert_eq!(fs::read(&csv_path).unwrap(), csv);
+            assert_eq!(git_status_snapshot(root), initial_status);
+        }
+    }
+    stamp_p13_prerequisites(root);
+    let generic = report_dir.join("gate-P02.json");
+    let body = fs::read_to_string(&generic).unwrap();
+    let duplicated = body.replacen("\"checks\": [", "\"checks\": [{\"name\": \"smoke\", \"command\": \"synthetic\", \"exit_code\": 0, \"status\": \"PASS\", \"diagnostic\": \"duplicate\", \"report_path\": \"report\"}, ", 1);
+    assert_ne!(duplicated, body);
+    fs::write(&generic, duplicated).unwrap();
+    let _ = fs::remove_file(&child_log);
+    let output = run_p13_fake(root, &fake_dir, "valid", &child_log);
+    assert!(!output.status.success(), "P02 generic check 重複意外通過");
+    assert_p13_json(&report_dir.join("gate-P13.json"), "FAIL", &digest);
+    assert_no_p13_case_files(&report_dir);
+    assert!(!child_log.exists(), "P02 generic check 重複啟動了 child");
+    for mutation in ["missing", "fail", "invalid", "stale"] {
+        stamp_p13_prerequisites(root);
+        let path = report_dir.join("P12-GC-001-lua55.json");
+        match mutation {
+            "missing" => fs::remove_file(&path).unwrap(),
+            "fail" => {
+                let body = fs::read_to_string(&path).unwrap();
+                fs::write(
+                    &path,
+                    body.replace("\"status\": \"PASS\"", "\"status\": \"FAIL\""),
+                )
+                .unwrap();
+            }
+            "invalid" => fs::write(&path, b"{").unwrap(),
+            "stale" => {
+                let body = fs::read_to_string(&path).unwrap();
+                fs::write(&path, body.replace(&digest, &"0".repeat(64))).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let _ = fs::remove_file(&child_log);
+        let output = run_p13_fake(root, &fake_dir, "valid", &child_log);
+        assert!(
+            !output.status.success(),
+            "P12 case prerequisite {mutation} passed"
+        );
+        assert_p13_json(&report_dir.join("gate-P13.json"), "FAIL", &digest);
+        assert_no_p13_case_files(&report_dir);
+        assert!(!child_log.exists(), "P12 case {mutation} started child");
+    }
+
+    let fixture_text = String::from_utf8(fixture.clone()).unwrap();
+    let first = fixture_text
+        .lines()
+        .find(|line| line.starts_with("case|lua55-i64f64|LIB-001|"))
+        .unwrap();
+    let fixture_mutations = [
+        fixture_text.replacen(&format!("{first}\n"), "", 1),
+        format!("{fixture_text}{first}\n"),
+        fixture_text.replacen(
+            "case|lua55-i64f64|LIB-001|",
+            "case|lua55-i64f64|LIB-999|",
+            1,
+        ),
+        fixture_text.replacen(
+            "profile|lua54-i64f64|lua54",
+            "profile|lua54-i64f64|lua55",
+            1,
+        ),
+        fixture_text.replacen("int:6,int:2", "int:7,int:2", 1),
+        fixture_text.replacen(
+            "case|lua55-i64f64|LIB-001|",
+            "broken|lua55-i64f64|LIB-001|",
+            1,
+        ),
+    ];
+    for mutation in fixture_mutations {
+        fs::write(&fixture_path, mutation).unwrap();
+        stamp_p13_prerequisites(root);
+        let current = current_source_digest(root);
+        let _ = fs::remove_file(&child_log);
+        let output = run_p13_fake(root, &fake_dir, "valid", &child_log);
+        assert!(!output.status.success(), "malformed fixture passed");
+        assert_p13_json(&report_dir.join("gate-P13.json"), "FAIL", &current);
+        assert_no_p13_case_files(&report_dir);
+        assert!(!child_log.exists(), "malformed fixture started child");
+        fs::write(&fixture_path, &fixture).unwrap();
+        assert_eq!(fs::read(&fixture_path).unwrap(), fixture);
+        assert_eq!(git_status_snapshot(root), initial_status);
+    }
+    let csv_text = String::from_utf8(csv.clone()).unwrap();
+    let row = csv_text
+        .lines()
+        .find(|line| line.starts_with("p13.stdlib-modules,lua55,"))
+        .unwrap();
+    let csv_mutations = [
+        csv_text.replacen(&format!("{row}\n"), "", 1),
+        format!("{csv_text}{row}\n"),
+        csv_text.replacen("p13.stdlib-modules,lua55,", "p13.other,lua55,", 1),
+        csv_text.replacen("p13.stdlib-modules,lua54,", "p13.stdlib-modules,common,", 1),
+        csv_text.replacen(row, row.trim_end_matches(','), 1),
+    ];
+    for mutation in csv_mutations {
+        fs::write(&csv_path, mutation).unwrap();
+        stamp_p13_prerequisites(root);
+        let current = current_source_digest(root);
+        let _ = fs::remove_file(&child_log);
+        let output = run_p13_fake(root, &fake_dir, "valid", &child_log);
+        assert!(!output.status.success(), "malformed CSV passed");
+        assert_p13_json(&report_dir.join("gate-P13.json"), "FAIL", &current);
+        assert_no_p13_case_files(&report_dir);
+        assert!(!child_log.exists(), "malformed CSV started child");
+        fs::write(&csv_path, &csv).unwrap();
+        assert_eq!(fs::read(&csv_path).unwrap(), csv);
+        assert_eq!(git_status_snapshot(root), initial_status);
+    }
+
+    for scenario in [
+        "unit-fail",
+        "unit-zero",
+        "case-child-fail",
+        "case-zero",
+        "case-two",
+        "case-ignored",
+        "marker-missing",
+        "marker-duplicate",
+        "marker-unknown",
+        "marker-profile",
+        "marker-wrong-actual",
+        "marker-malformed",
+        "report-write-fail",
+        "aggregate-write-fail",
+    ] {
+        stamp_p13_prerequisites(root);
+        let _ = fs::remove_file(&child_log);
+        let output = run_p13_fake(root, &fake_dir, scenario, &child_log);
+        assert!(!output.status.success(), "{scenario} unexpectedly passed");
+        let gate = report_dir.join("gate-P13.json");
+        let fallback = root.join("target/gate-P13-fail.json");
+        assert_p13_json(
+            if scenario == "aggregate-write-fail" {
+                &fallback
+            } else {
+                &gate
+            },
+            "FAIL",
+            &digest,
+        );
+        assert_no_p13_case_files(&report_dir);
+        assert!(child_log.exists(), "{scenario} did not start child");
+        if scenario == "report-write-fail" {
+            fs::remove_dir_all(report_dir.join("P13-LIB-001-lua55.json")).unwrap();
+        }
+        if scenario == "aggregate-write-fail" {
+            fs::remove_dir_all(&gate).unwrap();
+        }
+        assert_eq!(fs::read(&fixture_path).unwrap(), fixture);
+        assert_eq!(fs::read(&csv_path).unwrap(), csv);
+        assert_eq!(git_status_snapshot(root), initial_status);
+    }
+    fs::remove_dir_all(fake_dir).unwrap();
+    drop(restore);
+    for (path, contents) in original_paths {
+        assert_eq!(
+            fs::read(&path).ok(),
+            contents,
+            "P13 CLI input/report was not restored: {}",
+            path.display()
+        );
+    }
+    assert_eq!(git_status_snapshot(root), initial_status);
 }

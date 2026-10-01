@@ -1,14 +1,25 @@
 //! P11 的 Lua 錯誤值、受保護呼叫邊界與三個必要內建入口。
 
+use core::mem::size_of;
 use std::rc::Rc;
 
 use rivetlua_core::{Register, ResultMode, Value};
 
+use crate::alloc::AllocationLedger;
 use crate::call::PendingCloseSnapshot;
+use crate::stdlib::basic::BasicBuiltin;
+use crate::stdlib::debug::DebugBuiltin;
+use crate::stdlib::io::IoBuiltin;
+use crate::stdlib::math::MathBuiltin;
+use crate::stdlib::os::OsBuiltin;
+use crate::stdlib::package::LoadBuiltin;
+use crate::stdlib::string::StringBuiltin;
+use crate::stdlib::table::TableBuiltin;
+use crate::stdlib::utf8::Utf8Builtin;
 use crate::vm::{RuntimeError, RuntimeErrorKind};
 use crate::{HostHandle, RootId, Vm, VmError};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Builtin {
     Error,
     PCall,
@@ -20,6 +31,21 @@ pub(crate) enum Builtin {
     CoroutineClose,
     CoroutineWrap,
     CoroutineWrapped(rivetlua_core::ObjectRef),
+    Basic(BasicBuiltin),
+    Debug(DebugBuiltin),
+    Math(MathBuiltin),
+    Table(TableBuiltin),
+    String(StringBuiltin),
+    Utf8(Utf8Builtin),
+    Load(LoadBuiltin),
+    Io(IoBuiltin),
+    Os(OsBuiltin),
+    StringIterator {
+        source: Value,
+        pattern: Value,
+        next: usize,
+        last: Option<usize>,
+    },
 }
 
 /// 宿主可保留的 Lua error；最後一份複本丟棄時釋放物件 root。
@@ -31,7 +57,19 @@ pub struct LuaError {
     pub source_pc: Option<usize>,
     pub source_prototype: Option<usize>,
     pub source_depth: Option<usize>,
-    _root: Option<Rc<HostHandle<Value>>>,
+    _root: Option<Rc<LuaErrorRoot>>,
+}
+
+struct LuaErrorRoot {
+    _handle: HostHandle<Value>,
+    ledger: AllocationLedger,
+    charge: usize,
+}
+
+impl Drop for LuaErrorRoot {
+    fn drop(&mut self) {
+        self.ledger.refund_on_drop(self.charge);
+    }
 }
 
 impl LuaError {
@@ -43,7 +81,19 @@ impl LuaError {
         pc: usize,
     ) -> Result<Self, VmError> {
         let root = if let Value::Object(object) = error.value {
-            Some(Rc::new(HostHandle::new(vm, object)?))
+            let handle = HostHandle::new(vm, object)?;
+            let ledger = vm.allocation_ledger().clone();
+            let charge = size_of::<usize>()
+                .checked_mul(2)
+                .and_then(|header| header.checked_add(size_of::<LuaErrorRoot>()))
+                .ok_or(VmError::ArithmeticOverflow)?;
+            let ticket = ledger.reserve(charge)?;
+            ticket.commit()?;
+            Some(Rc::new(LuaErrorRoot {
+                _handle: handle,
+                ledger,
+                charge,
+            }))
         } else {
             None
         };
@@ -84,6 +134,33 @@ impl PartialEq for LuaError {
     }
 }
 
+#[cfg(test)]
+mod p12_6_tests {
+    use rivetlua_core::Value;
+
+    use super::{LuaError, RuntimeError, RuntimeErrorKind};
+    use crate::{RootKind, Vm, VmError};
+
+    #[test]
+    fn p12_6_lua_error_rc_reserve_failure_rolls_back_host_root() {
+        let mut vm = Vm::new().unwrap();
+        let value = vm.allocate(Value::Integer(7)).unwrap();
+        let before = vm.ledger_snapshot();
+        let ordinal = vm.allocation_trace().next_ordinal + 1;
+        vm.inject_allocation_failure_at(ordinal);
+        let mut source = RuntimeError::new(RuntimeErrorKind::Thrown);
+        source.value = Value::Object(value);
+        let error = LuaError::from_runtime(&mut vm, source, 0, 0, 0)
+            .err()
+            .expect("Rc reserve 注入應失敗");
+        assert!(
+            matches!(error, VmError::InjectedAllocation(attempt) if attempt.ordinal == ordinal && attempt.site.file.ends_with("errors.rs"))
+        );
+        assert_eq!(vm.roots().count(RootKind::Host), 0);
+        assert_eq!(vm.ledger_snapshot(), before);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProtectedStage {
     Body,
@@ -105,6 +182,7 @@ pub(crate) struct ProtectedBoundary {
     pub(crate) handler_depth: Option<usize>,
     pub(crate) handler_errors: u8,
     pub(crate) close_scope: Option<PendingCloseSnapshot>,
+    pub(crate) finalizer: Option<rivetlua_core::ObjectRef>,
 }
 
 impl ProtectedBoundary {

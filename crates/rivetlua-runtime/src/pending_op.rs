@@ -3,6 +3,13 @@
 use rivetlua_core::{ObjectRef, Register, ResultMode, Value};
 
 use crate::alloc::{AllocationLedger, FailPoint, checked_bytes, reserve_vec};
+use crate::stdlib::basic::PrintBuffer;
+use crate::stdlib::format::FormatState;
+use crate::stdlib::gsub::GSubState;
+use crate::stdlib::math::MinMaxState;
+use crate::stdlib::os::CalendarTimeState;
+use crate::stdlib::package::{LoadReaderState, PathSearcherState, PreloadState, RequireState};
+use crate::stdlib::table::{SortState, TableOpState, TableSortTrace};
 use crate::{RootId, RootKind, Vm, VmError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +25,211 @@ pub(crate) enum PendingKind {
     Boolean { invert: bool },
     Call,
     Close,
+    Basic,
+}
+
+pub(crate) enum BasicPending {
+    DebugHook {
+        original: Value,
+    },
+    OsCalendarTime {
+        state: CalendarTimeState,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    Preload {
+        state: PreloadState,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    PackagePath {
+        state: PathSearcherState,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    Require {
+        state: RequireState,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    LoadReader {
+        state: LoadReaderState,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    DoFile {
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    ToString {
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    Pairs {
+        count: u16,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    IPairsAux {
+        index: i64,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    Print {
+        buffer: PrintBuffer,
+        arguments: PrintArguments,
+        next_argument: usize,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    StringFormat {
+        state: FormatState,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    StringGSub {
+        state: GSubState,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    MathMinMax {
+        state: MinMaxState,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    TableSort {
+        state: SortState,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    TableOp {
+        state: TableOpState,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+}
+
+impl BasicPending {
+    pub(crate) fn clear(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        if matches!(self, Self::DebugHook { .. }) {
+            vm.set_debug_hook_running(false);
+        }
+        if let Self::OsCalendarTime { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
+        if let Self::Print { arguments, .. } = self {
+            arguments.clear_roots(vm)?;
+        }
+        if let Self::StringFormat { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
+        if let Self::StringGSub { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
+        if let Self::MathMinMax { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
+        if let Self::TableOp { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
+        if let Self::TableSort { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
+        if let Self::LoadReader { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
+        if let Self::Require { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
+        if let Self::Preload { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
+        if let Self::PackagePath { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct PrintArguments {
+    values: Vec<Value>,
+    roots: Vec<RootId>,
+    ledger: AllocationLedger,
+    charge: usize,
+}
+
+impl PrintArguments {
+    pub(crate) fn new(vm: &mut Vm, values: &[Value]) -> Result<Self, VmError> {
+        let ledger = vm.allocation_ledger().clone();
+        let mut owned = Vec::new();
+        let values_ticket = reserve_vec(&ledger, &mut owned, values.len(), FailPoint::WorkReserve)?;
+        owned.extend_from_slice(values);
+        let mut roots = Vec::new();
+        let roots_ticket = reserve_vec(&ledger, &mut roots, values.len(), FailPoint::WorkReserve)?;
+        let charge = checked_bytes(values.len(), core::mem::size_of::<Value>())?
+            .checked_add(checked_bytes(values.len(), core::mem::size_of::<RootId>())?)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        values_ticket.commit()?;
+        if let Err(error) = roots_ticket.commit() {
+            ledger.refund_on_drop(checked_bytes(values.len(), core::mem::size_of::<Value>())?);
+            return Err(error);
+        }
+        let mut arguments = Self {
+            values: owned,
+            roots,
+            ledger,
+            charge,
+        };
+        if let Err(error) = arguments.restore_roots(vm) {
+            arguments.clear_roots(vm)?;
+            return Err(error);
+        }
+        Ok(arguments)
+    }
+
+    pub(crate) fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    pub(crate) fn clear_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        while let Some(root) = self.roots.pop() {
+            vm.remove_root(root)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        for value in &self.values {
+            if let Value::Object(object) = value {
+                match vm.add_root(RootKind::Temporary, *object) {
+                    Ok(root) => self.roots.push(root),
+                    Err(error) => {
+                        self.clear_roots(vm)?;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn trace_children(
+        &self,
+        mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
+    ) -> Result<(), VmError> {
+        for value in &self.values {
+            if let Value::Object(object) = value {
+                visit(*object)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PrintArguments {
+    fn drop(&mut self) {
+        self.ledger.refund_on_drop(self.charge);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +252,7 @@ pub(crate) struct PendingOp {
     pub(crate) dynamic_top: usize,
     pub(crate) chain_steps: usize,
     pub(crate) stage: ResumeStage,
+    pub(crate) basic: Option<BasicPending>,
     roots: [Option<RootId>; 5],
 }
 
@@ -74,6 +287,7 @@ impl PendingOp {
             dynamic_top,
             chain_steps,
             stage: ResumeStage::AwaitingReturn,
+            basic: None,
             roots: [None; 5],
         };
         for (index, value) in values.into_iter().enumerate() {
@@ -91,6 +305,15 @@ impl PendingOp {
     }
 
     pub(crate) fn clear(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        self.park_roots(vm)?;
+        self.basic = None;
+        Ok(())
+    }
+
+    fn park_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        if let Some(basic) = self.basic.as_mut() {
+            basic.clear(vm)?;
+        }
         for root in self.roots.iter_mut().rev() {
             if let Some(id) = root.take() {
                 vm.remove_root(id)?;
@@ -105,11 +328,44 @@ impl PendingOp {
                 match vm.add_root(RootKind::Temporary, *object) {
                     Ok(root) => self.roots[index] = Some(root),
                     Err(error) => {
-                        self.clear(vm)?;
+                        self.park_roots(vm)?;
                         return Err(error);
                     }
                 }
             }
+        }
+        if let Some(BasicPending::OsCalendarTime { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
+        }
+        if let Some(BasicPending::Print { arguments, .. }) = self.basic.as_mut() {
+            arguments.restore_roots(vm)?;
+        }
+        if let Some(BasicPending::StringFormat { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
+        }
+        if let Some(BasicPending::StringGSub { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
+        }
+        if let Some(BasicPending::MathMinMax { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
+        }
+        if let Some(BasicPending::TableOp { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
+        }
+        if let Some(BasicPending::TableSort { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
+        }
+        if let Some(BasicPending::LoadReader { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
+        }
+        if let Some(BasicPending::Require { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
+        }
+        if let Some(BasicPending::Preload { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
+        }
+        if let Some(BasicPending::PackagePath { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
         }
         Ok(())
     }
@@ -125,6 +381,39 @@ impl PendingOp {
             if let Value::Object(object) = value {
                 visit(object)?;
             }
+        }
+        if let Some(BasicPending::OsCalendarTime { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::Print { arguments, .. }) = self.basic.as_ref() {
+            arguments.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::StringFormat { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::StringGSub { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::MathMinMax { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::TableOp { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::TableSort { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::LoadReader { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::Require { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::Preload { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::PackagePath { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
         }
         Ok(())
     }
@@ -160,9 +449,30 @@ impl PendingStack {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn basic_depth(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|pending| pending.kind == PendingKind::Basic)
+            .count()
+    }
+
+    pub(crate) fn contains_debug_hook(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|pending| matches!(pending.basic, Some(BasicPending::DebugHook { .. })))
+    }
+
+    pub(crate) fn outermost_sort_trace(&self) -> Option<TableSortTrace> {
+        self.entries
+            .iter()
+            .find_map(|pending| match pending.basic.as_ref() {
+                Some(BasicPending::TableSort { state, .. }) => Some(state.trace),
+                _ => None,
+            })
     }
 
     #[cfg(test)]
@@ -259,7 +569,7 @@ impl PendingStack {
 
     pub(crate) fn park_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
         for pending in &mut self.entries {
-            pending.clear(vm)?;
+            pending.park_roots(vm)?;
         }
         Ok(())
     }
@@ -282,6 +592,84 @@ impl PendingStack {
             pending.trace_children(&mut visit)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod p13_a_tests {
+    use rivetlua_core::{Register, ResultMode, Value};
+
+    use super::{BasicPending, PendingKind, PendingOp, PendingStack, PrintArguments};
+    use crate::alloc::FailPoint;
+    use crate::stdlib::basic::PrintBuffer;
+    use crate::{Vm, VmError};
+
+    #[test]
+    fn p13_a_print_pending_parks_restores_and_releases_roots_and_host_bytes() {
+        let mut vm = Vm::new().unwrap();
+        let object = vm.allocate_table().unwrap();
+        let baseline = vm.ledger_snapshot().host_allocation_bytes;
+        let arguments = PrintArguments::new(&mut vm, &[Value::Object(object)]).unwrap();
+        let mut pending = PendingOp::new(
+            &mut vm,
+            PendingKind::Basic,
+            [
+                Value::Object(object),
+                Value::Nil,
+                Value::Nil,
+                Value::Nil,
+                Value::Nil,
+            ],
+            0,
+            0,
+            0,
+            0,
+            None,
+            1,
+            Register(0),
+            ResultMode::Fixed(1),
+            0,
+            1,
+        )
+        .unwrap();
+        pending.basic = Some(BasicPending::Print {
+            buffer: PrintBuffer::new(&vm),
+            arguments,
+            next_argument: 0,
+            outer_mode: ResultMode::All,
+            tail_return: false,
+        });
+        let mut stack = PendingStack::new(vm.allocation_ledger().clone());
+        let prepared = stack.prepare_push().unwrap();
+        stack.push_prepared(prepared, pending);
+        assert_eq!(vm.roots().total_count(), 2);
+        assert!(vm.ledger_snapshot().host_allocation_bytes > baseline);
+        stack.park_roots(&mut vm).unwrap();
+        assert_eq!(vm.roots().total_count(), 0);
+        assert!(stack.last().unwrap().basic.is_some());
+        stack.restore_roots(&mut vm).unwrap();
+        assert_eq!(vm.roots().total_count(), 2);
+        stack.clear(&mut vm).unwrap();
+        assert_eq!(vm.roots().total_count(), 0);
+        assert_eq!(vm.ledger_snapshot().host_allocation_bytes, baseline);
+    }
+
+    #[test]
+    fn p13_a_print_arguments_failure_keeps_roots_and_ledger_unchanged() {
+        let mut vm = Vm::new().unwrap();
+        let object = vm.allocate_table().unwrap();
+        let baseline = vm.ledger_snapshot();
+        vm.inject_failure_once(FailPoint::WorkReserve);
+        assert!(matches!(
+            PrintArguments::new(&mut vm, &[Value::Object(object)]),
+            Err(VmError::InjectedFailure(FailPoint::WorkReserve))
+        ));
+        assert_eq!(vm.roots().total_count(), 0);
+        assert_eq!(
+            vm.ledger_snapshot().host_allocation_bytes,
+            baseline.host_allocation_bytes
+        );
+        assert_eq!(vm.ledger_snapshot().reserved, baseline.reserved);
     }
 }
 

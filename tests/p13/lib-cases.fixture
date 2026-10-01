@@ -1,0 +1,30 @@
+profile|lua55-i64f64|lua55
+case|lua55-i64f64|LIB-001|bytes-utf8-length|lib_case_001|P13_CASE:LIB-001|int:6,int:2|蘋果字串的 byte 長度與 UTF-8 碼點數
+case|lua55-i64f64|LIB-002|pack-nil|lib_case_002|P13_CASE:LIB-002|int:3,int:3,int:1,nil,int:3|table.pack 的 n 與中間 nil、unpack 多回傳
+case|lua55-i64f64|LIB-003|lua-pattern-match|lib_case_003|P13_CASE:LIB-003|bytes:313233|Lua %d+ 比對 x=123 並取出 123
+case|lua55-i64f64|LIB-004|require-nil-loader|lib_case_004|P13_CASE:LIB-004|bool:true,bytes:3a7072656c6f61643a,bool:true,int:1|preload loader 回傳 nil 後的 loaded true 與 loader data
+case|lua55-i64f64|LIB-005|require-false-loader|lib_case_005|P13_CASE:LIB-005|bool:false,bytes:7061796c6f6164,bool:false,bytes:7061796c6f6164,int:2,int:2,bool:false|false loader 連續兩次 require 與 searcher 次數
+case|lua55-i64f64|LIB-006|string-budget|lib_case_006|P13_CASE:LIB-006|size:FuelExhausted,budget:Heap(AllocationFailed)|巨大 string.rep 的版本差異與配置上限
+case|lua55-i64f64|LIB-007|sort-abort|lib_case_007|P13_CASE:LIB-007|inconsistent:bool:false,bytes:332c312c32,int:3;comparisons=2;swaps=0;stop=InconsistentComparator;partial:bool:false,bytes:312c332c32,int:3,int:3;comparisons=3;swaps=1;stop=LuaError|不一致 comparator 與局部重排後的有效 table
+case|lua55-i64f64|LIB-008|load-policy|lib_case_008|P13_CASE:LIB-008|HostPolicyLoad|未配置 compiler 的 load 明確拒絕
+case|lua55-i64f64|LIB-009|lua-pattern-substitution|lib_case_009|P13_CASE:LIB-009|bytes:28612862296329,int:2,int:3,bytes:6e616d65,bytes:616263,bytes:61786278,int:2,bytes:61326233,int:2,bytes:5859,int:2|%b、%f、capture 與三種 gsub replacement
+case|lua55-i64f64|LIB-010|utf8-invalid-profile|lib_case_010|P13_CASE:LIB-010|bytes:ff,nil,int:1,bool:false,int:55296,bytes:eda080;offset:Utf8Sequence|原始 ff byte、invalid codes、lax surrogate 與 offset 差異
+case|lua55-i64f64|LIB-011|package-searchers|lib_case_011|P13_CASE:LIB-011|lookup:bytes:6c656674,bytes:3a7072656c6f61643a,bytes:637573746f6d3a64617461,bytes:3a64617461,bool:false,bytes:6d6f64756c652027676f6e6527206e6f7420666f756e643a3237,bool:false,bool:true,bytes:6c656674,int:1;recursive:FuelExhausted;other-vm:bytes:7269676874,bytes:7269676874|preload、searcher data、缺模組診斷、原錯誤、遞迴與第二 VM
+case|lua55-i64f64|LIB-012|host-policy|lib_case_012|P13_CASE:LIB-012|io:HostPolicyIo;os:HostPolicyOs;debug:HostPolicyDebug;native:HostPolicyNative|Io、Os、Debug、Native 的型別化 policy 拒絕與呼叫次數
+case|lua55-i64f64|LIB-013|vm-isolation|lib_case_013|P13_CASE:LIB-013|left:nil,bytes:6c656674,bytes:6c656674,int:8291693048688576641,bytes:6c656674;right:nil,bytes:7269676874,bytes:7269676874,int:-8904508047278803908,bytes:7269676874;left-replay:int:8291693048688576641,bytes:6c656674,bytes:6c656674;right-replay:int:-8904508047278803908,bytes:7269676874,bytes:7269676874|兩個 VM 的 package、RNG、output sink、可變標準庫隔離
+case|lua55-i64f64|LIB-014|resource-abort|lib_case_014|P13_CASE:LIB-014|fuel:FuelExhausted;lua:Thrown:6d61726b6572;host:HostOutputFailed;sort:bool:false,bytes:312c332c32,int:3,int:3;comparisons=3;swaps=1;stop=LuaError;allocation:Heap(AllocationFailed);other:bytes:66756e6374696f6e,nil,int:42|低 fuel、LuaError、host failure、部分排序、配置失敗及 collect 後 roots
+profile|lua54-i64f64|lua54
+case|lua54-i64f64|LIB-001|bytes-utf8-length|lib_case_001|P13_CASE:LIB-001|int:6,int:2|蘋果字串的 byte 長度與 UTF-8 碼點數
+case|lua54-i64f64|LIB-002|pack-nil|lib_case_002|P13_CASE:LIB-002|int:3,int:3,int:1,nil,int:3|table.pack 的 n 與中間 nil、unpack 多回傳
+case|lua54-i64f64|LIB-003|lua-pattern-match|lib_case_003|P13_CASE:LIB-003|bytes:313233|Lua %d+ 比對 x=123 並取出 123
+case|lua54-i64f64|LIB-004|require-nil-loader|lib_case_004|P13_CASE:LIB-004|bool:true,bytes:3a7072656c6f61643a,bool:true,int:1|preload loader 回傳 nil 後的 loaded true 與 loader data
+case|lua54-i64f64|LIB-005|require-false-loader|lib_case_005|P13_CASE:LIB-005|bool:false,bytes:7061796c6f6164,bool:false,bytes:7061796c6f6164,int:2,int:2,bool:false|false loader 連續兩次 require 與 searcher 次數
+case|lua54-i64f64|LIB-006|string-budget|lib_case_006|P13_CASE:LIB-006|size:StringArgument,budget:Heap(AllocationFailed)|巨大 string.rep 的版本差異與配置上限
+case|lua54-i64f64|LIB-007|sort-abort|lib_case_007|P13_CASE:LIB-007|inconsistent:bool:false,bytes:332c312c32,int:3;comparisons=2;swaps=0;stop=InconsistentComparator;partial:bool:false,bytes:312c332c32,int:3,int:3;comparisons=3;swaps=1;stop=LuaError|不一致 comparator 與局部重排後的有效 table
+case|lua54-i64f64|LIB-008|load-policy|lib_case_008|P13_CASE:LIB-008|HostPolicyLoad|未配置 compiler 的 load 明確拒絕
+case|lua54-i64f64|LIB-009|lua-pattern-substitution|lib_case_009|P13_CASE:LIB-009|bytes:28612862296329,int:2,int:3,bytes:6e616d65,bytes:616263,bytes:61786278,int:2,bytes:61326233,int:2,bytes:5859,int:2|%b、%f、capture 與三種 gsub replacement
+case|lua54-i64f64|LIB-010|utf8-invalid-profile|lib_case_010|P13_CASE:LIB-010|bytes:ff,nil,int:1,bool:false,int:55296,bytes:eda080;offset:int:1|原始 ff byte、invalid codes、lax surrogate 與 offset 差異
+case|lua54-i64f64|LIB-011|package-searchers|lib_case_011|P13_CASE:LIB-011|lookup:bytes:6c656674,bytes:3a7072656c6f61643a,bytes:637573746f6d3a64617461,bytes:3a64617461,bool:false,bytes:6d6f64756c652027676f6e6527206e6f7420666f756e643a3237,bool:false,bool:true,bytes:6c656674,int:1;recursive:FuelExhausted;other-vm:bytes:7269676874,bytes:7269676874|preload、searcher data、缺模組診斷、原錯誤、遞迴與第二 VM
+case|lua54-i64f64|LIB-012|host-policy|lib_case_012|P13_CASE:LIB-012|io:HostPolicyIo;os:HostPolicyOs;debug:HostPolicyDebug;native:HostPolicyNative|Io、Os、Debug、Native 的型別化 policy 拒絕與呼叫次數
+case|lua54-i64f64|LIB-013|vm-isolation|lib_case_013|P13_CASE:LIB-013|left:nil,bytes:6c656674,bytes:6c656674,int:8291693048688576641,bytes:6c656674;right:nil,bytes:7269676874,bytes:7269676874,int:-8904508047278803908,bytes:7269676874;left-replay:int:8291693048688576641,bytes:6c656674,bytes:6c656674;right-replay:int:-8904508047278803908,bytes:7269676874,bytes:7269676874|兩個 VM 的 package、RNG、output sink、可變標準庫隔離
+case|lua54-i64f64|LIB-014|resource-abort|lib_case_014|P13_CASE:LIB-014|fuel:FuelExhausted;lua:Thrown:6d61726b6572;host:HostOutputFailed;sort:bool:false,bytes:312c332c32,int:3,int:3;comparisons=3;swaps=1;stop=LuaError;allocation:Heap(AllocationFailed);other:bytes:66756e6374696f6e,nil,int:42|低 fuel、LuaError、host failure、部分排序、配置失敗及 collect 後 roots

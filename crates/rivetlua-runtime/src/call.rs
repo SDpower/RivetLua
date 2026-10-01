@@ -64,6 +64,52 @@ pub(crate) struct OpenUpvalue {
 }
 
 impl CallFrame {
+    pub(crate) fn new_native_finalizer(ledger: &AllocationLedger) -> Result<Self, RuntimeError> {
+        let charge = core::mem::size_of::<Value>() + core::mem::size_of::<Option<RootId>>();
+        let mut registers = Vec::new();
+        let register_ticket =
+            reserve_vec(ledger, &mut registers, 1, FailPoint::FrameRegistersReserve)?;
+        registers.push(Value::Nil);
+        let mut roots = Vec::new();
+        let root_ticket = reserve_vec(ledger, &mut roots, 1, FailPoint::FrameRootsReserve)?;
+        roots.push(None);
+        register_ticket.commit()?;
+        if let Err(error) = root_ticket.commit() {
+            ledger.refund_on_drop(core::mem::size_of::<Value>());
+            return Err(error.into());
+        }
+        Ok(Self {
+            module: None,
+            closure: None,
+            closure_root: None,
+            stack_base: 0,
+            prototype: 0,
+            base: 0,
+            return_destination: None,
+            return_mode: ResultMode::Fixed(0),
+            tail_return: false,
+            pending_close: None,
+            caller: None,
+            depth: 0,
+            pc: 0,
+            registers,
+            roots,
+            varargs: Vec::new(),
+            vararg_roots: Vec::new(),
+            vararg_charge: 0,
+            named_vararg: None,
+            dynamic_top: 1,
+            register_limit: 1,
+            max_register_limit: usize::from(u16::MAX),
+            ledger: ledger.clone(),
+            charge,
+            open_upvalues: Vec::new(),
+            open_charge: 0,
+            close_entries: Vec::new(),
+            close_charge: 0,
+        })
+    }
+
     pub(crate) fn new(
         prototype: &BytecodePrototype,
         prototype_index: usize,
@@ -530,7 +576,7 @@ impl CallFrame {
                 .filter(|index| *index < self.register_limit)
                 .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?;
             let value = self.registers[index];
-            vm.with_upvalue_mut(entry.object, |upvalue| upvalue.close(value))?;
+            vm.close_upvalue(entry.object, value)?;
             if let Some(root) = entry.root {
                 vm.remove_root(root)?;
             }
@@ -557,7 +603,7 @@ impl CallFrame {
             return Ok(());
         };
         let entry = self.open_upvalues[position];
-        vm.with_upvalue_mut(entry.object, |upvalue| upvalue.close(self.registers[index]))?;
+        vm.close_upvalue(entry.object, self.registers[index])?;
         if let Some(root) = entry.root {
             vm.remove_root(root)?;
         }

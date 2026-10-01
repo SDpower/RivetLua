@@ -80,7 +80,7 @@ impl Closure {
 impl Drop for Closure {
     fn drop(&mut self) {
         if self.charge != 0 {
-            self.ledger.refund_on_drop(self.charge);
+            self.ledger.refund_lua_on_drop(self.charge);
             self.charge = 0;
         }
     }

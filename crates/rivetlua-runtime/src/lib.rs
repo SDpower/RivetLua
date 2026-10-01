@@ -7,27 +7,45 @@ mod call;
 mod closure;
 mod coroutine;
 mod errors;
+mod gc;
 mod handle;
 mod heap;
+mod host;
 mod metamethod;
 mod pending_op;
 mod roots;
+mod stdlib;
 mod string;
 mod table;
 mod unwind;
 mod upvalue;
 mod vm;
 
-pub use alloc::{AllocationLedger, FailPoint, LedgerSnapshot};
+pub use alloc::{
+    AllocationAttempt, AllocationDomain, AllocationFailure, AllocationFailureKind,
+    AllocationLedger, AllocationSite, AllocationTrace, FailPoint, LedgerProbe, LedgerSnapshot,
+};
 pub use call::PendingCloseSnapshot;
 pub use closure::Closure;
 pub use coroutine::CoroutineState;
 pub use errors::LuaError;
+pub use gc::trace::ActiveRootKind;
+pub use gc::{FinalizerState, GcAge, GcColor, GcCycleKind, GcMode, GcPhase, GcTrace, WeakMode};
 pub use handle::HostHandle;
 pub use heap::{ObjectKind, SlotState, Vm, VmError};
+pub use host::{
+    DebugCapability, DebugLimits, DebugPermission, FileOperation, FileReadFormat, FileSeekOrigin,
+    HostCalendar, HostCloseResult, HostDeadline, HostEntropy, HostEntropyError, HostExitStatus,
+    HostFileLease, HostIo, HostIoFailure, HostLoadCompiler, HostLoadError, HostLoadErrorKind,
+    HostModuleBytes, HostModuleRepository, HostNativeLoader, HostNativeModule, HostOs,
+    HostOsOperation, HostOsValue, HostOutput, HostOutputError, HostResourceError,
+    HostResourceErrorKind, HostServices, HostSourceReader, LoadBudget, LoadCapability, LoadFormat,
+    LoadLimits, PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
+};
 pub use metamethod::MetamethodEvent;
 pub use rivetlua_core::{Generation, ObjectId, SlotId, VmId};
 pub use roots::{RootId, RootKind, RootSet};
+pub use stdlib::table::{TableSortStop, TableSortTrace};
 pub use string::ByteString;
 pub use table::{CanonicalKey, CanonicalKeyClass, Table};
 pub use upvalue::{Upvalue, UpvalueState};
@@ -37,6 +55,684 @@ pub use vm::{AbortReason, Execution, RunOutcome, RuntimeError, RuntimeErrorKind}
 mod tests {
     use super::{Generation, ObjectId, SlotId, SlotState, Vm, VmError};
     use rivetlua_core::{ObjectRef, Value};
+
+    fn p12_4_weak_table(vm: &mut Vm, mode: &[u8]) -> (ObjectRef, ObjectRef) {
+        let table = vm.allocate_table().unwrap();
+        let metatable = vm.allocate_table().unwrap();
+        let name = vm.allocate_byte_string(b"__mode").unwrap();
+        let value = vm.allocate_byte_string(mode).unwrap();
+        vm.raw_set(metatable, Value::Object(name), Value::Object(value))
+            .unwrap();
+        vm.set_metatable(table, Some(metatable)).unwrap();
+        (table, metatable)
+    }
+
+    #[test]
+    fn p12_4_weak_key_reverse_reference_cannot_self_preserve() {
+        let mut vm = Vm::new().unwrap();
+        let (table, _) = p12_4_weak_table(&mut vm, b"k");
+        let table_root = vm.add_root(super::RootKind::Host, table).unwrap();
+        let key = vm.allocate_table().unwrap();
+        let value = vm.allocate_table().unwrap();
+        vm.add_child(value, key).unwrap();
+        vm.raw_set(table, Value::Object(key), Value::Object(value))
+            .unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(value), Err(VmError::StaleObject));
+        assert!(vm.with_table(table, |table| table.is_empty()).unwrap());
+        vm.remove_root(table_root).unwrap();
+    }
+
+    #[test]
+    fn p12_4_weak_key_multihop_ephemeron_reaches_fixed_point() {
+        let mut vm = Vm::new().unwrap();
+        let (later, _) = p12_4_weak_table(&mut vm, b"k");
+        let (first, _) = p12_4_weak_table(&mut vm, b"k");
+        let later_root = vm.add_root(super::RootKind::Host, later).unwrap();
+        let first_root = vm.add_root(super::RootKind::Host, first).unwrap();
+        let key1 = vm.allocate_table().unwrap();
+        let key1_root = vm.add_root(super::RootKind::Host, key1).unwrap();
+        let key2 = vm.allocate_table().unwrap();
+        let value1 = vm.allocate_table().unwrap();
+        let value2 = vm.allocate_table().unwrap();
+        vm.add_child(value1, key2).unwrap();
+        vm.raw_set(later, Value::Object(key2), Value::Object(value2))
+            .unwrap();
+        vm.raw_set(first, Value::Object(key1), Value::Object(value1))
+            .unwrap();
+        assert_eq!(vm.collect(), Ok(0));
+        assert_eq!(vm.object_kind(value2), Ok(super::ObjectKind::Table));
+        assert!(vm.gc_trace().ephemeron_iterations >= 2);
+        assert_eq!(vm.gc_trace().ephemeron_last_key, Some(key2));
+        assert!(vm.gc_trace().ephemeron_converged);
+        vm.remove_root(key1_root).unwrap();
+        vm.collect().unwrap();
+        assert!(vm.gc_trace().weak_cleared_pairs >= 2);
+        for object in [key1, key2, value1, value2] {
+            assert_eq!(vm.object_kind(object), Err(VmError::StaleObject));
+        }
+        vm.remove_root(first_root).unwrap();
+        vm.remove_root(later_root).unwrap();
+    }
+
+    #[test]
+    fn p12_4_weak_values_all_and_string_exceptions() {
+        let mut vm = Vm::new().unwrap();
+        let (values, _) = p12_4_weak_table(&mut vm, b"v");
+        let (all, _) = p12_4_weak_table(&mut vm, b"kv");
+        let values_root = vm.add_root(super::RootKind::Host, values).unwrap();
+        let all_root = vm.add_root(super::RootKind::Host, all).unwrap();
+        let key = vm.allocate_table().unwrap();
+        let value = vm.allocate_table().unwrap();
+        vm.raw_set(values, Value::Object(key), Value::Object(value))
+            .unwrap();
+        let all_key = vm.allocate_table().unwrap();
+        let all_value = vm.allocate_table().unwrap();
+        vm.raw_set(all, Value::Object(all_key), Value::Object(all_value))
+            .unwrap();
+        vm.raw_set(all, Value::Integer(2), Value::Integer(3))
+            .unwrap();
+        let string_key = vm.allocate_byte_string(b"key").unwrap();
+        let string_value = vm.allocate_byte_string(b"value").unwrap();
+        vm.raw_set(all, Value::Object(string_key), Value::Object(string_value))
+            .unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(key), Ok(super::ObjectKind::Table));
+        assert_eq!(vm.object_kind(value), Err(VmError::StaleObject));
+        assert_eq!(vm.raw_get(values, Value::Object(key)), Ok(Value::Nil));
+        assert_eq!(vm.object_kind(all_key), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(all_value), Err(VmError::StaleObject));
+        assert_eq!(vm.raw_get(all, Value::Integer(2)), Ok(Value::Integer(3)));
+        assert_eq!(
+            vm.object_kind(string_key),
+            Ok(super::ObjectKind::ByteString)
+        );
+        assert_eq!(
+            vm.object_kind(string_value),
+            Ok(super::ObjectKind::ByteString)
+        );
+        vm.remove_root(values_root).unwrap();
+        vm.remove_root(all_root).unwrap();
+    }
+
+    #[test]
+    fn p12_4_weak_mode_changes_only_at_next_cycle_and_minor_clears_young() {
+        let mut vm = Vm::new().unwrap();
+        vm.set_gc_mode(super::GcMode::Generational).unwrap();
+        vm.set_gc_promotion_survivals(1).unwrap();
+        let (table, metatable) = p12_4_weak_table(&mut vm, b"strong");
+        let root = vm.add_root(super::RootKind::Host, table).unwrap();
+        vm.collect_minor().unwrap();
+        vm.set_gc_promotion_survivals(2).unwrap();
+        let child = vm.allocate_table().unwrap();
+        vm.raw_set(table, Value::Integer(1), Value::Object(child))
+            .unwrap();
+        let mode_key = vm.allocate_byte_string(b"__mode").unwrap();
+        let mode_value = vm.allocate_byte_string(b"v").unwrap();
+        vm.incremental_step(1).unwrap();
+        vm.raw_set(
+            metatable,
+            Value::Object(mode_key),
+            Value::Object(mode_value),
+        )
+        .unwrap();
+        while vm.gc_trace().phase != super::GcPhase::Pause {
+            vm.incremental_step(1).unwrap();
+        }
+        assert_eq!(vm.object_kind(child), Ok(super::ObjectKind::Table));
+        assert!(vm.collect_minor().unwrap() >= 1);
+        assert_eq!(vm.object_kind(child), Err(VmError::StaleObject));
+        assert_eq!(vm.raw_get(table, Value::Integer(1)), Ok(Value::Nil));
+        vm.remove_root(root).unwrap();
+        vm.collect_major().unwrap();
+    }
+
+    #[test]
+    fn p12_4_long_mode_profile_and_nonstring_mode() {
+        for (profile, expected_weak) in [
+            (rivetlua_core::LuaProfile::Lua54, false),
+            (rivetlua_core::LuaProfile::Lua55, true),
+        ] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let mut long_mode = vec![b'x'; 40];
+            long_mode.push(b'v');
+            let (table, mt) = p12_4_weak_table(&mut vm, &long_mode);
+            let root = vm.add_root(super::RootKind::Host, table).unwrap();
+            let value = vm.allocate_table().unwrap();
+            vm.raw_set(table, Value::Integer(1), Value::Object(value))
+                .unwrap();
+            vm.collect().unwrap();
+            assert_eq!(vm.object_kind(value).is_err(), expected_weak);
+            let mode_name = vm.allocate_byte_string(b"__mode").unwrap();
+            vm.raw_set(mt, Value::Object(mode_name), Value::Integer(7))
+                .unwrap();
+            let second = vm.allocate_table().unwrap();
+            vm.raw_set(table, Value::Integer(2), Value::Object(second))
+                .unwrap();
+            vm.collect().unwrap();
+            assert_eq!(vm.object_kind(second), Ok(super::ObjectKind::Table));
+            vm.remove_root(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn p12_4_cycle_reserve_failure_keeps_weak_pair_until_retry() {
+        let mut vm = Vm::new().unwrap();
+        let (table, _) = p12_4_weak_table(&mut vm, b"v");
+        let root = vm.add_root(super::RootKind::Host, table).unwrap();
+        let value = vm.allocate_table().unwrap();
+        vm.raw_set(table, Value::Integer(1), Value::Object(value))
+            .unwrap();
+        let ledger = vm.ledger_snapshot();
+        vm.inject_failure_once(super::FailPoint::WorkReserve);
+        assert_eq!(
+            vm.collect(),
+            Err(VmError::InjectedFailure(super::FailPoint::WorkReserve))
+        );
+        assert_eq!(vm.gc_trace().phase, super::GcPhase::Pause);
+        assert_eq!(
+            vm.raw_get(table, Value::Integer(1)),
+            Ok(Value::Object(value))
+        );
+        assert_eq!(vm.ledger_snapshot(), ledger);
+        vm.collect().unwrap();
+        assert_eq!(vm.raw_get(table, Value::Integer(1)), Ok(Value::Nil));
+        assert_eq!(vm.object_kind(value), Err(VmError::StaleObject));
+        vm.remove_root(root).unwrap();
+    }
+
+    #[test]
+    fn p12_4_atomic_remembered_failure_keeps_live_ephemeron_pair() {
+        let mut vm = Vm::new().unwrap();
+        vm.set_gc_mode(super::GcMode::Generational).unwrap();
+        vm.set_gc_promotion_survivals(2).unwrap();
+        let (table, _) = p12_4_weak_table(&mut vm, b"k");
+        let root = vm.add_root(super::RootKind::Host, table).unwrap();
+        vm.collect_minor().unwrap();
+        vm.collect_minor().unwrap();
+        assert_eq!(vm.gc_age(table), Ok(super::GcAge::Old));
+        let value = vm.allocate_table().unwrap();
+        vm.raw_set(table, Value::Integer(1), Value::Object(value))
+            .unwrap();
+        vm.inject_failure_once(super::FailPoint::RememberedReserve);
+        assert_eq!(
+            vm.collect_minor(),
+            Err(VmError::InjectedFailure(
+                super::FailPoint::RememberedReserve
+            ))
+        );
+        assert_eq!(vm.gc_trace().phase, super::GcPhase::Atomic);
+        assert_eq!(
+            vm.raw_get(table, Value::Integer(1)),
+            Ok(Value::Object(value))
+        );
+        while vm.gc_trace().phase != super::GcPhase::Pause {
+            vm.incremental_step(1).unwrap();
+        }
+        assert_eq!(vm.object_kind(value), Ok(super::ObjectKind::Table));
+        assert_eq!(
+            vm.raw_get(table, Value::Integer(1)),
+            Ok(Value::Object(value))
+        );
+        vm.remove_root(root).unwrap();
+        vm.collect_major().unwrap();
+        assert_eq!(vm.object_kind(value), Err(VmError::StaleObject));
+    }
+
+    #[test]
+    fn p12_4_minor_keeps_old_weak_pair_until_major_discovers_dead_key() {
+        let mut vm = Vm::new().unwrap();
+        vm.set_gc_mode(super::GcMode::Generational).unwrap();
+        vm.set_gc_promotion_survivals(1).unwrap();
+        let (table, _) = p12_4_weak_table(&mut vm, b"k");
+        let table_root = vm.add_root(super::RootKind::Host, table).unwrap();
+        let key = vm.allocate_table().unwrap();
+        let key_root = vm.add_root(super::RootKind::Host, key).unwrap();
+        let value = vm.allocate_table().unwrap();
+        vm.raw_set(table, Value::Object(key), Value::Object(value))
+            .unwrap();
+        vm.collect_minor().unwrap();
+        for object in [table, key, value] {
+            assert_eq!(vm.gc_age(object), Ok(super::GcAge::Old));
+        }
+        vm.remove_root(key_root).unwrap();
+        vm.collect_minor().unwrap();
+        assert_eq!(vm.object_kind(value), Ok(super::ObjectKind::Table));
+        vm.collect_major().unwrap();
+        assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(value), Err(VmError::StaleObject));
+        assert!(vm.with_table(table, |table| table.is_empty()).unwrap());
+        vm.remove_root(table_root).unwrap();
+    }
+
+    #[test]
+    fn p12_4_dead_weak_key_does_not_keep_string_value() {
+        let mut vm = Vm::new().unwrap();
+        let (table, _) = p12_4_weak_table(&mut vm, b"k");
+        let root = vm.add_root(super::RootKind::Host, table).unwrap();
+        let key = vm.allocate_table().unwrap();
+        let value = vm.allocate_byte_string(b"value").unwrap();
+        vm.raw_set(table, Value::Object(key), Value::Object(value))
+            .unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(value), Err(VmError::StaleObject));
+        vm.remove_root(root).unwrap();
+    }
+
+    #[test]
+    fn p12_3_old_black_table_remembers_young_until_major() {
+        let mut vm = Vm::new().unwrap();
+        vm.set_gc_mode(super::GcMode::Generational).unwrap();
+        vm.set_gc_promotion_survivals(1).unwrap();
+        let table = vm.allocate_table().unwrap();
+        let root = vm.add_root(super::RootKind::Host, table).unwrap();
+        assert_eq!(vm.collect_minor(), Ok(0));
+        assert_eq!(vm.gc_age(table), Ok(super::GcAge::Old));
+        vm.incremental_step(1).unwrap();
+        assert_eq!(vm.gc_color(table), Ok(super::GcColor::Black));
+        let child = vm.allocate_table().unwrap();
+        vm.raw_set(table, Value::Integer(1), Value::Object(child))
+            .unwrap();
+        assert_eq!(vm.gc_trace().remembered_len, 1);
+        while vm.gc_trace().phase != super::GcPhase::Pause {
+            vm.incremental_step(1).unwrap();
+        }
+        assert_eq!(vm.collect_minor(), Ok(0));
+        assert_eq!(
+            vm.raw_get(table, Value::Integer(1)),
+            Ok(Value::Object(child))
+        );
+        assert_eq!(vm.gc_age(child), Ok(super::GcAge::Old));
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.collect_major(), Ok(2));
+        assert_eq!(vm.object_kind(table), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(child), Err(VmError::StaleObject));
+    }
+
+    #[test]
+    fn p12_3_mode_boundary_promotion_and_major_threshold() {
+        let mut vm = Vm::new().unwrap();
+        assert_eq!(
+            vm.set_gc_promotion_survivals(0),
+            Err(VmError::InvalidGcConfig)
+        );
+        assert_eq!(vm.set_gc_major_threshold(0), Err(VmError::InvalidGcConfig));
+        vm.set_gc_promotion_survivals(2).unwrap();
+        vm.set_gc_major_threshold(1).unwrap();
+        vm.set_gc_mode(super::GcMode::Generational).unwrap();
+        let object = vm.allocate(Value::Integer(1)).unwrap();
+        let root = vm.add_root(super::RootKind::Host, object).unwrap();
+        let trace = vm.incremental_step(1).unwrap();
+        assert_eq!(trace.cycle, super::GcCycleKind::Major);
+        assert_eq!(trace.major_threshold_bytes, 1);
+        assert_eq!(trace.promotion_survivals, 2);
+        assert_eq!(
+            vm.set_gc_mode(super::GcMode::Incremental),
+            Err(VmError::WrongGcPhase)
+        );
+        while vm.gc_trace().phase != super::GcPhase::Pause {
+            vm.incremental_step(1).unwrap();
+        }
+        assert_eq!(vm.gc_age(object), Ok(super::GcAge::Survivor));
+        vm.set_gc_mode(super::GcMode::Incremental).unwrap();
+        assert_eq!(vm.gc_age(object), Ok(super::GcAge::Young));
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.collect(), Ok(1));
+    }
+
+    #[test]
+    fn p12_3_remembered_reserve_failure_does_not_write_edge() {
+        let mut vm = Vm::new().unwrap();
+        vm.set_gc_mode(super::GcMode::Generational).unwrap();
+        vm.set_gc_promotion_survivals(1).unwrap();
+        let table = vm.allocate_table().unwrap();
+        let root = vm.add_root(super::RootKind::Host, table).unwrap();
+        vm.collect_minor().unwrap();
+        let child = vm.allocate_table().unwrap();
+        let before = vm.ledger_snapshot();
+        vm.inject_failure_once(super::FailPoint::RememberedReserve);
+        assert_eq!(
+            vm.raw_set(table, Value::Integer(1), Value::Object(child)),
+            Err(VmError::InjectedFailure(
+                super::FailPoint::RememberedReserve
+            ))
+        );
+        assert_eq!(vm.raw_get(table, Value::Integer(1)), Ok(Value::Nil));
+        assert_eq!(vm.gc_trace().remembered_len, 0);
+        assert_eq!(vm.ledger_snapshot(), before);
+        vm.raw_set(table, Value::Integer(1), Value::Object(child))
+            .unwrap();
+        assert_eq!(vm.gc_trace().remembered_len, 1);
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.collect_major(), Ok(2));
+    }
+
+    #[test]
+    fn p12_3_atomic_remembered_rebuild_failure_retries_without_promotion() {
+        let mut vm = Vm::new().unwrap();
+        vm.set_gc_mode(super::GcMode::Generational).unwrap();
+        vm.set_gc_promotion_survivals(2).unwrap();
+        let table = vm.allocate_table().unwrap();
+        let root = vm.add_root(super::RootKind::Host, table).unwrap();
+        vm.collect_minor().unwrap();
+        vm.collect_minor().unwrap();
+        assert_eq!(vm.gc_age(table), Ok(super::GcAge::Old));
+        let child = vm.allocate_table().unwrap();
+        vm.raw_set(table, Value::Integer(1), Value::Object(child))
+            .unwrap();
+        let before = vm.gc_trace();
+        vm.inject_failure_once(super::FailPoint::RememberedReserve);
+        assert_eq!(
+            vm.collect_minor(),
+            Err(VmError::InjectedFailure(
+                super::FailPoint::RememberedReserve
+            ))
+        );
+        assert_eq!(vm.gc_trace().phase, super::GcPhase::Atomic);
+        assert_eq!(vm.gc_age(child), Ok(super::GcAge::Young));
+        assert_eq!(vm.gc_trace().remembered_len, before.remembered_len);
+        while vm.gc_trace().phase != super::GcPhase::Pause {
+            vm.incremental_step(1).unwrap();
+        }
+        assert_eq!(vm.gc_age(child), Ok(super::GcAge::Survivor));
+        assert_eq!(vm.gc_trace().remembered_len, 1);
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.collect_major(), Ok(2));
+        assert_eq!(vm.gc_trace().remembered_len, 0);
+    }
+
+    #[test]
+    fn p12_3_minor_reclaims_young_but_major_reclaims_unrooted_old() {
+        let mut vm = Vm::new().unwrap();
+        vm.set_gc_mode(super::GcMode::Generational).unwrap();
+        vm.set_gc_promotion_survivals(1).unwrap();
+        let old = vm.allocate_table().unwrap();
+        let root = vm.add_root(super::RootKind::Host, old).unwrap();
+        vm.collect_minor().unwrap();
+        vm.remove_root(root).unwrap();
+        let young = vm.allocate_table().unwrap();
+        assert_eq!(vm.collect_minor(), Ok(1));
+        assert_eq!(vm.object_kind(young), Err(VmError::StaleObject));
+        assert_eq!(vm.gc_age(old), Ok(super::GcAge::Old));
+        assert_eq!(vm.collect_major(), Ok(1));
+        assert_eq!(vm.object_kind(old), Err(VmError::StaleObject));
+    }
+
+    #[test]
+    fn p12_3_mode_change_clears_remembered_without_losing_edges() {
+        let mut vm = Vm::new().unwrap();
+        vm.set_gc_mode(super::GcMode::Generational).unwrap();
+        vm.set_gc_promotion_survivals(1).unwrap();
+        let table = vm.allocate_table().unwrap();
+        let root = vm.add_root(super::RootKind::Host, table).unwrap();
+        vm.collect_minor().unwrap();
+        let child = vm.allocate_table().unwrap();
+        vm.add_child(table, child).unwrap();
+        assert_eq!(vm.gc_trace().remembered_len, 1);
+        vm.set_gc_mode(super::GcMode::Incremental).unwrap();
+        assert_eq!(vm.gc_trace().remembered_len, 0);
+        assert_eq!(vm.gc_age(table), Ok(super::GcAge::Young));
+        assert_eq!(vm.gc_age(child), Ok(super::GcAge::Young));
+        assert_eq!(vm.collect(), Ok(0));
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.collect(), Ok(2));
+    }
+
+    #[test]
+    fn p12_2_limited_steps_expose_all_phases_and_reclaim() {
+        let mut vm = Vm::new().unwrap();
+        let live = vm.allocate_table().unwrap();
+        let dead = vm.allocate_table().unwrap();
+        let root = vm.add_root(super::RootKind::Host, live).unwrap();
+        let mut phases = Vec::new();
+        for _ in 0..32 {
+            let trace = vm.incremental_step(1).unwrap();
+            phases.push(trace.phase);
+            if phases.len() > 1 && trace.phase == super::GcPhase::Pause {
+                break;
+            }
+        }
+        for phase in [
+            super::GcPhase::RootMark,
+            super::GcPhase::Propagate,
+            super::GcPhase::Atomic,
+            super::GcPhase::Sweep,
+            super::GcPhase::Pause,
+        ] {
+            assert!(phases.contains(&phase), "缺少 {phase:?}: {phases:?}");
+        }
+        assert_eq!(vm.object_kind(dead), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(live), Ok(super::ObjectKind::Table));
+        assert!(vm.gc_trace().reclaimed_bytes > 0);
+        vm.remove_root(root).unwrap();
+    }
+
+    #[test]
+    fn p12_2_worklist_failure_and_invalid_budget_keep_collector_recoverable() {
+        let mut vm = Vm::new().unwrap();
+        let object = vm.allocate(Value::Integer(1)).unwrap();
+        let before = vm.ledger_snapshot();
+        assert_eq!(vm.incremental_step(0), Err(VmError::InvalidGcStepBudget));
+        assert_eq!(vm.gc_trace().phase, super::GcPhase::Pause);
+        vm.inject_failure_once(super::FailPoint::WorkReserve);
+        assert_eq!(
+            vm.incremental_step(1),
+            Err(VmError::InjectedFailure(super::FailPoint::WorkReserve))
+        );
+        assert_eq!(vm.ledger_snapshot(), before);
+        assert_eq!(vm.gc_trace().phase, super::GcPhase::Pause);
+        assert_eq!(vm.collect(), Ok(1));
+        assert_eq!(vm.object_kind(object), Err(VmError::StaleObject));
+    }
+
+    #[test]
+    fn p12_2_cycle_start_rejects_active_phase() {
+        let mut vm = Vm::new().unwrap();
+        vm.allocate(Value::Integer(1)).unwrap();
+        vm.incremental_step(1).unwrap();
+        let before = vm.gc_trace();
+        let ledger = vm.ledger_snapshot();
+        assert_eq!(vm.begin_gc_cycle(), Err(VmError::WrongGcPhase));
+        assert_eq!(vm.gc_trace(), before);
+        assert_eq!(vm.ledger_snapshot(), ledger);
+    }
+
+    #[test]
+    fn p12_2_allocation_debt_starts_bounded_work() {
+        let mut vm = Vm::new().unwrap();
+        vm.set_gc_debt_threshold(1);
+        let first = vm.allocate(Value::Integer(1)).unwrap();
+        let root = vm.add_root(super::RootKind::Host, first).unwrap();
+        assert!(vm.gc_trace().debt_bytes > 0);
+        let _second = vm.allocate(Value::Integer(2)).unwrap();
+        assert_eq!(vm.gc_trace().phase, super::GcPhase::RootMark);
+        vm.remove_root(root).unwrap();
+
+        let mut strings = Vm::new().unwrap();
+        strings.allocate_byte_string(&[b'x'; 256]).unwrap();
+        assert!(strings.gc_trace().debt_bytes >= 256);
+    }
+
+    #[test]
+    fn p12_2_sweep_root_barrier_and_coroutine_field_barrier() {
+        let mut vm = Vm::new().unwrap();
+        let late = vm.allocate(Value::Integer(1)).unwrap();
+        for _ in 0..16 {
+            if vm.incremental_step(1).unwrap().phase == super::GcPhase::Sweep {
+                break;
+            }
+        }
+        assert_eq!(vm.gc_trace().phase, super::GcPhase::Sweep);
+        let late_root = vm.add_root(super::RootKind::Host, late).unwrap();
+        assert_eq!(vm.gc_color(late), Ok(super::GcColor::Gray));
+        assert_eq!(vm.gc_trace().phase, super::GcPhase::Propagate);
+        while vm.gc_trace().phase != super::GcPhase::Pause {
+            vm.incremental_step(1).unwrap();
+        }
+        assert_eq!(vm.read(late), Ok(Value::Integer(1)));
+
+        let coroutine = vm.allocate_coroutine(Value::Nil).unwrap();
+        let coroutine_root = vm.add_root(super::RootKind::Host, coroutine).unwrap();
+        for _ in 0..32 {
+            vm.incremental_step(1).unwrap();
+            if vm.gc_color(coroutine) == Ok(super::GcColor::Black) {
+                break;
+            }
+        }
+        assert_eq!(vm.gc_color(coroutine), Ok(super::GcColor::Black));
+        let error = vm.allocate(Value::Integer(9)).unwrap();
+        let before = vm.gc_trace().barrier_count;
+        vm.with_coroutine_mut(coroutine, &[error], |co| {
+            co.error = Some(Value::Object(error));
+        })
+        .unwrap();
+        assert_eq!(vm.gc_color(error), Ok(super::GcColor::Gray));
+        assert_eq!(vm.gc_trace().barrier_count, before + 1);
+        while vm.gc_trace().phase != super::GcPhase::Pause {
+            vm.incremental_step(1).unwrap();
+        }
+        assert_eq!(vm.read(error), Ok(Value::Integer(9)));
+        vm.remove_root(coroutine_root).unwrap();
+        vm.remove_root(late_root).unwrap();
+        assert_eq!(vm.collect(), Ok(3));
+    }
+
+    #[test]
+    fn p12_2_active_worklist_growth_failure_keeps_slots_and_ledger() {
+        let mut vm = Vm::new().unwrap();
+        let owner = vm.allocate_table().unwrap();
+        let root = vm.add_root(super::RootKind::Host, owner).unwrap();
+        vm.incremental_step(1).unwrap();
+        let trace = vm.gc_trace();
+        let ledger = vm.ledger_snapshot();
+        vm.inject_failure_once(super::FailPoint::WorkReserve);
+        assert_eq!(
+            vm.allocate_table(),
+            Err(VmError::InjectedFailure(super::FailPoint::WorkReserve))
+        );
+        assert_eq!(vm.gc_trace(), trace);
+        assert_eq!(vm.ledger_snapshot(), ledger);
+        let child = vm.allocate_table().unwrap();
+        vm.add_child(owner, child).unwrap();
+        assert_eq!(vm.collect(), Ok(0));
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.collect(), Ok(2));
+    }
+
+    #[test]
+    fn p12_2_forced_collection_preserves_candidate_edge_during_active_cycle() {
+        let mut vm = Vm::new().unwrap();
+        let child = vm.allocate(Value::Integer(17)).unwrap();
+        vm.incremental_step(1).unwrap();
+        vm.set_collect_every_allocation(true);
+        let parent = vm.allocate(Value::Object(child)).unwrap();
+        assert_eq!(vm.read(parent), Ok(Value::Object(child)));
+        assert_eq!(vm.read(child), Ok(Value::Integer(17)));
+        assert_eq!(vm.gc_trace().phase, super::GcPhase::Pause);
+        assert_eq!(vm.collect(), Ok(2));
+    }
+
+    #[test]
+    fn p12_1_native_resume_payload_traces_outer_parent_and_handler() {
+        let mut vm = Vm::new().unwrap();
+        let outer = vm.allocate(Value::Integer(1)).unwrap();
+        let parent = vm.allocate(Value::Integer(2)).unwrap();
+        let handler = vm.allocate(Value::Integer(3)).unwrap();
+        let coroutine = vm.allocate_coroutine(Value::Nil).unwrap();
+        vm.with_coroutine_mut(coroutine, &[outer, parent, handler], |co| {
+            co.native = Some(super::vm::NativeCompletion::Resume {
+                outer,
+                parent: Some(parent),
+                parent_root: None,
+                protected: Some(super::vm::NativeProtected::XPCall {
+                    handler: Value::Object(handler),
+                }),
+            });
+        })
+        .unwrap();
+        let root = vm.add_root(super::RootKind::Host, coroutine).unwrap();
+        assert_eq!(vm.collect(), Ok(0));
+        for (object, expected) in [(outer, 1), (parent, 2), (handler, 3)] {
+            assert_eq!(vm.read(object), Ok(Value::Integer(expected)));
+        }
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.collect(), Ok(4));
+    }
+
+    #[test]
+    fn p12_1_new_payload_rejects_foreign_and_stale_edges_before_commit() {
+        let mut vm = Vm::new().unwrap();
+        let mut other = Vm::new().unwrap();
+        let foreign = other.allocate(Value::Integer(1)).unwrap();
+        let before = vm.ledger_snapshot();
+        assert_eq!(
+            vm.allocate_upvalue(super::Upvalue::open(vm.id(), Some(foreign), 0)),
+            Err(VmError::WrongVm)
+        );
+        assert_eq!(vm.ledger_snapshot(), before);
+
+        let stale = vm.allocate(Value::Integer(2)).unwrap();
+        assert_eq!(vm.collect(), Ok(1));
+        let before = vm.ledger_snapshot();
+        let mut upvalue = super::Upvalue::open(vm.id(), None, 0);
+        upvalue.close(Value::Object(stale));
+        assert_eq!(vm.allocate_upvalue(upvalue), Err(VmError::StaleObject));
+        assert_eq!(vm.ledger_snapshot(), before);
+        assert_eq!(vm.roots().total_count(), 0);
+    }
+
+    #[test]
+    fn p12_1_coroutine_write_preflight_and_reserve_failure_leave_payload_unchanged() {
+        let mut vm = Vm::new().unwrap();
+        let coroutine = vm.allocate_coroutine(Value::Nil).unwrap();
+        let root = vm.add_root(super::RootKind::Host, coroutine).unwrap();
+        let mut other = Vm::new().unwrap();
+        let foreign = other.allocate(Value::Integer(1)).unwrap();
+        let before = vm.ledger_snapshot();
+        assert_eq!(
+            vm.with_coroutine_mut(coroutine, &[foreign], |co| {
+                co.state = super::CoroutineState::Dead;
+                co.error = Some(Value::Object(foreign));
+            }),
+            Err(VmError::WrongVm)
+        );
+        assert_eq!(vm.ledger_snapshot(), before);
+        assert_eq!(
+            vm.with_coroutine(coroutine, |co| (co.state, co.error)),
+            Ok((super::CoroutineState::Suspended, None))
+        );
+
+        let stale = vm.allocate(Value::Integer(2)).unwrap();
+        assert_eq!(vm.collect(), Ok(1));
+        let before = vm.ledger_snapshot();
+        assert_eq!(
+            vm.with_coroutine_mut(coroutine, &[stale], |co| {
+                co.error = Some(Value::Object(stale));
+            }),
+            Err(VmError::StaleObject)
+        );
+        assert_eq!(vm.ledger_snapshot(), before);
+        assert_eq!(vm.with_coroutine(coroutine, |co| co.error), Ok(None));
+
+        let child = vm.allocate(Value::Integer(3)).unwrap();
+        let before = vm.ledger_snapshot();
+        vm.inject_failure_once(super::FailPoint::ChildReserve);
+        assert_eq!(
+            vm.add_child(coroutine, child),
+            Err(VmError::InjectedFailure(super::FailPoint::ChildReserve))
+        );
+        assert_eq!(vm.ledger_snapshot(), before);
+        assert_eq!(vm.collect(), Ok(1));
+        assert_eq!(vm.read(child), Err(VmError::StaleObject));
+        assert_eq!(
+            vm.with_coroutine(coroutine, |co| (co.state, co.error)),
+            Ok((super::CoroutineState::Suspended, None))
+        );
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.collect(), Ok(1));
+    }
 
     #[test]
     fn p11_2_coroutine_installer_provides_traceable_table() {
@@ -632,5 +1328,67 @@ mod tests {
             first.identity().unwrap().slot
         );
         assert!(vm.ledger_snapshot().committed > after_sweep.committed);
+    }
+}
+
+#[cfg(test)]
+mod p13_a_tests {
+    use rivetlua_core::{LuaProfile, Value};
+
+    use crate::{ObjectKind, RootKind, Vm};
+
+    #[test]
+    fn p13_a_installer_exposes_basic_callables_without_losing_roots() {
+        let mut vm = Vm::new().unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let root = vm.add_root(RootKind::Host, environment).unwrap();
+        vm.install_basic_builtins(environment).unwrap();
+        for name in [
+            b"assert".as_slice(),
+            b"error",
+            b"pcall",
+            b"xpcall",
+            b"select",
+            b"type",
+            b"tostring",
+            b"tonumber",
+            b"next",
+            b"pairs",
+            b"ipairs",
+            b"getmetatable",
+            b"setmetatable",
+            b"rawget",
+            b"rawset",
+            b"rawequal",
+            b"rawlen",
+            b"print",
+        ] {
+            let key = vm.allocate_byte_string(name).unwrap();
+            let value = vm.raw_get(environment, Value::Object(key)).unwrap();
+            let Value::Object(function) = value else {
+                panic!("缺少 basic function: {name:?}");
+            };
+            assert_eq!(vm.object_kind(function), Ok(ObjectKind::Builtin));
+        }
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(environment), Ok(ObjectKind::Table));
+        vm.remove_root(root).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.roots().total_count(), 0);
+    }
+
+    #[test]
+    fn p13_a_default_vm_constructors_deny_output() {
+        assert!(!Vm::new().unwrap().host_output_allowed());
+        assert!(
+            !Vm::new_with_profile(LuaProfile::Lua54)
+                .unwrap()
+                .host_output_allowed()
+        );
+        assert!(
+            !Vm::new_with_profile(LuaProfile::Lua55)
+                .unwrap()
+                .host_output_allowed()
+        );
     }
 }

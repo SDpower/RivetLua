@@ -7,11 +7,14 @@ use std::collections::hash_map::DefaultHasher;
 use rivetlua_core::{ObjectId, ObjectRef, Value};
 
 use crate::alloc::{AllocationLedger, FailPoint, Reservation, checked_bytes, reserve_vec};
+use crate::gc::WeakMode;
+use crate::gc::trace::RefField;
 use crate::{ByteString, ObjectKind, RootId, RootKind, Vm, VmError};
 
 /// 保留 array 欄位與 hash bucket；以 raw 語意讀寫。
 pub struct Table {
     metatable: Option<ObjectRef>,
+    weak_mode: WeakMode,
     array: Vec<Option<Value>>,
     hash: Vec<Option<(CanonicalKey, Value)>>,
 }
@@ -41,6 +44,7 @@ impl Table {
         Ok((
             Self {
                 metatable: None,
+                weak_mode: WeakMode::Strong,
                 array,
                 hash,
             },
@@ -55,6 +59,34 @@ impl Table {
 
     pub(crate) fn set_metatable(&mut self, metatable: Option<ObjectRef>) {
         self.metatable = metatable;
+    }
+
+    pub(crate) const fn weak_mode(&self) -> WeakMode {
+        self.weak_mode
+    }
+
+    pub(crate) fn set_weak_mode(&mut self, mode: WeakMode) {
+        self.weak_mode = mode;
+    }
+
+    pub(crate) fn mode_value(&self) -> Value {
+        self.hash.iter().flatten().find_map(|(key, value)| {
+            if matches!(&key.kind, KeyKind::ByteString(string) if string.bytes.as_bytes() == b"__mode") {
+                Some(*value)
+            } else {
+                None
+            }
+        }).unwrap_or(Value::Nil)
+    }
+
+    pub(crate) fn finalizer_value(&self) -> Value {
+        self.hash.iter().flatten().find_map(|(key, value)| {
+            if matches!(&key.kind, KeyKind::ByteString(string) if string.bytes.as_bytes() == b"__gc") {
+                Some(*value)
+            } else {
+                None
+            }
+        }).unwrap_or(Value::Nil)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -99,6 +131,122 @@ impl Table {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn trace_gc_children(
+        &self,
+        mut is_string: impl FnMut(ObjectRef) -> Result<bool, VmError>,
+        mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
+    ) -> Result<(), VmError> {
+        if self.weak_mode == WeakMode::Strong {
+            return self.trace_children(visit);
+        }
+        if let Some(metatable) = self.metatable {
+            visit(metatable)?;
+        }
+        for value in self.array.iter().flatten() {
+            if let Value::Object(object) = value {
+                if self.weak_mode == WeakMode::Keys || is_string(*object)? {
+                    visit(*object)?;
+                }
+            }
+        }
+        for (key, value) in self.hash.iter().flatten() {
+            if let Some(object) = key.source_object() {
+                if self.weak_mode == WeakMode::Values
+                    || key.class() == CanonicalKeyClass::ByteString
+                {
+                    visit(object)?;
+                }
+            }
+            if let Value::Object(object) = value {
+                let live_key_without_scan = matches!(
+                    key.class(),
+                    CanonicalKeyClass::Integer
+                        | CanonicalKeyClass::Float
+                        | CanonicalKeyClass::Boolean
+                        | CanonicalKeyClass::ByteString
+                );
+                let strong_value = match self.weak_mode {
+                    WeakMode::Keys => live_key_without_scan,
+                    WeakMode::Values | WeakMode::All => is_string(*object)?,
+                    WeakMode::Strong => true,
+                };
+                if strong_value {
+                    visit(*object)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn visit_ephemeron_pairs(
+        &self,
+        mut visit: impl FnMut(Option<ObjectRef>, ObjectRef) -> Result<(), VmError>,
+    ) -> Result<(), VmError> {
+        if self.weak_mode != WeakMode::Keys {
+            return Ok(());
+        }
+        for (key, value) in self.hash.iter().flatten() {
+            if let Value::Object(value) = value {
+                let key = match &key.kind {
+                    KeyKind::Object(key) => Some(key.source),
+                    _ => None,
+                };
+                visit(key, *value)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_dead_weak_pairs(
+        &mut self,
+        mut is_dead: impl FnMut(ObjectRef) -> Result<bool, VmError>,
+        clear_values: bool,
+        clear_keys: bool,
+    ) -> Result<usize, VmError> {
+        if self.weak_mode == WeakMode::Strong {
+            return Ok(0);
+        }
+        let mut cleared = 0;
+        if clear_values && matches!(self.weak_mode, WeakMode::Values | WeakMode::All) {
+            for entry in &mut self.array {
+                if let Some(Value::Object(object)) = entry {
+                    if is_dead(*object)? {
+                        *entry = None;
+                        cleared += 1;
+                    }
+                }
+            }
+        }
+        for entry in &mut self.hash {
+            let Some((key, value)) = entry else {
+                continue;
+            };
+            let dead_key = if clear_keys && matches!(self.weak_mode, WeakMode::Keys | WeakMode::All)
+            {
+                match &key.kind {
+                    KeyKind::Object(key) => is_dead(key.source)?,
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            let dead_value =
+                if clear_values && matches!(self.weak_mode, WeakMode::Values | WeakMode::All) {
+                    match value {
+                        Value::Object(object) => is_dead(*object)?,
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+            if dead_key || dead_value {
+                *entry = None;
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
     }
 
     fn bucket(key: &CanonicalKey, count: usize) -> usize {
@@ -215,8 +363,8 @@ impl Table {
         next[..old_capacity].copy_from_slice(&self.array);
         ledger.checkpoint(FailPoint::TableInsert)?;
         ticket.commit()?;
-        if let Err(error) = ledger.refund(old_bytes) {
-            ledger.refund_on_drop(new_bytes);
+        if let Err(error) = ledger.refund_lua(old_bytes) {
+            ledger.refund_lua_on_drop(new_bytes);
             return Err(error);
         }
         next[index] = Some(value);
@@ -244,8 +392,8 @@ impl Table {
         ledger.checkpoint(FailPoint::TableRehash)?;
         ledger.checkpoint(FailPoint::TableInsert)?;
         ticket.commit()?;
-        if let Err(error) = ledger.refund(old_bytes) {
-            ledger.refund_on_drop(new_bytes);
+        if let Err(error) = ledger.refund_lua(old_bytes) {
+            ledger.refund_lua_on_drop(new_bytes);
             return Err(error);
         }
         let old = core::mem::replace(&mut self.hash, next);
@@ -302,6 +450,23 @@ impl Table {
             Self::insert_bucket(&mut self.hash, (key, value))
         }
     }
+
+    /// 僅供 installer 的已存在 byte-key rollback；不重新建立 canonical key。
+    fn restore_existing_byte_key(&mut self, name: &[u8], value: Value) -> Result<(), VmError> {
+        let Some(index) = self.hash.iter().position(|entry| {
+            entry.as_ref().is_some_and(|(key, _)| {
+                matches!(&key.kind, KeyKind::ByteString(string) if string.bytes.as_bytes() == name)
+            })
+        }) else {
+            return Err(VmError::LedgerInvariant);
+        };
+        if value == Value::Nil {
+            self.hash[index] = None;
+        } else if let Some((_, stored)) = &mut self.hash[index] {
+            *stored = value;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -321,7 +486,7 @@ struct StringKey {
 
 impl Drop for StringKey {
     fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.bytes.len());
+        self.ledger.refund_lua_on_drop(self.bytes.len());
     }
 }
 
@@ -434,6 +599,21 @@ impl Hash for CanonicalKey {
 }
 
 impl Vm {
+    /// 呼叫端先根住舊值並完成 TableValue write barrier，再以此無配置回滾。
+    pub(crate) fn restore_existing_byte_key(
+        &mut self,
+        table: ObjectRef,
+        name: &[u8],
+        value: Value,
+    ) -> Result<(), VmError> {
+        if let Value::Object(object) = value {
+            self.object_kind(object)?;
+        }
+        self.with_table_mut(table, |stored, _| {
+            stored.restore_existing_byte_key(name, value)
+        })
+    }
+
     pub fn canonical_key(&self, value: Value) -> Result<Option<CanonicalKey>, VmError> {
         let kind = match value {
             Value::Nil => return Ok(None),
@@ -470,7 +650,8 @@ impl Vm {
                 | ObjectKind::Builtin
                 | ObjectKind::Coroutine
                 | ObjectKind::Upvalue
-                | ObjectKind::Module => KeyKind::Object(ObjectKey {
+                | ObjectKind::Module
+                | ObjectKind::File => KeyKind::Object(ObjectKey {
                     source,
                     id: source.identity().ok_or(VmError::StaleObject)?,
                 }),
@@ -509,6 +690,12 @@ impl Vm {
             Value::Nil => return Err(VmError::NilTableKey),
             Value::Float(number) if number.is_nan() => return Err(VmError::NaNTableKey),
             _ => {}
+        }
+        if let Value::Object(object) = key {
+            self.write_ref(table, RefField::TableKey, object)?;
+        }
+        if let Value::Object(object) = value {
+            self.write_ref(table, RefField::TableValue, object)?;
         }
         let mut roots = [None; 3];
         let objects = [

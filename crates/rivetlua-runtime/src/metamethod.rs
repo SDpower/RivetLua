@@ -87,9 +87,13 @@ impl MetamethodEvent {
 }
 
 impl Vm {
-    /// 目前僅 table 有獨立 metatable；完整 ObjectId 每次重新驗證。
+    /// table 與受控 file payload 有獨立 metatable；完整 ObjectId 每次重新驗證。
     pub fn get_metatable(&self, object: ObjectRef) -> Result<Option<ObjectRef>, VmError> {
-        self.with_table(object, |table| table.metatable())
+        match self.object_kind(object)? {
+            ObjectKind::Table => self.with_table(object, |table| table.metatable()),
+            ObjectKind::File => self.with_file(object, |file| file.metatable),
+            _ => Err(VmError::WrongObjectType),
+        }
     }
 
     pub fn set_metatable(
@@ -100,15 +104,28 @@ impl Vm {
         if self.object_kind(object)? != ObjectKind::Table {
             return Err(VmError::WrongObjectType);
         }
+        let register = if let Some(reference) = metatable {
+            self.with_table(reference, |table| table.finalizer_value() != Value::Nil)?
+        } else {
+            false
+        };
+        if register {
+            self.preflight_finalizer_registration(object)?;
+        }
         if let Some(reference) = metatable {
             if self.object_kind(reference)? != ObjectKind::Table {
                 return Err(VmError::WrongObjectType);
             }
+            self.write_ref(object, crate::gc::trace::RefField::Metatable, reference)?;
         }
         self.with_table_mut(object, |table, _ledger| {
             table.set_metatable(metatable);
             Ok(())
-        })
+        })?;
+        if register {
+            self.register_finalizer(object)?;
+        }
+        Ok(())
     }
 
     /// 只讀取 metatable 的 raw 欄位；本步不呼叫事件，也不建立缺席快取。

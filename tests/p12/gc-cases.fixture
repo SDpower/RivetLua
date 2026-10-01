@@ -1,0 +1,22 @@
+profile|lua55-i64f64|lua55
+case|lua55-i64f64|GC-001|cycle|gc_case_001|P12_CASE:GC-001|cycle=reclaimed;roots=0;generation=stale-handle-rejected|移除最後強 root 後互相引用的 table 可回收，舊 generation handle 失效
+case|lua55-i64f64|GC-002|incremental-barrier|gc_case_002|P12_CASE:GC-002|barrier=marked;child=retained;cycle=complete|black owner 寫入 white child 經 barrier 保留
+case|lua55-i64f64|GC-003|ephemeron|gc_case_003|P12_CASE:GC-003|ephemeron=converged;reverse-key=not-root;pair=cleared|weak-key value 反向引用 key 仍依固定點規則清除 pair
+case|lua55-i64f64|GC-004|finalizer-revival|gc_case_004|P12_CASE:GC-004|finalizer=once;revival=observed;reclaimed=after-root-drop|finalizer 復活物件，撤除復活 root 後回收且不自動重複
+case|lua55-i64f64|GC-005|allocation-failure|gc_case_005|P12_CASE:GC-005|allocation=atomic;lua-sites=covered;ordinals=failed-and-retried|每個 Lua heap 配置 site/ordinal 失敗具原子回滾與成功重試
+case|lua55-i64f64|GC-006|vm-lifecycle|gc_case_006|P12_CASE:GC-006|vms=10000;domains=balanced;coroutines=collected|一萬次 VM 生命週期含 coroutine、handle、error、PendingOp 與 close state
+case|lua55-i64f64|GC-007|generational|gc_case_007|P12_CASE:GC-007|minor=retained;major=reclaimed;remembered-set=cleared|old 到 young 引用在 minor 保留，major 撤根後回收
+case|lua55-i64f64|GC-008|weak-finalizer-boundary|gc_case_008|P12_CASE:GC-008|weak-v=cleared-before-finalizer;weak-k=visible-to-finalizer;weak-kv=cleared-before-finalizer;revival=collected|weak values、keys、all-weak 在 finalizer/revival 邊界依順序清理並可觀察
+case|lua55-i64f64|GC-009|finalizer-error|gc_case_009|P12_CASE:GC-009|yield=warning;error=diagnostic;gc-reentry=unit-asserted|正式測試驗 yield/error，gate 另要求 reentrant GC unit 精確通過
+case|lua55-i64f64|GC-010|finalizer-remark|gc_case_010|P12_CASE:GC-010|explicit-remark=next-eligible-only;unmarked=not-repeated|explicit re-mark 僅下一 eligible collection 再執行
+profile|lua54-i64f64|lua54
+case|lua54-i64f64|GC-001|cycle|gc_case_001|P12_CASE:GC-001|cycle=reclaimed;roots=0;generation=stale-handle-rejected|移除最後強 root 後互相引用的 table 可回收，舊 generation handle 失效
+case|lua54-i64f64|GC-002|incremental-barrier|gc_case_002|P12_CASE:GC-002|barrier=marked;child=retained;cycle=complete|black owner 寫入 white child 經 barrier 保留
+case|lua54-i64f64|GC-003|ephemeron|gc_case_003|P12_CASE:GC-003|ephemeron=converged;reverse-key=not-root;pair=cleared|weak-key value 反向引用 key 仍依固定點規則清除 pair
+case|lua54-i64f64|GC-004|finalizer-revival|gc_case_004|P12_CASE:GC-004|finalizer=once;revival=observed;reclaimed=after-root-drop|finalizer 復活物件，撤除復活 root 後回收且不自動重複
+case|lua54-i64f64|GC-005|allocation-failure|gc_case_005|P12_CASE:GC-005|allocation=atomic;lua-sites=covered;ordinals=failed-and-retried|每個 Lua heap 配置 site/ordinal 失敗具原子回滾與成功重試
+case|lua54-i64f64|GC-006|vm-lifecycle|gc_case_006|P12_CASE:GC-006|vms=10000;domains=balanced;coroutines=collected|一萬次 VM 生命週期含 coroutine、handle、error、PendingOp 與 close state
+case|lua54-i64f64|GC-007|generational|gc_case_007|P12_CASE:GC-007|minor=retained;major=reclaimed;remembered-set=cleared|old 到 young 引用在 minor 保留，major 撤根後回收
+case|lua54-i64f64|GC-008|weak-finalizer-boundary|gc_case_008|P12_CASE:GC-008|weak-v=cleared-before-finalizer;weak-k=visible-to-finalizer;weak-kv=cleared-before-finalizer;revival=collected|weak values、keys、all-weak 在 finalizer/revival 邊界依順序清理並可觀察
+case|lua54-i64f64|GC-009|finalizer-error|gc_case_009|P12_CASE:GC-009|yield=warning;error=diagnostic;gc-reentry=unit-asserted|正式測試驗 yield/error，gate 另要求 reentrant GC unit 精確通過
+case|lua54-i64f64|GC-010|finalizer-remark|gc_case_010|P12_CASE:GC-010|explicit-remark=next-eligible-only;unmarked=not-repeated|explicit re-mark 僅下一 eligible collection 再執行
