@@ -2,7 +2,7 @@
 
 [English](IMPLEMENTATION_STATUS.md) | 繁體中文 | [한국어](IMPLEMENTATION_STATUS.ko.md) | [日本語](IMPLEMENTATION_STATUS.ja.md)
 
-更新日期：2026-10-01。本頁列出專案中已實作與待實作的功能。勾選代表所述範圍已通過測試；未勾選代表尚未實作。規格文件或測試資料存在，不代表對應的執行功能已完成。
+更新日期：2026-10-03。本頁列出專案中已實作與待實作的功能。勾選代表所述範圍已通過測試；未勾選代表尚未實作。規格文件或測試資料存在，不代表對應的執行功能已完成。
 
 ## 已實作並驗收
 
@@ -25,8 +25,8 @@
 - [x] **函式、閉包、upvalue、vararg、多重回傳與尾呼叫**：runtime 使用明確的呼叫 frame，以 open／closed upvalue 保留捕捉的 local，處理固定參數與 vararg、多重結果調整、Lua 5.5 具名 vararg table；Lua 5.4 會拒絕該語法。runtime 也支援合法尾呼叫的 frame 重用與非尾呼叫深度限制。P09 本機 gate 29/29 項檢查通過，CALL-001～013 共 24 份唯一報告：`lua55-i64f64` 12 份（CALL-001～011／013），`lua54-i64f64` 12 份（CALL-001～010／012／013）。CALL-013 驗證保留 Pending ClosePath、不重用尾呼叫 frame、結果數量，並實際依 LIFO 執行 `__close`。
 - [x] **Metatable 與可續行操作**：runtime 支援 raw fast path、`__index`／`__newindex`、table `__call` 與 operator event、受限事件鏈，以及透過 P09 call frame 與 roots 續行的 PendingOp。P10 本機 gate 26/26 項檢查通過，META-001～010 共 20 份唯一報告，每個 profile 十份。
 - [x] **Lua 錯誤、協程與關閉值**：P11 在 protected boundary 間保留原始錯誤 `Value` 身分，支援 yield/resume、`coroutine.close`／`wrap`，並在適用出口依 LIFO 執行 `<close>` 與 generic-for closing value。Hard abort 維持終結的宿主結果，不轉成一般 Lua 錯誤或正常 close 結果。只安裝 P11 案例所需的 VM 內建入口。本機 P11 gate 通過 366 項檢查，產生 ERR-001～005、COR-001～006、CLOSE-001～005 共 32 份唯一報告（每個 profile 16 份；各類 5/6/5）。
-- [x] **增量與分代垃圾回收**：P12 保留非移動 `ObjectId`／slot／generation 與既有 roots，加入完整追蹤及引用寫入入口、增量三色標記與屏障、remembered set、weak table／ephemeron 固定點、`__gc` finalizer／復活及配置失敗回復。P12 本機 gate 經主代理驗收：46/46 checks 通過；GC-001～010 在 Lua 5.5 與 5.4 profile 各有十份唯一 PASS 報告，共 20/20。GC-009 的 yield/error 案例與 reentry unit 合併作為該案例證據。遠端 P12 CI 尚未執行。
-- [x] **P13 基礎標準函式庫與模組載入**：本機 gate 驗證 basic、raw、type、`pairs`／`next`、table、bytes string／Lua pattern／pack、math 與 RNG、utf8，以及受控的 load／package、io／os 和受限 debug 功能。純 Rust `HostServices` 由 VM 個別持有，預設拒絕宿主能力；載入與原生資源操作須明確授權，執行仍接受已驗證的 `VerifiedModule`／RVLU_V2。P13 本機 gate 47/47 項檢查通過，LIB-001～014 在 Lua 5.5 與 5.4 profile 各有 14 份唯一 PASS 報告，共 28/28；遠端 P13 CI 尚未執行。
+- [x] **增量與分代垃圾回收**：P12 保留非移動 `ObjectId`／slot／generation 與既有 roots，加入完整追蹤及引用寫入入口、增量三色標記與屏障、remembered set、weak table／ephemeron 固定點、`__gc` finalizer／復活及配置失敗回復。P12 本機 gate 經主代理驗收：46/46 checks 通過；GC-001～010 在 Lua 5.5 與 5.4 profile 各有十份唯一 PASS 報告，共 20/20。GC-009 的 yield/error 案例與 reentry unit 合併作為該案例證據。遠端 CI 驗收見下節。
+- [x] **P13 基礎標準函式庫與模組載入**：本機 gate 驗證 basic、raw、type、`pairs`／`next`、table、bytes string／Lua pattern／pack、math 與 RNG、utf8，以及受控的 load／package、io／os 和受限 debug 功能。純 Rust `HostServices` 由 VM 個別持有，預設拒絕宿主能力；載入與原生資源操作須明確授權，執行仍接受已驗證的 `VerifiedModule`／RVLU_V2。P13 本機 gate 47/47 項檢查通過，LIB-001～014 在 Lua 5.5 與 5.4 profile 各有 14 份唯一 PASS 報告，共 28/28；遠端 CI 驗收見下節。
 
 值、數值、詞法與語法測試直接呼叫 Rust API。**RivetLua 目前執行 P13 本機驗證過的 Lua 子集；完整 Lua 相容性尚未驗證。**P11 階段只安裝當時正式案例所需的 VM 內建入口；P13 已加入上列受控標準函式庫與模組載入範圍。
 
@@ -88,7 +88,7 @@ cargo run --locked -p rivetlua-xtask -- gate P13
 ## P12 本機 gate 驗收（2026-09-29）
 
 - P12 已由主代理驗收通過。本機 gate 報告 `target/rivetlua-reports/gate-P12.json` 為 `PASS`、46/46 checks；GC-001～010 兩個 profile 各十份唯一 PASS 報告，共 20/20。Lua 5.5 與 Lua 5.4 各 10/10；GC-009 的正式 yield/error 案例與精確 reentry unit 共同構成驗收證據。gate 及案例報告在本次公開狀態更新前使用 source digest `0b24a52873b780ab5fd198fa872a361962429da9ed92aa208abd70b2aace6152`。
-- P12 遠端 CI 尚未執行；P11 的 GitHub Actions run 不包含 P12。P13 本機驗收見下節。
+- 此節記錄 2026-09-29 的本機驗收；當時 P12 遠端 CI 尚未執行，P11 的 GitHub Actions run 不包含 P12。P13 本機驗收與較新的遠端 CI 結果見後續各節。
 - 當時的 P12 公開狀態更新改變了納入 gate source digest 的文件內容，因此後續報告須按更新後來源重建並驗證。P13 公開狀態更新同樣改變 digest；完整 workspace 與 P00～P13 串行 gates 的後續本機結果見「P13 最終本機整合」。依使用者本次指示，接續以正式提交後的三平台 CI 驗證。
 
 ## P13 本機 gate 驗收（2026-10-01）
@@ -96,11 +96,17 @@ cargo run --locked -p rivetlua-xtask -- gate P13
 - 主代理已驗收本機 `gate P13`：報告 `target/rivetlua-reports/gate-P13.json` 為 `PASS`，47/47 checks 通過，其中 P13 runtime unit 測試 39 項匹配且通過。LIB-001～014 共 28 份唯一 PASS 案例報告，`lua55-i64f64` 與 `lua54-i64f64` 各 14 份；逐一核對 schema、expected／actual、trace 及來源 digest。
 - LIB-006 記錄巨大 `string.rep` 的 size／fuel 處理差異：Lua 5.5 回傳 `FuelExhausted`，Lua 5.4 回傳 `StringArgument`；allocation budget 情境在兩個 profile 均回傳 `Heap(AllocationFailed)`。LIB-010 記錄 utf8 差異：Lua 5.5 的 offset 情境回傳 `Utf8Sequence`，Lua 5.4 回傳整數 `1`。兩個 profile 的案例均依各自預期驗收。
 - gate 驗收時 P00～P13 報告共用 source digest `9279b479be6468e3727f43f6c1ba578829919b6e079e10663703746bbd6d1fdb`。此值是前次 P13 公開狀態更新前的來源快照；更新後的本機重建結果見下節。兩個 profile 的 P13 案例通過，不等於官方完整 Lua 語言、Lua bytecode 或 C API／ABI 相容性驗收。
-- debug 限於已核准的檢視、traceback 與 count hook；不支援的操作依明示政策拒絕。io／os、load 與原生能力須由 VM 個別的 `HostServices` 明確提供，預設不取得宿主資源。CI workflow 已加入 P13 gate 配置，但 P12／P13 尚無遠端執行結果；上述 `badd790` 的三平台 P11 CI 不涵蓋 P13 新來源。
+- debug 限於已核准的檢視、traceback 與 count hook；不支援的操作依明示政策拒絕。io／os、load 與原生能力須由 VM 個別的 `HostServices` 明確提供，預設不取得宿主資源。當時 CI workflow 已加入 P13 gate 配置，但 P12／P13 尚無遠端執行結果；上述 `badd790` 的三平台 P11 CI 不涵蓋 P13 新來源。較新的結果見後節。
 
 ## P13 最終本機整合（2026-10-01）
 
 - 在專案根目錄使用系統預設 Rust stable，設定 `CARGO_TARGET_DIR=/tmp/rivetlua-p13-xtask-target-20261001`，依序執行 `cargo fmt --all -- --check`、`cargo test --locked --workspace -- --test-threads=1`、上列 P00～P13 的 14 個 gate 命令及 `git diff --check`，共 17 個命令全部 exit 0。workspace 的 28 個測試摘要合計 875 tests 與 4 doctests，0 failed／0 ignored；包含 xtask unit 59 項、CLI 28 項、runtime unit 216 項、P13 contracts 232 項、compiler unit 16 項及 core unit 35 項。
 - 14 個 gate 報告均為 `PASS`，P00～P13 checks 依序為 22/37/29/25/25/33/29/30/33/29/26/366/46/47。主代理核對 P12 的 20 份與 P13 的 28 份唯一案例報告，包括各自的 schema、profile、fixture、expected／actual、trace、exit、command 與 report path；P13 runtime unit 39 項匹配且通過。命令與結果明細保存在 `/tmp/rivetlua-p13-final-20261001/`，報告快照保存在 `/tmp/rivetlua-p13-final-reports-20261001/`。
 - 上述本機驗證使用本次文件更新前的同一來源快照，P00～P13 報告的 source digest 均為 `94e29e7e04735b0f4e5debb752d6198be0faec51b34b5ed82c3d7ed3f2ce4154`。本次文件更新會使該摘要失效；正式提交後的 CI 須以新來源重建報告與 digest，不能將此舊摘要當作新提交的驗收結果。
-- 隔離來源候選雖已準備，未建立快照提交，也未執行乾淨 checkout 的獨立重建。依使用者本次指示，後續採正式提交、推送及三平台 CI 驗證；P12／P13 遠端 CI 目前尚未執行，無遠端通過結果。
+- 隔離來源候選雖已準備，未建立快照提交，也未執行乾淨 checkout 的獨立重建。依使用者本次指示，後續採正式提交、推送及三平台 CI 驗證；此節本機驗收當時尚無 P12／P13 遠端結果，後續結果見下節。
+
+## P12／P13 GitHub Actions 驗收（2026-10-03）
+
+- 主代理於 2026-10-03 核對 [GitHub Actions CI run #11](https://github.com/SDpower/RivetLua/actions/runs/36843092702)：提交 `e2c4190ea627eac7e7f89626b3ae3b885b099496` 的總覽狀態為 `Success`，三個 job 均完成且顯示成功，總耗時 1 小時 26 分 7 秒。
+- [CI workflow](../.github/workflows/ci.yml) 使用 macOS 15 aarch64、Ubuntu 24.04 x86_64 與 Ubuntu 24.04 ARM aarch64 三平台矩陣；格式檢查、`cargo test --locked --workspace` 與 P00～P13 gates 均為必要步驟，未設定 `continue-on-error` 或略過這些驗證的條件。結合三個 job 的成功狀態，可確認本次配置的必要檢查在三平台通過。
+- run 總覽列出三份 gate report artifacts（macos-15 223 KB、ubuntu-24.04 222 KB、ubuntu-24.04-arm 222 KB）。尚未另行下載並逐份核對遠端報告 JSON，因此此處不列遠端案例計數或 source digest；上節的 `94e29e7e04735b0f4e5debb752d6198be0faec51b34b5ed82c3d7ed3f2ce4154` 仍僅代表公開文件最後更新前的本機來源快照。此次 CI 通過不等於官方完整 Lua 語言、Lua bytecode 或 C API／ABI 相容性驗收。
