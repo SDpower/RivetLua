@@ -8,14 +8,46 @@ pub mod limits;
 pub mod number;
 pub mod value;
 
+pub use bytecode::input::{
+    InputAdmission, InputError, InputErrorKind, InputFormat, InputPreflight, classify_input,
+    decode_input_module, input_scan_admission, preflight_input_module,
+};
+
+pub use bytecode::native_debug::{
+    NativeDebug, NativeDebugCandidate, NativeLocal, NativePrototypeDebug, verify_native_debug,
+};
+pub use bytecode::official::{
+    OfficialAbsLine, OfficialChunk, OfficialChunkError, OfficialChunkErrorKind,
+    OfficialChunkLimits, OfficialConstant, OfficialDebug, OfficialLocal, OfficialPrototype,
+    OfficialUpvalue, decode_official_chunk, encode_official_chunk,
+};
+pub use bytecode::official_execution::{
+    OfficialExecutionPlan, OfficialPlanBuiltin, OfficialPlanCall, OfficialPlanCandidate,
+    OfficialPlanFrameInput, OfficialPlanFrameInputSource, OfficialPlanRootBinding,
+    OfficialPlanRootSource, OfficialPlanUpvalueMap, native_builtin_candidate_from_calls,
+    verify_native_builtin_plan, verify_official_execution_plan,
+};
+pub use bytecode::official_preflight::{OfficialChunkPreflight, preflight_official_chunk};
+pub use bytecode::official_translation::{
+    OfficialTranslationError, OfficialTranslationErrorKind, OfficialWorkBudget,
+    translate_official_chunk, translate_official_chunk_with_work,
+};
+pub use bytecode::transport::{
+    EncodedTransportModule, TransportAdmission, TransportError, TransportErrorKind,
+    TransportLimits, TransportScanAdmission, bytecode_module_allocation_bytes,
+    bytecode_wire_upper_bytes, decode_transport_module, encode_transport_module,
+    preflight_transport_decode, preflight_transport_encode, transport_encode_scan_admission,
+    transport_scan_admission, verified_module_allocation_bytes, verified_module_measurement_work,
+};
 pub use bytecode::{
     BinaryOperation, BytecodeBindingId, BytecodeClosePath, BytecodeConstant, BytecodeError,
     BytecodeErrorCode, BytecodeExitKind, BytecodeInstruction, BytecodeModule, BytecodePrototype,
     BytecodeSpan, BytecodeUpvalue, BytecodeUpvalueSource, BytecodeVersion, ConstId, ControlFlow,
     EncodedModule, EnvironmentSource, FrameLayout, Instruction, InstructionEffects,
-    InstructionOffset, IrLimits, LuaProfile, Opcode, ProfileRequirement, ProtoId, RVLU_MAGIC,
-    RVLU_NUMERIC_I64_F64, RVLU_V1, RVLU_V2, Register, RegisterEffects, ResultMode, UnaryOperation,
-    UpvalueId, VerifiedModule, VerifyLimits, decode_module, encode_module, verify_module,
+    InstructionOffset, IrLimits, LuaProfile, ModuleOrigin, OfficialArtifact, OfficialRvluPc,
+    Opcode, ProfileRequirement, ProtoId, RVLU_MAGIC, RVLU_NUMERIC_I64_F64, RVLU_V1, RVLU_V2,
+    Register, RegisterEffects, ResultMode, UnaryOperation, UpvalueId, VerifiedModule, VerifyLimits,
+    decode_module, encode_module, verify_module,
 };
 pub use error::{CoreError, CoreErrorKind, Operation};
 pub use number::{

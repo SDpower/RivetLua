@@ -21,6 +21,8 @@ use crate::{HostHandle, RootId, Vm, VmError};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Builtin {
+    HostCallback(usize),
+    Official(rivetlua_core::OfficialPlanBuiltin),
     Error,
     PCall,
     XPCall,

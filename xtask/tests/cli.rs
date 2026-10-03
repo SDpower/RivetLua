@@ -3599,3 +3599,547 @@ p.write_text(json.dumps(r)+'\n')
     }
     assert_eq!(git_status_snapshot(root), initial_status);
 }
+
+struct RestoreP14State {
+    _p13: RestoreP13State,
+    report_dir: PathBuf,
+    preserved_p14: std::collections::HashSet<PathBuf>,
+    aggregate_paths: [(PathBuf, bool); 2],
+    paths: Vec<RestoreBytes>,
+}
+
+impl RestoreP14State {
+    fn new(root: &Path) -> Self {
+        let p13 = RestoreP13State::new(root);
+        let report_dir = root.join("target/rivetlua-reports");
+        let preserved_p14: std::collections::HashSet<_> = fs::read_dir(&report_dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("P14-"))
+            })
+            .collect();
+        let aggregate_paths = [
+            report_dir.join("gate-P14.json"),
+            root.join("target/gate-P14-fail.json"),
+        ]
+        .map(|path| {
+            let was_dir = path.is_dir();
+            (path, was_dir)
+        });
+        let mut paths = vec![
+            RestoreBytes::new(aggregate_paths[0].0.clone()),
+            RestoreBytes::new(aggregate_paths[1].0.clone()),
+            RestoreBytes::new(root.join("tests/p14/sdk-cases.fixture")),
+        ];
+        for path in &preserved_p14 {
+            if path.is_file() {
+                paths.push(RestoreBytes::new(path.clone()));
+            }
+        }
+        Self {
+            _p13: p13,
+            report_dir,
+            preserved_p14,
+            aggregate_paths,
+            paths,
+        }
+    }
+}
+
+impl Drop for RestoreP14State {
+    fn drop(&mut self) {
+        for (path, was_dir) in &self.aggregate_paths {
+            if !was_dir && path.is_dir() {
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+        for entry in fs::read_dir(&self.report_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with("P14-")
+                && !self.preserved_p14.contains(&path)
+            {
+                if path.is_dir() {
+                    fs::remove_dir_all(path).unwrap();
+                } else {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn p14_restore_after_panic_removes_aggregate_blockers_and_restores_bytes() {
+    let root = std::env::temp_dir().join(format!("rivetlua-p14-restore-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let reports = root.join("target/rivetlua-reports");
+    fs::create_dir_all(&reports).unwrap();
+    fs::create_dir_all(root.join("tests/p13")).unwrap();
+    fs::create_dir_all(root.join("tests/p14")).unwrap();
+    fs::create_dir_all(root.join("spec")).unwrap();
+    let originals = [
+        (
+            root.join("spec/compatibility.csv"),
+            b"original csv\n".as_slice(),
+        ),
+        (
+            root.join("tests/p13/lib-cases.fixture"),
+            b"original p13 fixture\n".as_slice(),
+        ),
+        (
+            root.join("tests/p14/sdk-cases.fixture"),
+            b"original p14 fixture\n".as_slice(),
+        ),
+        (
+            reports.join("gate-P13.json"),
+            b"original p13 report\n".as_slice(),
+        ),
+        (
+            reports.join("gate-P14.json"),
+            b"original p14 aggregate\n".as_slice(),
+        ),
+        (
+            root.join("target/gate-P14-fail.json"),
+            b"original p14 fallback\n".as_slice(),
+        ),
+    ];
+    for (path, bytes) in &originals {
+        fs::write(path, bytes).unwrap();
+    }
+    let panicked = std::panic::catch_unwind(|| {
+        let _restore = RestoreP14State::new(&root);
+        for (path, _) in &originals {
+            fs::write(path, b"mutated").unwrap();
+        }
+        for path in [
+            reports.join("gate-P14.json"),
+            root.join("target/gate-P14-fail.json"),
+        ] {
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("block"), b"block").unwrap();
+        }
+        fs::create_dir(reports.join("P14-SDK-001-lua55.json")).unwrap();
+        panic!("模擬 P14 負向驗證中途失敗");
+    });
+    assert!(panicked.is_err());
+    for (path, bytes) in &originals {
+        assert_eq!(fs::read(path).unwrap(), *bytes);
+    }
+    assert!(!reports.join("P14-SDK-001-lua55.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn stamp_p14_prerequisites(root: &Path) {
+    stamp_p13_prerequisites(root);
+    let digest = current_source_digest(root);
+    let script = r#"import json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); digest=sys.argv[2]
+reports=root/'target/rivetlua-reports'
+def check(name,command='synthetic P14 protocol prior',path='target/rivetlua-reports/fixture.json'):
+    return dict(name=name,command=command,exit_code=0,status='PASS',diagnostic='isolated protocol fixture',report_path=path)
+gate_path='target/rivetlua-reports/gate-P13.json'
+checks=[check(f'P{number:02}-aggregate',f'validate {reports / f"gate-P{number:02}.json"}',gate_path) for number in range(13)]
+fixed={
+    'p13-dependencies':'validate spec/phase-dependencies.csv DA-09/14/18/19/20',
+    'p13-csv':'validate spec/compatibility.csv',
+    'p13-fixture':'validate tests/p13/lib-cases.fixture',
+    'p13-runtime-unit':'cargo test --locked -p rivetlua-runtime --lib p13_ -- --test-threads=1',
+    'p13-case-reports':'validate 28 unique P13 case JSON',
+    'p13-source-digest':'verify source digest after children',
+}
+checks += [check(name,command,gate_path) for name,command in fixed.items()]
+refs=[]
+for line in (root/'tests/p13/lib-cases.fixture').read_text().splitlines():
+    fields=line.split('|')
+    if fields[0]!='case': continue
+    _,profile,case_id,mode,input_name,marker,expected,note=fields
+    lua_profile=profile.split('-')[0]
+    path=f'target/rivetlua-reports/P13-{case_id}-{lua_profile}.json'
+    command=f'RIVETLUA_P13_PROFILE={profile} cargo test --locked -p rivetlua-runtime --test p13_contracts {input_name} -- --nocapture --exact --test-threads=1'
+    report=dict(case_id=case_id,lua_profile=lua_profile,profile=profile,fullprofile=profile,
+                mode=mode,input=input_name,expected=expected,actual=expected,status='PASS',
+                exit_code=0,command=command,report_path=path,diagnostic=note,
+                capability_policy='host=deny',fuel_trace='fuel=observed',
+                allocation_trace='reserved=0',resource_trace='roots=checked',source_digest=digest)
+    (root/path).write_text(json.dumps(report)+'\n')
+    checks.append(check(f'{case_id}-{lua_profile}',command,path))
+    refs.append(dict(case_id=case_id,lua_profile=lua_profile,report_path=path))
+(reports/'gate-P13.json').write_text(json.dumps(dict(status='PASS',source_digest=digest,checks=checks,case_reports=refs))+'\n')
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(root)
+        .arg(&digest)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "P14 synthetic prior 失敗：{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn make_p14_fake_cargo(directory: &Path) -> PathBuf {
+    fs::create_dir_all(directory).unwrap();
+    let fake = directory.join("cargo");
+    fs::write(&fake, r##"#!/usr/bin/env python3
+import os,pathlib,sys
+args=sys.argv[1:]
+scenario=os.environ.get('RIVETLUA_P14_FAKE','valid')
+profile=os.environ.get('RIVETLUA_P14_PROFILE','')
+log=os.environ.get('RIVETLUA_P14_CHILD_LOG')
+def record(name):
+    if log:
+        with open(log,'a') as stream: stream.write(f'{profile}:{name}\n')
+if args[0]=='run':
+    selected=args[-1]; record('example-'+selected)
+    print(f'P14_EXAMPLE:{selected}:PASS')
+    raise SystemExit(0)
+if '--test' not in args:
+    record('filter-'+args[-1])
+    if scenario=='filter-zero': count=0
+    else: count=2
+    print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured')
+    raise SystemExit(0)
+name=args[args.index('--test')+2]
+record(name)
+fixture=pathlib.Path('tests/p14/sdk-cases.fixture').read_text().splitlines()
+fields=next(line.split('|') for line in fixture if line.startswith('case|') and line.split('|')[1]==profile and line.split('|')[4]==name)
+case_id,actual=fields[2],fields[6]
+first=profile=='lua55-i64f64' and case_id=='SDK-001'
+last=profile=='lua54-i64f64' and case_id=='SDK-NEG-006'
+if scenario=='child-fail' and first:
+    print('test result: FAILED. 0 passed; 1 failed; 0 ignored')
+    raise SystemExit(101)
+if scenario=='source-change' and first:
+    pathlib.Path('tests/p14/sdk-cases.fixture').write_text(pathlib.Path('tests/p14/sdk-cases.fixture').read_text()+'\n')
+if scenario=='wrong-profile' and first: profile='lua54-i64f64'
+if scenario=='wrong-id' and first: case_id='SDK-999'
+if scenario=='wrong-actual' and first: actual='int:41'
+marker=f'P14_CASE\t{case_id}\t{profile}\tstatus=PASS;actual={actual};diagnostic=asserted-by-fake\tallocation=reserved=0\tresource=roots=checked\tvm=isolated\tcli=checked'
+if scenario=='malformed-marker' and first: marker=marker.replace('\tresource=roots=checked','')
+if not (scenario=='missing-marker' and first): print(marker)
+if scenario=='duplicate-marker' and first: print(marker)
+count=0 if scenario=='zero-test' and first else 2 if scenario=='two-tests' and first else 1
+ignored=1 if scenario=='ignored-test' and first else 0
+if not (scenario=='missing-summary' and first):
+    measured=1 if scenario=='measured-test' and first else 0
+    print(f'test result: ok. {count} passed; 0 failed; {ignored} ignored; {measured} measured; 13 filtered out')
+reports=pathlib.Path('target/rivetlua-reports')
+if last and scenario in ('p13-check-after','p13-case-after'):
+    if scenario=='p13-check-after':
+        path=reports/'gate-P13.json'; document=__import__('json').loads(path.read_text())
+        document['checks'][0]['command']='tampered by later child'
+    else:
+        path=reports/'P13-LIB-001-lua55.json'; document=__import__('json').loads(path.read_text())
+        document['fuel_trace']='tampered by later child'
+    path.write_text(__import__('json').dumps(document)+'\n')
+if last and scenario in ('case-trace-after','case-metadata-after'):
+    path=reports/'P14-SDK-001-lua55.json'; document=__import__('json').loads(path.read_text())
+    if scenario=='case-trace-after': document['allocation_trace']='reserved=9'
+    else: document['diagnostic']='tampered by later child'
+    path.write_text(__import__('json').dumps(document)+'\n')
+if scenario=='report-write-fail' and first:
+    path=reports/'P14-SDK-001-lua55.json'; path.mkdir(exist_ok=True)
+    (path/'block').write_text('keep')
+if scenario=='extra-report' and last:
+    (reports/'P14-SDK-999-lua54.json').write_text('{"status":"PASS"}')
+if scenario=='aggregate-write-fail' and last:
+    path=reports/'gate-P14.json'; path.mkdir(exist_ok=True)
+    (path/'block').write_text('keep')
+"##).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    fake
+}
+
+fn run_p14_fake(
+    root: &Path,
+    fake_dir: &Path,
+    scenario: &str,
+    child_log: &Path,
+) -> std::process::Output {
+    let path = std::env::join_paths(
+        std::iter::once(fake_dir.to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    Command::new(BIN)
+        .current_dir(root)
+        .env("PATH", path)
+        .env("RIVETLUA_P14_FAKE", scenario)
+        .env("RIVETLUA_P14_CHILD_LOG", child_log)
+        .args(["gate", "P14"])
+        .output()
+        .unwrap()
+}
+
+fn assert_p14_fail_json(root: &Path, digest: &str, expected_name: &str) {
+    let canonical = root.join("target/rivetlua-reports/gate-P14.json");
+    let fallback = root.join("target/gate-P14-fail.json");
+    let path = if canonical.is_file() {
+        canonical
+    } else {
+        fallback
+    };
+    let script = r#"import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); digest=sys.argv[2]; name=sys.argv[3]
+r=json.loads(p.read_text())
+assert r['status']=='FAIL' and r['source_digest']==digest
+assert r['case_reports']==[]
+checks=r['checks']; assert checks and checks[-1]['name']==name
+assert checks[-1]['status']=='FAIL' and checks[-1]['exit_code']!=0
+assert checks[-1]['command'] and checks[-1]['diagnostic'] and checks[-1]['report_path']
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(&path)
+        .arg(digest)
+        .arg(expected_name)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "P14 FAIL JSON {} 無效：{}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for entry in fs::read_dir(root.join("target/rivetlua-reports")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().starts_with("P14-") {
+            assert!(
+                !entry.path().is_file(),
+                "FAIL 留下舊 P14 PASS 檔案：{}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
+#[test]
+fn p14_gate_fake_protocol_and_fail_closed_matrix() {
+    let _guard = CLI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let root = workspace_root();
+    let initial_status = git_status_snapshot(root);
+    let restore = RestoreP14State::new(root);
+    let original_paths = restore
+        .paths
+        .iter()
+        .map(|item| (item.path.clone(), item.contents.clone()))
+        .collect::<Vec<_>>();
+    let report_dir = root.join("target/rivetlua-reports");
+    let csv_path = root.join("spec/compatibility.csv");
+    let csv_original = fs::read(&csv_path).unwrap();
+    let fixture_path = root.join("tests/p14/sdk-cases.fixture");
+    let fixture_original = fs::read(&fixture_path).unwrap();
+    let mut csv_active = String::from_utf8(csv_original.clone()).unwrap();
+    if !csv_active
+        .lines()
+        .any(|line| line.starts_with("p14.sdk-cli,lua55,"))
+    {
+        let ids = String::from_utf8(fixture_original.clone())
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("case|lua55-i64f64|"))
+            .map(|line| line.split('|').nth(2).unwrap().to_owned())
+            .collect::<Vec<_>>()
+            .join(";");
+        for profile in ["lua55", "lua54"] {
+            csv_active.push_str(&format!("p14.sdk-cli,{profile},docs/plane/P14.md#6-正常與錯誤案例,rivetlua;rivetlua-cli,{ids},PASS,\n"));
+        }
+        fs::write(&csv_path, &csv_active).unwrap();
+    }
+    let fake_dir = std::env::temp_dir().join(format!("rivetlua-p14-cli-{}", std::process::id()));
+    let _fake = make_p14_fake_cargo(&fake_dir);
+    let child_log = fake_dir.join("child.log");
+
+    stamp_p14_prerequisites(root);
+    let digest = current_source_digest(root);
+    let positive = run_p14_fake(root, &fake_dir, "valid", &child_log);
+    assert!(
+        positive.status.success(),
+        "P14 fake protocol PASS 失敗：{}",
+        String::from_utf8_lossy(&positive.stderr)
+    );
+    let script = r#"import json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); digest=sys.argv[2]; reports=root/'target/rivetlua-reports'
+r=json.loads((reports/'gate-P14.json').read_text()); assert r['status']=='PASS' and r['source_digest']==digest
+assert len(r['case_reports'])==28
+cases=list(reports.glob('P14-*.json')); assert len(cases)==28
+for p in cases:
+    c=json.loads(p.read_text()); assert c['status']=='PASS' and c['source_digest']==digest
+    assert c['expected']==c['actual'] and c['exit_code']==0 and c['cwd']==str(root)
+    assert all(c[k] for k in ('command','report_path','diagnostic','allocation_trace','resource_trace','vm_trace','cli_trace'))
+"#;
+    let check = Command::new("python3")
+        .args(["-c", script])
+        .arg(root)
+        .arg(&digest)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "P14 fake protocol case schema 無效：{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    for (scenario, expected) in [
+        ("filter-zero", "p14-sdk-filter"),
+        ("child-fail", "SDK-001-lua55"),
+        ("zero-test", "SDK-001-lua55"),
+        ("two-tests", "SDK-001-lua55"),
+        ("ignored-test", "SDK-001-lua55"),
+        ("missing-summary", "SDK-001-lua55"),
+        ("measured-test", "SDK-001-lua55"),
+        ("missing-marker", "SDK-001-lua55"),
+        ("duplicate-marker", "SDK-001-lua55"),
+        ("wrong-profile", "SDK-001-lua55"),
+        ("wrong-id", "SDK-001-lua55"),
+        ("wrong-actual", "SDK-001-lua55"),
+        ("malformed-marker", "SDK-001-lua55"),
+        ("report-write-fail", "SDK-001-lua55"),
+        ("extra-report", "p14-case-reports"),
+        ("aggregate-write-fail", "p14-aggregate-write"),
+        ("source-change", "p14-source-digest"),
+        ("p13-check-after", "p00-p13-after"),
+        ("p13-case-after", "p00-p13-after"),
+        ("case-trace-after", "p14-case-reports"),
+        ("case-metadata-after", "p14-case-reports"),
+    ] {
+        fs::write(&fixture_path, &fixture_original).unwrap();
+        stamp_p14_prerequisites(root);
+        let digest = current_source_digest(root);
+        let _ = fs::remove_file(&child_log);
+        let output = run_p14_fake(root, &fake_dir, scenario, &child_log);
+        assert!(!output.status.success(), "{scenario} 意外 PASS");
+        assert_p14_fail_json(root, &digest, expected);
+        if scenario == "report-write-fail" {
+            fs::remove_dir_all(report_dir.join("P14-SDK-001-lua55.json")).unwrap();
+        }
+        if scenario == "aggregate-write-fail" {
+            fs::remove_dir_all(report_dir.join("gate-P14.json")).unwrap();
+        }
+    }
+    fs::write(&fixture_path, &fixture_original).unwrap();
+    for (mutation, expected) in [
+        (
+            String::from_utf8(fixture_original.clone())
+                .unwrap()
+                .replacen("SDK-001", "SDK-999", 1),
+            "p14-fixture",
+        ),
+        (
+            String::from_utf8(fixture_original.clone())
+                .unwrap()
+                .replacen("int:42", "int:41", 1),
+            "p14-fixture",
+        ),
+    ] {
+        fs::write(&fixture_path, mutation).unwrap();
+        stamp_p14_prerequisites(root);
+        let digest = current_source_digest(root);
+        let output = run_p14_fake(root, &fake_dir, "valid", &child_log);
+        assert!(!output.status.success());
+        assert_p14_fail_json(root, &digest, expected);
+        fs::write(&fixture_path, &fixture_original).unwrap();
+    }
+    let csv = csv_active.clone();
+    for bad in [
+        csv.replacen("p14.sdk-cli,lua55,", "p14.bad,lua55,", 1),
+        csv.replacen("SDK-NEG-006", "SDK-NEG-999", 1),
+        csv.replacen("p14.sdk-cli,lua54,", "p14.sdk-cli,lua55,", 1),
+    ] {
+        fs::write(&csv_path, bad).unwrap();
+        stamp_p14_prerequisites(root);
+        let digest = current_source_digest(root);
+        let output = run_p14_fake(root, &fake_dir, "valid", &child_log);
+        assert!(!output.status.success());
+        assert_p14_fail_json(root, &digest, "p14-csv");
+        fs::write(&csv_path, &csv_active).unwrap();
+    }
+    for scenario in [
+        "p13-missing",
+        "p13-json",
+        "p13-digest",
+        "p13-check",
+        "p13-case-trace",
+    ] {
+        stamp_p14_prerequisites(root);
+        let digest = current_source_digest(root);
+        let p13_path = report_dir.join("gate-P13.json");
+        let original = fs::read(&p13_path).unwrap();
+        let case_path = report_dir.join("P13-LIB-001-lua55.json");
+        let case_original = fs::read(&case_path).unwrap();
+        match scenario {
+            "p13-missing" => {
+                fs::remove_file(&p13_path).unwrap();
+            }
+            "p13-json" => {
+                fs::write(&p13_path, "{bad-json").unwrap();
+            }
+            "p13-digest" => {
+                fs::write(
+                    &p13_path,
+                    String::from_utf8(original.clone()).unwrap().replacen(
+                        &digest,
+                        &"0".repeat(64),
+                        1,
+                    ),
+                )
+                .unwrap();
+            }
+            "p13-check" => {
+                fs::write(
+                    &p13_path,
+                    String::from_utf8(original.clone()).unwrap().replacen(
+                        "p13-runtime-unit",
+                        "removed-runtime-unit",
+                        1,
+                    ),
+                )
+                .unwrap();
+            }
+            "p13-case-trace" => {
+                fs::write(
+                    &case_path,
+                    String::from_utf8(case_original.clone()).unwrap().replacen(
+                        "fuel_trace",
+                        "missing_trace",
+                        1,
+                    ),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let output = run_p14_fake(root, &fake_dir, "valid", &child_log);
+        assert!(!output.status.success(), "{scenario} 意外 PASS");
+        assert_p14_fail_json(root, &digest, "p00-p13-before");
+        fs::write(&p13_path, original).unwrap();
+        fs::write(&case_path, case_original).unwrap();
+    }
+    fs::remove_dir_all(&fake_dir).unwrap();
+    fs::write(&csv_path, &csv_original).unwrap();
+    drop(restore);
+    for (path, contents) in original_paths {
+        assert_eq!(
+            fs::read(&path).ok(),
+            contents,
+            "P14 protocol test 未逐位元組還原：{}",
+            path.display()
+        );
+    }
+    assert_eq!(fs::read(&csv_path).unwrap(), csv_original);
+    assert_eq!(fs::read(&fixture_path).unwrap(), fixture_original);
+    assert_eq!(git_status_snapshot(root), initial_status);
+}

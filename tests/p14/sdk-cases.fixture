@@ -1,0 +1,30 @@
+profile|lua55-i64f64|lua55
+profile|lua54-i64f64|lua54
+case|lua55-i64f64|SDK-001|roundtrip|sdk_case_001|P14_CASE:SDK-001|int:42|編譯保存重啟載入與呼叫
+case|lua55-i64f64|SDK-002|outer-admission|sdk_case_002|P14_CASE:SDK-002|length+crc:preallocation|外層長度與完整性
+case|lua55-i64f64|SDK-003|p05-rejection|sdk_case_003|P14_CASE:SDK-003|version+numeric+profile:payload|P05 typed 拒絕
+case|lua55-i64f64|SDK-004|vm-isolation|sdk_case_004|P14_CASE:SDK-004|vm:isolated|同模組雙 VM
+case|lua55-i64f64|SDK-005|public-api|sdk_case_005|P14_CASE:SDK-005|public-api:root+callback+resume|公開 SDK 操作
+case|lua55-i64f64|SDK-006|cli-errors|cli_case_006|P14_CASE:SDK-006|lua+codec:nonzero|CLI 錯誤狀態
+case|lua55-i64f64|SDK-007|cli-install|cli_case_007|P14_CASE:SDK-007|install:rivet-only|獨立安裝與 sentinel
+case|lua55-i64f64|SDK-008|decode-errors|sdk_case_008|P14_CASE:SDK-008|overflow+section-boundary+opcode+injection:retry|解碼錯誤與重試
+case|lua55-i64f64|SDK-NEG-001|no-second-parser|sdk_case_neg_001|P14_CASE:SDK-NEG-001|payload:delegated|wrapper 不自行解語言
+case|lua55-i64f64|SDK-NEG-002|no-unchecked-module|sdk_case_neg_002|P14_CASE:SDK-NEG-002|private-module:compile-rejected|不允許未驗證 module
+case|lua55-i64f64|SDK-NEG-003|no-runtime-snapshot|sdk_case_neg_003|P14_CASE:SDK-NEG-003|runtime:absent-after-restart|runtime 不可序列化
+case|lua55-i64f64|SDK-NEG-004|no-shared-execution|sdk_case_neg_004|P14_CASE:SDK-NEG-004|cross-vm:rejected|跨 VM execution 拒絕
+case|lua55-i64f64|SDK-NEG-005|no-system-lua|cli_case_neg_005|P14_CASE:SDK-NEG-005|decoy:untouched|不得 fallback 系統 Lua
+case|lua55-i64f64|SDK-NEG-006|no-false-success|cli_case_neg_006|P14_CASE:SDK-NEG-006|failure:nonzero|失敗狀態不可為零
+case|lua54-i64f64|SDK-001|roundtrip|sdk_case_001|P14_CASE:SDK-001|int:42|編譯保存重啟載入與呼叫
+case|lua54-i64f64|SDK-002|outer-admission|sdk_case_002|P14_CASE:SDK-002|length+crc:preallocation|外層長度與完整性
+case|lua54-i64f64|SDK-003|p05-rejection|sdk_case_003|P14_CASE:SDK-003|version+numeric+profile:payload|P05 typed 拒絕
+case|lua54-i64f64|SDK-004|vm-isolation|sdk_case_004|P14_CASE:SDK-004|vm:isolated|同模組雙 VM
+case|lua54-i64f64|SDK-005|public-api|sdk_case_005|P14_CASE:SDK-005|public-api:root+callback+resume|公開 SDK 操作
+case|lua54-i64f64|SDK-006|cli-errors|cli_case_006|P14_CASE:SDK-006|lua+codec:nonzero|CLI 錯誤狀態
+case|lua54-i64f64|SDK-007|cli-install|cli_case_007|P14_CASE:SDK-007|install:rivet-only|獨立安裝與 sentinel
+case|lua54-i64f64|SDK-008|decode-errors|sdk_case_008|P14_CASE:SDK-008|overflow+section-boundary+opcode+injection:retry|解碼錯誤與重試
+case|lua54-i64f64|SDK-NEG-001|no-second-parser|sdk_case_neg_001|P14_CASE:SDK-NEG-001|payload:delegated|wrapper 不自行解語言
+case|lua54-i64f64|SDK-NEG-002|no-unchecked-module|sdk_case_neg_002|P14_CASE:SDK-NEG-002|private-module:compile-rejected|不允許未驗證 module
+case|lua54-i64f64|SDK-NEG-003|no-runtime-snapshot|sdk_case_neg_003|P14_CASE:SDK-NEG-003|runtime:absent-after-restart|runtime 不可序列化
+case|lua54-i64f64|SDK-NEG-004|no-shared-execution|sdk_case_neg_004|P14_CASE:SDK-NEG-004|cross-vm:rejected|跨 VM execution 拒絕
+case|lua54-i64f64|SDK-NEG-005|no-system-lua|cli_case_neg_005|P14_CASE:SDK-NEG-005|decoy:untouched|不得 fallback 系統 Lua
+case|lua54-i64f64|SDK-NEG-006|no-false-success|cli_case_neg_006|P14_CASE:SDK-NEG-006|failure:nonzero|失敗狀態不可為零

@@ -48,9 +48,21 @@ impl<T> HostHandle<T> {
         vm.read(self.object)
     }
 
+    /// 驗證宿主根與物件世代後，將任意 VM 物件作為 Lua 值交給執行器。
+    pub fn as_value(&self, vm: &Vm) -> Result<Value, VmError> {
+        if vm.id() != self.id.vm {
+            return Err(VmError::WrongVm);
+        }
+        if !self.lease.is_active() {
+            return Err(VmError::StaleObject);
+        }
+        vm.object_kind(self.object)?;
+        Ok(Value::Object(self.object))
+    }
+
     /// 複製需在原 VM 中新增一筆可檢查的 host root。
     pub fn try_clone(&self, vm: &mut Vm) -> Result<Self, VmError> {
-        self.read(vm)?;
+        self.as_value(vm)?;
         Self::new(vm, self.object)
     }
 }

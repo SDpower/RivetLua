@@ -681,6 +681,7 @@ fn validate_csv(contents: &str) -> Result<(), String> {
                 || columns[0].starts_with("p11.")
                 || columns[0].starts_with("p12.")
                 || columns[0].starts_with("p13.")
+                || columns[0].starts_with("p14.")
             {
                 continue;
             }
@@ -719,6 +720,7 @@ fn validate_pass_evidence(csv: &str, results: &[GateResult]) -> Result<(), Strin
             || columns[0].starts_with("p11.")
             || columns[0].starts_with("p12.")
             || columns[0].starts_with("p13.")
+            || columns[0].starts_with("p14.")
         {
             continue;
         }
@@ -5558,7 +5560,7 @@ fn validate_p06_records(
 }
 
 fn validate_phase_dependency_graph(csv: &str) -> Result<(), String> {
-    const EXPECTED_EDGES: [(&str, &str, &str, &str); 32] = [
+    const EXPECTED_EDGES: [(&str, &str, &str, &str); 34] = [
         ("DA-01", "P01", "P06", "P01"),
         ("DA-01A", "P06", "P07", "P06"),
         ("DA-02", "P06", "P07", "P06"),
@@ -5591,6 +5593,8 @@ fn validate_phase_dependency_graph(csv: &str) -> Result<(), String> {
         ("DA-29", "P05", "P22", "P22"),
         ("DA-30", "P05", "P23", "P23"),
         ("DA-31", "P05", "P24", "P24"),
+        ("DA-32", "P05", "P13", "P13"),
+        ("DA-33", "P05", "P14", "P14"),
     ];
     let mut rows = std::collections::HashSet::new();
     let mut stages = std::collections::HashSet::new();
@@ -5606,7 +5610,7 @@ fn validate_phase_dependency_graph(csv: &str) -> Result<(), String> {
                 line_number + 1
             ));
         }
-        let (id, producer, consumer, _interface, status, earliest_gate) = (
+        let (id, producer, consumer, interface, status, earliest_gate) = (
             columns[0], columns[1], columns[2], columns[3], columns[4], columns[5],
         );
         if !rows.insert(id) {
@@ -5639,6 +5643,16 @@ fn validate_phase_dependency_graph(csv: &str) -> Result<(), String> {
                 "phase-dependencies.csv {id} 含未解 status：{status}"
             ));
         }
+        let official_interface = match id {
+            "DA-32" => Some("Lua55 Lua54 official chunk codec translation VerifiedModule"),
+            "DA-33" => Some("immutable validated artifact metadata transport"),
+            _ => None,
+        };
+        if official_interface.is_some_and(|expected| interface != expected)
+            || (official_interface.is_some() && status != "IMPLEMENTED")
+        {
+            return Err(format!("phase-dependencies.csv {id} 官方 chunk 契約不符"));
+        }
         let parse_stage = |value: &str| {
             value
                 .strip_prefix('P')
@@ -5657,13 +5671,13 @@ fn validate_phase_dependency_graph(csv: &str) -> Result<(), String> {
         stages.insert(consumer_stage);
         critical.insert((id, producer, consumer));
     }
-    if rows.len() != 32
-        || !(1..=31).all(|number| {
+    if rows.len() != 34
+        || !(1..=33).all(|number| {
             let id = format!("DA-{number:02}");
             rows.contains(id.as_str())
         })
     {
-        return Err("phase-dependencies.csv 必須完整覆蓋 DA-01～DA-31".into());
+        return Err("phase-dependencies.csv 必須完整覆蓋 DA-01～DA-33".into());
     }
     if !rows.contains("DA-01A") {
         return Err("phase-dependencies.csv 缺 P06 ObjectRef identity bridge edge".into());
@@ -5681,6 +5695,8 @@ fn validate_phase_dependency_graph(csv: &str) -> Result<(), String> {
         ("DA-20", "P05", "P14"),
         ("DA-30", "P05", "P23"),
         ("DA-31", "P05", "P24"),
+        ("DA-32", "P05", "P13"),
+        ("DA-33", "P05", "P14"),
     ] {
         if !critical.contains(&edge) {
             return Err(format!(
@@ -6702,7 +6718,7 @@ fn p05_gate() -> Result<(), String> {
         graph_command,
         0,
         "PASS",
-        "32 條 dependency edge 覆蓋 31 筆 DA、無 CONFLICT、無 cycle，且 critical owner edge 存在",
+        "34 條 dependency edge 覆蓋 33 筆 DA 與 DA-01A、無 CONFLICT、無 cycle，且 critical owner edge 存在",
     ));
     for (name, arguments) in [
         ("p05-format", vec!["fmt", "--all", "--", "--check"]),
@@ -10831,6 +10847,1455 @@ fn p13_gate() -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct P14CaseSpec {
+    id: &'static str,
+    mode: &'static str,
+    input: &'static str,
+    expected: &'static str,
+    package: &'static str,
+}
+
+const P14_CASE_SPECS: [P14CaseSpec; 14] = [
+    P14CaseSpec {
+        id: "SDK-001",
+        mode: "roundtrip",
+        input: "sdk_case_001",
+        expected: "int:42",
+        package: "rivetlua",
+    },
+    P14CaseSpec {
+        id: "SDK-002",
+        mode: "outer-admission",
+        input: "sdk_case_002",
+        expected: "length+crc:preallocation",
+        package: "rivetlua",
+    },
+    P14CaseSpec {
+        id: "SDK-003",
+        mode: "p05-rejection",
+        input: "sdk_case_003",
+        expected: "version+numeric+profile:payload",
+        package: "rivetlua",
+    },
+    P14CaseSpec {
+        id: "SDK-004",
+        mode: "vm-isolation",
+        input: "sdk_case_004",
+        expected: "vm:isolated",
+        package: "rivetlua",
+    },
+    P14CaseSpec {
+        id: "SDK-005",
+        mode: "public-api",
+        input: "sdk_case_005",
+        expected: "public-api:root+callback+resume",
+        package: "rivetlua",
+    },
+    P14CaseSpec {
+        id: "SDK-006",
+        mode: "cli-errors",
+        input: "cli_case_006",
+        expected: "lua+codec:nonzero",
+        package: "rivetlua-cli",
+    },
+    P14CaseSpec {
+        id: "SDK-007",
+        mode: "cli-install",
+        input: "cli_case_007",
+        expected: "install:rivet-only",
+        package: "rivetlua-cli",
+    },
+    P14CaseSpec {
+        id: "SDK-008",
+        mode: "decode-errors",
+        input: "sdk_case_008",
+        expected: "overflow+section-boundary+opcode+injection:retry",
+        package: "rivetlua",
+    },
+    P14CaseSpec {
+        id: "SDK-NEG-001",
+        mode: "no-second-parser",
+        input: "sdk_case_neg_001",
+        expected: "payload:delegated",
+        package: "rivetlua",
+    },
+    P14CaseSpec {
+        id: "SDK-NEG-002",
+        mode: "no-unchecked-module",
+        input: "sdk_case_neg_002",
+        expected: "private-module:compile-rejected",
+        package: "rivetlua",
+    },
+    P14CaseSpec {
+        id: "SDK-NEG-003",
+        mode: "no-runtime-snapshot",
+        input: "sdk_case_neg_003",
+        expected: "runtime:absent-after-restart",
+        package: "rivetlua",
+    },
+    P14CaseSpec {
+        id: "SDK-NEG-004",
+        mode: "no-shared-execution",
+        input: "sdk_case_neg_004",
+        expected: "cross-vm:rejected",
+        package: "rivetlua",
+    },
+    P14CaseSpec {
+        id: "SDK-NEG-005",
+        mode: "no-system-lua",
+        input: "cli_case_neg_005",
+        expected: "decoy:untouched",
+        package: "rivetlua-cli",
+    },
+    P14CaseSpec {
+        id: "SDK-NEG-006",
+        mode: "no-false-success",
+        input: "cli_case_neg_006",
+        expected: "failure:nonzero",
+        package: "rivetlua-cli",
+    },
+];
+
+#[derive(Clone)]
+struct P14FixtureCase {
+    profile: String,
+    lua_profile: String,
+    id: String,
+    mode: String,
+    input: String,
+    marker: String,
+    expected: String,
+    note: String,
+}
+
+#[derive(Clone, Debug)]
+struct P14Record {
+    id: String,
+    profile: String,
+    actual: String,
+    diagnostic: String,
+    allocation: String,
+    resource: String,
+    vm: String,
+    cli: String,
+}
+
+fn p14_spec(id: &str) -> Option<&'static P14CaseSpec> {
+    P14_CASE_SPECS.iter().find(|spec| spec.id == id)
+}
+
+fn p14_lua_profile(profile: &str) -> Result<&'static str, String> {
+    match profile {
+        "lua55-i64f64" => Ok("lua55"),
+        "lua54-i64f64" => Ok("lua54"),
+        _ => Err(format!("P14 完整 profile 不合法：{profile}")),
+    }
+}
+
+fn parse_p14_fixture(contents: &str) -> Result<Vec<P14FixtureCase>, String> {
+    let mut mappings = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cases = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        let fields = line.split('|').collect::<Vec<_>>();
+        match fields.as_slice() {
+            ["profile", profile, lua_profile] => {
+                if p14_lua_profile(profile)? != *lua_profile
+                    || mappings.insert(*profile, *lua_profile).is_some()
+                {
+                    return Err(format!(
+                        "P14 fixture 第 {} 行 profile 映射錯誤或重複",
+                        index + 1
+                    ));
+                }
+            }
+            ["case", profile, id, mode, input, marker, expected, note] => {
+                if [profile, id, mode, input, marker, expected, note]
+                    .iter()
+                    .any(|field| field.is_empty() || field.contains(['\t', '\r', '\n']))
+                {
+                    return Err(format!("P14 fixture 第 {} 行有空值或控制字元", index + 1));
+                }
+                let lua_profile = p14_lua_profile(profile)?;
+                let spec = p14_spec(id).ok_or_else(|| format!("P14 fixture 未知案例：{id}"))?;
+                if *mode != spec.mode
+                    || *input != spec.input
+                    || *expected != spec.expected
+                    || *marker != format!("P14_CASE:{id}")
+                    || !seen.insert((*profile, *id))
+                {
+                    return Err(format!("P14 fixture {profile}/{id} 固定契約錯誤或重複"));
+                }
+                cases.push(P14FixtureCase {
+                    profile: (*profile).into(),
+                    lua_profile: lua_profile.into(),
+                    id: (*id).into(),
+                    mode: (*mode).into(),
+                    input: (*input).into(),
+                    marker: (*marker).into(),
+                    expected: (*expected).into(),
+                    note: (*note).into(),
+                });
+            }
+            _ => return Err(format!("P14 fixture 第 {} 行格式錯誤", index + 1)),
+        }
+    }
+    if mappings.len() != 2
+        || mappings.get("lua55-i64f64") != Some(&"lua55")
+        || mappings.get("lua54-i64f64") != Some(&"lua54")
+        || cases.len() != 28
+    {
+        return Err("P14 fixture 必須有兩個 profile、各 14 個唯一案例".into());
+    }
+    for profile in ["lua55-i64f64", "lua54-i64f64"] {
+        if P14_CASE_SPECS
+            .iter()
+            .any(|spec| !seen.contains(&(profile, spec.id)))
+        {
+            return Err(format!("P14 fixture {profile} 缺少固定案例"));
+        }
+    }
+    Ok(cases)
+}
+
+fn p14_validate_csv_cases(csv: &str) -> Result<(), String> {
+    validate_csv(csv)?;
+    let p05_rows = csv
+        .lines()
+        .skip(1)
+        .filter(|line| {
+            line.starts_with("p05.official-chunk,") || line.starts_with("p05.artifact-metadata,")
+        })
+        .collect::<Vec<_>>();
+    if p05_rows.len() != 4 {
+        return Err(format!(
+            "P14 CSV P05 官方／artifact 應恰有四列，實際 {}",
+            p05_rows.len()
+        ));
+    }
+    for profile in ["lua55", "lua54"] {
+        let official_ids = (1..=18)
+            .filter(|id| match (profile, id) {
+                ("lua55", 1 | 3) | ("lua54", 2 | 4) => false,
+                _ => true,
+            })
+            .map(|id| format!("OFFCHUNK-{id:03}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let artifact_ids = [7, 8, 17, 18]
+            .map(|id| format!("OFFCHUNK-{id:03}"))
+            .join(";");
+        for (feature, modules, ids) in [
+            (
+                "p05.official-chunk",
+                "rivetlua-core;rivetlua-compiler;rivetlua-runtime",
+                official_ids,
+            ),
+            (
+                "p05.artifact-metadata",
+                "rivetlua-core;rivetlua-runtime",
+                artifact_ids,
+            ),
+        ] {
+            let row = format!("{feature},{profile},docs/plane/WorkP14.md,{modules},{ids},PASS,");
+            if !p05_rows.iter().any(|actual| *actual == row.as_str()) {
+                return Err(format!("P14 CSV {feature}/{profile} OFFCHUNK 映射不符"));
+            }
+        }
+    }
+    let rows = csv
+        .lines()
+        .skip(1)
+        .filter(|line| line.starts_with("p14."))
+        .collect::<Vec<_>>();
+    if rows.len() != 2 {
+        return Err(format!(
+            "P14 CSV 應恰有雙 profile 兩列，實際 {}",
+            rows.len()
+        ));
+    }
+    let ids = P14_CASE_SPECS
+        .iter()
+        .map(|spec| spec.id)
+        .collect::<Vec<_>>()
+        .join(";");
+    for profile in ["lua55", "lua54"] {
+        let matches = rows
+            .iter()
+            .filter(|row| row.split(',').nth(1) == Some(profile))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(format!("P14 CSV {profile} 映射缺少或重複"));
+        }
+        let columns = matches[0].split(',').collect::<Vec<_>>();
+        if columns.len() != 7
+            || columns[0] != "p14.sdk-cli"
+            || columns[2] != "docs/plane/P14.md#6-正常與錯誤案例"
+            || columns[3] != "rivetlua;rivetlua-cli"
+            || columns[4] != ids
+            || columns[5] != "PASS"
+            || !columns[6].is_empty()
+        {
+            return Err(format!("P14 CSV {profile} 欄位或 ID 集合不符"));
+        }
+    }
+    Ok(())
+}
+
+fn p14_records_from_output(profile: &str, output: &str) -> Result<P14Record, String> {
+    let mut records = Vec::new();
+    for line in output.lines() {
+        if let Some(position) = line.find("P14_CASE") {
+            let fields = line[position..].split('\t').collect::<Vec<_>>();
+            if fields.len() != 8 || fields[0] != "P14_CASE" || fields[2] != profile {
+                return Err(format!("P14 marker 八欄或 profile 錯誤：{line}"));
+            }
+            let spec =
+                p14_spec(fields[1]).ok_or_else(|| format!("P14 marker 未知 ID：{}", fields[1]))?;
+            let payload = fields[3]
+                .strip_prefix("status=PASS;actual=")
+                .ok_or_else(|| format!("P14 {} marker 無 PASS/actual", spec.id))?;
+            let (actual, diagnostic) = payload
+                .rsplit_once(";diagnostic=")
+                .ok_or_else(|| format!("P14 {} marker 無 diagnostic", spec.id))?;
+            if actual != spec.expected || diagnostic.is_empty() {
+                return Err(format!("P14 {} marker actual/diagnostic 不符", spec.id));
+            }
+            let trace = |index: usize, prefix: &str| -> Result<String, String> {
+                fields[index]
+                    .strip_prefix(prefix)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("P14 {} 缺 trace {prefix}", spec.id))
+            };
+            records.push(P14Record {
+                id: spec.id.into(),
+                profile: profile.into(),
+                actual: actual.into(),
+                diagnostic: diagnostic.into(),
+                allocation: trace(4, "allocation=")?,
+                resource: trace(5, "resource=")?,
+                vm: trace(6, "vm=")?,
+                cli: trace(7, "cli=")?,
+            });
+        }
+    }
+    if records.len() != 1 {
+        return Err(format!(
+            "P14 exact child marker 預期 1 個，實際 {}",
+            records.len()
+        ));
+    }
+    Ok(records.remove(0))
+}
+
+fn p14_check_exact_summary(output: &str) -> Result<(), String> {
+    let lines = output
+        .lines()
+        .filter(|line| line.contains("test result:"))
+        .collect::<Vec<_>>();
+    if lines.len() != 1 {
+        return Err(format!(
+            "P14 exact child 摘要預期 1 個，實際 {}",
+            lines.len()
+        ));
+    }
+    let summary = lines[0]
+        .split_once("test result: ok. ")
+        .map(|(_, text)| text)
+        .ok_or("P14 exact child 無成功摘要")?;
+    let fields = summary.split(';').map(str::trim).collect::<Vec<_>>();
+    if !(5..=6).contains(&fields.len())
+        || fields[0] != "1 passed"
+        || fields[1] != "0 failed"
+        || fields[2] != "0 ignored"
+        || fields[3] != "0 measured"
+        || fields[4]
+            .strip_suffix(" filtered out")
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_none()
+        || (fields.len() == 6 && !fields[5].starts_with("finished in "))
+    {
+        return Err(format!(
+            "P14 exact child 必須 1 passed/0 failed/0 ignored：{}",
+            lines[0]
+        ));
+    }
+    Ok(())
+}
+
+fn p14_case_command(profile: &str, spec: &P14CaseSpec) -> String {
+    let target = env::var("CARGO_TARGET_DIR")
+        .ok()
+        .map(|value| format!("CARGO_TARGET_DIR={value} "))
+        .unwrap_or_default();
+    format!(
+        "{target}RIVETLUA_P14_PROFILE={profile} cargo test --locked -p {} --test p14_contracts {} -- --exact --nocapture --test-threads=1",
+        spec.package, spec.input
+    )
+}
+
+fn p14_capture(root: &Path, profile: Option<&str>, args: &[&str]) -> Result<(i32, String), String> {
+    let mut command = Command::new("cargo");
+    command.args(args).current_dir(root);
+    if let Some(profile) = profile {
+        command.env("RIVETLUA_P14_PROFILE", profile);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("啟動 P14 child 失敗：{error}"))?;
+    Ok((
+        output.status.code().unwrap_or(1),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    ))
+}
+
+fn p14_clear_case_reports(root: &Path) -> Result<(), String> {
+    let dir = p13_report_dir(root);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("P14 報告目錄不可讀：{error}")),
+    };
+    let mut failure = None;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.file_name().to_string_lossy().starts_with("P14-") {
+            let path = entry.path();
+            if !path.is_file() {
+                failure
+                    .get_or_insert_with(|| format!("P14 舊報告路徑不是檔案：{}", path.display()));
+                continue;
+            }
+            if let Err(error) = fs::remove_file(&path) {
+                failure.get_or_insert_with(|| format!("清除 {} 失敗：{error}", path.display()));
+            }
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+fn p14_aggregate_json(
+    digest: &str,
+    results: &[GateResult],
+    status: &str,
+    diagnostic: &str,
+) -> String {
+    let checks = results.iter().map(|item| format!(
+        "{{\"name\":\"{}\",\"command\":\"{}\",\"exit_code\":{},\"status\":\"{}\",\"diagnostic\":\"{}\",\"report_path\":\"{}\"}}",
+        json_escape(&item.name), json_escape(&item.command), item.exit_code, item.status,
+        json_escape(&item.diagnostic), json_escape(&item.report_path)
+    )).collect::<Vec<_>>().join(",");
+    let cases = if status == "PASS" {
+        results
+            .iter()
+            .filter(|item| item.name.starts_with("SDK-"))
+            .map(|item| {
+                let (id, profile) = item.name.rsplit_once('-').expect("已驗 P14 case check");
+                format!(
+                    "{{\"case_id\":\"{}\",\"lua_profile\":\"{}\",\"report_path\":\"{}\"}}",
+                    json_escape(id),
+                    json_escape(profile),
+                    json_escape(&item.report_path)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        String::new()
+    };
+    format!(
+        "{{\"status\":\"{status}\",\"source_digest\":\"{}\",\"diagnostic\":\"{}\",\"checks\":[{checks}],\"case_reports\":[{cases}]}}\n",
+        json_escape(digest),
+        json_escape(diagnostic)
+    )
+}
+
+fn p14_write_aggregate(
+    digest: &str,
+    results: &[GateResult],
+    status: &str,
+    diagnostic: &str,
+    path: &Path,
+) -> Result<(), String> {
+    fs::create_dir_all(path.parent().ok_or("P14 aggregate 路徑無 parent")?)
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        path,
+        p14_aggregate_json(digest, results, status, diagnostic),
+    )
+    .map_err(|error| format!("寫 P14 aggregate {} 失敗：{error}", path.display()))?;
+    let parsed =
+        StrictJsonParser::parse(&fs::read_to_string(path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("P14 aggregate JSON 無效：{error}"))?;
+    if parsed.get("status").and_then(StrictJsonValue::as_str) != Some(status)
+        || parsed
+            .get("source_digest")
+            .and_then(StrictJsonValue::as_str)
+            != Some(digest)
+    {
+        return Err("P14 aggregate 寫後欄位不符".into());
+    }
+    Ok(())
+}
+
+fn p14_fail(
+    root: &Path,
+    digest: &str,
+    results: &mut Vec<GateResult>,
+    name: &str,
+    command: &str,
+    exit_code: i32,
+    error: String,
+) -> String {
+    let mut diagnostic = error;
+    if let Err(error) = p14_clear_case_reports(root) {
+        diagnostic.push_str(&format!("；清理 P14 案例失敗：{error}"));
+    }
+    let canonical = p13_report_dir(root).join("gate-P14.json");
+    if canonical.is_file() {
+        if let Err(error) = fs::remove_file(&canonical) {
+            diagnostic.push_str(&format!("；清除舊 P14 aggregate 失敗：{error}"));
+        }
+    }
+    results.push(p13_result(
+        name,
+        command,
+        exit_code.max(1),
+        "FAIL",
+        &diagnostic,
+        "target/rivetlua-reports/gate-P14.json",
+    ));
+    if let Err(error) = p14_write_aggregate(digest, results, "FAIL", &diagnostic, &canonical) {
+        let fallback = root.join("target/gate-P14-fail.json");
+        diagnostic.push_str(&format!("；canonical 寫入失敗：{error}"));
+        if let Some(last) = results.last_mut() {
+            last.report_path = "target/gate-P14-fail.json".into();
+            last.diagnostic = diagnostic.clone();
+        }
+        if let Err(fallback_error) =
+            p14_write_aggregate(digest, results, "FAIL", &diagnostic, &fallback)
+        {
+            diagnostic.push_str(&format!("；fallback FAIL 寫入失敗：{fallback_error}"));
+        }
+    }
+    diagnostic
+}
+
+fn p14_case_json(
+    case: &P14FixtureCase,
+    record: &P14Record,
+    digest: &str,
+    command: &str,
+    cwd: &Path,
+    report_path: &str,
+) -> String {
+    format!(
+        "{{\"case_id\":\"{}\",\"profile\":\"{}\",\"lua_profile\":\"{}\",\"mode\":\"{}\",\"input\":\"{}\",\"expected\":\"{}\",\"actual\":\"{}\",\"status\":\"PASS\",\"command\":\"{}\",\"cwd\":\"{}\",\"exit_code\":0,\"source_digest\":\"{}\",\"report_path\":\"{}\",\"diagnostic\":\"{}\",\"allocation_trace\":\"{}\",\"resource_trace\":\"{}\",\"vm_trace\":\"{}\",\"cli_trace\":\"{}\"}}\n",
+        json_escape(&case.id),
+        json_escape(&case.profile),
+        json_escape(&case.lua_profile),
+        json_escape(&case.mode),
+        json_escape(&case.input),
+        json_escape(&case.expected),
+        json_escape(&record.actual),
+        json_escape(command),
+        json_escape(&cwd.display().to_string()),
+        json_escape(digest),
+        json_escape(report_path),
+        json_escape(&format!("{}；{}", case.note, record.diagnostic)),
+        json_escape(&record.allocation),
+        json_escape(&record.resource),
+        json_escape(&record.vm),
+        json_escape(&record.cli)
+    )
+}
+
+fn p14_validate_case_report(
+    path: &Path,
+    case: &P14FixtureCase,
+    digest: &str,
+    command: &str,
+    cwd: &Path,
+) -> Result<(), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("P14 case {} 不可讀：{error}", path.display()))?;
+    let parsed = StrictJsonParser::parse(&text)
+        .map_err(|error| format!("P14 case {} JSON 無效：{error}", path.display()))?;
+    let relative = format!(
+        "target/rivetlua-reports/P14-{}-{}.json",
+        case.id, case.lua_profile
+    );
+    let cwd_text = cwd.display().to_string();
+    for (key, expected) in [
+        ("case_id", case.id.as_str()),
+        ("profile", case.profile.as_str()),
+        ("lua_profile", case.lua_profile.as_str()),
+        ("mode", case.mode.as_str()),
+        ("input", case.input.as_str()),
+        ("expected", case.expected.as_str()),
+        ("actual", case.expected.as_str()),
+        ("status", "PASS"),
+        ("command", command),
+        ("cwd", cwd_text.as_str()),
+        ("source_digest", digest),
+        ("report_path", relative.as_str()),
+    ] {
+        if parsed.get(key).and_then(StrictJsonValue::as_str) != Some(expected) {
+            return Err(format!("P14 case {} 欄位 {key} 不符", path.display()));
+        }
+    }
+    if parsed.get("exit_code").and_then(StrictJsonValue::as_i32) != Some(0) {
+        return Err(format!("P14 case {} exit 非零", path.display()));
+    }
+    for key in [
+        "diagnostic",
+        "allocation_trace",
+        "resource_trace",
+        "vm_trace",
+        "cli_trace",
+    ] {
+        if !parsed
+            .get(key)
+            .and_then(StrictJsonValue::as_str)
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Err(format!("P14 case {} 缺 {key}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn p14_validate_all_case_reports(
+    root: &Path,
+    cases: &[P14FixtureCase],
+    digest: &str,
+    expected: &std::collections::HashMap<PathBuf, String>,
+) -> Result<(), String> {
+    let dir = p13_report_dir(root);
+    let paths = fs::read_dir(&dir)
+        .map_err(|error| error.to_string())?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("P14-"))
+        })
+        .collect::<Vec<_>>();
+    if paths.len() != 28 || cases.len() != 28 {
+        return Err(format!("P14 case reports 預期 28 個，實際 {}", paths.len()));
+    }
+    if expected.len() != 28 {
+        return Err(format!("P14 marker 產生案例數錯誤：{}", expected.len()));
+    }
+    for case in cases {
+        let spec = p14_spec(&case.id).ok_or("P14 未知案例")?;
+        let path = dir.join(format!("P14-{}-{}.json", case.id, case.lua_profile));
+        if !paths.contains(&path) {
+            return Err(format!("P14 缺案例報告：{}", path.display()));
+        }
+        p14_validate_case_report(
+            &path,
+            case,
+            digest,
+            &p14_case_command(&case.profile, spec),
+            root,
+        )?;
+        let actual = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        if expected.get(&path) != Some(&actual) {
+            return Err(format!(
+                "P14 case {} 與 child marker 原始紀錄不符",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn p14_validate_prior_reports(root: &Path, digest: &str) -> Result<Vec<GateResult>, String> {
+    let mut results = p13_validate_prior_reports(root, digest)?;
+    let path = p13_report_dir(root).join("gate-P13.json");
+    let text =
+        fs::read_to_string(&path).map_err(|error| format!("缺 P13 前置 gate 報告：{error}"))?;
+    let parsed = StrictJsonParser::parse(&text)
+        .map_err(|error| format!("P13 前置 gate JSON 無效：{error}"))?;
+    if parsed.get("status").and_then(StrictJsonValue::as_str) != Some("PASS") {
+        return Err("P13 前置 gate 非 PASS".into());
+    }
+    validate_report_source_digest("P13", &parsed, digest)?;
+    let checks = parsed
+        .get("checks")
+        .and_then(StrictJsonValue::as_array)
+        .filter(|checks| !checks.is_empty())
+        .ok_or("P13 前置 checks 缺失")?;
+    let mut names = std::collections::HashSet::new();
+    for check in checks {
+        let name = p13_validate_prior_check("P13", check)?;
+        if !names.insert(name.clone()) {
+            return Err(format!("P13 前置 check 重複：{name}"));
+        }
+        if let Some(phase) = name.strip_suffix("-aggregate") {
+            let prior = results
+                .iter()
+                .find(|item| item.name == name)
+                .ok_or_else(|| format!("P13 前置 aggregate 未經 {phase} 報告核驗"))?;
+            if check.get("command").and_then(StrictJsonValue::as_str)
+                != Some(prior.command.as_str())
+                || check.get("report_path").and_then(StrictJsonValue::as_str)
+                    != Some(prior.report_path.as_str())
+            {
+                return Err(format!("P13 前置 aggregate {name} command/path 不符"));
+            }
+        }
+        let fixed_command = match name.as_str() {
+            "p13-dependencies" => Some("validate spec/phase-dependencies.csv DA-09/14/18/19/20"),
+            "p13-csv" => Some("validate spec/compatibility.csv"),
+            "p13-fixture" => Some("validate tests/p13/lib-cases.fixture"),
+            "p13-runtime-unit" => {
+                Some("cargo test --locked -p rivetlua-runtime --lib p13_ -- --test-threads=1")
+            }
+            "p13-case-reports" => Some("validate 28 unique P13 case JSON"),
+            "p13-source-digest" => Some("verify source digest after children"),
+            _ => None,
+        };
+        if let Some(command) = fixed_command {
+            if check.get("command").and_then(StrictJsonValue::as_str) != Some(command)
+                || check.get("report_path").and_then(StrictJsonValue::as_str)
+                    != Some("target/rivetlua-reports/gate-P13.json")
+            {
+                return Err(format!("P13 前置 {name} command/path 不符"));
+            }
+        }
+        if name.starts_with("LIB-") {
+            let (id, lua_profile) = name.rsplit_once('-').ok_or("P13 LIB check 無 profile")?;
+            let spec = p13_spec(id).ok_or_else(|| format!("P13 未知 LIB check：{name}"))?;
+            let fullprofile = match lua_profile {
+                "lua55" => "lua55-i64f64",
+                "lua54" => "lua54-i64f64",
+                _ => return Err(format!("P13 LIB check profile 不合法：{name}")),
+            };
+            let expected_command = p13_case_command(fullprofile, spec.test_name);
+            let expected_path = format!("target/rivetlua-reports/P13-{id}-{lua_profile}.json");
+            if check.get("command").and_then(StrictJsonValue::as_str)
+                != Some(expected_command.as_str())
+                || check.get("report_path").and_then(StrictJsonValue::as_str)
+                    != Some(expected_path.as_str())
+            {
+                return Err(format!("P13 LIB check {name} command/path 不符"));
+            }
+        }
+    }
+    let mut required = vec![
+        "p13-csv".to_owned(),
+        "p13-fixture".to_owned(),
+        "p13-runtime-unit".to_owned(),
+        "p13-case-reports".to_owned(),
+        "p13-source-digest".to_owned(),
+        "p13-dependencies".to_owned(),
+    ];
+    for phase in 0..=12 {
+        required.push(format!("P{phase:02}-aggregate"));
+    }
+    for spec in P13_CASE_SPECS {
+        for profile in ["lua55", "lua54"] {
+            required.push(format!("{}-{profile}", spec.id));
+        }
+    }
+    p13_check_names(checks, &required, "P13")?;
+    if checks.len() != required.len() {
+        return Err(format!(
+            "P13 前置 checks 數錯誤：預期 {}，實際 {}",
+            required.len(),
+            checks.len()
+        ));
+    }
+    let p13_fixture = fs::read_to_string(root.join("tests/p13/lib-cases.fixture"))
+        .map_err(|error| format!("P13 fixture 不可讀：{error}"))?;
+    let p13_cases = parse_p13_fixture(&p13_fixture)?;
+    p13_validate_all_case_reports(root, &p13_cases, digest)?;
+    let case_refs = parsed
+        .get("case_reports")
+        .and_then(StrictJsonValue::as_array)
+        .ok_or("P13 aggregate 缺 case_reports")?;
+    if case_refs.len() != 28 {
+        return Err(format!(
+            "P13 aggregate case_refs 非 28：{}",
+            case_refs.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for reference in case_refs {
+        let id = reference
+            .get("case_id")
+            .and_then(StrictJsonValue::as_str)
+            .ok_or("P13 case_ref 缺 ID")?;
+        let lua_profile = reference
+            .get("lua_profile")
+            .and_then(StrictJsonValue::as_str)
+            .ok_or("P13 case_ref 缺 profile")?;
+        let case = p13_cases
+            .iter()
+            .find(|case| {
+                case.id == id
+                    && ((lua_profile == "lua55" && case.profile == "lua55-i64f64")
+                        || (lua_profile == "lua54" && case.profile == "lua54-i64f64"))
+            })
+            .ok_or_else(|| format!("P13 case_ref 未知：{id}/{lua_profile}"))?;
+        let expected = format!("target/rivetlua-reports/P13-{}-{lua_profile}.json", case.id);
+        if reference
+            .get("report_path")
+            .and_then(StrictJsonValue::as_str)
+            != Some(expected.as_str())
+            || !seen.insert((id, lua_profile))
+        {
+            return Err(format!("P13 case_ref 路徑不符或重複：{id}/{lua_profile}"));
+        }
+        let report = fs::read_to_string(root.join(&expected)).map_err(|error| error.to_string())?;
+        let report = StrictJsonParser::parse(&report).map_err(|error| error.to_string())?;
+        for (key, value) in [
+            ("mode", case.mode.as_str()),
+            ("input", case.input.as_str()),
+            ("expected", case.expected.as_str()),
+            ("actual", case.expected.as_str()),
+            (
+                "command",
+                p13_case_command(&case.profile, &case.input).as_str(),
+            ),
+        ] {
+            if report.get(key).and_then(StrictJsonValue::as_str) != Some(value) {
+                return Err(format!("P13 case report {id}/{lua_profile} {key} 不符"));
+            }
+        }
+        if report.get("report_path").and_then(StrictJsonValue::as_str) != Some(expected.as_str()) {
+            return Err(format!("P13 case report {id}/{lua_profile} 路徑不符"));
+        }
+    }
+    results.push(p13_result(
+        "P13-aggregate",
+        format!("validate {}", path.display()),
+        0,
+        "PASS",
+        format!(
+            "P13 fresh digest、{} exact checks、28 LIB reports/schema/reference",
+            checks.len()
+        ),
+        "target/rivetlua-reports/gate-P14.json",
+    ));
+    Ok(results)
+}
+
+fn p14_prior_report_snapshot(
+    root: &Path,
+) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
+    let mut snapshot = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(p13_report_dir(root)).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if (0..=13).any(|phase| {
+            name == format!("gate-P{phase:02}.json") || name.starts_with(&format!("P{phase:02}-"))
+        }) {
+            let bytes = fs::read(entry.path())
+                .map_err(|error| format!("前置報告 {name} 不可讀：{error}"))?;
+            snapshot.insert(name, bytes);
+        }
+    }
+    Ok(snapshot)
+}
+
+fn p14_validate_dependencies(root: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(root.join("spec/phase-dependencies.csv"))
+        .map_err(|error| format!("讀 phase-dependencies.csv 失敗：{error}"))?;
+    validate_phase_dependency_graph(&text)?;
+    for row in [
+        "DA-19,P12,P13,runtime root fuel table frame effect contracts,CONTRACTED,P13",
+        "DA-20,P05,P14,RVLU_V2 language payload VerifiedModule,CONTRACTED,P14",
+        "DA-21,P14,P16,SDK wrapper container policy,CONTRACTED,P14",
+        "DA-32,P05,P13,Lua55 Lua54 official chunk codec translation VerifiedModule,IMPLEMENTED,P13",
+        "DA-33,P05,P14,immutable validated artifact metadata transport,IMPLEMENTED,P14",
+    ] {
+        if !text.lines().any(|line| line == row) {
+            return Err(format!("P14 dependency 契約列缺少或變更：{row}"));
+        }
+    }
+    Ok(())
+}
+
+fn p14_check_filter_summary(label: &str, output: &str) -> Result<usize, String> {
+    let summaries = output
+        .lines()
+        .filter(|line| line.contains("test result:"))
+        .collect::<Vec<_>>();
+    if summaries.is_empty() {
+        return Err(format!("P14 {label} 無測試摘要"));
+    }
+    let mut passed_total: usize = 0;
+    for line in summaries {
+        let summary = line
+            .split_once("test result: ok. ")
+            .map(|(_, text)| text)
+            .ok_or_else(|| format!("P14 {label} 摘要非成功：{line}"))?;
+        let fields = summary.split(';').map(str::trim).collect::<Vec<_>>();
+        let count = |index: usize, suffix: &str| {
+            fields
+                .get(index)
+                .and_then(|field| field.strip_suffix(suffix))
+                .and_then(|value| value.parse::<usize>().ok())
+        };
+        if count(1, " failed") != Some(0) || count(2, " ignored") != Some(0) {
+            return Err(format!("P14 {label} 摘要有 failed/ignored：{line}"));
+        }
+        passed_total = passed_total
+            .checked_add(
+                count(0, " passed").ok_or_else(|| format!("P14 {label} passed 數無效：{line}"))?,
+            )
+            .ok_or_else(|| format!("P14 {label} passed 數溢位：{line}"))?;
+    }
+    if passed_total == 0 {
+        return Err(format!("P14 {label} 零匹配"));
+    }
+    Ok(passed_total)
+}
+
+fn p14_gate() -> Result<(), String> {
+    let root = root()?;
+    let mut results = Vec::new();
+    let digest = match source_digest(&root) {
+        Ok(digest) => digest,
+        Err(error) => {
+            return Err(p14_fail(
+                &root,
+                &"0".repeat(64),
+                &mut results,
+                "p14-source-digest",
+                "compute source digest",
+                1,
+                error,
+            ));
+        }
+    };
+    if let Err(error) = p14_clear_case_reports(&root) {
+        return Err(p14_fail(
+            &root,
+            &digest,
+            &mut results,
+            "p14-clear-cases",
+            "clear old P14 case reports",
+            1,
+            error,
+        ));
+    }
+    for relative in [
+        "target/rivetlua-reports/gate-P14.json",
+        "target/gate-P14-fail.json",
+    ] {
+        let path = root.join(relative);
+        if path.exists() {
+            if !path.is_file() {
+                return Err(p14_fail(
+                    &root,
+                    &digest,
+                    &mut results,
+                    "p14-clear-aggregate",
+                    relative,
+                    1,
+                    format!("舊 P14 aggregate 不是一般檔案：{}", path.display()),
+                ));
+            }
+            if let Err(error) = fs::remove_file(&path) {
+                return Err(p14_fail(
+                    &root,
+                    &digest,
+                    &mut results,
+                    "p14-clear-aggregate",
+                    relative,
+                    1,
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+    match p14_validate_prior_reports(&root, &digest) {
+        Ok(prior) => results.extend(prior),
+        Err(error) => {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                "p00-p13-before",
+                "validate fresh P00-P13 reports, checks, cases and digest",
+                1,
+                error,
+            ));
+        }
+    }
+    let prior_snapshot = match p14_prior_report_snapshot(&root) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                "p00-p13-before",
+                "snapshot P00-P13 reports",
+                1,
+                error,
+            ));
+        }
+    };
+    if let Err(error) = p14_validate_dependencies(&root) {
+        return Err(p14_fail(
+            &root,
+            &digest,
+            &mut results,
+            "p14-dependencies",
+            "validate DA-19/20/21/32/33",
+            1,
+            error,
+        ));
+    }
+    results.push(p13_result(
+        "p14-dependencies",
+        "validate spec/phase-dependencies.csv DA-19/20/21/32/33",
+        0,
+        "PASS",
+        "owner/status/interface exact rows",
+        "target/rivetlua-reports/gate-P14.json",
+    ));
+    let csv = match fs::read_to_string(root.join("spec/compatibility.csv")) {
+        Ok(csv) => csv,
+        Err(error) => {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                "p14-csv",
+                "read spec/compatibility.csv",
+                1,
+                error.to_string(),
+            ));
+        }
+    };
+    if let Err(error) = p14_validate_csv_cases(&csv) {
+        return Err(p14_fail(
+            &root,
+            &digest,
+            &mut results,
+            "p14-csv",
+            "validate P14 CSV exact cases",
+            1,
+            error,
+        ));
+    }
+    results.push(p13_result(
+        "p14-csv",
+        "validate spec/compatibility.csv P14 rows",
+        0,
+        "PASS",
+        "兩 profile 各 14 個固定案例",
+        "target/rivetlua-reports/gate-P14.json",
+    ));
+    let fixture = match fs::read_to_string(root.join("tests/p14/sdk-cases.fixture")) {
+        Ok(text) => text,
+        Err(error) => {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                "p14-fixture",
+                "read tests/p14/sdk-cases.fixture",
+                1,
+                error.to_string(),
+            ));
+        }
+    };
+    let cases = match parse_p14_fixture(&fixture) {
+        Ok(cases) => cases,
+        Err(error) => {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                "p14-fixture",
+                "validate P14 fixture",
+                1,
+                error,
+            ));
+        }
+    };
+    results.push(p13_result(
+        "p14-fixture",
+        "validate tests/p14/sdk-cases.fixture",
+        0,
+        "PASS",
+        "28 unique profile/ID 與固定 mode/input/marker/expected",
+        "target/rivetlua-reports/gate-P14.json",
+    ));
+    for (name, package, filter) in [
+        ("p14-sdk-filter", "rivetlua", "sdk"),
+        ("p14-wrapper-filter", "rivetlua", "wrapper"),
+        ("p14-cli-filter", "rivetlua-cli", "cli"),
+    ] {
+        let command = format!("cargo test --locked -p {package} -- {filter}");
+        let (exit, output) = match p14_capture(
+            &root,
+            None,
+            &["test", "--locked", "-p", package, "--", filter],
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(p14_fail(
+                    &root,
+                    &digest,
+                    &mut results,
+                    name,
+                    &command,
+                    1,
+                    error,
+                ));
+            }
+        };
+        if exit != 0 {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                name,
+                &command,
+                exit,
+                format!("selector child exit={exit}；{output}"),
+            ));
+        }
+        let passed = match p14_check_filter_summary(name, &output) {
+            Ok(passed) => passed,
+            Err(error) => {
+                return Err(p14_fail(
+                    &root,
+                    &digest,
+                    &mut results,
+                    name,
+                    &command,
+                    1,
+                    format!("{error}；{output}"),
+                ));
+            }
+        };
+        results.push(p13_result(
+            name,
+            command,
+            0,
+            "PASS",
+            format!("{passed} 個真實匹配且 0 failed/ignored"),
+            "target/rivetlua-reports/gate-P14.json",
+        ));
+    }
+    for profile in ["lua55", "lua54"] {
+        let name = format!("p14-example-{profile}");
+        let command = format!("cargo run --locked -p rivetlua --example embed -- {profile}");
+        let (exit, output) = match p14_capture(
+            &root,
+            None,
+            &[
+                "run",
+                "--locked",
+                "-p",
+                "rivetlua",
+                "--example",
+                "embed",
+                "--",
+                profile,
+            ],
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(p14_fail(
+                    &root,
+                    &digest,
+                    &mut results,
+                    &name,
+                    &command,
+                    1,
+                    error,
+                ));
+            }
+        };
+        let marker = format!("P14_EXAMPLE:{profile}:PASS");
+        if exit != 0 || output.lines().filter(|line| *line == marker).count() != 1 {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                &name,
+                &command,
+                exit.max(1),
+                format!("公開 example exit/marker 不符：{output}"),
+            ));
+        }
+        results.push(p13_result(
+            name,
+            command,
+            0,
+            "PASS",
+            "公開 example 真 Root/GC/VM assertion 與唯一 marker",
+            "target/rivetlua-reports/gate-P14.json",
+        ));
+    }
+    let mut expected_case_json = std::collections::HashMap::new();
+    for (profile, lua_profile) in [("lua55-i64f64", "lua55"), ("lua54-i64f64", "lua54")] {
+        for spec in P14_CASE_SPECS {
+            let case = cases
+                .iter()
+                .find(|case| case.profile == profile && case.id == spec.id)
+                .expect("P14 fixture 已核對完整");
+            let name = format!("{}-{lua_profile}", spec.id);
+            let command = p14_case_command(profile, &spec);
+            let (exit, output) = match p14_capture(
+                &root,
+                Some(profile),
+                &[
+                    "test",
+                    "--locked",
+                    "-p",
+                    spec.package,
+                    "--test",
+                    "p14_contracts",
+                    spec.input,
+                    "--",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ],
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(p14_fail(
+                        &root,
+                        &digest,
+                        &mut results,
+                        &name,
+                        &command,
+                        1,
+                        error,
+                    ));
+                }
+            };
+            if exit != 0 {
+                return Err(p14_fail(
+                    &root,
+                    &digest,
+                    &mut results,
+                    &name,
+                    &command,
+                    exit,
+                    format!("exact child exit={exit}；{output}"),
+                ));
+            }
+            if let Err(error) = p14_check_exact_summary(&output) {
+                return Err(p14_fail(
+                    &root,
+                    &digest,
+                    &mut results,
+                    &name,
+                    &command,
+                    1,
+                    format!("{error}；{output}"),
+                ));
+            }
+            let record = match p14_records_from_output(profile, &output) {
+                Ok(record) => record,
+                Err(error) => {
+                    return Err(p14_fail(
+                        &root,
+                        &digest,
+                        &mut results,
+                        &name,
+                        &command,
+                        1,
+                        error,
+                    ));
+                }
+            };
+            if record.id != case.id
+                || record.profile != case.profile
+                || case.marker != format!("P14_CASE:{}", record.id)
+                || record.actual != case.expected
+            {
+                return Err(p14_fail(
+                    &root,
+                    &digest,
+                    &mut results,
+                    &name,
+                    &command,
+                    1,
+                    "P14 child marker 與 fixture 不符".into(),
+                ));
+            }
+            let relative = format!("target/rivetlua-reports/P14-{}-{lua_profile}.json", case.id);
+            let path = root.join(&relative);
+            let json = p14_case_json(case, &record, &digest, &command, &root, &relative);
+            if let Err(error) = fs::write(&path, &json) {
+                return Err(p14_fail(
+                    &root,
+                    &digest,
+                    &mut results,
+                    &name,
+                    &command,
+                    1,
+                    format!("P14 case 寫入失敗：{error}"),
+                ));
+            }
+            expected_case_json.insert(path.clone(), json);
+            if let Err(error) = p14_validate_case_report(&path, case, &digest, &command, &root) {
+                return Err(p14_fail(
+                    &root,
+                    &digest,
+                    &mut results,
+                    &name,
+                    &command,
+                    1,
+                    error,
+                ));
+            }
+            results.push(p13_result(
+                name,
+                command,
+                0,
+                "PASS",
+                format!(
+                    "{}；exact 1/1、唯一 marker、固定 expected/trace/schema",
+                    case.note
+                ),
+                relative,
+            ));
+        }
+    }
+    if let Err(error) = p14_validate_prior_reports(&root, &digest) {
+        return Err(p14_fail(
+            &root,
+            &digest,
+            &mut results,
+            "p00-p13-after",
+            "validate P00-P13 reports after P14 children",
+            1,
+            error,
+        ));
+    }
+    match p14_prior_report_snapshot(&root) {
+        Ok(after) if after == prior_snapshot => {}
+        Ok(_) => {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                "p00-p13-after",
+                "compare P00-P13 reports after P14 children",
+                1,
+                "P00-P13 前置報告在 child 執行期間變更".into(),
+            ));
+        }
+        Err(error) => {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                "p00-p13-after",
+                "compare P00-P13 reports after P14 children",
+                1,
+                error,
+            ));
+        }
+    }
+    results.push(p13_result(
+        "p00-p13-after",
+        "validate P00-P13 reports after P14 children",
+        0,
+        "PASS",
+        "前置報告、checks、cases 於 child 後仍有效",
+        "target/rivetlua-reports/gate-P14.json",
+    ));
+    if let Err(error) = p14_validate_all_case_reports(&root, &cases, &digest, &expected_case_json) {
+        return Err(p14_fail(
+            &root,
+            &digest,
+            &mut results,
+            "p14-case-reports",
+            "validate 28 P14 case reports",
+            1,
+            error,
+        ));
+    }
+    results.push(p13_result(
+        "p14-case-reports",
+        "validate 28 P14 case reports",
+        0,
+        "PASS",
+        "28 unique profile/ID、schema/digest/path",
+        "target/rivetlua-reports/gate-P14.json",
+    ));
+    match source_digest(&root) {
+        Ok(current) if current == digest => {}
+        Ok(_) => {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                "p14-source-digest",
+                "verify source digest after children",
+                1,
+                "P14 執行期間 source digest 已變更".into(),
+            ));
+        }
+        Err(error) => {
+            return Err(p14_fail(
+                &root,
+                &digest,
+                &mut results,
+                "p14-source-digest",
+                "verify source digest after children",
+                1,
+                error,
+            ));
+        }
+    }
+    results.push(p13_result(
+        "p14-source-digest",
+        "verify source digest after children",
+        0,
+        "PASS",
+        "受測來源於所有 child 後未變",
+        "target/rivetlua-reports/gate-P14.json",
+    ));
+    let path = p13_report_dir(&root).join("gate-P14.json");
+    if let Err(error) = p14_write_aggregate(
+        &digest,
+        &results,
+        "PASS",
+        "28 formal cases, selectors, examples and P00-P13 prerequisites verified",
+        &path,
+    ) {
+        return Err(p14_fail(
+            &root,
+            &digest,
+            &mut results,
+            "p14-aggregate-write",
+            "write gate-P14.json",
+            1,
+            error,
+        ));
+    }
+    println!("PASS report={}", path.display());
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
     let result = match arguments.first().map(String::as_str) {
@@ -10862,8 +12327,9 @@ fn main() -> ExitCode {
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P11") && arguments.len() == 2 => p11_gate(),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P12") && arguments.len() == 2 => p12_gate(),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P13") && arguments.len() == 2 => p13_gate(),
+        Some("gate") if arguments.get(1).map(String::as_str) == Some("P14") && arguments.len() == 2 => p14_gate(),
         _ => Err(
-            "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | gate P00|P01|P02|P03|P04|P05|P06|P07|P08|P09|P10|P11|P12|P13".into(),
+            "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | gate P00|P01|P02|P03|P04|P05|P06|P07|P08|P09|P10|P11|P12|P13|P14".into(),
         ),
     };
     match result {
@@ -11357,6 +12823,36 @@ mod tests {
             validate_phase_dependency_graph(&graph.replacen("IMPLEMENTED", "CONFLICT", 1)).is_err()
         );
         assert!(validate_phase_dependency_graph(&graph.replacen("DA-14", "DA-99", 1)).is_err());
+    }
+
+    #[test]
+    fn phase_dependency_graph_requires_official_chunk_and_artifact_edges() {
+        let graph = include_str!("../../spec/phase-dependencies.csv");
+        assert!(validate_phase_dependency_graph(graph).is_ok());
+        for (row, wrong_owner, wrong_interface, wrong_status) in [
+            (
+                "DA-32,P05,P13,Lua55 Lua54 official chunk codec translation VerifiedModule,IMPLEMENTED,P13\n",
+                "DA-32,P06,P13,Lua55 Lua54 official chunk codec translation VerifiedModule,IMPLEMENTED,P13\n",
+                "DA-32,P05,P13,unknown official chunk contract,IMPLEMENTED,P13\n",
+                "DA-32,P05,P13,Lua55 Lua54 official chunk codec translation VerifiedModule,CONTRACTED,P13\n",
+            ),
+            (
+                "DA-33,P05,P14,immutable validated artifact metadata transport,IMPLEMENTED,P14\n",
+                "DA-33,P06,P14,immutable validated artifact metadata transport,IMPLEMENTED,P14\n",
+                "DA-33,P05,P14,unknown artifact contract,IMPLEMENTED,P14\n",
+                "DA-33,P05,P14,immutable validated artifact metadata transport,CONTRACTED,P14\n",
+            ),
+        ] {
+            assert!(graph.contains(row));
+            assert!(validate_phase_dependency_graph(&graph.replacen(row, "", 1)).is_err());
+            assert!(validate_phase_dependency_graph(&graph.replacen(row, wrong_owner, 1)).is_err());
+            assert!(
+                validate_phase_dependency_graph(&graph.replacen(row, wrong_interface, 1)).is_err()
+            );
+            assert!(
+                validate_phase_dependency_graph(&graph.replacen(row, wrong_status, 1)).is_err()
+            );
+        }
     }
 
     #[test]
@@ -12972,7 +14468,13 @@ newline"}"#,
                 )
                 .is_err()
             );
-            assert!(p12_records_from_output(profile, &format!("{output}P12_CASE\tGC-UNKNOWN\t{profile}\tstatus=PASS;actual=x;diagnostic=x\n")).is_err());
+            assert!(p12_records_from_output(
+                profile,
+                &format!(
+                    "{output}P12_CASE\tGC-UNKNOWN\t{profile}\tstatus=PASS;actual=x;diagnostic=x\n"
+                )
+            )
+            .is_err());
         }
         assert!(
             p12_check_case_summary("test result: ok. 1 passed; 0 failed; 49 filtered out").is_ok()
@@ -13283,6 +14785,202 @@ newline"}"#,
         assert_eq!(
             std::fs::read_to_string(fallback.join("block")).unwrap(),
             "keep"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn p14_fixture_marker_summary_csv_and_report_reject_mutations() {
+        let fixture = include_str!("../../tests/p14/sdk-cases.fixture");
+        let cases = super::parse_p14_fixture(fixture).unwrap();
+        assert_eq!(cases.len(), 28);
+        let first = fixture
+            .lines()
+            .find(|line| line.starts_with("case|"))
+            .unwrap();
+        for bad in [
+            fixture.replacen(&format!("{first}\n"), "", 1),
+            format!("{fixture}{first}\n"),
+            fixture.replacen("SDK-001", "SDK-999", 1),
+            fixture.replacen("lua55-i64f64|lua55", "lua55-i64f64|lua54", 1),
+            fixture.replacen("|int:42|", "|int:41|", 1),
+            fixture.replacen("sdk_case_001", "sdk_case_002", 1),
+        ] {
+            assert!(super::parse_p14_fixture(&bad).is_err());
+        }
+        let marker = "test sdk_case_001 ... P14_CASE\tSDK-001\tlua55-i64f64\tstatus=PASS;actual=int:42;diagnostic=asserted\tallocation=reserved=0\tresource=root=1\tvm=isolated\tcli=not-applicable\n";
+        let record = super::p14_records_from_output("lua55-i64f64", marker).unwrap();
+        assert_eq!(record.id, "SDK-001");
+        for bad in [
+            "".to_owned(),
+            format!("{marker}{marker}"),
+            marker.replace("SDK-001", "SDK-999"),
+            marker.replace("lua55-i64f64", "lua54-i64f64"),
+            marker.replace("actual=int:42", "actual=int:41"),
+            marker.replace("resource=root=1", "resource="),
+            marker.replace("status=PASS", "status=FAIL"),
+        ] {
+            assert!(super::p14_records_from_output("lua55-i64f64", &bad).is_err());
+        }
+        let good_summary =
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out";
+        assert!(super::p14_check_exact_summary(good_summary).is_ok());
+        for bad in [
+            "",
+            "test result: ok. 0 passed; 0 failed; 0 ignored",
+            "test result: ok. 2 passed; 0 failed; 0 ignored",
+            "test result: ok. 1 passed; 0 failed; 1 ignored",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 1 measured; 13 filtered out",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 13 filtered out",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; extra; fields",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored",
+            &format!("{good_summary}\n{good_summary}"),
+        ] {
+            assert!(super::p14_check_exact_summary(bad).is_err());
+        }
+        assert!(
+            super::p14_check_filter_summary(
+                "sdk",
+                "test result: ok. 1 passed; 0 failed; 0 ignored"
+            )
+            .is_ok()
+        );
+        assert!(
+            super::p14_check_filter_summary(
+                "sdk",
+                "test result: ok. 0 passed; 0 failed; 0 ignored"
+            )
+            .is_err()
+        );
+        assert!(
+            super::p14_check_filter_summary(
+                "sdk",
+                "test result: ok. 1 passed; 0 failed; 1 ignored"
+            )
+            .is_err()
+        );
+        assert!(super::p14_check_filter_summary("sdk", "test result: ok. 18446744073709551615 passed; 0 failed; 0 ignored\ntest result: ok. 1 passed; 0 failed; 0 ignored").is_err());
+        let root = std::env::temp_dir().join(format!("rivetlua-p14-unit-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("target/rivetlua-reports")).unwrap();
+        let case = &cases[0];
+        let spec = super::p14_spec(&case.id).unwrap();
+        let command = super::p14_case_command(&case.profile, spec);
+        let path = root.join(format!(
+            "target/rivetlua-reports/P14-{}-{}.json",
+            case.id, case.lua_profile
+        ));
+        let json = super::p14_case_json(
+            case,
+            &record,
+            &"a".repeat(64),
+            &command,
+            &root,
+            &format!(
+                "target/rivetlua-reports/P14-{}-{}.json",
+                case.id, case.lua_profile
+            ),
+        );
+        std::fs::write(&path, &json).unwrap();
+        super::p14_validate_case_report(&path, case, &"a".repeat(64), &command, &root).unwrap();
+        for bad in [
+            json.replacen("\"actual\":\"int:42\"", "\"actual\":\"int:41\"", 1),
+            json.replacen("\"source_digest\":\"", "\"source_digest\":\"broken", 1),
+            json.replacen("\"resource_trace\"", "\"missing_trace\"", 1),
+            json.replacen("\"exit_code\":0", "\"exit_code\":1", 1),
+            "{bad-json".into(),
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(
+                super::p14_validate_case_report(&path, case, &"a".repeat(64), &command, &root)
+                    .is_err()
+            );
+        }
+        let existing = include_str!("../../spec/compatibility.csv")
+            .lines()
+            .filter(|line| !line.starts_with("p14."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ids = super::P14_CASE_SPECS
+            .iter()
+            .map(|spec| spec.id)
+            .collect::<Vec<_>>()
+            .join(";");
+        let csv = format!(
+            "{existing}\np14.sdk-cli,lua55,docs/plane/P14.md#6-正常與錯誤案例,rivetlua;rivetlua-cli,{ids},PASS,\np14.sdk-cli,lua54,docs/plane/P14.md#6-正常與錯誤案例,rivetlua;rivetlua-cli,{ids},PASS,\n"
+        );
+        super::p14_validate_csv_cases(&csv).unwrap();
+        for bad in [
+            csv.replacen("p14.sdk-cli,lua55,", "p14.other,lua55,", 1),
+            csv.replacen("SDK-NEG-006", "SDK-NEG-999", 1),
+            csv.replacen("p14.sdk-cli,lua54,", "p14.sdk-cli,lua55,", 1),
+            csv.replacen("rivetlua;rivetlua-cli", "rivetlua", 1),
+            csv.replacen("OFFCHUNK-002;OFFCHUNK-004", "OFFCHUNK-001;OFFCHUNK-004", 1),
+            csv.replacen(
+                "OFFCHUNK-007;OFFCHUNK-008;OFFCHUNK-017;OFFCHUNK-018",
+                "OFFCHUNK-007;OFFCHUNK-008;OFFCHUNK-017",
+                1,
+            ),
+        ] {
+            assert!(super::p14_validate_csv_cases(&bad).is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn p14_fail_clears_stale_case_and_falls_back_on_blocked_report() {
+        let root = std::env::temp_dir().join(format!("rivetlua-p14-fail-{}", std::process::id()));
+        let directory = root.join("target/rivetlua-reports");
+        std::fs::create_dir_all(&directory).unwrap();
+        let stale = directory.join("P14-SDK-001-lua55.json");
+        std::fs::write(&stale, "{\"status\":\"PASS\"}").unwrap();
+        let digest = "b".repeat(64);
+        let mut results = Vec::new();
+        let error = super::p14_fail(
+            &root,
+            &digest,
+            &mut results,
+            "child",
+            "cargo test --exact",
+            101,
+            "failed".into(),
+        );
+        assert_eq!(error, "failed");
+        assert!(!stale.exists());
+        assert_eq!(results[0].exit_code, 101);
+        let canonical = directory.join("gate-P14.json");
+        let parsed =
+            StrictJsonParser::parse(&std::fs::read_to_string(&canonical).unwrap()).unwrap();
+        assert_eq!(
+            parsed.get("status").and_then(StrictJsonValue::as_str),
+            Some("FAIL")
+        );
+        std::fs::remove_file(&canonical).unwrap();
+        std::fs::create_dir(&canonical).unwrap();
+        std::fs::write(canonical.join("block"), "keep").unwrap();
+        std::fs::write(&stale, "{\"status\":\"PASS\"}").unwrap();
+        let mut results = Vec::new();
+        let error = super::p14_fail(
+            &root,
+            &digest,
+            &mut results,
+            "write",
+            "write gate-P14.json",
+            1,
+            "blocked".into(),
+        );
+        assert!(error.contains("canonical 寫入失敗"));
+        assert!(!stale.exists());
+        let fallback = root.join("target/gate-P14-fail.json");
+        let parsed = StrictJsonParser::parse(&std::fs::read_to_string(fallback).unwrap()).unwrap();
+        assert_eq!(
+            parsed.get("status").and_then(StrictJsonValue::as_str),
+            Some("FAIL")
+        );
+        assert_eq!(
+            parsed
+                .get("source_digest")
+                .and_then(StrictJsonValue::as_str),
+            Some(digest.as_str())
         );
         std::fs::remove_dir_all(root).unwrap();
     }

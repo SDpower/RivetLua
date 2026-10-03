@@ -1,7 +1,22 @@
 //! P05 自有 typed IR 的共用 bytecode 契約；不含 VM。
 
 pub mod codec;
+pub mod input;
+pub mod native_debug;
+pub mod official;
+pub mod official_artifact;
+pub mod official_execution;
+pub mod official_export;
+mod official_native;
+pub mod official_preflight;
+pub mod official_translation;
+pub mod transport;
 pub use codec::*;
+pub use input::*;
+pub use native_debug::*;
+pub use official_artifact::*;
+pub use official_execution::*;
+pub use transport::*;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Register(pub u16);

@@ -5,9 +5,47 @@ use crate::unwind::CloseEntry;
 use crate::vm::{RuntimeError, RuntimeErrorKind};
 use crate::{RootId, RootKind, Vm, VmError};
 use rivetlua_core::{
-    BytecodeBindingId, BytecodeExitKind, BytecodePrototype, ObjectRef, ProtoId, Register,
-    ResultMode, Value,
+    BytecodeBindingId, BytecodeExitKind, BytecodePrototype, ObjectRef, OfficialExecutionPlan,
+    OfficialPlanFrameInputSource, ProtoId, Register, ResultMode, Value,
 };
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OfficialFrameRegisters {
+    pub(crate) raw: Option<Register>,
+    pub(crate) guest_named: Option<Register>,
+    pub(crate) active: Option<Register>,
+}
+
+impl OfficialFrameRegisters {
+    pub(crate) fn from_plan(plan: &OfficialExecutionPlan, prototype: ProtoId) -> Self {
+        let mut result = Self::default();
+        for input in plan.frame_inputs(prototype) {
+            match input.source {
+                OfficialPlanFrameInputSource::OriginalVarargs => result.raw = Some(input.register),
+                OfficialPlanFrameInputSource::GuestNamedVarargTable => {
+                    result.guest_named = Some(input.register)
+                }
+                OfficialPlanFrameInputSource::ActiveVarargs => result.active = Some(input.register),
+            }
+        }
+        result
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct VarargPayloads {
+    entries: [Option<(ObjectRef, ObjectRef)>; 2],
+}
+
+impl VarargPayloads {
+    pub(crate) fn reclaim(self, vm: &mut Vm) -> Result<(), RuntimeError> {
+        for (table, key) in self.entries.into_iter().flatten() {
+            vm.reclaim(table)?;
+            vm.reclaim(key)?;
+        }
+        Ok(())
+    }
+}
 
 /// 暫停於已驗證 ClosePath 的位置；metadata 仍由 Execution 的 VerifiedModule 持有。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -404,6 +442,50 @@ impl CallFrame {
         let register = self
             .named_vararg
             .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?;
+        self.set_named_varargs_at(vm, register, values)
+    }
+
+    pub(crate) fn initialize_variadic_inputs(
+        &mut self,
+        vm: &mut Vm,
+        values: &[Value],
+        official: Option<OfficialFrameRegisters>,
+    ) -> Result<VarargPayloads, RuntimeError> {
+        let Some(official) = official else {
+            let mut payloads = VarargPayloads::default();
+            if self.named_vararg.is_some() {
+                payloads.entries[0] = Some(self.set_named_varargs(vm, values)?);
+            } else {
+                self.set_varargs(vm, values)?;
+            }
+            return Ok(payloads);
+        };
+        let mut payloads = VarargPayloads::default();
+        if let Some(register) = official.raw {
+            payloads.entries[0] = Some(self.set_named_varargs_at(vm, register, values)?);
+        }
+        if let Some(register) = official.guest_named {
+            match self.set_named_varargs_at(vm, register, values) {
+                Ok(payload) => payloads.entries[1] = Some(payload),
+                Err(error) => {
+                    self.clear_roots(vm)?;
+                    payloads.reclaim(vm)?;
+                    return Err(error);
+                }
+            }
+        }
+        if official.raw.is_none() && official.guest_named.is_none() && official.active.is_none() {
+            self.set_varargs(vm, values)?;
+        }
+        Ok(payloads)
+    }
+
+    fn set_named_varargs_at(
+        &mut self,
+        vm: &mut Vm,
+        register: Register,
+        values: &[Value],
+    ) -> Result<(ObjectRef, ObjectRef), RuntimeError> {
         let table = vm.allocate_table_with_capacity(values.len(), 1)?;
         if let Err(error) = self.write(vm, register, Value::Object(table)) {
             vm.reclaim(table)?;

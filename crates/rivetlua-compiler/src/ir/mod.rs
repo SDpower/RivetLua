@@ -1,7 +1,9 @@
 //! P05 owned typed IR；只保存 P04 resolved tree 降階結果，尚未封裝 bytecode 或執行。
 
 use crate::{BindingId, ExitKind, FunctionId, Literal, ScopeId, Span, UpvalueSource};
-use rivetlua_core::{FrameLayout, Instruction, LuaProfile, ProtoId, Register, UpvalueId};
+use rivetlua_core::{
+    FrameLayout, Instruction, InstructionOffset, LuaProfile, ProtoId, Register, UpvalueId,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum IrConstant {
@@ -33,6 +35,30 @@ pub struct IrUpvalue {
     pub source: UpvalueSource,
 }
 
+/// 僅供 P05 native debug sidecar 使用；不屬於 RVLU_V2 wire。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrNativeLocal {
+    pub binding: BindingId,
+    pub register: Register,
+    pub slot: u16,
+    pub initialized_pc: u32,
+    pub start_pc: u32,
+    pub end_pc: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IrNativeDebug {
+    pub locals: Vec<IrNativeLocal>,
+    pub max_active_locals: u16,
+}
+
+/// 已編譯的 native RawListWrite 呼叫宣告；P05 仍須對 bytecode 重新驗證。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IrNativeListWrite {
+    pub call_pc: InstructionOffset,
+    pub function_register: Register,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct IrPrototype {
     pub id: ProtoId,
@@ -51,6 +77,9 @@ pub struct IrPrototype {
     pub upvalues: Vec<IrUpvalue>,
     pub instructions: Vec<IrInstruction>,
     pub close_paths: Vec<IrClosePath>,
+    pub native_debug: Option<IrNativeDebug>,
+    pub native_list_write_upvalue: Option<UpvalueId>,
+    pub native_list_writes: Vec<IrNativeListWrite>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -10,6 +10,7 @@ use crate::alloc::{
     AllocationAttempt, AllocationLedger, AllocationTrace, FailPoint, LedgerProbe, LedgerSnapshot,
     Reservation, checked_bytes, reserve_vec,
 };
+use crate::callback::CallbackFn;
 use crate::closure::Closure;
 use crate::coroutine::{Coroutine, CoroutineState, ThreadContext};
 use crate::errors::Builtin;
@@ -19,9 +20,9 @@ use crate::gc::{
     GcTrace, WeakMode,
 };
 use crate::host::{
-    DebugCapability, HostEntropyServiceError, HostFileLease, HostOsOperation, HostOsValue,
-    HostResourceError, HostResourceErrorKind, HostServiceError, HostServices, LoadBudget,
-    LoadLimits, LoadServiceError, LoadTemporaryCharge, PathEncoding, ResourceBudget,
+    DebugCapability, DumpCapability, HostEntropyServiceError, HostFileLease, HostOsOperation,
+    HostOsValue, HostResourceError, HostResourceErrorKind, HostServiceError, HostServices,
+    LoadBudget, LoadLimits, LoadServiceError, LoadTemporaryCharge, PathEncoding, ResourceBudget,
     ResourceLimits,
 };
 use crate::roots::{RootId, RootKind, RootLease, RootSet};
@@ -190,88 +191,12 @@ impl Drop for ModulePayload {
 }
 
 pub(crate) fn module_allocation_bytes(module: &VerifiedModule) -> Result<usize, VmError> {
-    let data = module.module();
-    let mut bytes = checked_bytes(
-        data.function_prototypes.capacity(),
-        size_of::<(u32, rivetlua_core::ProtoId)>(),
-    )?
-    .checked_add(checked_bytes(
-        data.prototypes.capacity(),
-        size_of::<rivetlua_core::BytecodePrototype>(),
-    )?)
-    .ok_or(VmError::ArithmeticOverflow)?;
-    for prototype in &data.prototypes {
-        for amount in [
-            checked_bytes(
-                prototype.binding_registers.capacity(),
-                size_of::<(rivetlua_core::BytecodeBindingId, rivetlua_core::Register)>(),
-            )?,
-            checked_bytes(
-                prototype.constants.capacity(),
-                size_of::<rivetlua_core::BytecodeConstant>(),
-            )?,
-            checked_bytes(
-                prototype.upvalues.capacity(),
-                size_of::<rivetlua_core::BytecodeUpvalue>(),
-            )?,
-            checked_bytes(
-                prototype.instructions.capacity(),
-                size_of::<rivetlua_core::BytecodeInstruction>(),
-            )?,
-            checked_bytes(
-                prototype.close_paths.capacity(),
-                size_of::<rivetlua_core::BytecodeClosePath>(),
-            )?,
-        ] {
-            bytes = bytes
-                .checked_add(amount)
-                .ok_or(VmError::ArithmeticOverflow)?;
-        }
-        for constant in &prototype.constants {
-            if let rivetlua_core::BytecodeConstant::Name(value)
-            | rivetlua_core::BytecodeConstant::String(value) = constant
-            {
-                bytes = bytes
-                    .checked_add(value.capacity())
-                    .ok_or(VmError::ArithmeticOverflow)?;
-            }
-        }
-        for path in &prototype.close_paths {
-            for amount in [
-                checked_bytes(
-                    path.bindings.capacity(),
-                    size_of::<rivetlua_core::BytecodeBindingId>(),
-                )?,
-                checked_bytes(
-                    path.registers.capacity(),
-                    size_of::<rivetlua_core::Register>(),
-                )?,
-            ] {
-                bytes = bytes
-                    .checked_add(amount)
-                    .ok_or(VmError::ArithmeticOverflow)?;
-            }
-        }
-        for instruction in &prototype.instructions {
-            if let Some(path) = &instruction.close_path {
-                for amount in [
-                    checked_bytes(
-                        path.bindings.capacity(),
-                        size_of::<rivetlua_core::BytecodeBindingId>(),
-                    )?,
-                    checked_bytes(
-                        path.registers.capacity(),
-                        size_of::<rivetlua_core::Register>(),
-                    )?,
-                ] {
-                    bytes = bytes
-                        .checked_add(amount)
-                        .ok_or(VmError::ArithmeticOverflow)?;
-                }
-            }
-        }
-    }
-    Ok(bytes)
+    // HeapObject 已計入 inline VerifiedModule；Core 持有唯一巢狀容量算法。
+    let retained = rivetlua_core::verified_module_allocation_bytes(module)
+        .map_err(|_| VmError::ArithmeticOverflow)?;
+    retained
+        .checked_sub(size_of::<VerifiedModule>())
+        .ok_or(VmError::ArithmeticOverflow)
 }
 
 impl HeapObject {
@@ -334,7 +259,9 @@ impl HeapObject {
                 }
             }
             HeapPayload::Builtin(
-                Builtin::Error
+                Builtin::HostCallback(_)
+                | Builtin::Official(_)
+                | Builtin::Error
                 | Builtin::PCall
                 | Builtin::XPCall
                 | Builtin::CoroutineCreate
@@ -513,6 +440,14 @@ pub struct Vm {
     io_registry: Option<(ObjectRef, RootId)>,
     debug_main_hook: Option<(DebugHook, RootId)>,
     debug_hook_running: bool,
+    callbacks: Vec<Option<CallbackEntry>>,
+    callbacks_charge: usize,
+}
+
+struct CallbackEntry {
+    callback: std::rc::Rc<CallbackFn>,
+    captures: Vec<Value>,
+    charge: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -561,6 +496,8 @@ impl Vm {
             io_registry: None,
             debug_main_hook: None,
             debug_hook_running: false,
+            callbacks: Vec::new(),
+            callbacks_charge: 0,
         })
     }
 
@@ -586,6 +523,10 @@ impl Vm {
 
     pub(crate) fn debug_capability(&self) -> DebugCapability {
         self.host_services.debug
+    }
+
+    pub(crate) fn dump_capability(&self) -> DumpCapability {
+        self.host_services.dump
     }
 
     pub(crate) fn debug_hook_running(&self) -> bool {
@@ -822,6 +763,10 @@ impl Vm {
 
     pub(crate) fn load_allows_bytecode(&self) -> bool {
         self.host_services.load.allow_bytecode
+    }
+
+    pub(crate) fn load_allows_official_bytecode(&self) -> bool {
+        self.host_services.load.allow_official_bytecode
     }
 
     pub(crate) fn host_compile(
@@ -2937,11 +2882,169 @@ impl Vm {
         }
     }
 
+    /// 將宿主函式綁定為 VM 內的 callable；捕獲物件由 builtin 的強邊追蹤。
+    pub fn register_callback(
+        &mut self,
+        captures: &[Value],
+        callback: std::rc::Rc<CallbackFn>,
+    ) -> Result<crate::HostHandle<Value>, VmError> {
+        for &value in captures {
+            if let Value::Object(object) = value {
+                self.checked_slot(object)?;
+            }
+        }
+        let mut temporary_roots = Vec::new();
+        let root_ticket = reserve_vec(
+            &self.ledger,
+            &mut temporary_roots,
+            captures.len(),
+            FailPoint::WorkReserve,
+        )?;
+        let registered = (|| {
+            for &value in captures {
+                if let Value::Object(object) = value {
+                    temporary_roots.push(self.add_root(RootKind::Temporary, object)?);
+                }
+            }
+            let mut owned = Vec::new();
+            let capture_ticket = reserve_vec(
+                &self.ledger,
+                &mut owned,
+                captures.len(),
+                FailPoint::WorkReserve,
+            )?;
+            owned.extend_from_slice(captures);
+            let capture_base = checked_bytes(captures.len(), size_of::<Value>())?;
+            let charge = checked_bytes(owned.capacity(), size_of::<Value>())?;
+            let capture_extra_ticket = self.ledger.reserve(
+                charge
+                    .checked_sub(capture_base)
+                    .ok_or(VmError::LedgerInvariant)?,
+            )?;
+            let id = match self.callbacks.iter().position(Option::is_none) {
+                Some(id) => id,
+                None => {
+                    let old_charge = self.callbacks_charge;
+                    let needed = self
+                        .callbacks
+                        .len()
+                        .checked_add(1)
+                        .ok_or(VmError::ArithmeticOverflow)?;
+                    let minimum_charge = checked_bytes(needed, size_of::<Option<CallbackEntry>>())?;
+                    let mut replacement = Vec::new();
+                    let ticket = reserve_vec(
+                        &self.ledger,
+                        &mut replacement,
+                        needed,
+                        FailPoint::WorkReserve,
+                    )?;
+                    let new_charge =
+                        checked_bytes(replacement.capacity(), size_of::<Option<CallbackEntry>>())?;
+                    let extra = new_charge
+                        .checked_sub(minimum_charge)
+                        .ok_or(VmError::LedgerInvariant)?;
+                    let extra_ticket = self.ledger.reserve(extra)?;
+                    ticket.commit()?;
+                    if let Err(error) = extra_ticket.commit() {
+                        self.ledger.refund_on_drop(minimum_charge);
+                        return Err(error);
+                    }
+                    replacement.append(&mut self.callbacks);
+                    replacement.push(None);
+                    self.callbacks = replacement;
+                    self.ledger.refund_on_drop(old_charge);
+                    self.callbacks_charge = new_charge;
+                    self.callbacks.len() - 1
+                }
+            };
+            let function =
+                self.allocate_payload(HeapPayload::Builtin(Builtin::HostCallback(id)))?;
+            let attached = (|| {
+                let handle = crate::HostHandle::new(self, function)?;
+                for &value in captures {
+                    if let Value::Object(object) = value {
+                        self.add_child(function, object)?;
+                    }
+                }
+                capture_ticket.commit()?;
+                if let Err(error) = capture_extra_ticket.commit() {
+                    self.ledger.refund(capture_base)?;
+                    return Err(error);
+                }
+                Ok(handle)
+            })();
+            let handle = match attached {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.reclaim(function)?;
+                    return Err(error);
+                }
+            };
+            self.callbacks[id] = Some(CallbackEntry {
+                callback,
+                captures: owned,
+                charge,
+            });
+            Ok(handle)
+        })();
+        for root in temporary_roots {
+            self.remove_root(root)?;
+        }
+        drop(root_ticket);
+        registered
+    }
+
+    pub(crate) fn callback_snapshot(
+        &self,
+        id: usize,
+    ) -> Result<(std::rc::Rc<CallbackFn>, Vec<Value>, Reservation), VmError> {
+        let entry = self
+            .callbacks
+            .get(id)
+            .and_then(Option::as_ref)
+            .ok_or(VmError::StaleObject)?;
+        let mut captures = Vec::new();
+        let ticket = reserve_vec(
+            &self.ledger,
+            &mut captures,
+            entry.captures.len(),
+            FailPoint::WorkReserve,
+        )?;
+        captures.extend_from_slice(&entry.captures);
+        Ok((std::rc::Rc::clone(&entry.callback), captures, ticket))
+    }
+
+    pub(crate) fn callback_capture_len(&self, id: usize) -> Result<usize, VmError> {
+        self.callbacks
+            .get(id)
+            .and_then(Option::as_ref)
+            .map(|entry| entry.captures.len())
+            .ok_or(VmError::StaleObject)
+    }
+
     pub(crate) fn allocate_basic_builtin(
         &mut self,
         builtin: BasicBuiltin,
     ) -> Result<ObjectRef, VmError> {
         self.allocate_payload(HeapPayload::Builtin(Builtin::Basic(builtin)))
+    }
+
+    pub(crate) fn allocate_official_builtin(
+        &mut self,
+        builtin: rivetlua_core::OfficialPlanBuiltin,
+    ) -> Result<ObjectRef, VmError> {
+        self.allocate_payload(HeapPayload::Builtin(Builtin::Official(builtin)))
+    }
+
+    pub(crate) fn allocate_callback_action_builtin(
+        &mut self,
+        builtin: Builtin,
+    ) -> Result<ObjectRef, VmError> {
+        debug_assert!(matches!(
+            builtin,
+            Builtin::CoroutineResume | Builtin::CoroutineYield
+        ));
+        self.allocate_payload(HeapPayload::Builtin(builtin))
     }
 
     pub(crate) fn allocate_string_iterator(
@@ -3004,6 +3107,32 @@ impl Vm {
             self.checked_slot(object)?;
         }
         self.allocate_payload(HeapPayload::Coroutine(Coroutine::new(entry)))
+    }
+
+    /// 以 VM 自身的 coroutine payload 建立可由宿主持有的協程。
+    pub fn new_coroutine(&mut self, function: Value) -> Result<crate::HostHandle<Value>, VmError> {
+        let Value::Object(entry) = function else {
+            return Err(VmError::WrongObjectType);
+        };
+        if !matches!(
+            self.object_kind(entry)?,
+            ObjectKind::Closure | ObjectKind::Builtin
+        ) {
+            return Err(VmError::WrongObjectType);
+        }
+        let entry_root = self.add_root(RootKind::Temporary, entry)?;
+        let result = (|| {
+            let coroutine = self.allocate_coroutine(function)?;
+            match crate::HostHandle::new(self, coroutine) {
+                Ok(handle) => Ok(handle),
+                Err(error) => {
+                    self.reclaim(coroutine)?;
+                    Err(error)
+                }
+            }
+        })();
+        self.remove_root(entry_root)?;
+        result
     }
 
     pub(crate) fn allocate_coroutine_wrapper(
@@ -3753,6 +3882,10 @@ impl Vm {
             | HeapPayload::Module(_)
             | HeapPayload::File(_) => 0,
         };
+        let callback_id = match &stored[0].payload {
+            HeapPayload::Builtin(Builtin::HostCallback(id)) => Some(*id),
+            _ => None,
+        };
         let refund = object_bytes
             .checked_add(child_bytes)
             .and_then(|total| total.checked_add(payload_bytes))
@@ -3763,6 +3896,11 @@ impl Vm {
             Some(next) => Slot::Free { generation: next },
             None => Slot::Retired,
         };
+        if let Some(callback_id) = callback_id {
+            if let Some(entry) = self.callbacks.get_mut(callback_id).and_then(Option::take) {
+                self.ledger.refund(entry.charge)?;
+            }
+        }
         Ok(())
     }
 
@@ -3792,6 +3930,10 @@ impl Vm {
 impl Drop for Vm {
     fn drop(&mut self) {
         self.roots.release_all_on_vm_drop(&self.ledger);
+        self.ledger.refund_on_drop(self.callbacks_charge);
+        for entry in self.callbacks.iter().flatten() {
+            self.ledger.refund_on_drop(entry.charge);
+        }
         self.ledger.refund_on_drop(self.finalizer_queue_charge);
         for slot in &self.slots {
             let Slot::Occupied { object, .. } = slot else {

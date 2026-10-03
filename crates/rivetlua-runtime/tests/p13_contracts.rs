@@ -1,9 +1,14 @@
 use rivetlua_compiler::{
-    CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+    BudgetedCompileError, CompileBudgetSink, CompileLimits, IrLimits, LanguageProfile,
+    compile_with_budget, emit, lex, lower, parse, resolve,
 };
-use rivetlua_core::{LuaProfile, ObjectRef, Value, VerifyLimits};
+use rivetlua_core::{
+    LuaProfile, ObjectRef, OfficialChunkErrorKind, OfficialChunkLimits, Value, VerifyLimits,
+    preflight_official_chunk,
+};
 use rivetlua_runtime::{
-    AbortReason, AllocationTrace, DebugCapability, DebugLimits, DebugPermission, FailPoint,
+    AbortReason, AllocationFailureKind, AllocationTrace, CallbackContinuation, CallbackResult,
+    DebugCapability, DebugLimits, DebugPermission, DumpCapability, DumpLimits, FailPoint,
     HostEntropy, HostEntropyError, HostLoadCompiler, HostLoadError, HostLoadErrorKind,
     HostModuleBytes, HostModuleRepository, HostNativeLoader, HostNativeModule, HostOutput,
     HostOutputError, HostServices, HostSourceReader, LedgerSnapshot, LoadBudget, LoadCapability,
@@ -2455,6 +2460,325 @@ fn p13_f_repository_path_expansion_and_loader_data() {
     assert_eq!(vm.ledger_snapshot().reserved, 0);
 }
 
+struct OfficialRouteRepository {
+    official: Vec<u8>,
+    other_profile: Vec<u8>,
+    rivet: Vec<u8>,
+    calls: Rc<RefCell<Vec<Vec<u8>>>>,
+}
+
+impl HostModuleRepository for OfficialRouteRepository {
+    fn search(
+        &mut self,
+        modname: &[u8],
+        _path: &[u8],
+        budget: &mut LoadBudget<'_>,
+    ) -> Result<Option<HostModuleBytes>, HostLoadError> {
+        let retrying =
+            modname == b"retry" && self.calls.borrow().iter().any(|name| name == b"retry");
+        self.calls.borrow_mut().push(modname.to_vec());
+        let (source, format): (&[u8], LoadFormat) = match modname {
+            b"official" => (&self.official, LoadFormat::OfficialBytecode),
+            b"retry" if !retrying => (&self.other_profile, LoadFormat::OfficialBytecode),
+            b"retry" => (&self.official, LoadFormat::OfficialBytecode),
+            b"source" => (b"return 7", LoadFormat::Source),
+            b"rivet" => (&self.rivet, LoadFormat::RivetBytecode),
+            _ => return Ok(None),
+        };
+        let loader_data = b"repository-data";
+        budget.spend_work(modname.len() + 1)?;
+        budget.claim_temporary(source.len() + loader_data.len())?;
+        Ok(Some(HostModuleBytes {
+            data: source.to_vec(),
+            loader_data: loader_data.to_vec(),
+            format,
+        }))
+    }
+}
+
+fn official_route_rivet_bytes(language: LanguageProfile) -> Vec<u8> {
+    let source = b"return 9";
+    let limits = CompileLimits::default();
+    let chunk = lex(source, language, &limits).unwrap();
+    let parsed = parse(&chunk, language, &limits).unwrap();
+    let resolved = resolve(&parsed, &chunk, language, &limits).unwrap();
+    let ir = lower(&resolved, &IrLimits::default()).unwrap();
+    emit(&ir, &VerifyLimits::default())
+        .unwrap()
+        .bytes()
+        .to_vec()
+}
+
+fn run_official_require_in_vm(
+    vm: &mut Vm,
+    environment: ObjectRef,
+    language: LanguageProfile,
+    source: &[u8],
+) -> RunOutcome {
+    let mut execution = vm
+        .load_with_environment(compile(source, language), Value::Object(environment))
+        .unwrap();
+    let outcome = execution.run().unwrap();
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    outcome
+}
+
+#[test]
+fn p13_f_official_repository_uses_shared_load_admission_cache_and_existing_formats() {
+    for (language, profile, official, other) in [
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
+        ),
+    ] {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let repo = OfficialRouteRepository {
+            official: official.to_vec(),
+            other_profile: other.to_vec(),
+            rivet: official_route_rivet_bytes(language),
+            calls: calls.clone(),
+        };
+        let compiler_calls = Rc::new(Cell::new(0));
+        let load = LoadCapability::deny_all()
+            .and_repository(repo)
+            .and_compiler(TestLoadCompiler {
+                calls: compiler_calls.clone(),
+                names: None,
+            })
+            .with_bytecode(true)
+            .with_official_bytecode(true);
+        let mut vm =
+            Vm::new_with_services(profile, HostServices::deny_all().and_load(load)).unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let root = vm.add_root(RootKind::Host, environment).unwrap();
+        vm.install_basic_builtins(environment).unwrap();
+        vm.install_package_builtins(environment).unwrap();
+        let outcome = run_official_require_in_vm(
+            &mut vm,
+            environment,
+            language,
+            b"package.path='?.lua'; local a,d=require('official'); local b=require('official'); local s=require('source'); local r=require('rivet'); return a,b,d,select('#',require('official')),s,r",
+        );
+        let RunOutcome::Returned(values) = outcome else {
+            panic!("repository 三格式應成功：{profile:?}, {outcome:?}")
+        };
+        assert_eq!(values[0], Value::Integer(41));
+        assert_eq!(values[1], Value::Integer(41));
+        assert_eq!(bytes(&vm, values[2]), b"repository-data");
+        assert_eq!(values[3], Value::Integer(1));
+        assert_eq!(values[4], Value::Integer(7));
+        assert_eq!(values[5], Value::Integer(9));
+        assert_eq!(
+            &*calls.borrow(),
+            &[b"official".to_vec(), b"source".to_vec(), b"rivet".to_vec()]
+        );
+        assert_eq!(compiler_calls.get(), 1);
+
+        let outcome = run_official_require_in_vm(
+            &mut vm,
+            environment,
+            language,
+            b"package.path='?.lua'; local ok=pcall(require,'retry'); return ok,package.loaded.retry==nil,(require('retry'))",
+        );
+        assert_eq!(
+            outcome,
+            RunOutcome::Returned(vec![
+                Value::Boolean(false),
+                Value::Boolean(true),
+                Value::Integer(41)
+            ])
+        );
+        assert_eq!(
+            calls
+                .borrow()
+                .iter()
+                .filter(|name| name.as_slice() == b"retry")
+                .count(),
+            2
+        );
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+}
+
+#[test]
+fn p13_f_official_repository_denial_does_not_authorize_rivet_or_poison_cache() {
+    for (language, profile, official, other) in [
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
+        ),
+    ] {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let repo = OfficialRouteRepository {
+            official: official.to_vec(),
+            other_profile: other.to_vec(),
+            rivet: official_route_rivet_bytes(language),
+            calls: calls.clone(),
+        };
+        let load = LoadCapability::deny_all()
+            .and_repository(repo)
+            .and_compiler(TestLoadCompiler {
+                calls: Rc::new(Cell::new(0)),
+                names: None,
+            })
+            .with_bytecode(true);
+        let mut vm =
+            Vm::new_with_services(profile, HostServices::deny_all().and_load(load)).unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let root = vm.add_root(RootKind::Host, environment).unwrap();
+        vm.install_basic_builtins(environment).unwrap();
+        vm.install_package_builtins(environment).unwrap();
+        let baseline_roots = vm.roots().total_count();
+        let outcome = run_official_require_in_vm(
+            &mut vm,
+            environment,
+            language,
+            b"package.path='?.lua'; return require('official')",
+        );
+        let RunOutcome::LuaError(error) = outcome else {
+            panic!("官方 repository 應拒絕：{profile:?}, {outcome:?}")
+        };
+        assert_eq!(error.kind, RuntimeErrorKind::HostPolicyLoad);
+        drop(error);
+        assert_eq!(vm.roots().total_count(), baseline_roots);
+        let outcome = run_official_require_in_vm(
+            &mut vm,
+            environment,
+            language,
+            b"return package.loaded.official==nil,require('source'),(require('rivet'))",
+        );
+        assert_eq!(
+            outcome,
+            RunOutcome::Returned(vec![
+                Value::Boolean(true),
+                Value::Integer(7),
+                Value::Integer(9)
+            ])
+        );
+        let outcome = run_official_require_in_vm(
+            &mut vm,
+            environment,
+            language,
+            b"return require('official')",
+        );
+        let RunOutcome::LuaError(error) = outcome else {
+            panic!("拒絕後重試仍應拒絕：{outcome:?}")
+        };
+        assert_eq!(error.kind, RuntimeErrorKind::HostPolicyLoad);
+        drop(error);
+        assert_eq!(
+            calls
+                .borrow()
+                .iter()
+                .filter(|name| name.as_slice() == b"official")
+                .count(),
+            2
+        );
+        assert_eq!(vm.roots().total_count(), baseline_roots);
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+}
+
+#[test]
+fn p13_f_official_repository_pays_shared_admission_and_rolls_back_on_budget_error() {
+    for (language, profile, official, other) in [
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            include_bytes!("official_chunk_fixtures/lua54-list-flow.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua55-list-flow.luac").as_slice(),
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            include_bytes!("official_chunk_fixtures/lua55-list-flow.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua54-list-flow.luac").as_slice(),
+        ),
+    ] {
+        let stats = preflight_official_chunk(
+            official,
+            profile,
+            &OfficialChunkLimits::default(),
+            &VerifyLimits::default(),
+        )
+        .unwrap();
+        let total_work = official.len() * 2 + 1 + stats.subsequent_work as usize;
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let repo = OfficialRouteRepository {
+            official: official.to_vec(),
+            other_profile: other.to_vec(),
+            rivet: official_route_rivet_bytes(language),
+            calls: calls.clone(),
+        };
+        let load = LoadCapability::deny_all()
+            .and_repository(repo)
+            .and_compiler(TestLoadCompiler {
+                calls: Rc::new(Cell::new(0)),
+                names: None,
+            })
+            .with_official_bytecode(true)
+            .with_limits(LoadLimits {
+                max_work_units: total_work - 1,
+                ..LoadLimits::default()
+            });
+        let mut vm =
+            Vm::new_with_services(profile, HostServices::deny_all().and_load(load)).unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let root = vm.add_root(RootKind::Host, environment).unwrap();
+        vm.install_basic_builtins(environment).unwrap();
+        vm.install_package_builtins(environment).unwrap();
+        let baseline_roots = vm.roots().total_count();
+        let outcome = run_official_require_in_vm(
+            &mut vm,
+            environment,
+            language,
+            b"package.path='?.lua'; return require('official')",
+        );
+        let RunOutcome::LuaError(error) = outcome else {
+            panic!("官方 require 額度 one-below 應拒絕：{profile:?}, {outcome:?}")
+        };
+        assert_eq!(error.kind, RuntimeErrorKind::HostLoadBudget);
+        drop(error);
+        assert_eq!(vm.roots().total_count(), baseline_roots);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        let outcome = run_official_require_in_vm(
+            &mut vm,
+            environment,
+            language,
+            b"return package.loaded.official==nil,(require('source'))",
+        );
+        assert_eq!(
+            outcome,
+            RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(7)])
+        );
+        assert_eq!(
+            &*calls.borrow(),
+            &[b"official".to_vec(), b"source".to_vec()]
+        );
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+}
+
 struct FailingRepository(usize);
 
 impl HostModuleRepository for FailingRepository {
@@ -2815,6 +3139,264 @@ struct TestLoadCompiler {
     names: Option<Rc<RefCell<Vec<Vec<u8>>>>>,
 }
 
+struct MeteredCompileSink<'a, 'b>(&'a mut LoadBudget<'b>);
+
+impl CompileBudgetSink for MeteredCompileSink<'_, '_> {
+    type Error = HostLoadError;
+
+    fn spend_work(&mut self, units: usize) -> Result<(), Self::Error> {
+        self.0.spend_work(units)
+    }
+
+    fn claim_temporary(&mut self, bytes: usize) -> Result<(), Self::Error> {
+        self.0.claim_temporary(bytes)
+    }
+
+    fn claim_module_allocation(&mut self, bytes: usize) -> Result<(), Self::Error> {
+        self.0.claim_module_allocation(bytes)
+    }
+}
+
+struct MeteredTestCompiler;
+
+struct UnderMeteredCompiler {
+    calls: Rc<Cell<usize>>,
+    module: rivetlua_core::VerifiedModule,
+}
+
+impl HostLoadCompiler for UnderMeteredCompiler {
+    fn compile(
+        &mut self,
+        _source: &[u8],
+        _chunkname: &[u8],
+        _profile: LuaProfile,
+        _budget: &mut LoadBudget,
+    ) -> Result<rivetlua_core::VerifiedModule, HostLoadError> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(self.module.clone())
+    }
+}
+
+#[test]
+fn p13_f_source_module_measurement_pays_work_before_capacity_walk() {
+    let (_, language, _) = profile();
+    let mut large_source = b"return '".to_vec();
+    large_source.extend(std::iter::repeat_n(b'x', 4096));
+    large_source.push(b'\'');
+    let module = compile(&large_source, language);
+
+    let calls = Rc::new(Cell::new(0));
+    let services = HostServices::deny_all().and_load(
+        LoadCapability::deny_all()
+            .and_compiler(UnderMeteredCompiler {
+                calls: calls.clone(),
+                module: module.clone(),
+            })
+            .with_limits(LoadLimits {
+                max_work_units: 1,
+                ..LoadLimits::default()
+            }),
+    );
+    let (vm, outcome) = run_with_load(b"return load('return 7')", services);
+    assert!(
+        matches!(outcome, RunOutcome::LuaError(error) if error.kind == RuntimeErrorKind::HostLoadBudget)
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+
+    let calls = Rc::new(Cell::new(0));
+    let services = HostServices::deny_all().and_load(LoadCapability::deny_all().and_compiler(
+        UnderMeteredCompiler {
+            calls: calls.clone(),
+            module,
+        },
+    ));
+    let (vm, outcome) = run_with_load_config(
+        b"return load('return 7')",
+        services,
+        false,
+        false,
+        Some(500),
+    );
+    assert_eq!(outcome, RunOutcome::Aborted(AbortReason::FuelExhausted));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+impl HostLoadCompiler for MeteredTestCompiler {
+    fn compile(
+        &mut self,
+        source: &[u8],
+        chunkname: &[u8],
+        profile: LuaProfile,
+        budget: &mut LoadBudget,
+    ) -> Result<rivetlua_core::VerifiedModule, HostLoadError> {
+        let language = match profile {
+            LuaProfile::Lua54 => LanguageProfile::Lua54,
+            LuaProfile::Lua55 => LanguageProfile::Lua55,
+        };
+        let result = compile_with_budget(
+            source,
+            chunkname,
+            language,
+            &CompileLimits::default(),
+            &IrLimits::default(),
+            &VerifyLimits::default(),
+            &mut MeteredCompileSink(budget),
+        );
+        match result {
+            Ok(module) => Ok(module),
+            Err(BudgetedCompileError::Budget(error)) => Err(error),
+            Err(BudgetedCompileError::Frontend(error)) => {
+                budget.spend_work(error.message.len() + 1)?;
+                budget.claim_temporary(error.message.len())?;
+                Err(HostLoadError::new(
+                    HostLoadErrorKind::Compile,
+                    error.message.as_bytes(),
+                ))
+            }
+            Err(
+                BudgetedCompileError::AdmissionOverflow
+                | BudgetedCompileError::AdmissionUnderestimated,
+            ) => Err(HostLoadError::new(HostLoadErrorKind::Budget, Vec::new())),
+            Err(BudgetedCompileError::Ir(_) | BudgetedCompileError::Bytecode(_)) => {
+                const MESSAGE: &[u8] = b"compile failed";
+                budget.spend_work(MESSAGE.len() + 1)?;
+                budget.claim_temporary(MESSAGE.len())?;
+                Err(HostLoadError::new(HostLoadErrorKind::Compile, MESSAGE))
+            }
+        }
+    }
+}
+
+#[test]
+fn p13_f_metered_compiler_loads_short_source_and_reports_syntax_and_budget() {
+    let services = HostServices::deny_all()
+        .and_load(LoadCapability::deny_all().and_compiler(MeteredTestCompiler));
+    let (_, outcome) = run_with_load(b"return load('return 7')()", services);
+    assert_eq!(outcome, RunOutcome::Returned(vec![Value::Integer(7)]));
+
+    let services = HostServices::deny_all()
+        .and_load(LoadCapability::deny_all().and_compiler(MeteredTestCompiler));
+    let (vm, outcome) = run_with_load(b"return load('return *')", services);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("syntax error 應回傳 nil+diagnostic: {outcome:?}");
+    };
+    assert_eq!(values[0], Value::Nil);
+    assert!(!bytes(&vm, values[1]).is_empty());
+
+    let services = HostServices::deny_all().and_load(
+        LoadCapability::deny_all()
+            .and_compiler(MeteredTestCompiler)
+            .with_limits(LoadLimits {
+                max_work_units: 1,
+                ..LoadLimits::default()
+            }),
+    );
+    let (_, outcome) = run_with_load(b"return load('return 7')", services);
+    assert!(
+        matches!(outcome, RunOutcome::LuaError(error) if error.kind == RuntimeErrorKind::HostLoadBudget)
+    );
+}
+
+#[test]
+fn p13_f_metered_compiler_spends_fuel_inside_callback_and_cleans_budget() {
+    let calls = Rc::new(Cell::new(0));
+    let services = HostServices::deny_all().and_load(LoadCapability::deny_all().and_compiler(
+        TestLoadCompiler {
+            calls: calls.clone(),
+            names: None,
+        },
+    ));
+    let (vm, outcome) = run_with_load_config(
+        b"return load('return 7')()",
+        services,
+        false,
+        false,
+        Some(500),
+    );
+    assert_eq!(calls.get(), 1, "燃料應在進入 compiler 後耗盡");
+    assert_eq!(outcome, RunOutcome::Aborted(AbortReason::FuelExhausted));
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_f_metered_compiler_allocation_faults_release_escrow_and_retry_in_same_vm() {
+    let (_, language, profile) = profile();
+    let runner = compile(b"return load('return 7')()", language);
+    let make_vm = |calls: Rc<Cell<usize>>| {
+        let services = HostServices::deny_all().and_load(
+            LoadCapability::deny_all().and_compiler(TestLoadCompiler { calls, names: None }),
+        );
+        let mut vm = Vm::new_with_services(profile, services).unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let root = vm.add_root(RootKind::Host, environment).unwrap();
+        vm.install_basic_builtins(environment).unwrap();
+        (vm, environment, root)
+    };
+    let calls = Rc::new(Cell::new(0));
+    let (mut vm, environment, root) = make_vm(calls.clone());
+    vm.collect_major().unwrap();
+    let probe = vm.ledger_probe();
+    let baseline = probe.trace().next_ordinal;
+    let mut execution = vm
+        .load_with_environment(runner.clone(), Value::Object(environment))
+        .unwrap();
+    let callback_start = probe.trace().next_ordinal;
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(7)])
+    );
+    let callback_end = probe.trace().next_ordinal;
+    drop(execution);
+    assert_eq!(calls.get(), 1);
+    assert!(callback_end > callback_start && callback_end - callback_start < 128);
+    vm.remove_root(root).unwrap();
+
+    let mut inside_compiler = 0;
+    for ordinal in callback_start..callback_end {
+        let calls = Rc::new(Cell::new(0));
+        let (mut vm, environment, root) = make_vm(calls.clone());
+        vm.collect_major().unwrap();
+        let probe = vm.ledger_probe();
+        assert_eq!(probe.trace().next_ordinal, baseline);
+        let baseline_roots = vm.roots().total_count();
+        let baseline_heap = vm.ledger_snapshot().host_allocation_bytes;
+        vm.inject_allocation_failure_at(ordinal);
+        let mut execution = vm
+            .load_with_environment(runner.clone(), Value::Object(environment))
+            .unwrap();
+        let failed = execution.run();
+        drop(execution);
+        assert!(failed.is_err(), "ordinal {ordinal} 意外成功: {failed:?}");
+        drop(failed);
+        assert_eq!(probe.trace().last_failure.unwrap().attempt.ordinal, ordinal);
+        assert_eq!(
+            probe.trace().last_failure.unwrap().kind,
+            AllocationFailureKind::Injection
+        );
+        if calls.get() != 0 {
+            inside_compiler += 1;
+        }
+        assert_eq!(vm.roots().total_count(), baseline_roots);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        vm.collect_major().unwrap();
+        assert_eq!(vm.ledger_snapshot().host_allocation_bytes, baseline_heap);
+        let outcome = vm
+            .load_with_environment(runner.clone(), Value::Object(environment))
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(outcome, RunOutcome::Returned(vec![Value::Integer(7)]));
+        assert_eq!(vm.roots().total_count(), baseline_roots);
+        vm.remove_root(root).unwrap();
+    }
+    assert!(
+        inside_compiler > 0,
+        "至少一個真實 compiler quota allocation site 須受測"
+    );
+}
+
 impl HostLoadCompiler for TestLoadCompiler {
     fn compile(
         &mut self,
@@ -2824,26 +3406,12 @@ impl HostLoadCompiler for TestLoadCompiler {
         budget: &mut LoadBudget,
     ) -> Result<rivetlua_core::VerifiedModule, HostLoadError> {
         self.calls.set(self.calls.get() + 1);
-        budget.claim_temporary(chunkname.len())?;
         if let Some(names) = &self.names {
+            budget.spend_work(chunkname.len() + 1)?;
+            budget.claim_temporary(chunkname.len())?;
             names.borrow_mut().push(chunkname.to_vec());
         }
-        budget.spend_work(source.len().saturating_mul(4).saturating_add(32))?;
-        budget.claim_temporary(source.len().saturating_mul(16).saturating_add(512))?;
-        let language = match profile {
-            LuaProfile::Lua54 => LanguageProfile::Lua54,
-            LuaProfile::Lua55 => LanguageProfile::Lua55,
-        };
-        let failed = || HostLoadError::new(HostLoadErrorKind::Compile, b"syntax error".to_vec());
-        let limits = CompileLimits::default();
-        let chunk = lex(source, language, &limits).map_err(|_| failed())?;
-        let parsed = parse(&chunk, language, &limits).map_err(|_| failed())?;
-        let resolved = resolve(&parsed, &chunk, language, &limits).map_err(|_| failed())?;
-        let ir = lower(&resolved, &IrLimits::default()).map_err(|_| failed())?;
-        Ok(emit(&ir, &VerifyLimits::default())
-            .map_err(|_| failed())?
-            .verified()
-            .clone())
+        MeteredTestCompiler.compile(source, chunkname, profile, budget)
     }
 }
 
@@ -3652,6 +4220,37 @@ fn p13_f_encoded_limit_is_independent_of_text_source_limit() {
 }
 
 #[test]
+fn p13_f_raw_rvlu_shared_preflight_loads() {
+    let (_, language, runtime_profile) = profile();
+    let chunk = lex(b"return 42", language, &CompileLimits::default()).unwrap();
+    let parsed = parse(&chunk, language, &CompileLimits::default()).unwrap();
+    let resolved = resolve(&parsed, &chunk, language, &CompileLimits::default()).unwrap();
+    let ir = lower(&resolved, &IrLimits::default()).unwrap();
+    let encoded = emit(&ir, &VerifyLimits::default()).unwrap();
+    let services =
+        HostServices::deny_all().and_load(LoadCapability::deny_all().with_bytecode(true));
+    let mut vm = Vm::new_with_services(runtime_profile, services).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    let key = vm.allocate_byte_string(b"chunk").unwrap();
+    let value = vm.allocate_byte_string(encoded.bytes()).unwrap();
+    vm.raw_set(environment, Value::Object(key), Value::Object(value))
+        .unwrap();
+    let runner = compile(
+        b"local f,e=load(chunk,nil,'b'); if not f then return e end; return f()",
+        language,
+    );
+    let mut execution = vm
+        .load_with_environment(runner, Value::Object(environment))
+        .unwrap();
+    let outcome = execution.run().unwrap();
+    drop(execution);
+    assert_eq!(outcome, RunOutcome::Returned(vec![Value::Integer(42)]));
+    vm.remove_root(root).unwrap();
+}
+
+#[test]
 fn p13_f_bytecode_rejects_v1_unknown_profile_and_invalid_payload() {
     let (_, language, runtime_profile) = profile();
     let chunk = lex(b"return 5", language, &CompileLimits::default()).unwrap();
@@ -3730,6 +4329,429 @@ fn p13_f_bytecode_rejects_v1_unknown_profile_and_invalid_payload() {
     };
     assert_eq!(error.kind, RuntimeErrorKind::HostPolicyLoad);
     vm.remove_root(root).unwrap();
+}
+
+#[test]
+fn p13_f_official_bytecode_requires_separate_capability_and_executes_both_profiles() {
+    for (language, runtime_profile, source) in [
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+        ),
+    ] {
+        for (authorized, expected) in [(false, None), (true, Some(vec![Value::Integer(41)]))] {
+            let capability = LoadCapability::deny_all()
+                .with_bytecode(!authorized)
+                .with_official_bytecode(authorized);
+            let mut vm = Vm::new_with_services(
+                runtime_profile,
+                HostServices::deny_all().and_load(capability),
+            )
+            .unwrap();
+            let environment = vm.allocate_table().unwrap();
+            let root = vm.add_root(RootKind::Host, environment).unwrap();
+            vm.install_basic_builtins(environment).unwrap();
+            let key = vm.allocate_byte_string(b"chunk").unwrap();
+            let bytes = vm.allocate_byte_string(source).unwrap();
+            vm.raw_set(environment, Value::Object(key), Value::Object(bytes))
+                .unwrap();
+            let mut execution = vm
+                .load_with_environment(
+                    compile(b"return load(chunk,nil,'b')()", language),
+                    Value::Object(environment),
+                )
+                .unwrap();
+            let outcome = execution.run().unwrap();
+            drop(execution);
+            match expected {
+                Some(values) => assert_eq!(outcome, RunOutcome::Returned(values)),
+                None => match outcome {
+                    RunOutcome::LuaError(error) => {
+                        assert_eq!(error.kind, RuntimeErrorKind::HostPolicyLoad)
+                    }
+                    other => panic!("應拒絕未授權官方 chunk：{other:?}"),
+                },
+            }
+            vm.remove_root(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn p13_f_official_load_checks_mode_profile_and_full_preflight_budget() {
+    for (language, profile, own, other, list) in [
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua54-list-flow.luac").as_slice(),
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua55-list-flow.luac").as_slice(),
+        ),
+    ] {
+        let run = |chunk: &[u8], mode: &[u8], max_work_units: usize, call: bool| {
+            let mut vm = Vm::new_with_services(
+                profile,
+                HostServices::deny_all().and_load(
+                    LoadCapability::deny_all()
+                        .with_official_bytecode(true)
+                        .with_limits(LoadLimits {
+                            max_work_units,
+                            ..LoadLimits::default()
+                        }),
+                ),
+            )
+            .unwrap();
+            let environment = vm.allocate_table().unwrap();
+            let root = vm.add_root(RootKind::Host, environment).unwrap();
+            vm.install_basic_builtins(environment).unwrap();
+            let key = vm.allocate_byte_string(b"chunk").unwrap();
+            let source = vm.allocate_byte_string(chunk).unwrap();
+            vm.raw_set(environment, Value::Object(key), Value::Object(source))
+                .unwrap();
+            let key = vm.allocate_byte_string(b"mode").unwrap();
+            let mode = vm.allocate_byte_string(mode).unwrap();
+            vm.raw_set(environment, Value::Object(key), Value::Object(mode))
+                .unwrap();
+            let script = if call {
+                b"return load(chunk,nil,mode)()".as_slice()
+            } else {
+                b"return load(chunk,nil,mode)".as_slice()
+            };
+            let mut execution = vm
+                .load_with_environment(compile(script, language), Value::Object(environment))
+                .unwrap();
+            let outcome = execution.run().unwrap();
+            drop(execution);
+            vm.remove_root(root).unwrap();
+            outcome
+        };
+
+        for (chunk, mode) in [(own, b"t".as_slice()), (other, b"b".as_slice())] {
+            let RunOutcome::Returned(values) = run(chunk, mode, 1, false) else {
+                panic!("模式／版本應早於預掃描 work 拒絕：{profile:?}")
+            };
+            assert_eq!(values[0], Value::Nil);
+            assert!(matches!(values[1], Value::Object(_)));
+        }
+        let truncated = &own[..own.len() - 1];
+        assert_eq!(
+            preflight_official_chunk(
+                truncated,
+                profile,
+                &OfficialChunkLimits::default(),
+                &VerifyLimits::default(),
+            )
+            .unwrap_err()
+            .kind,
+            OfficialChunkErrorKind::Truncated,
+        );
+        let RunOutcome::Returned(values) = run(truncated, b"b", 10_000, false) else {
+            panic!("格式截斷應回傳 nil+diagnostic：{profile:?}")
+        };
+        assert_eq!(values[0], Value::Nil);
+        assert!(matches!(values[1], Value::Object(_)));
+        for chunk in [own, list] {
+            let stats = preflight_official_chunk(
+                chunk,
+                profile,
+                &OfficialChunkLimits::default(),
+                &VerifyLimits::default(),
+            )
+            .unwrap();
+            let total = chunk.len() * 2 + 1 + stats.subsequent_work as usize;
+            let RunOutcome::LuaError(error) = run(chunk, b"b", total - 1, false) else {
+                panic!("預掃描總工作 one-below 應拒絕：{profile:?}")
+            };
+            assert_eq!(error.kind, RuntimeErrorKind::HostLoadBudget);
+            let expected = if chunk == own {
+                vec![Value::Integer(41)]
+            } else {
+                vec![
+                    Value::Integer(22),
+                    Value::Integer(44),
+                    Value::Integer(55),
+                    Value::Integer(66),
+                    Value::Integer(0),
+                    Value::Integer(11),
+                    Value::Integer(33),
+                ]
+            };
+            assert_eq!(
+                run(chunk, b"b", total, true),
+                RunOutcome::Returned(expected)
+            );
+        }
+    }
+}
+
+fn run_official_load_in_same_vm(
+    vm: &mut Vm,
+    language: LanguageProfile,
+    environment: ObjectRef,
+    fuel: Option<u64>,
+) -> (Result<RunOutcome, RuntimeError>, u64) {
+    let roots = vm.roots().total_count();
+    let mut roots_before = Vec::new();
+    vm.visit_roots(|kind, id, object| roots_before.push((kind, id, object)));
+    let reserved = vm.ledger_snapshot().reserved;
+    let mut execution = vm
+        .load_with_environment(
+            compile(b"return load(chunk,nil,'b')", language),
+            Value::Object(environment),
+        )
+        .unwrap();
+    if let Some(fuel) = fuel {
+        execution.set_fuel(fuel).unwrap();
+    }
+    let outcome = execution.run();
+    let remaining = execution.fuel_remaining();
+    drop(execution);
+    let mut roots_after = Vec::new();
+    vm.visit_roots(|kind, id, object| roots_after.push((kind, id, object)));
+    if let Ok(RunOutcome::LuaError(error)) = &outcome {
+        let extra: Vec<_> = roots_after
+            .iter()
+            .filter(|entry| !roots_before.contains(entry))
+            .collect();
+        assert_eq!(extra.len(), 1, "{roots_before:?} → {roots_after:?}");
+        assert_eq!(extra[0].0, RootKind::Host);
+        assert_eq!(error.value, Value::Object(extra[0].2));
+        assert_eq!(vm.object_kind(extra[0].2), Ok(ObjectKind::ByteString));
+        assert_eq!(vm.roots().total_count(), roots + 1);
+    } else {
+        assert_eq!(roots_after, roots_before, "{outcome:?}");
+    }
+    assert_eq!(vm.ledger_snapshot().reserved, reserved);
+    (outcome, remaining)
+}
+
+fn official_load_vm(
+    profile: LuaProfile,
+    chunk: &[u8],
+    limits: LoadLimits,
+) -> (Vm, ObjectRef, RootId) {
+    let mut vm = Vm::new_with_services(
+        profile,
+        HostServices::deny_all().and_load(
+            LoadCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(limits),
+        ),
+    )
+    .unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    let key = vm.allocate_byte_string(b"chunk").unwrap();
+    let value = vm.allocate_byte_string(chunk).unwrap();
+    vm.raw_set(environment, Value::Object(key), Value::Object(value))
+        .unwrap();
+    (vm, environment, root)
+}
+
+#[test]
+fn p13_f_official_temporary_and_retained_exact_one_below_retry_in_same_vm() {
+    for (language, profile, list, small) in [
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            include_bytes!("official_chunk_fixtures/lua54-list-flow.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            include_bytes!("official_chunk_fixtures/lua55-list-flow.luac").as_slice(),
+            include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+        ),
+    ] {
+        let list_stats = preflight_official_chunk(
+            list,
+            profile,
+            &OfficialChunkLimits::default(),
+            &VerifyLimits::default(),
+        )
+        .unwrap();
+        let small_stats = preflight_official_chunk(
+            small,
+            profile,
+            &OfficialChunkLimits::default(),
+            &VerifyLimits::default(),
+        )
+        .unwrap();
+        assert!(small_stats.temporary_bytes < list_stats.temporary_bytes);
+        assert!(small_stats.retained_bytes < list_stats.retained_bytes);
+
+        for (temporary, exact) in [(true, false), (true, true), (false, false), (false, true)] {
+            let limits = LoadLimits {
+                max_work_units: 200_000,
+                max_temporary_bytes: if temporary {
+                    list_stats.temporary_bytes - usize::from(!exact)
+                } else {
+                    LoadLimits::default().max_temporary_bytes
+                },
+                max_module_allocation_bytes: if temporary {
+                    LoadLimits::default().max_module_allocation_bytes
+                } else {
+                    list_stats.retained_bytes - usize::from(!exact)
+                },
+                ..LoadLimits::default()
+            };
+            let (mut vm, environment, root) = official_load_vm(profile, list, limits);
+            let (outcome, _) = run_official_load_in_same_vm(&mut vm, language, environment, None);
+            if exact {
+                let RunOutcome::Returned(values) = outcome.unwrap() else {
+                    panic!("exact 額度應載入成功：{profile:?}, temporary={temporary}")
+                };
+                assert!(matches!(values.as_slice(), [Value::Object(_)]));
+            } else {
+                let RunOutcome::LuaError(error) = outcome.unwrap() else {
+                    panic!("one-below 額度應由 Lua error 呈現：{profile:?}")
+                };
+                assert_eq!(error.kind, RuntimeErrorKind::HostLoadBudget);
+                drop(error);
+                assert_eq!(vm.roots().total_count(), 1);
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+                let key = vm.allocate_byte_string(b"chunk").unwrap();
+                let value = vm.allocate_byte_string(small).unwrap();
+                vm.raw_set(environment, Value::Object(key), Value::Object(value))
+                    .unwrap();
+                let (retry, _) = run_official_load_in_same_vm(&mut vm, language, environment, None);
+                assert!(
+                    matches!(retry.unwrap(), RunOutcome::Returned(values) if matches!(values.as_slice(), [Value::Object(_)]))
+                );
+            }
+            vm.remove_root(root).unwrap();
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+}
+
+#[test]
+fn p13_f_official_public_fuel_abort_leaves_same_vm_retryable() {
+    for (language, profile, list) in [
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            include_bytes!("official_chunk_fixtures/lua54-list-flow.luac").as_slice(),
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            include_bytes!("official_chunk_fixtures/lua55-list-flow.luac").as_slice(),
+        ),
+    ] {
+        let stats = preflight_official_chunk(
+            list,
+            profile,
+            &OfficialChunkLimits::default(),
+            &VerifyLimits::default(),
+        )
+        .unwrap();
+        let prescan = (list.len() * 2 + 1) as u64;
+        let (mut vm, environment, root) = official_load_vm(
+            profile,
+            list,
+            LoadLimits {
+                max_work_units: 200_000,
+                ..LoadLimits::default()
+            },
+        );
+        let full_fuel = 1_000_000;
+        let (calibration, remaining) =
+            run_official_load_in_same_vm(&mut vm, language, environment, Some(full_fuel));
+        assert!(matches!(calibration.unwrap(), RunOutcome::Returned(_)));
+        let wrapper_work = full_fuel - remaining - prescan - stats.subsequent_work;
+        assert!(stats.subsequent_work > wrapper_work + 1);
+        vm.collect().unwrap();
+
+        // 完整成功路徑的非官方預付成本包含輸入複製與回傳；以其作上界，
+        // 確保本次通過 wrapper 和 prescan，於 subsequent 預付處耗盡 fuel。
+        let fuel = wrapper_work + prescan + 1;
+        let (outcome, remaining) =
+            run_official_load_in_same_vm(&mut vm, language, environment, Some(fuel));
+        assert_eq!(
+            outcome.unwrap(),
+            RunOutcome::Aborted(AbortReason::FuelExhausted)
+        );
+        assert_eq!(remaining, 0);
+        assert_eq!(vm.roots().total_count(), 1);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        let (retry, _) =
+            run_official_load_in_same_vm(&mut vm, language, environment, Some(full_fuel));
+        assert!(matches!(retry.unwrap(), RunOutcome::Returned(_)));
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+}
+
+#[test]
+fn p13_f_official_admission_and_closure_failure_refund_and_retry() {
+    for (language, profile, small) in [
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+        ),
+    ] {
+        let stats = preflight_official_chunk(
+            small,
+            profile,
+            &OfficialChunkLimits::default(),
+            &VerifyLimits::default(),
+        )
+        .unwrap();
+        let (mut vm, environment, root) = official_load_vm(profile, small, LoadLimits::default());
+        let admission = stats.temporary_bytes + stats.retained_bytes;
+        vm.set_allocation_limit(vm.ledger_snapshot().committed + admission - 1);
+        let (outcome, _) = run_official_load_in_same_vm(&mut vm, language, environment, None);
+        assert_eq!(
+            outcome.unwrap_err().kind,
+            RuntimeErrorKind::Heap(VmError::AllocationFailed)
+        );
+        let admission_failure = vm.allocation_trace().last_failure.unwrap();
+        assert_eq!(admission_failure.kind, AllocationFailureKind::Budget);
+        assert_eq!(admission_failure.attempt.bytes, admission);
+        vm.set_allocation_limit(usize::MAX);
+        let (retry, _) = run_official_load_in_same_vm(&mut vm, language, environment, None);
+        assert!(matches!(retry.unwrap(), RunOutcome::Returned(_)));
+        vm.collect().unwrap();
+
+        vm.inject_failure_once(FailPoint::ClosureCapturesReserve);
+        let (outcome, _) = run_official_load_in_same_vm(&mut vm, language, environment, None);
+        assert_eq!(
+            outcome.unwrap_err().kind,
+            RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::ClosureCapturesReserve))
+        );
+        let closure_failure = vm.allocation_trace().last_failure.unwrap();
+        assert_eq!(closure_failure.kind, AllocationFailureKind::Injection);
+        assert_eq!(
+            closure_failure.attempt.point,
+            Some(FailPoint::ClosureCapturesReserve)
+        );
+        let (retry, _) = run_official_load_in_same_vm(&mut vm, language, environment, None);
+        assert!(matches!(retry.unwrap(), RunOutcome::Returned(_)));
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
 }
 
 #[test]
@@ -3815,7 +4837,7 @@ fn p13_f_mode_scan_exhausts_fuel_before_host_compile() {
             Value::Object(environment),
         )
         .unwrap();
-    execution.set_fuel(800).unwrap();
+    execution.set_fuel(500).unwrap();
     let outcome = execution.run().unwrap();
     drop(execution);
     assert_eq!(outcome, RunOutcome::Aborted(AbortReason::FuelExhausted));
@@ -5250,6 +6272,1454 @@ fn p13_c_string_errors_and_dump_policy_are_structured() {
         assert_eq!(vm.roots().total_count(), 2);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
     }
+}
+
+#[test]
+fn p13_f_string_dump_native_child_strip_omits_captured_values() {
+    let source = b"local function outer(x) return function() return x+1 end end; \
+        local first,second=outer(41),outer(99); \
+        return string.dump(first,true),string.dump(second,true),first(),second()";
+    let (vm, outcome, _) = run_with_string_services(
+        source,
+        HostServices::deny_all().and_dump(DumpCapability::deny_all().with_official_bytecode(true)),
+        None,
+        true,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("應可輸出 native child prototype: {outcome:?}");
+    };
+    assert_eq!(values[2], Value::Integer(42));
+    assert_eq!(values[3], Value::Integer(100));
+    let Value::Object(bytes_ref) = values[0] else {
+        panic!("應回傳 binary string")
+    };
+    let chunk_bytes = vm
+        .with_byte_string(bytes_ref, |s| s.as_bytes().to_vec())
+        .unwrap();
+    assert_eq!(chunk_bytes, bytes(&vm, values[1]));
+    let decoded = rivetlua_core::decode_official_chunk(
+        &chunk_bytes,
+        profile().2,
+        &OfficialChunkLimits::default(),
+    )
+    .unwrap();
+    assert!(decoded.main.debug.line_info.is_empty());
+    assert!(decoded.main.debug.locals.is_empty());
+    assert_eq!(decoded.main.children.len(), 0);
+}
+
+#[test]
+fn p13_f_string_dump_budget_and_policy_are_independent_of_load() {
+    let load = LoadCapability::deny_all().with_official_bytecode(true);
+    let (vm, outcome, _) = run_with_string_services(
+        b"local ok,err=pcall(string.dump,function() end); return ok,err",
+        HostServices::deny_all().and_load(load),
+        None,
+        true,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("policy 應為 LuaError: {outcome:?}")
+    };
+    assert_eq!(values[0], Value::Boolean(false));
+    assert_eq!(bytes(&vm, values[1]), b"E_HOST_POLICY_STRING_DUMP");
+
+    let limits = DumpLimits {
+        max_work_units: 1,
+        ..DumpLimits::default()
+    };
+    let (_, outcome, _) = run_with_string_services(
+        b"return string.dump(function() end)",
+        HostServices::deny_all().and_dump(
+            DumpCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(limits),
+        ),
+        None,
+        false,
+    );
+    let RunOutcome::LuaError(error) = outcome else {
+        panic!("work 上限應拒絕: {outcome:?}")
+    };
+    assert_eq!(error.kind, RuntimeErrorKind::HostDumpBudget);
+}
+
+#[test]
+fn p13_f_string_dump_imported_strip_and_reload_both_profiles() {
+    for (language, runtime_profile, source) in [
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+        ),
+    ] {
+        let services = HostServices::deny_all()
+            .and_load(LoadCapability::deny_all().with_official_bytecode(true))
+            .and_dump(DumpCapability::deny_all().with_official_bytecode(true));
+        let mut vm = Vm::new_with_services(runtime_profile, services).unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let root = vm.add_root(RootKind::Host, environment).unwrap();
+        vm.install_basic_builtins(environment).unwrap();
+        vm.install_string_builtins(environment).unwrap();
+        let key = vm.allocate_byte_string(b"chunk").unwrap();
+        let value = vm.allocate_byte_string(source).unwrap();
+        vm.raw_set(environment, Value::Object(key), Value::Object(value))
+            .unwrap();
+        let mut execution = vm
+            .load_with_environment(
+                compile(b"local f=assert(load(chunk,nil,'b')); local full=string.dump(f,false); \
+                    local strip=string.dump(f,true); return full,strip,assert(load(strip,nil,'b'))()", language),
+                Value::Object(environment),
+            )
+            .unwrap();
+        let outcome = execution.run().unwrap();
+        drop(execution);
+        let RunOutcome::Returned(values) = outcome else {
+            panic!("imported dump 失敗: {outcome:?}")
+        };
+        assert_eq!(values[2], Value::Integer(41));
+        let full = bytes(&vm, values[0]);
+        let stripped = bytes(&vm, values[1]);
+        let full = rivetlua_core::decode_official_chunk(
+            &full,
+            runtime_profile,
+            &OfficialChunkLimits::default(),
+        )
+        .unwrap();
+        let stripped = rivetlua_core::decode_official_chunk(
+            &stripped,
+            runtime_profile,
+            &OfficialChunkLimits::default(),
+        )
+        .unwrap();
+        assert!(!full.main.debug.line_info.is_empty());
+        assert!(stripped.main.debug.line_info.is_empty());
+        assert!(stripped.main.debug.locals.is_empty());
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        vm.remove_root(root).unwrap();
+    }
+}
+
+#[test]
+fn p13_f_string_dump_limits_fuel_and_same_vm_retry() {
+    let (_, language, runtime_profile) = profile();
+    let source = b"local ok,err=pcall(string.dump,function() return 42 end); return ok,err";
+    let limits = DumpLimits {
+        max_work_units: 40_000,
+        max_temporary_bytes: 256 * 1024,
+        max_encoded_bytes: 256 * 1024,
+    };
+    let mut vm = Vm::new_with_services(
+        runtime_profile,
+        HostServices::deny_all().and_dump(
+            DumpCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(limits),
+        ),
+    )
+    .unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_string_builtins(environment).unwrap();
+    let run = |vm: &mut Vm, fuel: u64| {
+        let mut execution = vm
+            .load_with_environment(compile(source, language), Value::Object(environment))
+            .unwrap();
+        execution.set_fuel(fuel).unwrap();
+        let result = execution.run().unwrap();
+        let remaining = execution.fuel_remaining();
+        drop(execution);
+        (result, remaining)
+    };
+    let (aborted, fuel) = run(&mut vm, 100);
+    assert_eq!(aborted, RunOutcome::Aborted(AbortReason::FuelExhausted));
+    assert_eq!(fuel, 0);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    let (returned, _) = run(&mut vm, 300_000);
+    let RunOutcome::Returned(values) = returned else {
+        panic!("同 VM 重試應成功: {returned:?}")
+    };
+    assert_eq!(values[0], Value::Boolean(true));
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    vm.remove_root(root).unwrap();
+
+    for changed in [
+        DumpLimits {
+            max_work_units: 40_000,
+            max_temporary_bytes: 1,
+            max_encoded_bytes: 256 * 1024,
+        },
+        DumpLimits {
+            max_work_units: 40_000,
+            max_temporary_bytes: 256 * 1024,
+            max_encoded_bytes: 32,
+        },
+    ] {
+        let (vm, outcome, _) = run_with_string_services(
+            source,
+            HostServices::deny_all().and_dump(
+                DumpCapability::deny_all()
+                    .with_official_bytecode(true)
+                    .with_limits(changed),
+            ),
+            Some(300_000),
+            false,
+        );
+        let RunOutcome::Returned(values) = outcome else {
+            panic!("limit 應由 pcall 捕捉: {outcome:?}")
+        };
+        assert_eq!(values[0], Value::Boolean(false));
+        assert_eq!(bytes(&vm, values[1]), b"E_HOST_DUMP_BUDGET");
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+}
+
+#[test]
+fn p13_f_host_call_uses_same_vm_frames_and_rejects_cross_vm_values() {
+    let (_, language, runtime_profile) = profile();
+    let mut vm = Vm::new_with_services(runtime_profile, HostServices::deny_all()).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_error_builtins(environment).unwrap();
+    let RunOutcome::Returned(values) = vm
+        .load_with_environment(
+            compile(b"return function(a,b) return a+b end", language),
+            Value::Object(environment),
+        )
+        .unwrap()
+        .run()
+        .unwrap()
+    else {
+        panic!("應建立 host callable")
+    };
+    let Value::Object(function) = values[0] else {
+        panic!("應回傳 closure")
+    };
+    let _handle = rivetlua_runtime::HostHandle::<Value>::new(&mut vm, function).unwrap();
+    let mut execution = vm
+        .call(
+            Value::Object(function),
+            &[Value::Integer(20), Value::Integer(22)],
+        )
+        .unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(42)])
+    );
+    drop(execution);
+
+    let key = vm.allocate_byte_string(b"type").unwrap();
+    let builtin = vm.raw_get(environment, Value::Object(key)).unwrap();
+    let mut execution = vm.call(builtin, &[Value::Integer(1)]).unwrap();
+    let RunOutcome::Returned(values) = execution.run().unwrap() else {
+        panic!("builtin 應成功")
+    };
+    drop(execution);
+    assert_eq!(bytes(&vm, values[0]), b"number");
+
+    let RunOutcome::Returned(values) = vm
+        .load_with_environment(
+            compile(b"return function(x) error(x) end", language),
+            Value::Object(environment),
+        )
+        .unwrap()
+        .run()
+        .unwrap()
+    else {
+        panic!("應建立 error closure")
+    };
+    let Value::Object(thrower) = values[0] else {
+        panic!("應回傳 closure")
+    };
+    let _thrower = rivetlua_runtime::HostHandle::<Value>::new(&mut vm, thrower).unwrap();
+    let mut execution = vm
+        .call(Value::Object(thrower), &[Value::Integer(13)])
+        .unwrap();
+    let RunOutcome::LuaError(error) = execution.run().unwrap() else {
+        panic!("錯誤應交宿主")
+    };
+    drop(execution);
+    assert_eq!(error.value, Value::Integer(13));
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+
+    let pcall_key = vm.allocate_byte_string(b"pcall").unwrap();
+    let pcall = vm.raw_get(environment, Value::Object(pcall_key)).unwrap();
+    let mut execution = vm
+        .call(pcall, &[Value::Object(thrower), Value::Integer(13)])
+        .unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(false), Value::Integer(13)])
+    );
+    drop(execution);
+
+    let roots = vm.roots().total_count();
+    drop(
+        vm.call(Value::Object(function), &[Value::Integer(1)])
+            .unwrap(),
+    );
+    assert_eq!(vm.roots().total_count(), roots);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    vm.inject_failure_once(FailPoint::RootReserve);
+    assert_eq!(
+        vm.call(
+            Value::Object(function),
+            &[Value::Integer(20), Value::Integer(22)]
+        )
+        .err()
+        .unwrap()
+        .kind,
+        RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::RootReserve)),
+    );
+    assert_eq!(vm.roots().total_count(), roots);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    let mut execution = vm
+        .call(
+            Value::Object(function),
+            &[Value::Integer(20), Value::Integer(22)],
+        )
+        .unwrap();
+    execution.set_fuel(0).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Aborted(AbortReason::FuelExhausted)
+    );
+    drop(execution);
+    assert_eq!(vm.roots().total_count(), roots);
+    let mut execution = vm
+        .call(
+            Value::Object(function),
+            &[Value::Integer(20), Value::Integer(22)],
+        )
+        .unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(42)])
+    );
+    drop(execution);
+
+    let mut other = Vm::new_with_profile(runtime_profile).unwrap();
+    let foreign_argument = other.allocate_table().unwrap();
+    assert_eq!(
+        other.call(Value::Object(function), &[]).err().unwrap().kind,
+        RuntimeErrorKind::Heap(VmError::WrongVm),
+    );
+    assert_eq!(
+        vm.call(Value::Object(function), &[Value::Object(foreign_argument)])
+            .err()
+            .unwrap()
+            .kind,
+        RuntimeErrorKind::Heap(VmError::WrongVm),
+    );
+    assert_eq!(vm.roots().total_count(), roots);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    vm.remove_root(environment_root).unwrap();
+}
+
+#[test]
+fn p13_f_host_callback_explicit_capture_return_throw_and_gc() {
+    let (_, language, runtime_profile) = profile();
+    let mut vm = Vm::new_with_services(runtime_profile, HostServices::deny_all()).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    let captured = vm.allocate_table().unwrap();
+    let callback = vm
+        .register_callback(
+            &[Value::Object(captured)],
+            Rc::new(|context, args| {
+                CallbackResult::Return(vec![
+                    context.capture(0).unwrap(),
+                    args.first().copied().unwrap_or(Value::Nil),
+                ])
+            }),
+        )
+        .unwrap();
+    let retained_callback = callback.try_clone(&mut vm).unwrap();
+    drop(callback);
+    let callback_key = vm.allocate_byte_string(b"host").unwrap();
+    vm.raw_set(
+        environment,
+        Value::Object(callback_key),
+        retained_callback.as_value(&vm).unwrap(),
+    )
+    .unwrap();
+    let thrower = vm
+        .register_callback(
+            &[],
+            Rc::new(|_, _| CallbackResult::Throw(Value::Integer(13))),
+        )
+        .unwrap();
+    let thrower_key = vm.allocate_byte_string(b"host_error").unwrap();
+    vm.raw_set(
+        environment,
+        Value::Object(thrower_key),
+        thrower.as_value(&vm).unwrap(),
+    )
+    .unwrap();
+    vm.collect().unwrap();
+    assert_eq!(vm.object_kind(captured), Ok(ObjectKind::Table));
+    let mut execution = vm
+        .load_with_environment(
+            compile(
+                b"local a,b=host(7); local ok,e=pcall(host_error); return a,b,ok,e",
+                language,
+            ),
+            Value::Object(environment),
+        )
+        .unwrap();
+    let outcome = execution.run().unwrap();
+    drop(execution);
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![
+            Value::Object(captured),
+            Value::Integer(7),
+            Value::Boolean(false),
+            Value::Integer(13)
+        ])
+    );
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    drop(retained_callback);
+    drop(thrower);
+    vm.remove_root(environment_root).unwrap();
+}
+
+#[test]
+fn p13_f_host_callback_failed_registration_reuse_and_gc() {
+    let mut vm = Vm::new().unwrap();
+    let captured = vm.allocate_table().unwrap();
+    vm.inject_failure_once(FailPoint::ChildReserve);
+    assert!(matches!(
+        vm.register_callback(
+            &[Value::Object(captured)],
+            Rc::new(|_, _| CallbackResult::Return(vec![]))
+        ),
+        Err(VmError::InjectedFailure(FailPoint::ChildReserve))
+    ));
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    let retry = vm
+        .register_callback(
+            &[Value::Object(captured)],
+            Rc::new(|context, _| CallbackResult::Return(vec![context.capture(0).unwrap()])),
+        )
+        .unwrap();
+    vm.collect().unwrap();
+    assert_eq!(vm.object_kind(captured), Ok(ObjectKind::Table));
+    let target = retry.as_value(&vm).unwrap();
+    let mut execution = vm.call(target, &[]).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Object(captured)])
+    );
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    drop(retry);
+    vm.collect().unwrap();
+    assert_eq!(vm.object_kind(captured), Err(VmError::StaleObject));
+
+    vm.inject_failure_once(FailPoint::RootReserve);
+    assert!(matches!(
+        vm.register_callback(&[], Rc::new(|_, _| CallbackResult::Return(vec![]))),
+        Err(VmError::InjectedFailure(FailPoint::RootReserve))
+    ));
+    let retry = vm
+        .register_callback(
+            &[],
+            Rc::new(|_, _| CallbackResult::Return(vec![Value::Integer(9)])),
+        )
+        .unwrap();
+    vm.collect().unwrap();
+    let mut execution = vm.call(retry.as_value(&vm).unwrap(), &[]).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(9)])
+    );
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_f_host_callback_registry_growth_failure_keeps_ledger_and_allows_retry() {
+    let mut vm = Vm::new().unwrap();
+    let before = vm.ledger_snapshot();
+    vm.set_allocation_limit(before.committed);
+    assert_eq!(
+        vm.register_callback(&[], Rc::new(|_, _| CallbackResult::Return(vec![])))
+            .err(),
+        Some(VmError::AllocationFailed)
+    );
+    assert_eq!(vm.ledger_snapshot().committed, before.committed);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+
+    vm.set_allocation_limit(usize::MAX);
+    let retry = vm
+        .register_callback(
+            &[],
+            Rc::new(|_, _| CallbackResult::Return(vec![Value::Integer(17)])),
+        )
+        .unwrap();
+    let mut execution = vm.call(retry.as_value(&vm).unwrap(), &[]).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(17)])
+    );
+    drop(execution);
+    drop(retry);
+    vm.collect().unwrap();
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    let after_first_collection = vm.ledger_snapshot().committed;
+    assert!(after_first_collection >= before.committed);
+    let reused = vm
+        .register_callback(
+            &[],
+            Rc::new(|_, _| CallbackResult::Return(vec![Value::Integer(18)])),
+        )
+        .unwrap();
+    let mut execution = vm.call(reused.as_value(&vm).unwrap(), &[]).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(18)])
+    );
+    drop(execution);
+    drop(reused);
+    vm.collect().unwrap();
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    assert_eq!(vm.ledger_snapshot().committed, after_first_collection);
+}
+
+#[test]
+fn p13_f_host_callback_call_continuation_receives_all_results_once() {
+    let (_, language, runtime_profile) = profile();
+    let mut vm = Vm::new_with_profile(runtime_profile).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    let mut helper_execution = vm
+        .load_with_environment(
+            compile(b"return function(x) return x+1,x+2 end", language),
+            Value::Object(environment),
+        )
+        .unwrap();
+    let RunOutcome::Returned(helper_values) = helper_execution.run().unwrap() else {
+        panic!("helper 應回傳 Lua closure");
+    };
+    drop(helper_execution);
+    let helper = helper_values[0];
+    let marker = Value::Object(vm.allocate_table().unwrap());
+    let callback = vm
+        .register_callback(
+            &[helper, marker],
+            Rc::new(|context, args| {
+                let continuation = CallbackContinuation::new(
+                    vec![context.capture(1).unwrap()],
+                    Rc::new(|context, results| {
+                        CallbackResult::Return(vec![
+                            context.capture(0).unwrap(),
+                            results[0],
+                            results[1],
+                        ])
+                    }),
+                );
+                context.call(context.capture(0).unwrap(), args.to_vec(), continuation)
+            }),
+        )
+        .unwrap();
+    let key = vm.allocate_byte_string(b"host_call").unwrap();
+    vm.raw_set(
+        environment,
+        Value::Object(key),
+        callback.as_value(&vm).unwrap(),
+    )
+    .unwrap();
+    vm.collect().unwrap();
+    let mut execution = vm
+        .load_with_environment(
+            compile(b"return host_call(5)", language),
+            Value::Object(environment),
+        )
+        .unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![marker, Value::Integer(6), Value::Integer(7)])
+    );
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    drop(callback);
+    vm.remove_root(environment_root).unwrap();
+}
+
+#[test]
+fn p13_f_host_callback_call_error_skips_continuation_and_cleans_pending() {
+    let (_, language, runtime_profile) = profile();
+    let mut vm = Vm::new_with_profile(runtime_profile).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    let mut helper_execution = vm
+        .load_with_environment(
+            compile(b"return function() error(17) end", language),
+            Value::Object(environment),
+        )
+        .unwrap();
+    let RunOutcome::Returned(helper_values) = helper_execution.run().unwrap() else {
+        panic!("helper 應回傳 Lua closure");
+    };
+    drop(helper_execution);
+    let calls = Rc::new(Cell::new(0));
+    let observed = Rc::clone(&calls);
+    let callback = vm
+        .register_callback(
+            &[helper_values[0]],
+            Rc::new(move |context, _| {
+                let observed = Rc::clone(&observed);
+                context.call(
+                    context.capture(0).unwrap(),
+                    vec![],
+                    CallbackContinuation::new(
+                        vec![],
+                        Rc::new(move |_, _| {
+                            observed.set(observed.get() + 1);
+                            CallbackResult::Return(vec![Value::Integer(99)])
+                        }),
+                    ),
+                )
+            }),
+        )
+        .unwrap();
+    let key = vm.allocate_byte_string(b"host_bad").unwrap();
+    vm.raw_set(
+        environment,
+        Value::Object(key),
+        callback.as_value(&vm).unwrap(),
+    )
+    .unwrap();
+    let mut execution = vm
+        .load_with_environment(
+            compile(b"local ok,e=pcall(host_bad); return ok,e,42", language),
+            Value::Object(environment),
+        )
+        .unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![
+            Value::Boolean(false),
+            Value::Integer(17),
+            Value::Integer(42)
+        ])
+    );
+    drop(execution);
+    assert_eq!(calls.get(), 0);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    drop(callback);
+    vm.remove_root(environment_root).unwrap();
+}
+
+#[test]
+fn p13_f_host_callback_chains_use_dispatch_loop_and_fuel_abort() {
+    let (_, language, runtime_profile) = profile();
+    fn next_type_chain(remaining: Rc<Cell<usize>>, target: Value) -> CallbackContinuation {
+        CallbackContinuation::new(
+            vec![target],
+            Rc::new(move |context, values| {
+                let count = remaining.get();
+                if count == 0 {
+                    CallbackResult::Return(values.to_vec())
+                } else {
+                    remaining.set(count - 1);
+                    let target = context.capture(0).unwrap();
+                    context.call(
+                        target,
+                        vec![Value::Integer(1)],
+                        next_type_chain(Rc::clone(&remaining), target),
+                    )
+                }
+            }),
+        )
+    }
+    let mut vm = Vm::new_with_profile(runtime_profile).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    let key = vm.allocate_byte_string(b"type").unwrap();
+    let target = vm.raw_get(environment, Value::Object(key)).unwrap();
+    let remaining = Rc::new(Cell::new(2_000));
+    let chain_remaining = Rc::clone(&remaining);
+    let callback = vm
+        .register_callback(
+            &[target],
+            Rc::new(move |context, _| {
+                let target = context.capture(0).unwrap();
+                context.call(
+                    target,
+                    vec![Value::Integer(1)],
+                    next_type_chain(Rc::clone(&chain_remaining), target),
+                )
+            }),
+        )
+        .unwrap();
+    let callback_value = callback.as_value(&vm).unwrap();
+    let mut execution = vm.call(callback_value, &[]).unwrap();
+    execution.set_fuel(200_000).unwrap();
+    let RunOutcome::Returned(values) = execution.run().unwrap() else {
+        panic!("immediate builtin continuation 長鏈應完成");
+    };
+    drop(execution);
+    assert_eq!(remaining.get(), 0);
+    assert_eq!(bytes(&vm, values[0]), b"number");
+    remaining.set(100_000);
+    let mut execution = vm.call(callback_value, &[]).unwrap();
+    execution.set_fuel(100).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Aborted(AbortReason::FuelExhausted)
+    );
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+
+    let callback_target = Rc::new(RefCell::new(Value::Nil));
+    let callback_target_for_call = Rc::clone(&callback_target);
+    let unwind_count = Rc::new(Cell::new(0));
+    let unwind_count_for_call = Rc::clone(&unwind_count);
+    let invocation_count = Rc::new(Cell::new(0));
+    let invocation_count_for_call = Rc::clone(&invocation_count);
+    let recursive = vm
+        .register_callback(
+            &[],
+            Rc::new(move |_, args| {
+                invocation_count_for_call.set(invocation_count_for_call.get() + 1);
+                let n = match args.first().copied().unwrap_or(Value::Nil) {
+                    Value::Integer(n) => n,
+                    _ => 0,
+                };
+                if n == 0 {
+                    CallbackResult::Return(vec![Value::Integer(0)])
+                } else {
+                    let unwind_count = Rc::clone(&unwind_count_for_call);
+                    CallbackResult::Call {
+                        target: *callback_target_for_call.borrow(),
+                        args: vec![Value::Integer(n - 1)],
+                        continuation: CallbackContinuation::new(
+                            vec![],
+                            Rc::new(move |_, values| {
+                                unwind_count.set(unwind_count.get() + 1);
+                                CallbackResult::Return(values.to_vec())
+                            }),
+                        ),
+                    }
+                }
+            }),
+        )
+        .unwrap();
+    let recursive_value = recursive.as_value(&vm).unwrap();
+    *callback_target.borrow_mut() = recursive_value;
+    let mut execution = vm
+        .call(recursive_value, &[Value::Integer(100_000)])
+        .unwrap();
+    execution.set_fuel(80).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Aborted(AbortReason::FuelExhausted)
+    );
+    drop(execution);
+    let mut execution = vm.call(recursive_value, &[Value::Integer(24)]).unwrap();
+    execution.set_fuel(10_000).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(0)])
+    );
+    drop(execution);
+    assert_eq!(unwind_count.get(), 24);
+    let mut execution = vm.call(recursive_value, &[Value::Integer(33)]).unwrap();
+    execution.set_fuel(10_000).unwrap();
+    let RunOutcome::LuaError(error) = execution.run().unwrap() else {
+        panic!("超過既有 basic pending 深度應為 StackLimit");
+    };
+    assert_eq!(error.kind, RuntimeErrorKind::StackLimit);
+    drop(execution);
+    assert_eq!(unwind_count.get(), 24);
+    let mut execution = vm.call(recursive_value, &[Value::Integer(0)]).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(0)])
+    );
+    drop(execution);
+    let chain_key = vm.allocate_byte_string(b"chain").unwrap();
+    vm.raw_set(environment, Value::Object(chain_key), recursive_value)
+        .unwrap();
+    let roots_before = vm.roots().total_count();
+    let calls_before = invocation_count.get();
+    let mut protected = vm
+        .load_with_environment(
+            compile(b"local ok,e=pcall(chain,100000); return ok,e", language),
+            Value::Object(environment),
+        )
+        .unwrap();
+    protected.set_fuel(80).unwrap();
+    assert_eq!(
+        protected.run().unwrap(),
+        RunOutcome::Aborted(AbortReason::FuelExhausted)
+    );
+    drop(protected);
+    assert!(invocation_count.get() > calls_before);
+    assert_eq!(vm.roots().total_count(), roots_before);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    let mut retry = vm
+        .load_with_environment(
+            compile(b"local ok,v=pcall(chain,0); return ok,v", language),
+            Value::Object(environment),
+        )
+        .unwrap();
+    assert_eq!(
+        retry.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(0)])
+    );
+    drop(retry);
+    let unwound_before_protected = unwind_count.get();
+    let mut nested_retry = vm
+        .load_with_environment(
+            compile(b"local ok,v=pcall(chain,3); return ok,v", language),
+            Value::Object(environment),
+        )
+        .unwrap();
+    nested_retry.set_fuel(10_000).unwrap();
+    assert_eq!(
+        nested_retry.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(0)])
+    );
+    drop(nested_retry);
+    assert_eq!(unwind_count.get(), unwound_before_protected + 3);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    drop(recursive);
+    drop(callback);
+    vm.remove_root(environment_root).unwrap();
+}
+
+#[test]
+fn p13_f_host_callback_resume_preserves_coroutine_contract() {
+    let (_, language, runtime_profile) = profile();
+    let mut vm = Vm::new_with_profile(runtime_profile).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_coroutine_builtins(environment).unwrap();
+    let mut execution = vm
+        .load_with_environment(
+            compile(
+                b"return coroutine.create(function(x) coroutine.yield(x+1); return x+2 end)",
+                language,
+            ),
+            Value::Object(environment),
+        )
+        .unwrap();
+    let RunOutcome::Returned(values) = execution.run().unwrap() else {
+        panic!("應建立 coroutine");
+    };
+    drop(execution);
+    let callback = vm
+        .register_callback(
+            &[values[0]],
+            Rc::new(|context, args| {
+                context.resume(
+                    context.capture(0).unwrap(),
+                    args.to_vec(),
+                    CallbackContinuation::new(
+                        vec![],
+                        Rc::new(|_, results| CallbackResult::Return(results.to_vec())),
+                    ),
+                )
+            }),
+        )
+        .unwrap();
+    let target = callback.as_value(&vm).unwrap();
+    let mut execution = vm.call(target, &[Value::Integer(10)]).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(11)])
+    );
+    drop(execution);
+    vm.collect().unwrap();
+    let mut execution = vm.call(target, &[Value::Integer(99)]).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(12)])
+    );
+    drop(execution);
+    let mut execution = vm.call(target, &[]).unwrap();
+    let RunOutcome::Returned(dead) = execution.run().unwrap() else {
+        panic!("dead resume 應回傳 false/error")
+    };
+    drop(execution);
+    assert_eq!(dead[0], Value::Boolean(false));
+    assert_eq!(bytes(&vm, dead[1]), b"cannot resume dead coroutine");
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    drop(callback);
+    vm.remove_root(environment_root).unwrap();
+}
+
+#[test]
+fn p13_f_host_callback_yield_continuation_survives_gc_and_invalid_site() {
+    let (_, language, runtime_profile) = profile();
+    let mut vm = Vm::new_with_profile(runtime_profile).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_coroutine_builtins(environment).unwrap();
+    let marker = Value::Object(vm.allocate_table().unwrap());
+    let resumed = Rc::new(Cell::new(0));
+    let resumed_for_callback = Rc::clone(&resumed);
+    let callback = vm
+        .register_callback(
+            &[marker],
+            Rc::new(move |context, _| {
+                let resumed = Rc::clone(&resumed_for_callback);
+                context.yield_with(
+                    vec![Value::Integer(7)],
+                    CallbackContinuation::new(
+                        vec![context.capture(0).unwrap()],
+                        Rc::new(move |context, args| {
+                            resumed.set(resumed.get() + 1);
+                            CallbackResult::Return(vec![
+                                context.capture(0).unwrap(),
+                                args.first().copied().unwrap_or(Value::Nil),
+                            ])
+                        }),
+                    ),
+                )
+            }),
+        )
+        .unwrap();
+    let callback_value = callback.as_value(&vm).unwrap();
+    let mut invalid = vm.call(callback_value, &[]).unwrap();
+    let RunOutcome::LuaError(error) = invalid.run().unwrap() else {
+        panic!("coroutine 外 Yield 應是 Lua error");
+    };
+    assert_eq!(error.kind, RuntimeErrorKind::CoroutineYield);
+    drop(invalid);
+    assert_eq!(resumed.get(), 0);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    let key = vm.allocate_byte_string(b"host_yield").unwrap();
+    vm.raw_set(environment, Value::Object(key), callback_value)
+        .unwrap();
+    let mut setup = vm.load_with_environment(
+        compile(b"return coroutine.create(function() local a,b=host_yield(); return a,b end), function(co,...) return coroutine.resume(co,...) end", language),
+        Value::Object(environment),
+    ).unwrap();
+    let RunOutcome::Returned(objects) = setup.run().unwrap() else {
+        panic!("應建立 coroutine 與 resumer");
+    };
+    drop(setup);
+    let Value::Object(coroutine) = objects[0] else {
+        panic!("coroutine 應為物件")
+    };
+    let Value::Object(resumer) = objects[1] else {
+        panic!("resumer 應為 closure")
+    };
+    let coroutine_handle = rivetlua_runtime::HostHandle::<Value>::new(&mut vm, coroutine).unwrap();
+    let resumer_handle = rivetlua_runtime::HostHandle::<Value>::new(&mut vm, resumer).unwrap();
+    let mut first = vm
+        .call(Value::Object(resumer), &[Value::Object(coroutine)])
+        .unwrap();
+    assert_eq!(
+        first.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(7)])
+    );
+    drop(first);
+    assert_eq!(resumed.get(), 0);
+    vm.collect().unwrap();
+    let Value::Object(marker_object) = marker else {
+        panic!("marker 應為 table")
+    };
+    assert_eq!(vm.object_kind(marker_object), Ok(ObjectKind::Table));
+    let mut second = vm
+        .call(
+            Value::Object(resumer),
+            &[Value::Object(coroutine), Value::Integer(42)],
+        )
+        .unwrap();
+    assert_eq!(
+        second.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(true), marker, Value::Integer(42)])
+    );
+    drop(second);
+    assert_eq!(resumed.get(), 1);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    drop(coroutine_handle);
+    drop(resumer_handle);
+    drop(callback);
+    vm.remove_root(environment_root).unwrap();
+}
+
+#[test]
+fn p13_f_host_callback_rejects_foreign_capture_return_throw_and_action() {
+    let mut foreign = Vm::new().unwrap();
+    let foreign_value = Value::Object(foreign.allocate_table().unwrap());
+    let mut vm = Vm::new().unwrap();
+    assert!(matches!(
+        vm.register_callback(
+            &[foreign_value],
+            Rc::new(|_, _| CallbackResult::Return(vec![]))
+        ),
+        Err(VmError::WrongVm)
+    ));
+    let ret = vm
+        .register_callback(
+            &[],
+            Rc::new(move |_, _| CallbackResult::Return(vec![foreign_value])),
+        )
+        .unwrap();
+    let mut execution = vm.call(ret.as_value(&vm).unwrap(), &[]).unwrap();
+    assert_eq!(
+        execution.run().err().unwrap().kind,
+        RuntimeErrorKind::Heap(VmError::WrongVm)
+    );
+    drop(execution);
+    let thrower = vm
+        .register_callback(
+            &[],
+            Rc::new(move |_, _| CallbackResult::Throw(foreign_value)),
+        )
+        .unwrap();
+    let mut execution = vm.call(thrower.as_value(&vm).unwrap(), &[]).unwrap();
+    assert_eq!(
+        execution.run().err().unwrap().kind,
+        RuntimeErrorKind::Heap(VmError::WrongVm)
+    );
+    drop(execution);
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    let key = vm.allocate_byte_string(b"type").unwrap();
+    let target = vm.raw_get(environment, Value::Object(key)).unwrap();
+    let continuation_capture = vm
+        .register_callback(
+            &[target],
+            Rc::new(move |context, _| {
+                context.call(
+                    context.capture(0).unwrap(),
+                    vec![Value::Integer(1)],
+                    CallbackContinuation::new(
+                        vec![foreign_value],
+                        Rc::new(|_, values| CallbackResult::Return(values.to_vec())),
+                    ),
+                )
+            }),
+        )
+        .unwrap();
+    let mut execution = vm
+        .call(continuation_capture.as_value(&vm).unwrap(), &[])
+        .unwrap();
+    assert_eq!(
+        execution.run().err().unwrap().kind,
+        RuntimeErrorKind::Heap(VmError::WrongVm)
+    );
+    drop(execution);
+    let action_args = vm
+        .register_callback(
+            &[target],
+            Rc::new(move |context, _| {
+                context.call(
+                    context.capture(0).unwrap(),
+                    vec![foreign_value],
+                    CallbackContinuation::new(
+                        vec![],
+                        Rc::new(|_, values| CallbackResult::Return(values.to_vec())),
+                    ),
+                )
+            }),
+        )
+        .unwrap();
+    let mut execution = vm.call(action_args.as_value(&vm).unwrap(), &[]).unwrap();
+    assert_eq!(
+        execution.run().err().unwrap().kind,
+        RuntimeErrorKind::Heap(VmError::WrongVm)
+    );
+    drop(execution);
+    let retry = vm
+        .register_callback(
+            &[],
+            Rc::new(|_, _| CallbackResult::Return(vec![Value::Integer(9)])),
+        )
+        .unwrap();
+    let mut execution = vm.call(retry.as_value(&vm).unwrap(), &[]).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(9)])
+    );
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    drop(ret);
+    drop(thrower);
+    drop(continuation_capture);
+    drop(action_args);
+    drop(retry);
+    vm.remove_root(environment_root).unwrap();
+}
+
+#[test]
+fn p13_f_host_callback_parked_continuation_is_only_marker_root() {
+    let (_, language, runtime_profile) = profile();
+    let mut vm = Vm::new_with_profile(runtime_profile).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_coroutine_builtins(environment).unwrap();
+    let marker = vm.allocate_table().unwrap();
+    let marker_handle = rivetlua_runtime::HostHandle::<Value>::new(&mut vm, marker).unwrap();
+    let marker_slot = Rc::new(RefCell::new(Some(Value::Object(marker))));
+    let marker_for_callback = Rc::clone(&marker_slot);
+    let callback = vm
+        .register_callback(
+            &[],
+            Rc::new(move |context, _| {
+                let marker = marker_for_callback
+                    .borrow()
+                    .expect("首次 yield 前有 host 保護的 marker");
+                context.yield_with(
+                    vec![Value::Integer(7)],
+                    CallbackContinuation::new(
+                        vec![marker],
+                        Rc::new(|context, args| {
+                            CallbackResult::Return(vec![
+                                context.capture(0).unwrap(),
+                                args.first().copied().unwrap_or(Value::Nil),
+                            ])
+                        }),
+                    ),
+                )
+            }),
+        )
+        .unwrap();
+    let key = vm.allocate_byte_string(b"host_yield").unwrap();
+    vm.raw_set(
+        environment,
+        Value::Object(key),
+        callback.as_value(&vm).unwrap(),
+    )
+    .unwrap();
+    let mut setup = vm.load_with_environment(
+        compile(b"return coroutine.create(function() return host_yield() end), function(co,...) return coroutine.resume(co,...) end", language),
+        Value::Object(environment),
+    ).unwrap();
+    let RunOutcome::Returned(objects) = setup.run().unwrap() else {
+        panic!("應建立 coroutine/resumer")
+    };
+    drop(setup);
+    let Value::Object(co) = objects[0] else {
+        panic!("應為 coroutine")
+    };
+    let Value::Object(resumer) = objects[1] else {
+        panic!("應為 resumer")
+    };
+    let co_handle = rivetlua_runtime::HostHandle::<Value>::new(&mut vm, co).unwrap();
+    let resumer_handle = rivetlua_runtime::HostHandle::<Value>::new(&mut vm, resumer).unwrap();
+    let mut first = vm
+        .call(Value::Object(resumer), &[Value::Object(co)])
+        .unwrap();
+    assert_eq!(
+        first.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(7)])
+    );
+    drop(first);
+    marker_slot.replace(None);
+    drop(marker_handle);
+    drop(callback);
+    vm.remove_root(environment_root).unwrap();
+    vm.collect().unwrap();
+    assert_eq!(vm.object_kind(marker), Ok(ObjectKind::Table));
+    let mut second = vm
+        .call(
+            Value::Object(resumer),
+            &[Value::Object(co), Value::Integer(42)],
+        )
+        .unwrap();
+    assert_eq!(
+        second.run().unwrap(),
+        RunOutcome::Returned(vec![
+            Value::Boolean(true),
+            Value::Object(marker),
+            Value::Integer(42)
+        ])
+    );
+    drop(second);
+    drop(co_handle);
+    drop(resumer_handle);
+    vm.collect().unwrap();
+    assert_eq!(vm.object_kind(marker), Err(VmError::StaleObject));
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_f_host_callback_unreachable_suspended_continuation_cycle_is_collected() {
+    let (_, language, runtime_profile) = profile();
+    let mut vm = Vm::new_with_profile(runtime_profile).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_coroutine_builtins(environment).unwrap();
+    let co_slot = Rc::new(RefCell::new(None));
+    let co_for_callback = Rc::clone(&co_slot);
+    let callback = vm
+        .register_callback(
+            &[],
+            Rc::new(move |context, _| {
+                let co = co_for_callback
+                    .borrow()
+                    .expect("首次 yield 前有 host 保護的 coroutine");
+                context.yield_with(
+                    vec![Value::Integer(1)],
+                    CallbackContinuation::new(
+                        vec![co],
+                        Rc::new(|_, _| CallbackResult::Return(vec![Value::Integer(2)])),
+                    ),
+                )
+            }),
+        )
+        .unwrap();
+    let key = vm.allocate_byte_string(b"host_cycle").unwrap();
+    vm.raw_set(
+        environment,
+        Value::Object(key),
+        callback.as_value(&vm).unwrap(),
+    )
+    .unwrap();
+    let mut setup = vm.load_with_environment(
+        compile(b"return coroutine.create(function() return host_cycle() end), function(co) return coroutine.resume(co) end", language),
+        Value::Object(environment),
+    ).unwrap();
+    let RunOutcome::Returned(objects) = setup.run().unwrap() else {
+        panic!("應建立 coroutine/resumer")
+    };
+    drop(setup);
+    let Value::Object(co) = objects[0] else {
+        panic!("應為 coroutine")
+    };
+    let Value::Object(resumer) = objects[1] else {
+        panic!("應為 resumer")
+    };
+    let co_handle = rivetlua_runtime::HostHandle::<Value>::new(&mut vm, co).unwrap();
+    let resumer_handle = rivetlua_runtime::HostHandle::<Value>::new(&mut vm, resumer).unwrap();
+    co_slot.replace(Some(Value::Object(co)));
+    let mut first = vm
+        .call(Value::Object(resumer), &[Value::Object(co)])
+        .unwrap();
+    assert_eq!(
+        first.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(1)])
+    );
+    drop(first);
+    co_slot.replace(None);
+    drop(co_handle);
+    drop(resumer_handle);
+    drop(callback);
+    vm.remove_root(environment_root).unwrap();
+    vm.collect().unwrap();
+    assert_eq!(vm.object_kind(co), Err(VmError::StaleObject));
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_f_host_new_coroutine_and_resume_share_vm_state_and_reject_foreign_values() {
+    let (_, language, runtime_profile) = profile();
+    let mut vm = Vm::new_with_profile(runtime_profile).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_coroutine_builtins(environment).unwrap();
+    let mut setup = vm
+        .load_with_environment(
+            compile(
+                b"return function(x) coroutine.yield(x+1); return x+2 end",
+                language,
+            ),
+            Value::Object(environment),
+        )
+        .unwrap();
+    let RunOutcome::Returned(values) = setup.run().unwrap() else {
+        panic!("應建立 closure")
+    };
+    drop(setup);
+    let coroutine = vm.new_coroutine(values[0]).unwrap();
+    let coroutine_value = coroutine.as_value(&vm).unwrap();
+    vm.inject_failure_once(FailPoint::RootReserve);
+    assert_eq!(
+        vm.resume(coroutine_value, &[]).err().unwrap().kind,
+        RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::RootReserve))
+    );
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    let mut exhausted = vm.resume(coroutine_value, &[Value::Integer(10)]).unwrap();
+    exhausted.set_fuel(0).unwrap();
+    assert_eq!(
+        exhausted.run().unwrap(),
+        RunOutcome::Aborted(AbortReason::FuelExhausted)
+    );
+    drop(exhausted);
+    let mut first = vm.resume(coroutine_value, &[Value::Integer(10)]).unwrap();
+    assert_eq!(
+        first.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(11)])
+    );
+    drop(first);
+    vm.collect().unwrap();
+    let mut second = vm.resume(coroutine_value, &[Value::Integer(99)]).unwrap();
+    assert_eq!(
+        second.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(12)])
+    );
+    drop(second);
+    let mut foreign = Vm::new().unwrap();
+    let foreign_value = Value::Object(foreign.allocate_table().unwrap());
+    assert_eq!(
+        vm.new_coroutine(foreign_value).err(),
+        Some(VmError::WrongVm)
+    );
+    assert_eq!(
+        vm.resume(foreign_value, &[]).err().unwrap().kind,
+        RuntimeErrorKind::Heap(VmError::WrongVm)
+    );
+    assert_eq!(
+        vm.resume(coroutine_value, &[foreign_value])
+            .err()
+            .unwrap()
+            .kind,
+        RuntimeErrorKind::Heap(VmError::WrongVm)
+    );
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    drop(coroutine);
+    vm.remove_root(environment_root).unwrap();
+}
+
+#[test]
+fn p13_f_host_callback_return_and_continuation_budget_fail_then_retry() {
+    let mut vm = Vm::new().unwrap();
+    let large_return = vm
+        .register_callback(
+            &[],
+            Rc::new(|_, _| CallbackResult::Return(vec![Value::Integer(1); 4_096])),
+        )
+        .unwrap();
+    let target = large_return.as_value(&vm).unwrap();
+    let probe = vm.ledger_probe();
+    let constructed = {
+        let _execution = vm.call(target, &[]).unwrap();
+        probe.snapshot().committed
+    };
+    vm.set_allocation_limit(constructed + 8_192);
+    let mut execution = vm.call(target, &[]).unwrap();
+    assert_eq!(
+        execution.run().err().unwrap().kind,
+        RuntimeErrorKind::Heap(VmError::AllocationFailed)
+    );
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    vm.set_allocation_limit(usize::MAX);
+
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    let key = vm.allocate_byte_string(b"type").unwrap();
+    let type_target = vm.raw_get(environment, Value::Object(key)).unwrap();
+    let large_capture = vm
+        .register_callback(
+            &[type_target],
+            Rc::new(|context, _| {
+                context.call(
+                    context.capture(0).unwrap(),
+                    vec![Value::Integer(1)],
+                    CallbackContinuation::new(
+                        vec![Value::Integer(7); 4_096],
+                        Rc::new(|_, values| CallbackResult::Return(values.to_vec())),
+                    ),
+                )
+            }),
+        )
+        .unwrap();
+    let target = large_capture.as_value(&vm).unwrap();
+    let constructed = {
+        let _execution = vm.call(target, &[]).unwrap();
+        probe.snapshot().committed
+    };
+    vm.set_allocation_limit(constructed + 8_192);
+    let mut execution = vm.call(target, &[]).unwrap();
+    assert_eq!(
+        execution.run().err().unwrap().kind,
+        RuntimeErrorKind::Heap(VmError::AllocationFailed)
+    );
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    vm.set_allocation_limit(usize::MAX);
+    let retry = vm
+        .register_callback(
+            &[],
+            Rc::new(|_, _| CallbackResult::Return(vec![Value::Integer(9)])),
+        )
+        .unwrap();
+    let mut execution = vm.call(retry.as_value(&vm).unwrap(), &[]).unwrap();
+    assert_eq!(
+        execution.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(9)])
+    );
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    drop(retry);
+    drop(large_return);
+    drop(large_capture);
+    vm.remove_root(environment_root).unwrap();
+}
+
+#[test]
+fn p13_f_host_callback_yield_rejects_foreign_values_and_recovers() {
+    let (_, language, runtime_profile) = profile();
+    let mut foreign = Vm::new().unwrap();
+    let foreign_value = Value::Object(foreign.allocate_table().unwrap());
+    let mut vm = Vm::new_with_profile(runtime_profile).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_coroutine_builtins(environment).unwrap();
+    let callback = vm
+        .register_callback(
+            &[],
+            Rc::new(move |context, _| {
+                context.yield_with(
+                    vec![foreign_value],
+                    CallbackContinuation::new(
+                        vec![],
+                        Rc::new(|_, values| CallbackResult::Return(values.to_vec())),
+                    ),
+                )
+            }),
+        )
+        .unwrap();
+    let key = vm.allocate_byte_string(b"host_foreign_yield").unwrap();
+    vm.raw_set(
+        environment,
+        Value::Object(key),
+        callback.as_value(&vm).unwrap(),
+    )
+    .unwrap();
+    let mut execution = vm.load_with_environment(
+        compile(b"return coroutine.resume(coroutine.create(function() return host_foreign_yield() end))", language),
+        Value::Object(environment),
+    ).unwrap();
+    assert_eq!(
+        execution.run().err().unwrap().kind,
+        RuntimeErrorKind::Heap(VmError::WrongVm)
+    );
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    let mut retry = vm
+        .load_with_environment(compile(b"return 9", language), Value::Object(environment))
+        .unwrap();
+    assert_eq!(
+        retry.run().unwrap(),
+        RunOutcome::Returned(vec![Value::Integer(9)])
+    );
+    drop(retry);
+    drop(callback);
+    vm.remove_root(environment_root).unwrap();
 }
 
 #[test]

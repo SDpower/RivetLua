@@ -1,6 +1,11 @@
 //! P05 P04 resolved AST 到 typed IR 的 deterministic lowering；不產生 RVLU bytes 或 VM 行為。
 
-use crate::ir::{IrClosePath, IrConstant, IrInstruction, IrModule, IrPrototype, IrUpvalue};
+pub mod official;
+
+use crate::ir::{
+    IrClosePath, IrConstant, IrInstruction, IrModule, IrNativeDebug, IrNativeListWrite,
+    IrNativeLocal, IrPrototype, IrUpvalue,
+};
 use crate::{
     BinaryOp, BindingId, BindingKind, ClosePath, ExitKind, FunctionId, LanguageProfile, Literal,
     ResolvedBlock, ResolvedExpr, ResolvedFunction, ResolvedFunctionBody, ResolvedGlobalDeclaration,
@@ -99,6 +104,51 @@ pub fn lower(module: &ResolvedModule, limits: &IrLimits) -> Result<IrModule, IrE
         )?;
         builder.lower_block(body)?;
         prototypes.push(builder.finish(body)?);
+    }
+    let mut needs_hidden = Vec::new();
+    needs_hidden
+        .try_reserve_exact(prototypes.len())
+        .map_err(|_| limit(module.span, "native hidden upvalue 索引配置失敗"))?;
+    needs_hidden.resize(prototypes.len(), false);
+    for index in 0..prototypes.len() {
+        if prototypes[index].native_list_writes.is_empty() {
+            continue;
+        }
+        let mut current = Some(prototypes[index].id);
+        while let Some(id) = current {
+            let position = id.0 as usize;
+            needs_hidden[position] = true;
+            current = prototypes[position].parent;
+        }
+    }
+    let mut guest_counts = Vec::new();
+    guest_counts
+        .try_reserve_exact(prototypes.len())
+        .map_err(|_| limit(module.span, "native guest upvalue 索引配置失敗"))?;
+    guest_counts.extend(prototypes.iter().map(|proto| proto.upvalues.len()));
+    for index in 0..prototypes.len() {
+        if !needs_hidden[index] {
+            continue;
+        }
+        let proto = &prototypes[index];
+        if proto.upvalues.len() >= limits.max_upvalues_per_prototype {
+            return Err(limit(proto.span, "native hidden upvalue 數超過 IR 限制"));
+        }
+        let hidden = UpvalueId(
+            u16::try_from(guest_counts[index])
+                .map_err(|_| limit(proto.span, "native hidden upvalue ID 超過限制"))?,
+        );
+        let source = match proto.parent {
+            Some(parent) => UpvalueSource::ParentUpvalue(crate::resolve::UpvalueId(
+                u32::try_from(guest_counts[parent.0 as usize])
+                    .map_err(|_| limit(proto.span, "parent hidden upvalue ID 超過限制"))?,
+            )),
+            None => UpvalueSource::ParentLocal(proto.global_environment_binding),
+        };
+        prototypes[index]
+            .upvalues
+            .push(IrUpvalue { id: hidden, source });
+        prototypes[index].native_list_write_upvalue = Some(hidden);
     }
     Ok(IrModule {
         profile,
@@ -291,6 +341,11 @@ struct Builder<'a> {
     label_frames: Vec<LabelFrame>,
     pending_gotos: Vec<PendingGoto>,
     loops: Vec<LoopFrame>,
+    debug_locals: Vec<IrNativeLocal>,
+    debug_active: Vec<usize>,
+    debug_scopes: Vec<usize>,
+    debug_max_active: u16,
+    native_list_writes: Vec<IrNativeListWrite>,
 }
 
 /// 已在 RHS 計算前依 Lua source 順序求值的 assignment destination。
@@ -326,6 +381,17 @@ struct PendingGoto {
 #[derive(Clone, Debug, Default)]
 struct LoopFrame {
     break_patches: Vec<usize>,
+}
+
+pub(crate) fn lower_scratch_unit_bytes() -> usize {
+    core::mem::size_of::<LabelFrame>()
+        + core::mem::size_of::<LabelEntry>()
+        + core::mem::size_of::<PendingGoto>()
+        + core::mem::size_of::<LoopFrame>()
+        + core::mem::size_of::<PreparedAssignmentTarget>()
+        + core::mem::size_of::<IrNativeLocal>()
+        + core::mem::size_of::<IrNativeListWrite>()
+        + core::mem::size_of::<(BindingId, Register)>()
 }
 
 impl<'a> Builder<'a> {
@@ -411,7 +477,15 @@ impl<'a> Builder<'a> {
                 register: environment_slot(parent_function, global_environment_binding, span)?,
             }
         };
-        Ok(Self {
+        let mut debug_locals = Vec::new();
+        debug_locals
+            .try_reserve_exact(function.bindings.len())
+            .map_err(|_| limit(span, "native debug local 配置失敗"))?;
+        let mut debug_active = Vec::new();
+        debug_active
+            .try_reserve_exact(function.bindings.len())
+            .map_err(|_| limit(span, "native debug active 配置失敗"))?;
+        let mut builder = Self {
             function,
             id,
             parent,
@@ -433,11 +507,86 @@ impl<'a> Builder<'a> {
             label_frames: Vec::new(),
             pending_gotos: Vec::new(),
             loops: Vec::new(),
-        })
+            debug_locals,
+            debug_active,
+            debug_scopes: Vec::new(),
+            debug_max_active: 0,
+            native_list_writes: Vec::new(),
+        };
+        if let Some(body) = function_body {
+            for parameter in &body.parameters {
+                builder.activate_debug_binding(parameter.binding, 0, 0, parameter.span)?;
+            }
+            if let Some(binding) = body.vararg.as_ref().and_then(|vararg| vararg.table_binding) {
+                builder.activate_debug_binding(binding, 0, 0, body.span)?;
+            }
+        }
+        Ok(builder)
+    }
+
+    fn activate_debug_binding(
+        &mut self,
+        binding: BindingId,
+        initialized_pc: usize,
+        start_pc: usize,
+        span: Span,
+    ) -> Result<(), IrError> {
+        if self.debug_locals.len() >= usize::from(self.limits.max_registers) {
+            return Err(limit(span, "native debug local 數超過 IR register 限制"));
+        }
+        let register = self.binding_register(binding, span)?;
+        let slot = u16::try_from(self.debug_active.len())
+            .map_err(|_| limit(span, "native debug local slot 溢位"))?;
+        let initialized_pc = u32::try_from(initialized_pc)
+            .map_err(|_| limit(span, "native debug 初始化 PC 溢位"))?;
+        let start_pc =
+            u32::try_from(start_pc).map_err(|_| limit(span, "native debug 起始 PC 溢位"))?;
+        self.debug_locals.push(IrNativeLocal {
+            binding,
+            register,
+            slot,
+            initialized_pc,
+            start_pc,
+            end_pc: u32::MAX,
+        });
+        self.debug_active.push(self.debug_locals.len() - 1);
+        self.debug_max_active = self.debug_max_active.max(slot.saturating_add(1));
+        Ok(())
+    }
+
+    fn end_debug_scope(&mut self, span: Span) -> Result<(), IrError> {
+        let count = self
+            .debug_scopes
+            .pop()
+            .ok_or_else(|| invalid(span, "native debug scope stack 不一致"))?;
+        let end_pc = u32::try_from(self.instructions.len())
+            .map_err(|_| limit(span, "native debug 結束 PC 溢位"))?;
+        while self.debug_active.len() > count {
+            let index = self
+                .debug_active
+                .pop()
+                .ok_or_else(|| invalid(span, "native debug active stack 不一致"))?;
+            self.debug_locals[index].end_pc = end_pc;
+        }
+        Ok(())
+    }
+
+    fn begin_debug_scope(&mut self, span: Span) -> Result<(), IrError> {
+        if self.debug_scopes.len() >= self.limits.max_instructions {
+            return Err(limit(span, "native debug scope 深度超過 IR 限制"));
+        }
+        self.debug_scopes
+            .try_reserve(1)
+            .map_err(|_| limit(span, "native debug scope 配置失敗"))?;
+        self.debug_scopes.push(self.debug_active.len());
+        Ok(())
     }
 
     fn finish(mut self, body: &ResolvedBlock) -> Result<IrPrototype, IrError> {
-        if !self.label_frames.is_empty() || !self.pending_gotos.is_empty() || !self.loops.is_empty()
+        if !self.label_frames.is_empty()
+            || !self.pending_gotos.is_empty()
+            || !self.loops.is_empty()
+            || !self.debug_scopes.is_empty()
         {
             return Err(invalid(
                 self.span,
@@ -476,6 +625,11 @@ impl<'a> Builder<'a> {
         self.validate_environment_source()?;
         self.validate_open_results()?;
         let instruction_len = self.instructions.len();
+        let end_pc = u32::try_from(instruction_len)
+            .map_err(|_| limit(self.span, "native debug 結束 PC 溢位"))?;
+        for index in self.debug_active.drain(..) {
+            self.debug_locals[index].end_pc = end_pc;
+        }
         for instruction in &self.instructions {
             match instruction.instruction {
                 Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. }
@@ -512,7 +666,7 @@ impl<'a> Builder<'a> {
             u16::try_from(body.parameters.len())
                 .map_err(|_| limit(self.span, "parameter 數超過 IR 限制"))
         })?;
-        let is_variadic = self.function_body.is_some_and(|body| body.vararg.is_some());
+        let is_variadic = self.function_body.is_none_or(|body| body.vararg.is_some());
         let named_vararg = self.function_body.and_then(|body| {
             body.vararg
                 .as_ref()
@@ -550,6 +704,12 @@ impl<'a> Builder<'a> {
             upvalues,
             instructions: self.instructions,
             close_paths: self.close_paths,
+            native_debug: Some(IrNativeDebug {
+                locals: self.debug_locals,
+                max_active_locals: self.debug_max_active,
+            }),
+            native_list_write_upvalue: None,
+            native_list_writes: self.native_list_writes,
         })
     }
 
@@ -957,6 +1117,7 @@ impl<'a> Builder<'a> {
     }
 
     fn lower_block_statements(&mut self, block: &ResolvedBlock) -> Result<(), IrError> {
+        self.begin_debug_scope(block.span)?;
         self.enter_label_frame(block)?;
         for statement in &block.statements {
             self.lower_statement(statement)?;
@@ -966,7 +1127,8 @@ impl<'a> Builder<'a> {
 
     fn lower_block(&mut self, block: &ResolvedBlock) -> Result<(), IrError> {
         self.lower_block_statements(block)?;
-        self.emit_close(&block.normal_close_path)
+        self.emit_close(&block.normal_close_path)?;
+        self.end_debug_scope(block.span)
     }
 
     fn emit_close(&mut self, path: &ClosePath) -> Result<(), IrError> {
@@ -1058,6 +1220,7 @@ impl<'a> Builder<'a> {
                 ..
             } => {
                 let base = self.lower_fixed_values(values, bindings.len(), *span)?;
+                let initialized_start = self.instructions.len();
                 for (index, binding) in bindings.iter().enumerate() {
                     let dest = self.binding_register(*binding, *span)?;
                     let src = register_offset(base, index, *span)?;
@@ -1076,6 +1239,15 @@ impl<'a> Builder<'a> {
                             )
                         });
                     self.emit(Instruction::Move { dest, src }, *span, close_path)?;
+                }
+                let start_pc = self.instructions.len();
+                for (index, binding) in bindings.iter().enumerate() {
+                    self.activate_debug_binding(
+                        *binding,
+                        initialized_start + index,
+                        start_pc,
+                        *span,
+                    )?;
                 }
                 Ok(())
             }
@@ -1166,6 +1338,7 @@ impl<'a> Builder<'a> {
                 self.lower_block_statements(body)?;
                 let condition_register = self.lower_expr(condition)?;
                 self.emit_close(&body.normal_close_path)?;
+                self.end_debug_scope(body.span)?;
                 self.emit(
                     Instruction::JumpIfFalse {
                         condition: condition_register,
@@ -1252,6 +1425,8 @@ impl<'a> Builder<'a> {
                 // 空 loop body 也必須有可驗證的 CFG entry，避免 Next 的 backedge
                 // 指向自己而失去「回到 body」的語意。
                 let body_start = self.emit_cfg_anchor(*span)?;
+                self.begin_debug_scope(*span)?;
+                self.activate_debug_binding(name.binding, prepare, body_start.0 as usize, *span)?;
                 self.push_loop();
                 self.lower_block(body)?;
                 self.emit(
@@ -1270,7 +1445,8 @@ impl<'a> Builder<'a> {
                 let exit = self.emit_cfg_anchor(*span)?;
                 self.patch_numeric_for_exit(prepare, exit)?;
                 self.patch_numeric_for_exit(next, exit)?;
-                self.finish_loop(exit, *span)
+                self.finish_loop(exit, *span)?;
+                self.end_debug_scope(*span)
             }
             ResolvedStmt::GenericFor {
                 names,
@@ -1400,6 +1576,8 @@ impl<'a> Builder<'a> {
                     *span,
                     None,
                 )?;
+                self.begin_debug_scope(*span)?;
+                let initialized_start = self.instructions.len();
                 for (index, name) in names.iter().enumerate() {
                     let source =
                         Register(
@@ -1420,6 +1598,15 @@ impl<'a> Builder<'a> {
                         None,
                     )?;
                 }
+                let start_pc = self.instructions.len();
+                for (index, name) in names.iter().enumerate() {
+                    self.activate_debug_binding(
+                        name.binding,
+                        initialized_start + index,
+                        start_pc,
+                        name.span,
+                    )?;
+                }
                 self.push_loop();
                 self.lower_block(body)?;
                 self.emit(Instruction::Jump { target: loop_start }, *span, None)?;
@@ -1427,7 +1614,8 @@ impl<'a> Builder<'a> {
                 self.patch_jump(exit_jump, normal_exit)?;
                 self.emit_close(close_path)?;
                 let break_exit = self.emit_cfg_anchor(*span)?;
-                self.finish_loop(break_exit, *span)
+                self.finish_loop(break_exit, *span)?;
+                self.end_debug_scope(*span)
             }
             ResolvedStmt::Function {
                 name, body, span, ..
@@ -1438,7 +1626,14 @@ impl<'a> Builder<'a> {
             ResolvedStmt::LocalFunction { name, body, span } => {
                 let closure = self.lower_function(body)?;
                 let dest = self.binding_register(name.binding, *span)?;
-                self.emit(Instruction::Move { dest, src: closure }, *span, None)
+                let initialized_pc = self.instructions.len();
+                self.emit(Instruction::Move { dest, src: closure }, *span, None)?;
+                self.activate_debug_binding(
+                    name.binding,
+                    initialized_pc,
+                    self.instructions.len(),
+                    *span,
+                )
             }
             ResolvedStmt::Global { declaration, span } => self.lower_global(declaration, *span),
         }
@@ -2104,9 +2299,13 @@ impl<'a> Builder<'a> {
                 let table = self.allocate(*span)?;
                 self.emit(Instruction::NewTable { dest: table }, *span, None)?;
                 let mut array_index = 1i64;
-                for field in fields {
+                for (field_index, field) in fields.iter().enumerate() {
                     match field {
                         ResolvedTableField::Array { value, span, .. } => {
+                            if field_index + 1 == fields.len() && self.is_open_expression(value) {
+                                self.lower_open_array_field(table, array_index, value, *span)?;
+                                continue;
+                            }
                             let key = self.constant_register(
                                 IrConstant::Literal(Literal::Integer(Number::Integer(array_index))),
                                 *span,
@@ -2136,6 +2335,95 @@ impl<'a> Builder<'a> {
                 Ok(table)
             }
         }
+    }
+
+    fn lower_open_array_field(
+        &mut self,
+        table: Register,
+        first: i64,
+        value: &ResolvedExpr,
+        span: Span,
+    ) -> Result<(), IrError> {
+        let base = self.reserve_registers(5, span)?;
+        let source_upvalue = UpvalueId(
+            u16::try_from(self.function.upvalues.len())
+                .map_err(|_| limit(span, "native RawListWrite upvalue 超出限制"))?,
+        );
+        let first_id = self.constant(
+            IrConstant::Literal(Literal::Integer(Number::Integer(first))),
+            span,
+        )?;
+        let skip_id = self.constant(
+            IrConstant::Literal(Literal::Integer(Number::Integer(0))),
+            span,
+        )?;
+        self.emit(
+            Instruction::GetUpvalue {
+                dest: base,
+                upvalue: source_upvalue,
+            },
+            span,
+            None,
+        )?;
+        self.emit(
+            Instruction::Move {
+                dest: register_offset(base, 1, span)?,
+                src: table,
+            },
+            span,
+            None,
+        )?;
+        self.emit(
+            Instruction::LoadConst {
+                dest: register_offset(base, 2, span)?,
+                constant: first_id,
+            },
+            span,
+            None,
+        )?;
+        self.emit(
+            Instruction::LoadConst {
+                dest: register_offset(base, 3, span)?,
+                constant: skip_id,
+            },
+            span,
+            None,
+        )?;
+        self.lower_open_expression_at(
+            value,
+            register_offset(base, 4, span)?,
+            ResultMode::All,
+            span,
+        )?;
+        let call_pc = InstructionOffset(
+            u32::try_from(self.instructions.len())
+                .map_err(|_| limit(span, "native RawListWrite PC 超出限制"))?,
+        );
+        self.emit(
+            Instruction::Call {
+                base,
+                arg_count: u16::MAX,
+                result_mode: ResultMode::Fixed(0),
+            },
+            span,
+            None,
+        )?;
+        self.emit(
+            Instruction::LoadNil {
+                start: base,
+                count: 1,
+            },
+            span,
+            None,
+        )?;
+        self.native_list_writes
+            .try_reserve(1)
+            .map_err(|_| limit(span, "native RawListWrite 宣告配置失敗"))?;
+        self.native_list_writes.push(IrNativeListWrite {
+            call_pc,
+            function_register: base,
+        });
+        Ok(())
     }
 
     fn lower_function(&mut self, body: &ResolvedFunctionBody) -> Result<Register, IrError> {
@@ -2719,10 +3007,399 @@ pub fn emit(
     module: &IrModule,
     limits: &rivetlua_core::VerifyLimits,
 ) -> Result<rivetlua_core::EncodedModule, rivetlua_core::BytecodeError> {
-    rivetlua_core::encode_module(bytecode_module(module)?, module.profile, limits)
+    emit_candidate(module, bytecode_module(module)?, limits)
 }
 
-fn bytecode_module(
+pub(crate) fn emit_candidate(
+    module: &IrModule,
+    candidate: rivetlua_core::BytecodeModule,
+    limits: &rivetlua_core::VerifyLimits,
+) -> Result<rivetlua_core::EncodedModule, rivetlua_core::BytecodeError> {
+    let encoded = rivetlua_core::encode_module(candidate, module.profile, limits)?;
+    if module
+        .prototypes
+        .iter()
+        .all(|proto| proto.native_list_writes.is_empty())
+    {
+        return Ok(encoded);
+    }
+    let mut calls = Vec::new();
+    let call_count = module.prototypes.iter().try_fold(0usize, |total, proto| {
+        total
+            .checked_add(proto.native_list_writes.len())
+            .ok_or_else(|| native_debug_limit("native RawListWrite 宣告數溢位"))
+    })?;
+    calls
+        .try_reserve_exact(call_count)
+        .map_err(|_| native_debug_allocation("native RawListWrite 宣告配置失敗"))?;
+    for proto in &module.prototypes {
+        for declaration in &proto.native_list_writes {
+            let base = declaration.function_register;
+            let register = |offset: u16| {
+                base.0
+                    .checked_add(offset)
+                    .map(Register)
+                    .ok_or_else(|| native_debug_limit("native RawListWrite register 溢位"))
+            };
+            let mut inputs = Vec::new();
+            inputs
+                .try_reserve_exact(3)
+                .map_err(|_| native_debug_allocation("native RawListWrite inputs 配置失敗"))?;
+            inputs.extend([register(1)?, register(2)?, register(3)?]);
+            calls.push(rivetlua_core::OfficialPlanCall {
+                prototype: proto.id,
+                call_pc: declaration.call_pc,
+                function_register: base,
+                source_upvalue: proto.native_list_write_upvalue.ok_or_else(|| {
+                    native_debug_verify("native RawListWrite hidden upvalue 缺失")
+                })?,
+                inputs,
+                open_tail: Some(register(4)?),
+                builtin: rivetlua_core::OfficialPlanBuiltin::RawListWrite,
+            });
+        }
+    }
+    let candidate = rivetlua_core::native_builtin_candidate_from_calls(encoded.verified(), calls)?;
+    encoded.with_native_builtin_plan(candidate, limits)
+}
+
+fn native_debug_allocation(message: &'static str) -> rivetlua_core::BytecodeError {
+    rivetlua_core::BytecodeError {
+        code: rivetlua_core::BytecodeErrorCode::AllocationFailed,
+        offset: 0,
+        message: message.into(),
+    }
+}
+
+fn native_debug_limit(message: &'static str) -> rivetlua_core::BytecodeError {
+    rivetlua_core::BytecodeError {
+        code: rivetlua_core::BytecodeErrorCode::CompileLimit,
+        offset: 0,
+        message: message.into(),
+    }
+}
+
+fn native_debug_verify(message: &'static str) -> rivetlua_core::BytecodeError {
+    rivetlua_core::BytecodeError {
+        code: rivetlua_core::BytecodeErrorCode::Verify,
+        offset: 0,
+        message: message.into(),
+    }
+}
+
+fn native_debug_charge(
+    work: &mut rivetlua_core::OfficialWorkBudget,
+    count: usize,
+) -> Result<(), rivetlua_core::BytecodeError> {
+    work.charge(count, ProtoId(0), 0)
+        .map_err(|_| native_debug_limit("native debug 編譯 work 額度耗盡"))
+}
+
+fn native_debug_name<'a>(
+    function: &ResolvedFunction,
+    upvalue: usize,
+    functions: &'a [ResolvedFunction],
+    depth: usize,
+    work: &mut rivetlua_core::OfficialWorkBudget,
+) -> Result<Option<&'a [u8]>, rivetlua_core::BytecodeError> {
+    native_debug_charge(work, functions.len())?;
+    if depth > functions.len() {
+        return Err(native_debug_verify("native debug upvalue parent 循環"));
+    }
+    let Some(parent_id) = function.parent else {
+        return Ok(None);
+    };
+    let parent = functions
+        .iter()
+        .find(|candidate| candidate.id == parent_id)
+        .ok_or_else(|| native_debug_verify("native debug upvalue parent 不存在"))?;
+    match function.upvalues.get(upvalue) {
+        Some(UpvalueSource::ParentLocal(binding)) => {
+            native_debug_charge(work, parent.bindings.len())?;
+            Ok(parent
+                .bindings
+                .iter()
+                .find(|candidate| candidate.id == *binding)
+                .map(|binding| binding.name.as_slice()))
+        }
+        Some(UpvalueSource::ParentUpvalue(id)) => {
+            native_debug_name(parent, id.0 as usize, functions, depth + 1, work)
+        }
+        None => Err(native_debug_verify("native debug upvalue index 無效")),
+    }
+}
+
+fn native_debug_add(
+    allocated: &mut usize,
+    bytes: usize,
+    limit: usize,
+) -> Result<(), rivetlua_core::BytecodeError> {
+    *allocated = allocated
+        .checked_add(bytes)
+        .filter(|sum| *sum <= limit)
+        .ok_or_else(|| native_debug_limit("native debug 配置額度超限"))?;
+    Ok(())
+}
+
+fn native_debug_clone(
+    bytes: &[u8],
+    allocated: &mut usize,
+    limit: usize,
+    work: &mut rivetlua_core::OfficialWorkBudget,
+) -> Result<Vec<u8>, rivetlua_core::BytecodeError> {
+    native_debug_charge(work, bytes.len())?;
+    native_debug_add(allocated, bytes.len(), limit)?;
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(bytes.len())
+        .map_err(|_| native_debug_limit("native debug 字串配置失敗"))?;
+    native_debug_add(allocated, copy.capacity() - bytes.len(), limit)?;
+    copy.extend_from_slice(bytes);
+    Ok(copy)
+}
+
+/// 編譯期來源資料只附於 P05 VerifiedModule，原 `emit` 與 RVLU_V2 wire 保持不變。
+pub fn emit_with_native_debug(
+    module: &IrModule,
+    resolved: &ResolvedModule,
+    source: &[u8],
+    chunk_name: &[u8],
+    limits: &rivetlua_core::VerifyLimits,
+) -> Result<rivetlua_core::EncodedModule, rivetlua_core::BytecodeError> {
+    emit_with_native_debug_candidate(
+        module,
+        resolved,
+        source,
+        chunk_name,
+        limits,
+        bytecode_module(module)?,
+    )
+}
+
+pub(crate) fn emit_with_native_debug_candidate(
+    module: &IrModule,
+    resolved: &ResolvedModule,
+    source: &[u8],
+    chunk_name: &[u8],
+    limits: &rivetlua_core::VerifyLimits,
+    candidate: rivetlua_core::BytecodeModule,
+) -> Result<rivetlua_core::EncodedModule, rivetlua_core::BytecodeError> {
+    if source.len() > limits.max_artifact_bytes
+        || chunk_name.len() > limits.max_artifact_bytes
+        || module.prototypes.len() != resolved.functions.len()
+    {
+        return Err(native_debug_limit("native debug 來源或 prototype 超限"));
+    }
+    let mut work = rivetlua_core::OfficialWorkBudget::for_limits(limits)
+        .map_err(|_| native_debug_limit("native debug work 額度計算溢位"))?;
+    native_debug_charge(&mut work, source.len())?;
+    let line_count = source
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        .checked_add(1)
+        .ok_or_else(|| native_debug_limit("native debug 行數溢位"))?;
+    let line_bytes = line_count
+        .checked_mul(core::mem::size_of::<usize>())
+        .ok_or_else(|| native_debug_limit("native debug 行索引大小溢位"))?;
+    let mut allocated = core::mem::size_of::<rivetlua_core::NativeDebugCandidate>();
+    native_debug_add(&mut allocated, line_bytes, limits.max_artifact_bytes)?;
+    if line_bytes > limits.max_artifact_bytes {
+        return Err(native_debug_limit("native debug 行索引配置額度超限"));
+    }
+    let mut line_starts = Vec::new();
+    line_starts
+        .try_reserve_exact(line_count)
+        .map_err(|_| native_debug_limit("native debug 行索引配置失敗"))?;
+    native_debug_add(
+        &mut allocated,
+        (line_starts.capacity() - line_count) * core::mem::size_of::<usize>(),
+        limits.max_artifact_bytes,
+    )?;
+    line_starts.push(0usize);
+    native_debug_charge(&mut work, source.len())?;
+    for (index, byte) in source.iter().enumerate() {
+        if *byte == b'\n' {
+            line_starts.push(index + 1);
+        }
+    }
+    let line_at = |offset: usize| -> Result<u32, rivetlua_core::BytecodeError> {
+        if offset > source.len() {
+            return Err(native_debug_verify("native debug span 超出來源"));
+        }
+        u32::try_from(line_starts.partition_point(|start| *start <= offset))
+            .map_err(|_| native_debug_limit("native debug 行號超出 u32"))
+    };
+    let source_name = native_debug_clone(
+        chunk_name,
+        &mut allocated,
+        limits.max_artifact_bytes,
+        &mut work,
+    )?;
+    let proto_bytes = module
+        .prototypes
+        .len()
+        .checked_mul(core::mem::size_of::<rivetlua_core::NativePrototypeDebug>())
+        .ok_or_else(|| native_debug_limit("native debug prototype 大小溢位"))?;
+    native_debug_add(&mut allocated, proto_bytes, limits.max_artifact_bytes)?;
+    let mut prototypes = Vec::new();
+    prototypes
+        .try_reserve_exact(module.prototypes.len())
+        .map_err(|_| native_debug_limit("native debug prototype 配置失敗"))?;
+    native_debug_add(
+        &mut allocated,
+        (prototypes.capacity() - module.prototypes.len())
+            * core::mem::size_of::<rivetlua_core::NativePrototypeDebug>(),
+        limits.max_artifact_bytes,
+    )?;
+    for proto in &module.prototypes {
+        native_debug_charge(&mut work, resolved.functions.len())?;
+        let function = resolved
+            .functions
+            .iter()
+            .find(|function| function.id == proto.function)
+            .ok_or_else(|| native_debug_verify("native debug function 不存在"))?;
+        let Some(debug) = proto.native_debug.as_ref() else {
+            return Err(native_debug_verify("native debug IR metadata 缺失"));
+        };
+        native_debug_charge(
+            &mut work,
+            proto
+                .instructions
+                .len()
+                .checked_add(debug.locals.len())
+                .ok_or_else(|| native_debug_limit("native debug work 溢位"))?,
+        )?;
+        let search_units = proto
+            .instructions
+            .len()
+            .checked_add(2)
+            .and_then(|count| count.checked_mul(usize::BITS as usize))
+            .ok_or_else(|| native_debug_limit("native debug line lookup work 溢位"))?;
+        native_debug_charge(&mut work, search_units)?;
+        allocated = allocated
+            .checked_add(
+                proto
+                    .instructions
+                    .len()
+                    .checked_mul(core::mem::size_of::<u32>())
+                    .ok_or_else(|| native_debug_limit("native debug lines 大小溢位"))?,
+            )
+            .filter(|sum| *sum <= limits.max_artifact_bytes)
+            .ok_or_else(|| native_debug_limit("native debug lines 配置超限"))?;
+        let mut lines = Vec::new();
+        lines
+            .try_reserve_exact(proto.instructions.len())
+            .map_err(|_| native_debug_limit("native debug lines 配置失敗"))?;
+        native_debug_add(
+            &mut allocated,
+            (lines.capacity() - proto.instructions.len()) * core::mem::size_of::<u32>(),
+            limits.max_artifact_bytes,
+        )?;
+        for entry in &proto.instructions {
+            lines.push(line_at(entry.span.start_byte)?);
+        }
+        allocated = allocated
+            .checked_add(
+                debug
+                    .locals
+                    .len()
+                    .checked_mul(core::mem::size_of::<rivetlua_core::NativeLocal>())
+                    .ok_or_else(|| native_debug_limit("native debug local 大小溢位"))?,
+            )
+            .filter(|sum| *sum <= limits.max_artifact_bytes)
+            .ok_or_else(|| native_debug_limit("native debug local 配置超限"))?;
+        let mut locals = Vec::new();
+        locals
+            .try_reserve_exact(debug.locals.len())
+            .map_err(|_| native_debug_limit("native debug local 配置失敗"))?;
+        native_debug_add(
+            &mut allocated,
+            (locals.capacity() - debug.locals.len())
+                * core::mem::size_of::<rivetlua_core::NativeLocal>(),
+            limits.max_artifact_bytes,
+        )?;
+        for local in &debug.locals {
+            native_debug_charge(&mut work, function.bindings.len())?;
+            let binding = function
+                .bindings
+                .iter()
+                .find(|binding| binding.id == local.binding)
+                .ok_or_else(|| native_debug_verify("native debug binding 不存在"))?;
+            let slot = u8::try_from(local.slot)
+                .map_err(|_| native_debug_limit("native debug local slot 超出官方範圍"))?;
+            let name = native_debug_clone(
+                &binding.name,
+                &mut allocated,
+                limits.max_artifact_bytes,
+                &mut work,
+            )?;
+            locals.push(rivetlua_core::NativeLocal {
+                binding: bytecode_binding(local.binding),
+                register: local.register,
+                slot,
+                initialized_pc: local.initialized_pc,
+                start_pc: local.start_pc,
+                end_pc: local.end_pc,
+                name,
+            });
+        }
+        allocated = allocated
+            .checked_add(
+                proto
+                    .upvalues
+                    .len()
+                    .checked_mul(core::mem::size_of::<Option<Vec<u8>>>())
+                    .ok_or_else(|| native_debug_limit("native debug upvalue 名稱大小溢位"))?,
+            )
+            .filter(|sum| *sum <= limits.max_artifact_bytes)
+            .ok_or_else(|| native_debug_limit("native debug upvalue 名稱配置超限"))?;
+        let mut upvalue_names = Vec::new();
+        upvalue_names
+            .try_reserve_exact(proto.upvalues.len())
+            .map_err(|_| native_debug_limit("native debug upvalue 名稱配置失敗"))?;
+        native_debug_add(
+            &mut allocated,
+            (upvalue_names.capacity() - proto.upvalues.len())
+                * core::mem::size_of::<Option<Vec<u8>>>(),
+            limits.max_artifact_bytes,
+        )?;
+        for index in 0..proto.upvalues.len() {
+            let name = if index < function.upvalues.len() {
+                native_debug_name(function, index, &resolved.functions, 0, &mut work)?
+            } else {
+                None
+            };
+            upvalue_names.push(
+                name.map(|name| {
+                    native_debug_clone(name, &mut allocated, limits.max_artifact_bytes, &mut work)
+                })
+                .transpose()?,
+            );
+        }
+        prototypes.push(rivetlua_core::NativePrototypeDebug {
+            prototype: proto.id,
+            line_defined: line_at(proto.span.start_byte)?,
+            last_line_defined: line_at(proto.span.end_byte.saturating_sub(1))?,
+            lines,
+            locals,
+            upvalue_names,
+            max_active_locals: u8::try_from(debug.max_active_locals)
+                .map_err(|_| native_debug_limit("native debug active local 超出官方範圍"))?,
+        });
+    }
+    drop(line_starts);
+    let encoded = emit_candidate(module, candidate, limits)?;
+    encoded.with_native_debug(
+        rivetlua_core::NativeDebugCandidate {
+            source_name,
+            prototypes,
+        },
+        limits,
+        &mut work,
+    )
+}
+
+pub(crate) fn bytecode_module(
     module: &IrModule,
 ) -> Result<rivetlua_core::BytecodeModule, rivetlua_core::BytecodeError> {
     Ok(rivetlua_core::BytecodeModule {

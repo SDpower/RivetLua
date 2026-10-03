@@ -372,23 +372,24 @@ pub fn resolve(
         scopes: Vec::new(),
         loops: Vec::new(),
         parent_metadata: HashMap::new(),
-        vararg_available: false,
+        vararg_available: true,
         vararg_binding: None,
         label_count: 0,
         goto_count: 0,
         parent_visible: None,
+        root_environment_binding: None,
         inherited_global_mode: None,
         implicit_globals: HashMap::new(),
         completed_functions: Vec::new(),
     };
     resolver.enter_scope(module.span)?;
-    resolver.declare_binding(
+    resolver.root_environment_binding = Some(resolver.declare_binding(
         b"_ENV".to_vec(),
         module.span,
         None,
         BindingKind::Environment,
         false,
-    )?;
+    )?);
     let root = resolver.resolve_block(&module.root)?;
     resolver.scopes.pop();
     let mut functions = vec![ResolvedFunction {
@@ -467,6 +468,7 @@ struct Resolver<'a> {
     label_count: usize,
     goto_count: usize,
     parent_visible: Option<HashMap<Vec<u8>, ParentBinding>>,
+    root_environment_binding: Option<BindingId>,
     inherited_global_mode: Option<bool>,
     implicit_globals: HashMap<Vec<u8>, BindingId>,
     completed_functions: Vec<ResolvedFunction>,
@@ -874,6 +876,18 @@ impl<'a> Resolver<'a> {
             }),
             Expr::Name { name, span } => {
                 let resolution = match self.lookup(name, *span)? {
+                    Some(ResolvedName::Global(binding))
+                        if self.profile == LanguageProfile::Lua55 =>
+                    {
+                        if let Some(env) = self.lexical_environment_shadow(*span)? {
+                            Some(ResolvedName::EnvField {
+                                env,
+                                name: name.clone(),
+                            })
+                        } else {
+                            Some(ResolvedName::Global(binding))
+                        }
+                    }
                     Some(resolution) => Some(resolution),
                     None => self.resolve_free_name(name, *span)?,
                 };
@@ -1213,6 +1227,7 @@ impl<'a> Resolver<'a> {
             label_count: 0,
             goto_count: 0,
             parent_visible: Some(self.visible_bindings()),
+            root_environment_binding: self.root_environment_binding,
             inherited_global_mode: self.effective_global_mode(),
             implicit_globals: HashMap::new(),
             completed_functions: Vec::new(),
@@ -1498,6 +1513,11 @@ impl<'a> Resolver<'a> {
             LanguageProfile::Lua55 => {
                 if self.effective_global_mode() == Some(true) {
                     Ok(None)
+                } else if let Some(env) = self.lexical_environment_shadow(span)? {
+                    Ok(Some(ResolvedName::EnvField {
+                        env,
+                        name: name.to_vec(),
+                    }))
                 } else {
                     Ok(Some(ResolvedName::Global(
                         self.declare_implicit_global(name, span)?,
@@ -1515,6 +1535,39 @@ impl<'a> Resolver<'a> {
                 })),
                 Some(ResolvedName::EnvField { .. } | ResolvedName::Global(_)) | None => Ok(None),
             },
+        }
+    }
+
+    fn lexical_environment_shadow(&mut self, span: Span) -> Result<Option<BindingId>, Diagnostic> {
+        let current = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.bindings.get(b"_ENV".as_slice()).copied());
+        let origin = if let Some(binding) = current {
+            if self.binding_kind(binding) == Some(BindingKind::Global) {
+                return Ok(None);
+            }
+            Some(binding)
+        } else {
+            match self
+                .parent_visible
+                .as_ref()
+                .and_then(|visible| visible.get(b"_ENV".as_slice()))
+            {
+                Some(ParentBinding::Direct(binding) | ParentBinding::Ancestor(binding)) => {
+                    Some(*binding)
+                }
+                Some(ParentBinding::Global(_)) | None => None,
+            }
+        };
+        if origin.is_none() || origin == self.root_environment_binding {
+            return Ok(None);
+        }
+        match self.lookup(b"_ENV", span)? {
+            Some(ResolvedName::Local(env)) => Ok(Some(env)),
+            Some(ResolvedName::Upvalue(upvalue)) => Ok(Some(self.upvalue_binding(upvalue, span)?)),
+            _ => Ok(None),
         }
     }
 

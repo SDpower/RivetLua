@@ -59,7 +59,7 @@ impl Default for LoadLimits {
 }
 
 /// 宿主 callback 必須在每段工作與暫存配置前扣除額度。
-/// compiler 使用 VM 預付的封閉額度；reader 使用逐筆扣除 fuel 與 ledger 的額度。
+/// compiler 與 reader 都逐筆扣除 fuel 與 ledger 的額度。
 /// 任一扣除失敗會持續記錄，callback 即使吞掉錯誤也不能回傳成功結果。
 pub struct LoadBudget<'a> {
     work_left: usize,
@@ -129,18 +129,6 @@ pub(crate) enum LoadBudgetStop {
 }
 
 impl<'a> LoadBudget<'a> {
-    pub(crate) fn new(work: usize, temporary: usize, module_allocation_limit: usize) -> Self {
-        Self {
-            work_left: work,
-            temporary_left: temporary,
-            temporary_claimed: 0,
-            module_allocation_limit,
-            module_claimed: 0,
-            meter: None,
-            stop: None,
-        }
-    }
-
     pub(crate) fn metered(
         work: usize,
         temporary: usize,
@@ -316,6 +304,7 @@ pub trait HostSourceReader {
 pub enum LoadFormat {
     Source,
     RivetBytecode,
+    OfficialBytecode,
 }
 
 pub struct HostModuleBytes {
@@ -358,6 +347,7 @@ pub struct LoadCapability {
     pub(crate) repository: Option<Box<dyn HostModuleRepository>>,
     pub(crate) native: Option<Box<dyn HostNativeLoader>>,
     pub(crate) allow_bytecode: bool,
+    pub(crate) allow_official_bytecode: bool,
     pub(crate) limits: LoadLimits,
     pub(crate) verify_limits: VerifyLimits,
 }
@@ -376,6 +366,7 @@ impl LoadCapability {
             repository: None,
             native: None,
             allow_bytecode: false,
+            allow_official_bytecode: false,
             limits: LoadLimits::default(),
             verify_limits: VerifyLimits::default(),
         }
@@ -406,6 +397,11 @@ impl LoadCapability {
         self
     }
 
+    pub fn with_official_bytecode(mut self, allow: bool) -> Self {
+        self.allow_official_bytecode = allow;
+        self
+    }
+
     pub fn with_limits(mut self, limits: LoadLimits) -> Self {
         self.limits = limits;
         self
@@ -413,6 +409,58 @@ impl LoadCapability {
 
     pub fn with_verify_limits(mut self, limits: VerifyLimits) -> Self {
         self.verify_limits = limits;
+        self
+    }
+}
+
+/// `string.dump` 的上限准入：呼叫前須預扣完整工作與暫存上限，
+/// 結束後依實際工作量退還未用額度。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DumpLimits {
+    pub max_work_units: usize,
+    pub max_temporary_bytes: usize,
+    pub max_encoded_bytes: usize,
+}
+
+impl Default for DumpLimits {
+    fn default() -> Self {
+        Self {
+            max_work_units: 200_000,
+            max_temporary_bytes: 4 * 1024 * 1024,
+            max_encoded_bytes: 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DumpCapability {
+    pub(crate) allowed: bool,
+    pub(crate) limits: DumpLimits,
+}
+
+impl Default for DumpCapability {
+    fn default() -> Self {
+        Self::deny_all()
+    }
+}
+
+impl DumpCapability {
+    pub fn deny_all() -> Self {
+        Self {
+            allowed: false,
+            limits: DumpLimits::default(),
+        }
+    }
+
+    /// 獨立允許官方 bytecode 輸出；不變更載入權限。
+    pub fn with_official_bytecode(mut self, allow: bool) -> Self {
+        self.allowed = allow;
+        self
+    }
+
+    /// 設定預扣上限；成功或錯誤時只保留本次實際耗用的工作額度。
+    pub fn with_limits(mut self, limits: DumpLimits) -> Self {
+        self.limits = limits;
         self
     }
 }
@@ -513,6 +561,7 @@ pub struct HostServices {
     pub(crate) load: LoadCapability,
     pub(crate) resource: ResourceCapability,
     pub(crate) debug: DebugCapability,
+    pub(crate) dump: DumpCapability,
 }
 
 impl HostServices {
@@ -550,6 +599,11 @@ impl HostServices {
 
     pub fn and_debug(mut self, debug: DebugCapability) -> Self {
         self.debug = debug;
+        self
+    }
+
+    pub fn and_dump(mut self, dump: DumpCapability) -> Self {
+        self.dump = dump;
         self
     }
 

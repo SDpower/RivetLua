@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ast;
+pub mod budget;
 pub mod codegen;
 pub mod ir;
 pub mod lexer;
@@ -10,7 +11,13 @@ pub mod parser;
 pub mod resolve;
 
 pub use ast::*;
-pub use codegen::{IrError, emit, lower};
+pub use budget::{BudgetedCompileError, CompileBudgetSink, compile_with_budget};
+pub use codegen::official::{
+    OfficialFixedBuiltin, OfficialFrameInput, OfficialFrameInputSource, OfficialInternalCall,
+    OfficialPcMap, OfficialRootBinding, OfficialRootBindingSource, OfficialTranslation,
+    OfficialTranslationError, OfficialUpvalueMap, translate_official_chunk,
+};
+pub use codegen::{IrError, emit, emit_with_native_debug, lower};
 pub use ir::*;
 pub use lexer::{
     CompileLimits, Diagnostic, DiagnosticCode, Keyword, LanguageProfile, LexedChunk, Literal,

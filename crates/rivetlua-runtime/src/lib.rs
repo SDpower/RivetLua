@@ -4,6 +4,7 @@
 
 mod alloc;
 mod call;
+mod callback;
 mod closure;
 mod coroutine;
 mod errors;
@@ -26,6 +27,7 @@ pub use alloc::{
     AllocationLedger, AllocationSite, AllocationTrace, FailPoint, LedgerProbe, LedgerSnapshot,
 };
 pub use call::PendingCloseSnapshot;
+pub use callback::{CallbackContext, CallbackContinuation, CallbackFn, CallbackResult};
 pub use closure::Closure;
 pub use coroutine::CoroutineState;
 pub use errors::LuaError;
@@ -34,13 +36,14 @@ pub use gc::{FinalizerState, GcAge, GcColor, GcCycleKind, GcMode, GcPhase, GcTra
 pub use handle::HostHandle;
 pub use heap::{ObjectKind, SlotState, Vm, VmError};
 pub use host::{
-    DebugCapability, DebugLimits, DebugPermission, FileOperation, FileReadFormat, FileSeekOrigin,
-    HostCalendar, HostCloseResult, HostDeadline, HostEntropy, HostEntropyError, HostExitStatus,
-    HostFileLease, HostIo, HostIoFailure, HostLoadCompiler, HostLoadError, HostLoadErrorKind,
-    HostModuleBytes, HostModuleRepository, HostNativeLoader, HostNativeModule, HostOs,
-    HostOsOperation, HostOsValue, HostOutput, HostOutputError, HostResourceError,
-    HostResourceErrorKind, HostServices, HostSourceReader, LoadBudget, LoadCapability, LoadFormat,
-    LoadLimits, PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
+    DebugCapability, DebugLimits, DebugPermission, DumpCapability, DumpLimits, FileOperation,
+    FileReadFormat, FileSeekOrigin, HostCalendar, HostCloseResult, HostDeadline, HostEntropy,
+    HostEntropyError, HostExitStatus, HostFileLease, HostIo, HostIoFailure, HostLoadCompiler,
+    HostLoadError, HostLoadErrorKind, HostModuleBytes, HostModuleRepository, HostNativeLoader,
+    HostNativeModule, HostOs, HostOsOperation, HostOsValue, HostOutput, HostOutputError,
+    HostResourceError, HostResourceErrorKind, HostServices, HostSourceReader, LoadBudget,
+    LoadCapability, LoadFormat, LoadLimits, PathEncoding, ResourceBudget, ResourceCapability,
+    ResourceLimits,
 };
 pub use metamethod::MetamethodEvent;
 pub use rivetlua_core::{Generation, ObjectId, SlotId, VmId};

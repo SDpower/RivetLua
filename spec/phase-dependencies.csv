@@ -31,3 +31,5 @@ DA-28,P05,P21,verified module format profile numeric_config,CONTRACTED,P21
 DA-29,P05,P22,effect safe points language/runtime separation,CONTRACTED,P22
 DA-30,P05,P23,RVLU_V2 decoder verifier fuzz target,CONTRACTED,P23
 DA-31,P05,P24,VerifiedModule format_version release identity,CONTRACTED,P24
+DA-32,P05,P13,Lua55 Lua54 official chunk codec translation VerifiedModule,IMPLEMENTED,P13
+DA-33,P05,P14,immutable validated artifact metadata transport,IMPLEMENTED,P14

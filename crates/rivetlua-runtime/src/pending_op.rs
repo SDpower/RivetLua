@@ -3,6 +3,7 @@
 use rivetlua_core::{ObjectRef, Register, ResultMode, Value};
 
 use crate::alloc::{AllocationLedger, FailPoint, checked_bytes, reserve_vec};
+use crate::callback::{CallbackContext, CallbackContinuation, CallbackFn, CallbackResult};
 use crate::stdlib::basic::PrintBuffer;
 use crate::stdlib::format::FormatState;
 use crate::stdlib::gsub::GSubState;
@@ -29,6 +30,11 @@ pub(crate) enum PendingKind {
 }
 
 pub(crate) enum BasicPending {
+    HostCallback {
+        state: HostCallbackPending,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
     DebugHook {
         original: Value,
     },
@@ -111,6 +117,9 @@ pub(crate) enum BasicPending {
 
 impl BasicPending {
     pub(crate) fn clear(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        if let Self::HostCallback { state, .. } = self {
+            state.clear_roots(vm)?;
+        }
         if matches!(self, Self::DebugHook { .. }) {
             vm.set_debug_hook_running(false);
         }
@@ -148,6 +157,68 @@ impl BasicPending {
             state.clear_roots(vm)?;
         }
         Ok(())
+    }
+}
+
+pub(crate) struct HostCallbackPending {
+    callback: std::rc::Rc<CallbackFn>,
+    captures: PrintArguments,
+    arguments: PrintArguments,
+}
+
+impl HostCallbackPending {
+    pub(crate) fn new(
+        vm: &mut Vm,
+        continuation: CallbackContinuation,
+        args: &[Value],
+    ) -> Result<Self, VmError> {
+        let mut captures = PrintArguments::new(vm, &continuation.captures)?;
+        let arguments = match PrintArguments::new(vm, args) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                captures.clear_roots(vm)?;
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            callback: continuation.callback,
+            captures,
+            arguments,
+        })
+    }
+
+    pub(crate) fn invoke(&self, values: &[Value]) -> CallbackResult {
+        (self.callback)(&mut CallbackContext::new(self.captures.values()), values)
+    }
+
+    pub(crate) fn arguments(&self) -> &[Value] {
+        self.arguments.values()
+    }
+
+    pub(crate) fn capture_len(&self) -> usize {
+        self.captures.values().len()
+    }
+
+    pub(crate) fn clear_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        self.arguments.clear_roots(vm)?;
+        self.captures.clear_roots(vm)
+    }
+
+    pub(crate) fn restore_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        self.captures.restore_roots(vm)?;
+        if let Err(error) = self.arguments.restore_roots(vm) {
+            self.captures.clear_roots(vm)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn trace_children(
+        &self,
+        mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
+    ) -> Result<(), VmError> {
+        self.captures.trace_children(&mut visit)?;
+        self.arguments.trace_children(&mut visit)
     }
 }
 
@@ -234,6 +305,7 @@ impl Drop for PrintArguments {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResumeStage {
+    ReadyToInvoke,
     AwaitingReturn,
     Resuming,
 }
@@ -337,6 +409,9 @@ impl PendingOp {
         if let Some(BasicPending::OsCalendarTime { state, .. }) = self.basic.as_mut() {
             state.restore_roots(vm)?;
         }
+        if let Some(BasicPending::HostCallback { state, .. }) = self.basic.as_mut() {
+            state.restore_roots(vm)?;
+        }
         if let Some(BasicPending::Print { arguments, .. }) = self.basic.as_mut() {
             arguments.restore_roots(vm)?;
         }
@@ -383,6 +458,9 @@ impl PendingOp {
             }
         }
         if let Some(BasicPending::OsCalendarTime { state, .. }) = self.basic.as_ref() {
+            state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::HostCallback { state, .. }) = self.basic.as_ref() {
             state.trace_children(&mut visit)?;
         }
         if let Some(BasicPending::Print { arguments, .. }) = self.basic.as_ref() {
@@ -482,6 +560,10 @@ impl PendingStack {
 
     pub(crate) fn last(&self) -> Option<&PendingOp> {
         self.entries.last()
+    }
+
+    pub(crate) fn last_mut(&mut self) -> Option<&mut PendingOp> {
+        self.entries.last_mut()
     }
 
     #[cfg(test)]

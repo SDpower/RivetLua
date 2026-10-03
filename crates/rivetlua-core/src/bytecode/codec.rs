@@ -1,5 +1,7 @@
 //! RVLU v2 little-endian module codec；只做受限結構驗證，不含 VM 或 CFG/dataflow 驗證。
 
+use std::sync::Arc;
+
 use super::{
     BinaryOperation, BytecodeVersion, EnvironmentSource, FrameLayout, Instruction,
     InstructionEffects, InstructionOffset, LuaProfile, ProtoId, RVLU_V1, RVLU_V2, Register,
@@ -13,6 +15,7 @@ pub const RVLU_NUMERIC_I64_F64: u8 = 1;
 pub enum BytecodeErrorCode {
     CompileLimit,
     Verify,
+    AllocationFailed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,6 +36,7 @@ impl std::error::Error for BytecodeError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerifyLimits {
     pub max_module_bytes: usize,
+    pub max_artifact_bytes: usize,
     pub max_prototypes: usize,
     pub max_instructions: usize,
     pub max_constants: usize,
@@ -44,6 +48,7 @@ impl Default for VerifyLimits {
     fn default() -> Self {
         Self {
             max_module_bytes: 16 * 1024 * 1024,
+            max_artifact_bytes: 16 * 1024 * 1024,
             max_prototypes: 4096,
             max_instructions: 100_000,
             max_constants: 100_000,
@@ -151,6 +156,10 @@ pub struct BytecodeModule {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VerifiedModule {
     module: BytecodeModule,
+    transport_scan_units: usize,
+    official_execution: Option<super::official_execution::OfficialExecutionPlan>,
+    official_artifact: Option<Arc<super::official_artifact::OfficialArtifact>>,
+    native_debug: Option<Arc<super::native_debug::NativeDebug>>,
 }
 
 impl VerifiedModule {
@@ -165,6 +174,54 @@ impl VerifiedModule {
     pub fn module(&self) -> &BytecodeModule {
         &self.module
     }
+
+    pub(crate) fn transport_scan_units(&self) -> usize {
+        self.transport_scan_units
+    }
+
+    pub fn official_execution(&self) -> Option<&super::official_execution::OfficialExecutionPlan> {
+        self.official_execution.as_ref()
+    }
+
+    pub fn origin(&self) -> super::official_artifact::ModuleOrigin {
+        if self.official_artifact.is_some() {
+            super::official_artifact::ModuleOrigin::OfficialImport
+        } else {
+            super::official_artifact::ModuleOrigin::NativeRvlu
+        }
+    }
+
+    pub fn official_artifact(&self) -> Option<&super::official_artifact::OfficialArtifact> {
+        self.official_artifact.as_deref()
+    }
+
+    pub fn official_artifact_shared(
+        &self,
+    ) -> Option<Arc<super::official_artifact::OfficialArtifact>> {
+        self.official_artifact.as_ref().map(Arc::clone)
+    }
+
+    pub fn native_debug(&self) -> Option<&super::native_debug::NativeDebug> {
+        self.native_debug.as_deref()
+    }
+
+    pub(crate) fn set_official_execution(
+        &mut self,
+        plan: super::official_execution::OfficialExecutionPlan,
+    ) {
+        self.official_execution = Some(plan);
+    }
+
+    pub(crate) fn set_official_artifact(
+        &mut self,
+        artifact: Arc<super::official_artifact::OfficialArtifact>,
+    ) {
+        self.official_artifact = Some(artifact);
+    }
+
+    pub(crate) fn set_native_debug(&mut self, debug: Arc<super::native_debug::NativeDebug>) {
+        self.native_debug = Some(debug);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -178,8 +235,45 @@ impl EncodedModule {
         &self.bytes
     }
 
+    /// 編譯期暫存的 RVLU writer 實際保留容量。
+    pub fn encoded_bytes_capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
     pub fn verified(&self) -> &VerifiedModule {
         &self.verified
+    }
+
+    /// 消費編碼結果並保留已驗證的不可變模組。
+    pub fn into_verified(self) -> VerifiedModule {
+        self.verified
+    }
+
+    /// Native 靜態 helper 宣告先重新核對 bytecode，才成為不可變私有執行計畫。
+    pub fn with_native_builtin_plan(
+        mut self,
+        candidate: super::official_execution::OfficialPlanCandidate,
+        limits: &VerifyLimits,
+    ) -> Result<Self, BytecodeError> {
+        self.verified = super::official_execution::verify_native_builtin_plan(
+            self.verified,
+            candidate,
+            limits,
+        )?;
+        Ok(self)
+    }
+
+    /// P05 驗證後附加非 wire 的 native debug 資料。
+    pub fn with_native_debug(
+        mut self,
+        candidate: super::native_debug::NativeDebugCandidate,
+        limits: &VerifyLimits,
+        work: &mut super::official_translation::OfficialWorkBudget,
+    ) -> Result<Self, BytecodeError> {
+        let debug =
+            super::native_debug::verify_native_debug(&self.verified, candidate, limits, work)?;
+        self.verified.native_debug = Some(Arc::new(debug));
+        Ok(self)
     }
 }
 
@@ -248,7 +342,50 @@ pub fn verify_module(
             return Err(verify(0, "RVLU function/prototype map 不符"));
         }
     }
-    Ok(VerifiedModule { module })
+    let transport_scan_units = module_transport_scan_units(&module)?;
+    Ok(VerifiedModule {
+        module,
+        transport_scan_units,
+        official_execution: None,
+        official_artifact: None,
+        native_debug: None,
+    })
+}
+
+fn module_transport_scan_units(module: &BytecodeModule) -> Result<usize, BytecodeError> {
+    let mut units = module
+        .prototypes
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| limit(0, "transport scan work 溢位"))?;
+    for proto in &module.prototypes {
+        let mut add = |count: usize| -> Result<(), BytecodeError> {
+            units = units
+                .checked_add(count)
+                .ok_or_else(|| limit(0, "transport scan work 溢位"))?;
+            Ok(())
+        };
+        add(proto.constants.len())?;
+        add(proto.instructions.len())?;
+        add(proto.upvalues.len())?;
+        add(proto.binding_registers.len())?;
+        add(proto.close_paths.len())?;
+        for constant in &proto.constants {
+            if let BytecodeConstant::Name(bytes) | BytecodeConstant::String(bytes) = constant {
+                add(bytes.len())?;
+            }
+        }
+        for path in proto.close_paths.iter().chain(
+            proto
+                .instructions
+                .iter()
+                .filter_map(|instruction| instruction.close_path.as_ref()),
+        ) {
+            add(path.bindings.len())?;
+            add(path.registers.len())?;
+        }
+    }
+    Ok(units)
 }
 
 pub fn encode_module(
@@ -257,13 +394,38 @@ pub fn encode_module(
     limits: &VerifyLimits,
 ) -> Result<EncodedModule, BytecodeError> {
     let verified = verify_module(module, expected_profile, limits)?;
-    let mut writer = Writer::default();
+    let bytes = encode_verified_module_bytes(&verified, limits)?;
+    Ok(EncodedModule { bytes, verified })
+}
+
+/// 傳輸層使用已驗證模組；不複製 typed IR，也不附加私有 sidecar。
+pub(crate) fn encode_verified_module_bytes(
+    verified: &VerifiedModule,
+    limits: &VerifyLimits,
+) -> Result<Vec<u8>, BytecodeError> {
+    encode_verified_module_bytes_inner(verified, limits, None)
+}
+
+pub(crate) fn encode_verified_module_bytes_bounded(
+    verified: &VerifiedModule,
+    limits: &VerifyLimits,
+    allocation_bound: usize,
+) -> Result<Vec<u8>, BytecodeError> {
+    encode_verified_module_bytes_inner(verified, limits, Some(allocation_bound))
+}
+
+fn encode_verified_module_bytes_inner(
+    verified: &VerifiedModule,
+    limits: &VerifyLimits,
+    allocation_bound: Option<usize>,
+) -> Result<Vec<u8>, BytecodeError> {
+    let mut writer = Writer::with_limit(allocation_bound);
     writer.bytes(&RVLU_MAGIC);
     writer.u16(RVLU_V2.0);
     writer.u8(profile_tag(verified.profile()));
     writer.u8(verified.module.numeric_config);
     write_span(&mut writer, verified.module.span);
-    let prototype_section = encode_prototype_section(&verified.module, limits)?;
+    let prototype_section = encode_prototype_section(&verified.module, limits, allocation_bound)?;
     writer.u32(checked_u32(
         prototype_section.len(),
         0,
@@ -273,10 +435,7 @@ pub fn encode_module(
     if writer.bytes.len() > limits.max_module_bytes {
         return Err(limit(0, "RVLU module bytes 超過限制"));
     }
-    Ok(EncodedModule {
-        bytes: writer.bytes,
-        verified,
-    })
+    writer.finish()
 }
 
 pub fn decode_module(
@@ -830,8 +989,21 @@ fn validate_numeric_for_registers(
 /// `NumericForNext` 不能自行建立 numeric mode；它必須唯一配對同一組
 /// control registers 的 `NumericForPrepare`，並回到該 Prepare 後的 body entry。
 fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), BytecodeError> {
-    let mut prepares =
-        std::collections::BTreeMap::<(u16, u16, u16, u16), Vec<(usize, InstructionOffset)>>::new();
+    type Prepare = ((u16, u16, u16, u16), usize, InstructionOffset);
+    let prepare_count = prototype
+        .instructions
+        .iter()
+        .filter(|entry| matches!(entry.instruction, Instruction::NumericForPrepare { .. }))
+        .count();
+    let next_count = prototype
+        .instructions
+        .iter()
+        .filter(|entry| matches!(entry.instruction, Instruction::NumericForNext { .. }))
+        .count();
+    let mut prepares: Vec<Prepare> = Vec::new();
+    prepares
+        .try_reserve_exact(prepare_count)
+        .map_err(|_| limit(0, "RVLU NumericFor Prepare 索引配置失敗"))?;
     for (prepare_index, instruction) in prototype.instructions.iter().enumerate() {
         let Instruction::NumericForPrepare {
             control,
@@ -843,13 +1015,13 @@ fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), Bytec
         else {
             continue;
         };
-        prepares
-            .entry((control.0, limit.0, step.0, visible.0))
-            .or_default()
-            .push((prepare_index, exit));
+        prepares.push(((control.0, limit.0, step.0, visible.0), prepare_index, exit));
     }
 
     let mut pairs = Vec::new();
+    pairs
+        .try_reserve_exact(next_count)
+        .map_err(|_| limit(0, "RVLU NumericFor pair 索引配置失敗"))?;
     for (next_index, instruction) in prototype.instructions.iter().enumerate() {
         let Instruction::NumericForNext {
             control,
@@ -862,18 +1034,21 @@ fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), Bytec
         else {
             continue;
         };
-        let Some(candidates) = prepares.get(&(control.0, limit.0, step.0, visible.0)) else {
+        let mut candidates = prepares
+            .iter()
+            .filter(|(key, _, _)| *key == (control.0, limit.0, step.0, visible.0));
+        let Some((_, prepare_index, prepare_exit)) = candidates.next() else {
             return Err(verify(
                 0,
                 "RVLU NumericForNext 必須唯一配對 NumericForPrepare",
             ));
         };
-        let [(prepare_index, prepare_exit)] = candidates.as_slice() else {
+        if candidates.next().is_some() {
             return Err(verify(
                 0,
                 "RVLU NumericForNext 必須唯一配對 NumericForPrepare",
             ));
-        };
+        }
         if *prepare_exit != exit
             || prepare_index.checked_add(1) != Some(target.0 as usize)
             || target.0 as usize >= next_index
@@ -884,6 +1059,24 @@ fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), Bytec
             ));
         }
         pairs.push((*prepare_index, next_index));
+    }
+    let scratch = prepares
+        .capacity()
+        .checked_mul(core::mem::size_of::<Prepare>())
+        .and_then(|bytes| {
+            pairs
+                .capacity()
+                .checked_mul(core::mem::size_of::<(usize, usize)>())
+                .and_then(|pair_bytes| bytes.checked_add(pair_bytes))
+        })
+        .ok_or_else(|| limit(0, "RVLU NumericFor pair 容量溢位"))?;
+    if prototype
+        .instructions
+        .len()
+        .checked_mul(256)
+        .is_none_or(|bound| scratch > bound)
+    {
+        return Err(limit(0, "RVLU NumericFor pair 容量超過預准入上界"));
     }
     validate_numeric_for_body_dominance(prototype, &pairs)
 }
@@ -941,18 +1134,18 @@ fn validate_numeric_for_body_dominance(
 
     let mut visited = vec![false; next_gate];
     let mut postorder = Vec::with_capacity(next_gate);
-    let mut stack = vec![(0usize, 0usize)];
+    let mut dfs_stack = vec![(0usize, 0usize)];
     visited[0] = true;
-    while let Some((node, next_successor)) = stack.last_mut() {
+    while let Some((node, next_successor)) = dfs_stack.last_mut() {
         if *next_successor < edges[*node].len() {
             let successor = edges[*node][*next_successor];
             *next_successor += 1;
             if !visited[successor] {
                 visited[successor] = true;
-                stack.push((successor, 0));
+                dfs_stack.push((successor, 0));
             }
         } else {
-            let (finished, _) = stack.pop().expect("CFG stack 非空");
+            let (finished, _) = dfs_stack.pop().expect("CFG stack 非空");
             postorder.push(finished);
         }
     }
@@ -963,6 +1156,37 @@ fn validate_numeric_for_body_dominance(
     }
     let mut immediate_dominator = vec![None; next_gate];
     immediate_dominator[0] = Some(0usize);
+    let vec_bytes = |capacity: usize, unit: usize| capacity.checked_mul(unit);
+    let nested_bytes = |lists: &Vec<Vec<usize>>| {
+        lists.iter().try_fold(
+            vec_bytes(lists.capacity(), core::mem::size_of::<Vec<usize>>())?,
+            |total, list| {
+                total.checked_add(vec_bytes(list.capacity(), core::mem::size_of::<usize>())?)
+            },
+        )
+    };
+    let initial_bytes = [
+        vec_bytes(gates.capacity(), core::mem::size_of::<Option<usize>>()),
+        nested_bytes(&edges),
+        nested_bytes(&predecessors),
+        vec_bytes(visited.capacity(), core::mem::size_of::<bool>()),
+        vec_bytes(postorder.capacity(), core::mem::size_of::<usize>()),
+        vec_bytes(dfs_stack.capacity(), core::mem::size_of::<(usize, usize)>()),
+        vec_bytes(order.capacity(), core::mem::size_of::<usize>()),
+        vec_bytes(
+            immediate_dominator.capacity(),
+            core::mem::size_of::<Option<usize>>(),
+        ),
+    ]
+    .into_iter()
+    .try_fold(0usize, |sum, part| sum.checked_add(part?))
+    .ok_or_else(|| limit(0, "RVLU NumericFor CFG 容量溢位"))?;
+    if count
+        .checked_mul(768)
+        .is_none_or(|bound| initial_bytes > bound)
+    {
+        return Err(limit(0, "RVLU NumericFor CFG 實際容量超過預掃描上界"));
+    }
     let mut work_remaining = count.saturating_mul(128);
     let mut spend_work = || {
         work_remaining = work_remaining
@@ -1017,18 +1241,43 @@ fn validate_numeric_for_body_dominance(
     let mut entry = vec![0usize; next_gate];
     let mut exit = vec![0usize; next_gate];
     let mut tick = 0usize;
-    let mut stack = vec![(0usize, false)];
-    while let Some((node, leaving)) = stack.pop() {
+    let mut tree_stack = vec![(0usize, false)];
+    while let Some((node, leaving)) = tree_stack.pop() {
         tick += 1;
         if leaving {
             exit[node] = tick;
         } else {
             entry[node] = tick;
-            stack.push((node, true));
+            tree_stack.push((node, true));
             for &child in dominator_children[node].iter().rev() {
-                stack.push((child, false));
+                tree_stack.push((child, false));
             }
         }
+    }
+    // P13 官方預掃描為此 CFG helper 獨立預留 768 bytes/指令；舊 DFS stack
+    // 與新 tree stack 在同一 scope 內皆計入，並檢查巢狀 Vec 的實際容量。
+    let allocated = [
+        vec_bytes(gates.capacity(), core::mem::size_of::<Option<usize>>()),
+        nested_bytes(&edges),
+        nested_bytes(&predecessors),
+        vec_bytes(visited.capacity(), core::mem::size_of::<bool>()),
+        vec_bytes(postorder.capacity(), core::mem::size_of::<usize>()),
+        vec_bytes(dfs_stack.capacity(), core::mem::size_of::<(usize, usize)>()),
+        vec_bytes(order.capacity(), core::mem::size_of::<usize>()),
+        vec_bytes(
+            immediate_dominator.capacity(),
+            core::mem::size_of::<Option<usize>>(),
+        ),
+        nested_bytes(&dominator_children),
+        vec_bytes(entry.capacity(), core::mem::size_of::<usize>()),
+        vec_bytes(exit.capacity(), core::mem::size_of::<usize>()),
+        vec_bytes(tree_stack.capacity(), core::mem::size_of::<(usize, bool)>()),
+    ]
+    .into_iter()
+    .try_fold(0usize, |sum, part| sum.checked_add(part?))
+    .ok_or_else(|| limit(0, "RVLU NumericFor CFG 容量溢位"))?;
+    if count.checked_mul(768).is_none_or(|bound| allocated > bound) {
+        return Err(limit(0, "RVLU NumericFor CFG 實際容量超過預掃描上界"));
     }
     for &(prepare, next) in pairs {
         if !visited[next] {
@@ -1263,26 +1512,28 @@ fn verify_control_and_dataflow(
 fn encode_prototype_section(
     module: &BytecodeModule,
     limits: &VerifyLimits,
+    allocation_bound: Option<usize>,
 ) -> Result<Vec<u8>, BytecodeError> {
-    let mut writer = Writer::default();
+    let mut writer = Writer::with_limit(allocation_bound);
     writer.u32(checked_u32(
         module.prototypes.len(),
         0,
         "RVLU prototype 數過大",
     )?);
     for prototype in &module.prototypes {
-        let record = encode_prototype(prototype, limits)?;
+        let record = encode_prototype(prototype, limits, allocation_bound)?;
         writer.u32(checked_u32(record.len(), 0, "RVLU prototype record 太大")?);
         writer.bytes(&record);
     }
-    Ok(writer.bytes)
+    writer.finish()
 }
 
 fn encode_prototype(
     prototype: &BytecodePrototype,
     limits: &VerifyLimits,
+    allocation_bound: Option<usize>,
 ) -> Result<Vec<u8>, BytecodeError> {
-    let mut writer = Writer::default();
+    let mut writer = Writer::with_limit(allocation_bound);
     writer.u32(prototype.id.0);
     writer.u32(prototype.function);
     write_optional_proto(&mut writer, prototype.parent);
@@ -1301,28 +1552,28 @@ fn encode_prototype(
     write_frame(&mut writer, prototype.frame);
     writer.u16(prototype.global_environment.0);
     write_binding(&mut writer, prototype.global_environment_binding);
-    let constants = encode_constants(&prototype.constants, limits)?;
+    let constants = encode_constants(&prototype.constants, limits, allocation_bound)?;
     writer.u32(checked_u32(
         constants.len(),
         0,
         "RVLU constants section 太大",
     )?);
     writer.bytes(&constants);
-    let instructions = encode_instructions(&prototype.instructions, limits)?;
+    let instructions = encode_instructions(&prototype.instructions, limits, allocation_bound)?;
     writer.u32(checked_u32(
         instructions.len(),
         0,
         "RVLU instructions section 太大",
     )?);
     writer.bytes(&instructions);
-    let metadata = encode_metadata(prototype, limits)?;
+    let metadata = encode_metadata(prototype, limits, allocation_bound)?;
     writer.u32(checked_u32(
         metadata.len(),
         0,
         "RVLU metadata section 太大",
     )?);
     writer.bytes(&metadata);
-    Ok(writer.bytes)
+    writer.finish()
 }
 
 fn decode_prototype(
@@ -1390,11 +1641,12 @@ fn decode_prototype(
 fn encode_constants(
     constants: &[BytecodeConstant],
     limits: &VerifyLimits,
+    allocation_bound: Option<usize>,
 ) -> Result<Vec<u8>, BytecodeError> {
     if constants.len() > limits.max_constants {
         return Err(limit(0, "RVLU constant 數超過限制"));
     }
-    let mut writer = Writer::default();
+    let mut writer = Writer::with_limit(allocation_bound);
     writer.u32(checked_u32(constants.len(), 0, "RVLU constant 數過大")?);
     for constant in constants {
         match constant {
@@ -1420,7 +1672,7 @@ fn encode_constants(
             }
         }
     }
-    Ok(writer.bytes)
+    writer.finish()
 }
 
 fn decode_constants(
@@ -1459,11 +1711,12 @@ fn decode_constants(
 fn encode_instructions(
     instructions: &[BytecodeInstruction],
     limits: &VerifyLimits,
+    allocation_bound: Option<usize>,
 ) -> Result<Vec<u8>, BytecodeError> {
     if instructions.len() > limits.max_instructions {
         return Err(limit(0, "RVLU instruction 數超過限制"));
     }
-    let mut writer = Writer::default();
+    let mut writer = Writer::with_limit(allocation_bound);
     writer.u32(checked_u32(
         instructions.len(),
         0,
@@ -1481,7 +1734,7 @@ fn encode_instructions(
             None => writer.u8(0),
         }
     }
-    Ok(writer.bytes)
+    writer.finish()
 }
 
 fn decode_instructions(
@@ -1538,11 +1791,12 @@ fn decode_instructions(
 fn encode_metadata(
     prototype: &BytecodePrototype,
     limits: &VerifyLimits,
+    allocation_bound: Option<usize>,
 ) -> Result<Vec<u8>, BytecodeError> {
     if prototype.upvalues.len() > limits.max_upvalues_per_prototype {
         return Err(limit(0, "RVLU upvalue 數超過限制"));
     }
-    let mut writer = Writer::default();
+    let mut writer = Writer::with_limit(allocation_bound);
     writer.u32(checked_u32(
         prototype.binding_registers.len(),
         0,
@@ -1578,7 +1832,7 @@ fn encode_metadata(
     for close in &prototype.close_paths {
         write_close_path(&mut writer, close)?;
     }
-    Ok(writer.bytes)
+    writer.finish()
 }
 
 fn decode_metadata(
@@ -2163,25 +2417,70 @@ fn parse_exit(tag: u8, offset: usize) -> Result<BytecodeExitKind, BytecodeError>
 #[derive(Default)]
 struct Writer {
     bytes: Vec<u8>,
+    allocation_bound: Option<usize>,
+    failure: Option<BytecodeError>,
 }
 impl Writer {
+    fn with_limit(allocation_bound: Option<usize>) -> Self {
+        Self {
+            bytes: Vec::new(),
+            allocation_bound,
+            failure: None,
+        }
+    }
+    fn write(&mut self, value: &[u8]) {
+        if self.failure.is_some() {
+            return;
+        }
+        if let Some(bound) = self.allocation_bound {
+            let Some(end) = self.bytes.len().checked_add(value.len()) else {
+                self.failure = Some(limit(0, "RVLU 輸出長度溢位"));
+                return;
+            };
+            if end > bound {
+                self.failure = Some(limit(0, "RVLU 輸出超出預准入"));
+                return;
+            }
+            if end > self.bytes.capacity() {
+                if self.bytes.try_reserve_exact(value.len()).is_err() {
+                    self.failure = Some(BytecodeError {
+                        code: BytecodeErrorCode::AllocationFailed,
+                        offset: 0,
+                        message: "RVLU 輸出配置失敗".into(),
+                    });
+                    return;
+                }
+                if self.bytes.capacity() > bound {
+                    self.failure = Some(limit(0, "RVLU 實際容量超出預准入"));
+                    return;
+                }
+            }
+        }
+        self.bytes.extend_from_slice(value);
+    }
+    fn finish(self) -> Result<Vec<u8>, BytecodeError> {
+        match self.failure {
+            Some(error) => Err(error),
+            None => Ok(self.bytes),
+        }
+    }
     fn u8(&mut self, value: u8) {
-        self.bytes.push(value)
+        self.write(&[value])
     }
     fn u16(&mut self, value: u16) {
-        self.bytes.extend_from_slice(&value.to_le_bytes())
+        self.write(&value.to_le_bytes())
     }
     fn u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_le_bytes())
+        self.write(&value.to_le_bytes())
     }
     fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes())
+        self.write(&value.to_le_bytes())
     }
     fn i64(&mut self, value: i64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes())
+        self.write(&value.to_le_bytes())
     }
     fn bytes(&mut self, value: &[u8]) {
-        self.bytes.extend_from_slice(value)
+        self.write(value)
     }
     fn blob(&mut self, value: &[u8]) -> Result<(), BytecodeError> {
         self.u32(checked_u32(value.len(), 0, "RVLU blob 過大")?);

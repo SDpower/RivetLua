@@ -12,6 +12,8 @@ RivetLua can compile and execute the Lua subset verified through P11. The P08–
 
 See the [implementation status checklist](docs/IMPLEMENTATION_STATUS.md) for implemented features, remaining work, and verification commands.
 
+The Rust SDK can save a verified `Module` to the RVCT transport container and load it into a new engine. This preserves the module definition and its verified metadata; each `Vm` still owns its globals, heap, closures, coroutines, registries, and host services. A host may intentionally share state through an external provider, but the `Module` itself does not carry or propagate host authorization or execution state. See [the SDK transport contract](docs/sdk/transport.md) for limits and examples.
+
 ## Build baseline
 
 Development uses the system default Rust `stable` toolchain. The minimum supported Rust version (MSRV) is `1.94.1`; changing that support baseline requires a compatibility decision. Build and test commands use `--locked`.

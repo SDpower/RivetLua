@@ -1,0 +1,19 @@
+[package]
+name = "rivetlua-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RivetLua 的受控命令列介面。"
+
+[dependencies]
+rivetlua = { path = "../rivetlua" }
+
+[[bin]]
+name = "rivetlua"
+path = "src/bin/rivetlua.rs"
+
+[[bin]]
+name = "rivetluac"
+path = "src/bin/rivetluac.rs"

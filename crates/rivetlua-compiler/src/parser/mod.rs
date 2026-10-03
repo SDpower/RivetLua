@@ -10,6 +10,14 @@ pub fn parse(
     expected_profile: LanguageProfile,
     limits: &CompileLimits,
 ) -> Result<Module, Diagnostic> {
+    parse_with_metrics(chunk, expected_profile, limits).map(|(module, _)| module)
+}
+
+pub(crate) fn parse_with_metrics(
+    chunk: &LexedChunk,
+    expected_profile: LanguageProfile,
+    limits: &CompileLimits,
+) -> Result<(Module, usize), Diagnostic> {
     if chunk.tokens.is_empty() {
         return Err(diagnostic(
             None,
@@ -24,7 +32,7 @@ pub fn parse(
             "語言 profile 不符",
         ));
     }
-    Parser {
+    let mut parser = Parser {
         tokens: &chunk.tokens,
         index: 0,
         limits,
@@ -32,8 +40,9 @@ pub fn parse(
         depth: 0,
         statements: 0,
         profile: expected_profile,
-    }
-    .module(expected_profile, chunk.source_len)
+    };
+    let module = parser.module(expected_profile, chunk.source_len)?;
+    Ok((module, parser.nodes))
 }
 struct Parser<'a> {
     tokens: &'a [Token],

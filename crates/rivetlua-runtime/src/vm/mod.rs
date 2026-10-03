@@ -3,15 +3,21 @@
 mod numeric_for;
 mod ops;
 
+use rivetlua_core::bytecode::official_export::{OfficialExportErrorKind, emit_official_chunk};
 use rivetlua_core::{
     BinaryOperation, BytecodeConstant, BytecodePrototype, BytecodeUpvalueSource, CoreError,
-    CoreErrorKind, EnvironmentSource, Instruction, LuaProfile, ObjectRef, Opcode, RVLU_MAGIC,
-    RVLU_V2, Register, ResultMode, UnaryOperation, UpvalueId, Value, VerifiedModule, VmId,
-    decode_module,
+    CoreErrorKind, EnvironmentSource, InputErrorKind, InputFormat, Instruction, InstructionOffset,
+    LuaProfile, ObjectRef, OfficialChunkErrorKind, OfficialChunkLimits, OfficialPlanBuiltin,
+    OfficialPlanRootSource, OfficialTranslationErrorKind, OfficialWorkBudget, Opcode, RVLU_V2,
+    Register, ResultMode, TransportLimits, UnaryOperation, UpvalueId, Value, VerifiedModule, VmId,
+    classify_input, decode_input_module, decode_official_chunk, input_scan_admission,
+    preflight_input_module, preflight_official_chunk, translate_official_chunk_with_work,
+    verified_module_measurement_work,
 };
 
-use crate::alloc::{AllocationLedger, FailPoint, Reservation, reserve_vec};
-use crate::call::{CallFrame, PendingCloseSnapshot};
+use crate::alloc::{AllocationLedger, FailPoint, Reservation, checked_bytes, reserve_vec};
+use crate::call::{CallFrame, OfficialFrameRegisters, PendingCloseSnapshot, VarargPayloads};
+use crate::callback::{CallbackContext, CallbackResult};
 use crate::closure::Closure;
 use crate::coroutine::{CoroutineState, ThreadContext, YieldSite, root_coroutine};
 use crate::errors::{Builtin, ProtectedBoundary, ProtectedStage, explicit_error};
@@ -24,8 +30,8 @@ use crate::host::{
 };
 use crate::host::{HostLoadErrorKind, LoadBudget, LoadBudgetStop, LoadFormat, LoadServiceError};
 use crate::pending_op::{
-    BasicPending, PendingKind, PendingOp, PendingStack, PendingTableKind, PrintArguments,
-    ResumeStage,
+    BasicPending, HostCallbackPending, PendingKind, PendingOp, PendingStack, PendingTableKind,
+    PrintArguments, ResumeStage,
 };
 use crate::stdlib::basic::{self, BasicBuiltin};
 use crate::stdlib::debug::{self as debug_lib, DebugBuiltin, DebugHook};
@@ -60,6 +66,41 @@ pub(crate) fn basic_raw_equal(vm: &Vm, left: Value, right: Value) -> Result<bool
     ops::raw_equal(vm, left, right)
 }
 
+fn official_short_source(source: &[u8]) -> ([u8; 60], usize) {
+    let mut result = [0_u8; 60];
+    if let Some(name) = source.strip_prefix(b"=") {
+        let len = name.len().min(59);
+        result[..len].copy_from_slice(&name[..len]);
+        return (result, len);
+    }
+    if let Some(path) = source.strip_prefix(b"@") {
+        if path.len() <= 59 {
+            result[..path.len()].copy_from_slice(path);
+            return (result, path.len());
+        }
+        result[..3].copy_from_slice(b"...");
+        result[3..59].copy_from_slice(&path[path.len() - 56..]);
+        return (result, 59);
+    }
+    result[..9].copy_from_slice(b"[string \"");
+    let first_line = source
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(source.len());
+    if source.len() < 45 && first_line == source.len() {
+        result[9..9 + source.len()].copy_from_slice(source);
+        let end = 9 + source.len();
+        result[end..end + 2].copy_from_slice(b"\"]");
+        return (result, end + 2);
+    }
+    let len = first_line.min(45);
+    result[9..9 + len].copy_from_slice(&source[..len]);
+    let end = 9 + len;
+    result[end..end + 3].copy_from_slice(b"...");
+    result[end + 3..end + 5].copy_from_slice(b"\"]");
+    (result, end + 5)
+}
+
 /// VM 內部錯誤；不建立 Lua 字串，P08／P11 可用診斷 ID 映射可見錯誤值。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeErrorKind {
@@ -72,6 +113,7 @@ pub enum RuntimeErrorKind {
     UnsupportedResultMode,
     NumericForZeroStep,
     InvalidNamedVarargCount,
+    InvalidGlobalNilCheck,
     InvalidNumericForState,
     RegisterOutOfBounds,
     ProgramCounterOutOfBounds,
@@ -110,6 +152,7 @@ pub enum RuntimeErrorKind {
     IoStandardClose,
     HostLoadFailed,
     HostLoadBudget,
+    HostDumpBudget,
     LoadArgument,
     LoadMode,
     LoadReaderType,
@@ -138,6 +181,7 @@ impl RuntimeErrorKind {
             Self::Core(_)
                 | Self::NumericForZeroStep
                 | Self::InvalidNamedVarargCount
+                | Self::InvalidGlobalNilCheck
                 | Self::NotCallable
                 | Self::StackLimit
                 | Self::MetatableChainLimit
@@ -172,6 +216,7 @@ impl RuntimeErrorKind {
                 | Self::IoStandardClose
                 | Self::HostLoadFailed
                 | Self::HostLoadBudget
+                | Self::HostDumpBudget
                 | Self::LoadArgument
                 | Self::LoadMode
                 | Self::LoadReaderType
@@ -252,6 +297,7 @@ impl RuntimeError {
             RuntimeErrorKind::UnsupportedResultMode => "E_VM_RESULT_UNSUPPORTED",
             RuntimeErrorKind::NumericForZeroStep => "E_NUMERIC_FOR_ZERO_STEP",
             RuntimeErrorKind::InvalidNamedVarargCount => "E_VARARG_TABLE_COUNT",
+            RuntimeErrorKind::InvalidGlobalNilCheck => "E_GLOBAL_NOT_NIL",
             RuntimeErrorKind::InvalidNumericForState => "E_VM_NUMERIC_FOR_STATE",
             RuntimeErrorKind::RegisterOutOfBounds => "E_VM_REGISTER_BOUNDS",
             RuntimeErrorKind::ProgramCounterOutOfBounds => "E_VM_PC_BOUNDS",
@@ -290,6 +336,7 @@ impl RuntimeError {
             RuntimeErrorKind::IoStandardClose => "E_IO_STANDARD_CLOSE",
             RuntimeErrorKind::HostLoadFailed => "E_HOST_LOAD_FAILED",
             RuntimeErrorKind::HostLoadBudget => "E_HOST_LOAD_BUDGET",
+            RuntimeErrorKind::HostDumpBudget => "E_HOST_DUMP_BUDGET",
             RuntimeErrorKind::LoadArgument => "E_LOAD_ARGUMENT",
             RuntimeErrorKind::LoadMode => "E_LOAD_MODE",
             RuntimeErrorKind::LoadReaderType => "E_LOAD_READER_TYPE",
@@ -416,13 +463,11 @@ enum ResourceFileRead {
 }
 
 fn is_rivet_binary(source: &[u8]) -> bool {
-    source.first() == Some(&0x1b)
-        || (source.starts_with(&RVLU_MAGIC)
-            && source.get(4..6).is_some_and(|header| {
-                header
-                    .iter()
-                    .any(|byte| !byte.is_ascii_graphic() && !byte.is_ascii_whitespace())
-            }))
+    classify_input(source) != InputFormat::Source
+}
+
+fn is_official_binary(source: &[u8]) -> bool {
+    classify_input(source) == InputFormat::Official
 }
 
 enum TableOpRequest {
@@ -613,12 +658,89 @@ pub struct Execution<'vm> {
     fuel: u64,
     finalizer_steps: u64,
     debug_hook_skip_once: bool,
+    host_call_bootstrap: bool,
     deferred_roots: Vec<RootId>,
     deferred_charge: usize,
     state: ExecutionState,
 }
 
 impl Vm {
+    /// 在同一 VM 的執行器中呼叫 Lua 值；參數及目標在執行期間由 frame 持有。
+    pub fn call(&mut self, function: Value, args: &[Value]) -> Result<Execution<'_>, RuntimeError> {
+        let mut execution = Execution::for_native_finalizer(self)?;
+        let frame = execution.new_basic_coroutine_frame(function, args)?;
+        let mut empty = core::mem::replace(&mut execution.frame, frame);
+        empty.clear_roots(execution.vm)?;
+        execution.host_call_bootstrap = true;
+        Ok(execution)
+    }
+
+    /// 由宿主啟動協程；成功旗標及錯誤值遵循 `coroutine.resume`。
+    pub fn resume(
+        &mut self,
+        coroutine: Value,
+        args: &[Value],
+    ) -> Result<Execution<'_>, RuntimeError> {
+        if let Value::Object(object) = coroutine {
+            self.object_kind(object)?;
+        }
+        for &value in args {
+            if let Value::Object(object) = value {
+                self.object_kind(object)?;
+            }
+        }
+        let count = args
+            .len()
+            .checked_add(1)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let mut held = Vec::new();
+        let held_ticket = reserve_vec(
+            self.allocation_ledger(),
+            &mut held,
+            count,
+            FailPoint::WorkReserve,
+        )?;
+        for &value in core::iter::once(&coroutine).chain(args.iter()) {
+            if let Value::Object(object) = value {
+                held.push(crate::HostHandle::<Value>::new(self, object)?);
+            }
+        }
+        let mut execution = Execution::for_native_finalizer(self)?;
+        let mut input = Vec::new();
+        let input_ticket = reserve_vec(
+            execution.vm.allocation_ledger(),
+            &mut input,
+            count,
+            FailPoint::WorkReserve,
+        )?;
+        input.push(coroutine);
+        input.extend_from_slice(args);
+        let target = match execution
+            .vm
+            .allocate_callback_action_builtin(Builtin::CoroutineResume)
+        {
+            Ok(target) => target,
+            Err(error) => return Err(error.into()),
+        };
+        let target_handle = match crate::HostHandle::<Value>::new(execution.vm, target) {
+            Ok(handle) => handle,
+            Err(error) => {
+                execution.vm.reclaim(target)?;
+                return Err(error.into());
+            }
+        };
+        let frame = execution.new_basic_coroutine_frame(Value::Object(target), &input)?;
+        let mut empty = core::mem::replace(&mut execution.frame, frame);
+        empty.clear_roots(execution.vm)?;
+        execution.host_call_bootstrap = true;
+        drop(input);
+        drop(input_ticket);
+        drop(target_handle);
+        drop(held);
+        drop(held_ticket);
+        Ok(execution)
+    }
+
     fn resolve_finalizer_closure(
         &mut self,
         callback: Value,
@@ -756,7 +878,7 @@ impl Vm {
     /// let _execution = vm.load(candidate);
     /// ```
     pub fn load(&mut self, module: VerifiedModule) -> Result<Execution<'_>, RuntimeError> {
-        self.load_impl(module, None)
+        self.load_impl(module, None, &[])
     }
 
     /// 將宿主提供的 raw table 放入已驗證 root frame 的 `_ENV` register。
@@ -771,13 +893,137 @@ impl Vm {
         if self.object_kind(table)? != crate::ObjectKind::Table {
             return Err(VmError::WrongObjectType.into());
         }
-        self.load_impl(module, Some(table))
+        self.load_impl(module, Some(table), &[])
+    }
+
+    /// 以指定環境及參數啟動已驗證模組的 root function。
+    pub fn load_with_environment_and_args(
+        &mut self,
+        module: VerifiedModule,
+        environment: Value,
+        args: &[Value],
+    ) -> Result<Execution<'_>, RuntimeError> {
+        let Value::Object(table) = environment else {
+            return Err(VmError::WrongObjectType.into());
+        };
+        if self.object_kind(table)? != crate::ObjectKind::Table {
+            return Err(VmError::WrongObjectType.into());
+        }
+        self.load_impl(module, Some(table), args)
+    }
+
+    fn official_root_closure(
+        &mut self,
+        module: ObjectRef,
+        prototype: rivetlua_core::ProtoId,
+        environment: Value,
+    ) -> Result<(ObjectRef, RootId), RuntimeError> {
+        let count = self
+            .module(module)?
+            .official_execution()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?
+            .root_bindings()
+            .len();
+        let mut captures = Vec::new();
+        let capture_ticket = reserve_vec(
+            self.allocation_ledger(),
+            &mut captures,
+            count,
+            FailPoint::WorkReserve,
+        )?;
+        let mut created = Vec::<(ObjectRef, RootId)>::new();
+        let created_ticket = reserve_vec(
+            self.allocation_ledger(),
+            &mut created,
+            count
+                .checked_mul(2)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?,
+            FailPoint::WorkReserve,
+        )?;
+        let result = (|| {
+            for index in 0..count {
+                let binding = *self
+                    .module(module)?
+                    .official_execution()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?
+                    .root_bindings()
+                    .get(index)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+                let value = match binding.source {
+                    OfficialPlanRootSource::ExternalEnvironment => environment,
+                    OfficialPlanRootSource::InitialNil => Value::Nil,
+                    OfficialPlanRootSource::FixedBuiltin(kind) => {
+                        let object = self.allocate_official_builtin(kind)?;
+                        let root = match self.add_root(RootKind::Temporary, object) {
+                            Ok(root) => root,
+                            Err(error) => {
+                                self.reclaim(object)?;
+                                return Err(error.into());
+                            }
+                        };
+                        created.push((object, root));
+                        Value::Object(object)
+                    }
+                };
+                let mut upvalue = Upvalue::open(self.id(), None, 0);
+                upvalue.close(value);
+                let object = self.allocate_upvalue(upvalue)?;
+                let root = match self.add_root(RootKind::Temporary, object) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        self.reclaim(object)?;
+                        return Err(error.into());
+                    }
+                };
+                created.push((object, root));
+                captures.push(object);
+            }
+            let closure = Closure::new(
+                module,
+                prototype,
+                &captures,
+                Some(environment),
+                self.allocation_ledger(),
+            )?;
+            let object = self.allocate_closure(closure)?;
+            let root = match self.add_root(RootKind::Stack, object) {
+                Ok(root) => root,
+                Err(error) => {
+                    self.reclaim(object)?;
+                    return Err(error.into());
+                }
+            };
+            Ok::<_, RuntimeError>((object, root))
+        })();
+        for &(_, root) in created.iter().rev() {
+            self.remove_root(root)?;
+        }
+        if result.is_err() {
+            for &(object, _) in created.iter().rev() {
+                self.reclaim(object)?;
+            }
+        }
+        drop(created_ticket);
+        drop(capture_ticket);
+        result
+    }
+
+    fn official_frame_registers(
+        &self,
+        module: ObjectRef,
+        prototype: rivetlua_core::ProtoId,
+    ) -> Result<Option<OfficialFrameRegisters>, RuntimeError> {
+        Ok(self
+            .module(module)?
+            .official_execution()
+            .map(|plan| OfficialFrameRegisters::from_plan(plan, prototype)))
     }
 
     fn load_impl(
         &mut self,
         module: VerifiedModule,
         environment: Option<ObjectRef>,
+        args: &[Value],
     ) -> Result<Execution<'_>, RuntimeError> {
         if module.format_version() != RVLU_V2 {
             return Err(RuntimeError::new(RuntimeErrorKind::UnsupportedFormat));
@@ -793,10 +1039,11 @@ impl Vm {
         else {
             return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
         };
+        let entry_id = *entry_id;
         let entry_index = data
             .prototypes
             .iter()
-            .position(|candidate| candidate.id == *entry_id)
+            .position(|candidate| candidate.id == entry_id)
             .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
         if data.prototypes[entry_index].parent.is_some() {
             return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
@@ -882,51 +1129,138 @@ impl Vm {
                 }
             }
         }
-        let needs_module_payload = data.prototypes.iter().any(|prototype| {
-            prototype
-                .instructions
-                .iter()
-                .any(|entry| matches!(entry.instruction, Instruction::Closure { .. }))
-        });
-        let environment_guard = match environment {
-            Some(table) => Some(self.add_root(RootKind::Temporary, table)?),
-            None => None,
-        };
+        let has_official_plan = module.official_execution().is_some();
+        let parameter_count = usize::from(data.prototypes[entry_index].parameter_count);
+        let is_variadic = data.prototypes[entry_index].is_variadic;
+        let needs_module_payload = has_official_plan
+            || data.prototypes.iter().any(|prototype| {
+                prototype
+                    .instructions
+                    .iter()
+                    .any(|entry| matches!(entry.instruction, Instruction::Closure { .. }))
+            });
+        for &value in args {
+            if let Value::Object(object) = value {
+                self.object_kind(object)?;
+            }
+        }
+        let argument_objects = args
+            .iter()
+            .filter(|value| matches!(value, Value::Object(_)))
+            .count();
+        let mut argument_roots = Vec::new();
+        let argument_charge = checked_bytes(argument_objects, core::mem::size_of::<RootId>())?;
+        if argument_objects != 0 {
+            let ticket = reserve_vec(
+                self.allocation_ledger(),
+                &mut argument_roots,
+                argument_objects,
+                FailPoint::WorkReserve,
+            )?;
+            ticket.commit()?;
+        }
         let frame_result = (|| {
-            let (mut frame, owned_module, module_root) = if needs_module_payload {
-                let module_ref = self.allocate_module(module)?;
-                let root = match self.add_root(RootKind::Temporary, module_ref) {
-                    Ok(root) => root,
-                    Err(error) => {
-                        self.reclaim(module_ref)?;
-                        return Err(error.into());
+            let environment_guard = match environment {
+                Some(table) => Some(self.add_root(RootKind::Temporary, table)?),
+                None => None,
+            };
+            let result = (|| {
+                for &value in args {
+                    if let Value::Object(object) = value {
+                        argument_roots.push(self.add_root(RootKind::Temporary, object)?);
                     }
+                }
+                let (mut frame, owned_module, module_root) = if needs_module_payload {
+                    let module_ref = self.allocate_module(module)?;
+                    let root = match self.add_root(RootKind::Temporary, module_ref) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            self.reclaim(module_ref)?;
+                            return Err(error.into());
+                        }
+                    };
+                    let frame = match CallFrame::new(
+                        &self.module(module_ref)?.module().prototypes[entry_index],
+                        entry_index,
+                        Some(module_ref),
+                        self.allocation_ledger(),
+                    ) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            self.remove_root(root)?;
+                            self.reclaim(module_ref)?;
+                            return Err(error);
+                        }
+                    };
+                    (frame, None, Some(root))
+                } else {
+                    let frame = CallFrame::new(
+                        &module.module().prototypes[entry_index],
+                        entry_index,
+                        None,
+                        self.allocation_ledger(),
+                    )?;
+                    (frame, Some(module), None)
                 };
-                let frame = match CallFrame::new(
-                    &self.module(module_ref)?.module().prototypes[entry_index],
-                    entry_index,
-                    Some(module_ref),
-                    self.allocation_ledger(),
-                ) {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        self.remove_root(root)?;
-                        self.reclaim(module_ref)?;
+                if let Some(table) = environment {
+                    if let Err(error) =
+                        frame.write(self, environment_register, Value::Object(table))
+                    {
+                        frame.clear_roots(self)?;
+                        if let Some(root) = module_root {
+                            self.remove_root(root)?;
+                            if let Some(reference) = frame.module {
+                                self.reclaim(reference)?;
+                            }
+                        }
                         return Err(error);
                     }
-                };
-                (frame, None, Some(root))
-            } else {
-                let frame = CallFrame::new(
-                    &module.module().prototypes[entry_index],
-                    entry_index,
-                    None,
-                    self.allocation_ledger(),
-                )?;
-                (frame, Some(module), None)
-            };
-            if let Some(table) = environment {
-                if let Err(error) = frame.write(self, environment_register, Value::Object(table)) {
+                }
+                if has_official_plan {
+                    let module_ref = frame
+                        .module
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+                    match self.official_root_closure(
+                        module_ref,
+                        entry_id,
+                        environment.map(Value::Object).unwrap_or(Value::Nil),
+                    ) {
+                        Ok((closure, root)) => {
+                            frame.closure = Some(closure);
+                            frame.closure_root = Some(root);
+                        }
+                        Err(error) => {
+                            frame.clear_roots(self)?;
+                            if let Some(root) = module_root {
+                                self.remove_root(root)?;
+                                self.reclaim(module_ref)?;
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                let initialized = (|| {
+                    for (offset, value) in args.iter().copied().take(parameter_count).enumerate() {
+                        let register = Register(u16::try_from(offset + 1).map_err(|_| {
+                            RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds)
+                        })?);
+                        frame.write(self, register, value)?;
+                    }
+                    if is_variadic {
+                        let inputs = if let Some(module_ref) = frame.module {
+                            self.official_frame_registers(module_ref, entry_id)?
+                        } else {
+                            None
+                        };
+                        frame.initialize_variadic_inputs(
+                            self,
+                            args.get(parameter_count..).unwrap_or(&[]),
+                            inputs,
+                        )?;
+                    }
+                    Ok::<(), RuntimeError>(())
+                })();
+                if let Err(error) = initialized {
                     frame.clear_roots(self)?;
                     if let Some(root) = module_root {
                         self.remove_root(root)?;
@@ -936,11 +1270,18 @@ impl Vm {
                     }
                     return Err(error);
                 }
+                Ok((frame, owned_module, module_root))
+            })();
+            if let Some(root) = environment_guard {
+                self.remove_root(root)?;
             }
-            Ok((frame, owned_module, module_root))
+            result
         })();
-        if let Some(root) = environment_guard {
+        for root in argument_roots.into_iter().rev() {
             self.remove_root(root)?;
+        }
+        if argument_charge != 0 {
+            self.allocation_ledger().refund(argument_charge)?;
         }
         let (frame, owned_module, module_root) = frame_result?;
         let pending_ops = PendingStack::new(self.allocation_ledger().clone());
@@ -968,6 +1309,7 @@ impl Vm {
             fuel: 1_000_000,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
+            host_call_bootstrap: false,
             deferred_roots: Vec::new(),
             deferred_charge: 0,
             state: ExecutionState::Ready,
@@ -1004,6 +1346,7 @@ impl Vm {
             return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
         }
         let entry = *entry;
+        let has_official_plan = module.official_execution().is_some();
         let environment_root = match environment {
             Value::Object(object) => Some(self.add_root(RootKind::Temporary, object)?),
             _ => None,
@@ -1015,6 +1358,9 @@ impl Vm {
                 Err(error) => return Err(error.into()),
             };
             let closure_result = (|| {
+                if has_official_plan {
+                    return self.official_root_closure(module_ref, entry, environment);
+                }
                 let closure = Closure::new(
                     module_ref,
                     entry,
@@ -1066,6 +1412,7 @@ impl Execution<'_> {
             fuel: 1_000_000,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
+            host_call_bootstrap: false,
             deferred_roots: Vec::new(),
             deferred_charge: 0,
             state: ExecutionState::Ready,
@@ -1259,6 +1606,7 @@ impl Execution<'_> {
         let parameter_count = usize::from(prototype.parameter_count);
         let is_variadic = prototype.is_variadic;
         let env_register = prototype.frame.environment;
+        let official_inputs = vm.official_frame_registers(module, prototype_id)?;
         let mut frame = CallFrame::new(prototype, index, Some(module), vm.allocation_ledger())?;
         frame.closure = Some(closure);
         frame.closure_root = Some(vm.add_root(RootKind::Stack, closure)?);
@@ -1275,11 +1623,7 @@ impl Execution<'_> {
             }
             if is_variadic {
                 let extra = args.get(parameter_count..).unwrap_or(&[]);
-                if frame.named_vararg.is_some() {
-                    frame.set_named_varargs(vm, extra)?;
-                } else {
-                    frame.set_varargs(vm, extra)?;
-                }
+                frame.initialize_variadic_inputs(vm, extra, official_inputs)?;
             }
             Ok::<(), RuntimeError>(())
         })();
@@ -1312,6 +1656,7 @@ impl Execution<'_> {
             fuel: 1_000_000,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
+            host_call_bootstrap: false,
             deferred_roots: Vec::new(),
             deferred_charge: 0,
             state: ExecutionState::Ready,
@@ -1933,7 +2278,10 @@ impl Execution<'_> {
     fn basic_continuation_pending(&self, destination: Register, next: usize) -> bool {
         self.pending_ops.last().is_some_and(|pending| {
             pending.kind == PendingKind::Basic
-                && pending.stage == ResumeStage::AwaitingReturn
+                && matches!(
+                    pending.stage,
+                    ResumeStage::AwaitingReturn | ResumeStage::ReadyToInvoke
+                )
                 && pending.caller_depth == self.callers.len()
                 && pending.caller_stack_base == self.frame.stack_base
                 && pending.caller_prototype == self.frame.prototype
@@ -1964,6 +2312,53 @@ impl Execution<'_> {
         Ok(Some(self.resume_basic_pending(pending)?))
     }
 
+    fn invoke_ready_host_callback(&mut self) -> Result<DispatchResult, RuntimeError> {
+        let pending = self
+            .pending_ops
+            .last()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+        let Some(BasicPending::HostCallback { state, .. }) = pending.basic.as_ref() else {
+            return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
+        };
+        let (target, count, destination, mode, next) = (
+            pending.values[1],
+            state.arguments().len(),
+            pending.destination,
+            pending.result_mode,
+            pending.resume_pc,
+        );
+        if !self.charge_native_work(count)? {
+            return Ok(DispatchResult::Aborted);
+        }
+        let mut args = Vec::new();
+        let ticket = reserve_vec(
+            self.vm.allocation_ledger(),
+            &mut args,
+            count,
+            FailPoint::WorkReserve,
+        )?;
+        let pending = self
+            .pending_ops
+            .last()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+        let Some(BasicPending::HostCallback { state, .. }) = pending.basic.as_ref() else {
+            return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
+        };
+        args.extend_from_slice(state.arguments());
+        self.pending_ops
+            .last_mut()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?
+            .stage = ResumeStage::AwaitingReturn;
+        let called = self.enter_callable_values(target, &args, destination, mode, next);
+        drop(args);
+        drop(ticket);
+        match called? {
+            RegularCallAction::Entered => Ok(DispatchResult::Continue),
+            RegularCallAction::Aborted => Ok(DispatchResult::Aborted),
+            RegularCallAction::Completed(action) => Ok(action),
+        }
+    }
+
     fn enter_metamethod_call(
         &mut self,
         event: ObjectRef,
@@ -1992,6 +2387,7 @@ impl Execution<'_> {
         let parameter_count = usize::from(prototype.parameter_count);
         let is_variadic = prototype.is_variadic;
         let environment_register = prototype.frame.environment;
+        let official_inputs = self.vm.official_frame_registers(module_ref, prototype_id)?;
         let depth = if reuse_tail_frame {
             self.frame.depth
         } else {
@@ -2063,20 +2459,15 @@ impl Execution<'_> {
                 return Err(error);
             }
         }
-        let mut named_payload = None;
+        let mut named_payload = VarargPayloads::default();
         if is_variadic {
             let extra = args.get(parameter_count..).unwrap_or(&[]);
-            if callee.named_vararg.is_some() {
-                match callee.set_named_varargs(self.vm, extra) {
-                    Ok(payload) => named_payload = Some(payload),
-                    Err(error) => {
-                        callee.clear_roots(self.vm)?;
-                        return Err(error);
-                    }
+            match callee.initialize_variadic_inputs(self.vm, extra, official_inputs) {
+                Ok(payload) => named_payload = payload,
+                Err(error) => {
+                    callee.clear_roots(self.vm)?;
+                    return Err(error);
                 }
-            } else if let Err(error) = callee.set_varargs(self.vm, extra) {
-                callee.clear_roots(self.vm)?;
-                return Err(error);
             }
         }
         if !reuse_tail_frame && self.callers.len() == self.callers.capacity() {
@@ -2089,19 +2480,13 @@ impl Execution<'_> {
                 Ok(ticket) => ticket,
                 Err(error) => {
                     callee.clear_roots(self.vm)?;
-                    if let Some((table, key)) = named_payload {
-                        self.vm.reclaim(table)?;
-                        self.vm.reclaim(key)?;
-                    }
+                    named_payload.reclaim(self.vm)?;
                     return Err(error.into());
                 }
             };
             if let Err(error) = ticket.commit() {
                 callee.clear_roots(self.vm)?;
-                if let Some((table, key)) = named_payload {
-                    self.vm.reclaim(table)?;
-                    self.vm.reclaim(key)?;
-                }
+                named_payload.reclaim(self.vm)?;
                 return Err(error.into());
             }
             self.callers_charge = next_charge;
@@ -2113,10 +2498,7 @@ impl Execution<'_> {
                 .and_then(|()| self.frame.clear_roots(self.vm));
             if let Err(error) = close {
                 callee.clear_roots(self.vm)?;
-                if let Some((table, key)) = named_payload {
-                    self.vm.reclaim(table)?;
-                    self.vm.reclaim(key)?;
-                }
+                named_payload.reclaim(self.vm)?;
                 return Err(error);
             }
             self.frame.release_storage();
@@ -2419,6 +2801,24 @@ impl Execution<'_> {
             };
             match self.vm.object_kind(callee)? {
                 ObjectKind::Builtin => match self.vm.builtin(callee)? {
+                    Builtin::HostCallback(id) => {
+                        if let Some(boundary) = self.protected.last_mut() {
+                            boundary.inline_target = true;
+                        }
+                        let action = self.host_callback(
+                            id,
+                            &arguments,
+                            destination,
+                            current_mode,
+                            false,
+                            next,
+                        );
+                        drop(ticket);
+                        return action;
+                    }
+                    Builtin::Official(_) => {
+                        return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
+                    }
                     Builtin::Error => {
                         return Err(explicit_error(
                             arguments.first().copied().unwrap_or(Value::Nil),
@@ -2433,10 +2833,9 @@ impl Execution<'_> {
                         };
                         let skip = (if handler.is_some() { 2 } else { 1 }).min(arguments.len());
                         let next_target = arguments.first().copied().unwrap_or(Value::Nil);
-                        self.protected
-                            .last_mut()
-                            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?
-                            .inline_target = true;
+                        if let Some(boundary) = self.protected.last_mut() {
+                            boundary.inline_target = true;
+                        }
                         self.push_protected_boundary(
                             destination,
                             ResultMode::All,
@@ -2609,6 +3008,203 @@ impl Execution<'_> {
         }
     }
 
+    fn official_named_count(&mut self, table: ObjectRef) -> Result<usize, RuntimeError> {
+        let key = self.vm.allocate_byte_string(b"n")?;
+        let root = match self.vm.add_root(RootKind::Temporary, key) {
+            Ok(root) => root,
+            Err(error) => {
+                self.vm.reclaim(key)?;
+                return Err(error.into());
+            }
+        };
+        let field = self.vm.raw_get(table, Value::Object(key));
+        self.vm.remove_root(root)?;
+        self.vm.reclaim(key)?;
+        let count = match field? {
+            Value::Integer(count) if (0..=i64::from(i32::MAX / 2)).contains(&count) => count,
+            _ => return Err(self.invalid_official_named_count()?),
+        };
+        match usize::try_from(count) {
+            Ok(count) => Ok(count),
+            Err(_) => Err(self.invalid_official_named_count()?),
+        }
+    }
+
+    fn invalid_official_named_count(&mut self) -> Result<RuntimeError, RuntimeError> {
+        let mut error = RuntimeError::new(RuntimeErrorKind::InvalidNamedVarargCount);
+        error.value = Value::Object(
+            self.vm
+                .allocate_byte_string(b"vararg table has no proper 'n'")?,
+        );
+        Ok(error)
+    }
+
+    fn official_builtin(
+        &mut self,
+        kind: OfficialPlanBuiltin,
+        base: Register,
+        args: &[Value],
+        mode: ResultMode,
+        next: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        let pc = InstructionOffset(
+            u32::try_from(self.frame.pc)
+                .map_err(|_| RuntimeError::new(RuntimeErrorKind::ProgramCounterOutOfBounds))?,
+        );
+        let authorized = self
+            .current_module()?
+            .official_execution()
+            .and_then(|plan| plan.call(self.prototype().id, pc))
+            .is_some_and(|call| call.builtin == kind && call.function_register == base);
+        if !authorized {
+            return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
+        }
+        match kind {
+            OfficialPlanBuiltin::RawListWrite => {
+                let [Value::Object(table), first, skip, values @ ..] = args else {
+                    return Err(RuntimeError::new(RuntimeErrorKind::BasicArgument));
+                };
+                if self.vm.object_kind(*table)? != ObjectKind::Table {
+                    return Err(VmError::WrongObjectType.into());
+                }
+                let first = basic::lua_integer(*first)
+                    .filter(|first| *first >= 1)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::BasicArgument))?;
+                let skip = basic::lua_integer(*skip)
+                    .and_then(|skip| usize::try_from(skip).ok())
+                    .filter(|skip| *skip <= values.len())
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::BasicArgument))?;
+                let values = &values[skip..];
+                if !self.charge_native_work(values.len())? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+                for (offset, value) in values.iter().copied().enumerate() {
+                    let key = first
+                        .checked_add(
+                            i64::try_from(offset).map_err(|_| VmError::ArithmeticOverflow)?,
+                        )
+                        .ok_or(VmError::ArithmeticOverflow)?;
+                    self.vm.raw_set(*table, Value::Integer(key), value)?;
+                }
+                let (values, ticket) = math_lib::values(self.vm, &[])?;
+                self.complete_builtin_values(base, mode, false, next, values, ticket)
+            }
+            OfficialPlanBuiltin::RawVarargGet => {
+                let [Value::Object(table), key] = args else {
+                    return Err(RuntimeError::new(RuntimeErrorKind::BasicArgument));
+                };
+                let value = self.vm.raw_get(*table, *key)?;
+                let (values, ticket) = math_lib::values(self.vm, &[value])?;
+                self.complete_builtin_values(base, mode, false, next, values, ticket)
+            }
+            OfficialPlanBuiltin::PackUnpack => {
+                let [Value::Object(table), wanted] = args else {
+                    return Err(RuntimeError::new(RuntimeErrorKind::BasicArgument));
+                };
+                if self.vm.object_kind(*table)? != ObjectKind::Table {
+                    return Err(VmError::WrongObjectType.into());
+                }
+                let available = self.official_named_count(*table)?;
+                let wanted = basic::lua_integer(*wanted)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::BasicArgument))?;
+                let count = if wanted == -1 {
+                    available
+                } else {
+                    usize::try_from(wanted)
+                        .map_err(|_| RuntimeError::new(RuntimeErrorKind::BasicArgument))?
+                };
+                if count > self.frame.max_register_limit {
+                    return Err(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds));
+                }
+                if !self.charge_native_work(count)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+                let snapshot = self.vm.allocate_table_with_capacity(count, 1)?;
+                let root = match self.vm.add_root(RootKind::Temporary, snapshot) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        self.vm.reclaim(snapshot)?;
+                        return Err(error.into());
+                    }
+                };
+                let mut name_key = None;
+                let result = (|| {
+                    for offset in 0..count.min(available) {
+                        let index =
+                            i64::try_from(offset + 1).map_err(|_| VmError::ArithmeticOverflow)?;
+                        let value = self.vm.raw_get(*table, Value::Integer(index))?;
+                        self.vm.raw_set(snapshot, Value::Integer(index), value)?;
+                    }
+                    let key = self.vm.allocate_byte_string(b"n")?;
+                    name_key = Some(key);
+                    let key_root = self.vm.add_root(RootKind::Temporary, key)?;
+                    let count = i64::try_from(count).map_err(|_| VmError::ArithmeticOverflow)?;
+                    let inserted =
+                        self.vm
+                            .raw_set(snapshot, Value::Object(key), Value::Integer(count));
+                    self.vm.remove_root(key_root)?;
+                    inserted?;
+                    let (values, ticket) = math_lib::values(self.vm, &[Value::Object(snapshot)])?;
+                    self.complete_builtin_values(base, mode, false, next, values, ticket)
+                })();
+                self.vm.remove_root(root)?;
+                if result.is_err() {
+                    self.vm.reclaim(snapshot)?;
+                    if let Some(key) = name_key {
+                        self.vm.reclaim(key)?;
+                    }
+                }
+                result
+            }
+            OfficialPlanBuiltin::GlobalNilCheck => {
+                let [value, name] = args else {
+                    return Err(RuntimeError::new(RuntimeErrorKind::BasicArgument));
+                };
+                if *value != Value::Nil {
+                    let name = match name {
+                        Value::Object(object)
+                            if self.vm.object_kind(*object)? == ObjectKind::ByteString =>
+                        {
+                            Some(*object)
+                        }
+                        _ => None,
+                    };
+                    let name_len = match name {
+                        Some(name) => self.vm.with_byte_string(name, |text| text.len())?,
+                        None => 1,
+                    };
+                    let capacity = b"global '' already defined"
+                        .len()
+                        .checked_add(name_len)
+                        .ok_or(VmError::ArithmeticOverflow)?;
+                    let mut bytes = Vec::new();
+                    let ticket = reserve_vec(
+                        self.vm.allocation_ledger(),
+                        &mut bytes,
+                        capacity,
+                        FailPoint::WorkReserve,
+                    )?;
+                    bytes.extend_from_slice(b"global '");
+                    if let Some(name) = name {
+                        self.vm.with_byte_string(name, |text| {
+                            bytes.extend_from_slice(text.as_bytes())
+                        })?;
+                    } else {
+                        bytes.push(b'?');
+                    }
+                    bytes.extend_from_slice(b"' already defined");
+                    let message = self.vm.allocate_byte_string(&bytes)?;
+                    drop(ticket);
+                    let mut error = RuntimeError::new(RuntimeErrorKind::InvalidGlobalNilCheck);
+                    error.value = Value::Object(message);
+                    return Err(error);
+                }
+                let (values, ticket) = math_lib::values(self.vm, &[])?;
+                self.complete_builtin_values(base, mode, false, next, values, ticket)
+            }
+        }
+    }
+
     fn enter_regular_call(
         &mut self,
         base: Register,
@@ -2642,6 +3238,23 @@ impl Execution<'_> {
                     return Ok(RegularCallAction::Entered);
                 }
                 ObjectKind::Builtin => match self.vm.builtin(object)? {
+                    Builtin::Official(kind) => {
+                        if tail_return {
+                            return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
+                        }
+                        let next = self.next_pc()?;
+                        let mut args = Vec::new();
+                        let ticket = reserve_vec(
+                            self.vm.allocation_ledger(),
+                            &mut args,
+                            end - start,
+                            FailPoint::WorkReserve,
+                        )?;
+                        args.extend_from_slice(&self.frame.registers[start..end]);
+                        let action = self.official_builtin(kind, base, &args, result_mode, next);
+                        drop(ticket);
+                        return action;
+                    }
                     Builtin::Error => {
                         return Err(explicit_error(
                             self.frame
@@ -2826,6 +3439,7 @@ impl Execution<'_> {
         let parameter_count = prototype.parameter_count;
         let is_variadic = prototype.is_variadic;
         let environment_register = prototype.frame.environment;
+        let official_inputs = self.vm.official_frame_registers(module_ref, prototype_id)?;
         let depth = if reuse_tail_frame {
             self.frame.depth
         } else {
@@ -2899,7 +3513,7 @@ impl Execution<'_> {
                 return Err(error);
             }
         }
-        let mut named_payload = None;
+        let mut named_payload = VarargPayloads::default();
         if is_variadic {
             let extra_start = first + 1 + usize::from(parameter_count);
             let extra = if extra_start < arguments_end {
@@ -2907,17 +3521,12 @@ impl Execution<'_> {
             } else {
                 &[]
             };
-            if callee.named_vararg.is_some() {
-                match callee.set_named_varargs(self.vm, extra) {
-                    Ok(payload) => named_payload = Some(payload),
-                    Err(error) => {
-                        callee.clear_roots(self.vm)?;
-                        return Err(error);
-                    }
+            match callee.initialize_variadic_inputs(self.vm, extra, official_inputs) {
+                Ok(payload) => named_payload = payload,
+                Err(error) => {
+                    callee.clear_roots(self.vm)?;
+                    return Err(error);
                 }
-            } else if let Err(error) = callee.set_varargs(self.vm, extra) {
-                callee.clear_roots(self.vm)?;
-                return Err(error);
             }
         }
         debug_assert_eq!(arguments_end, arguments_start + actual_arg_count);
@@ -2931,19 +3540,13 @@ impl Execution<'_> {
                 Ok(ticket) => ticket,
                 Err(error) => {
                     callee.clear_roots(self.vm)?;
-                    if let Some((table, key)) = named_payload {
-                        self.vm.reclaim(table)?;
-                        self.vm.reclaim(key)?;
-                    }
+                    named_payload.reclaim(self.vm)?;
                     return Err(error.into());
                 }
             };
             if let Err(error) = ticket.commit() {
                 callee.clear_roots(self.vm)?;
-                if let Some((table, key)) = named_payload {
-                    self.vm.reclaim(table)?;
-                    self.vm.reclaim(key)?;
-                }
+                named_payload.reclaim(self.vm)?;
                 return Err(error.into());
             }
             self.callers_charge = next_charge;
@@ -2955,10 +3558,7 @@ impl Execution<'_> {
                 .and_then(|()| self.frame.clear_roots(self.vm));
             if let Err(error) = close {
                 callee.clear_roots(self.vm)?;
-                if let Some((table, key)) = named_payload {
-                    self.vm.reclaim(table)?;
-                    self.vm.reclaim(key)?;
-                }
+                named_payload.reclaim(self.vm)?;
                 return Err(error);
             }
             self.frame.release_storage();
@@ -3154,6 +3754,7 @@ impl Execution<'_> {
         let parameter_count = usize::from(prototype.parameter_count);
         let is_variadic = prototype.is_variadic;
         let env_register = prototype.frame.environment;
+        let official_inputs = self.vm.official_frame_registers(module, prototype_id)?;
         let mut frame =
             CallFrame::new(prototype, index, Some(module), self.vm.allocation_ledger())?;
         frame.closure = Some(closure);
@@ -3171,11 +3772,7 @@ impl Execution<'_> {
             }
             if is_variadic {
                 let extra = args.get(parameter_count..).unwrap_or(&[]);
-                if frame.named_vararg.is_some() {
-                    frame.set_named_varargs(self.vm, extra)?;
-                } else {
-                    frame.set_varargs(self.vm, extra)?;
-                }
+                frame.initialize_variadic_inputs(self.vm, extra, official_inputs)?;
             }
             Ok::<(), RuntimeError>(())
         })();
@@ -3597,6 +4194,9 @@ impl Execution<'_> {
         if let Value::Object(target_object) = target {
             if self.vm.object_kind(target_object)? == ObjectKind::Builtin {
                 match self.vm.builtin(target_object)? {
+                    Builtin::Official(_) => {
+                        return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
+                    }
                     Builtin::Error => {
                         return self.start_native_protected_error(
                             object,
@@ -3746,7 +4346,8 @@ impl Execution<'_> {
                         self.vm.remove_root(inner_root)?;
                         return action;
                     }
-                    Builtin::Basic(_)
+                    Builtin::HostCallback(_)
+                    | Builtin::Basic(_)
                     | Builtin::Table(_)
                     | Builtin::Math(_)
                     | Builtin::Utf8(_)
@@ -4411,6 +5012,9 @@ impl Execution<'_> {
                 (true, CoroutineState::Dead, None)
             } else {
                 match builtin {
+                    Builtin::Official(_) => {
+                        return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
+                    }
                     Builtin::CoroutineYield => {
                         values.extend_from_slice(input);
                         (true, CoroutineState::Suspended, None)
@@ -4472,7 +5076,8 @@ impl Execution<'_> {
                     | Builtin::CoroutineClose
                     | Builtin::CoroutineWrap
                     | Builtin::CoroutineWrapped(_) => unreachable!(),
-                    Builtin::Basic(_)
+                    Builtin::HostCallback(_)
+                    | Builtin::Basic(_)
                     | Builtin::Table(_)
                     | Builtin::Math(_)
                     | Builtin::Utf8(_)
@@ -4544,6 +5149,9 @@ impl Execution<'_> {
         next: usize,
     ) -> Result<RegularCallAction, RuntimeError> {
         match builtin {
+            Builtin::HostCallback(id) => {
+                self.host_callback(id, args, destination, mode, tail_return, next)
+            }
             Builtin::Basic(kind) => {
                 self.basic_builtin(kind, args, destination, mode, tail_return, next)
             }
@@ -4704,6 +5312,247 @@ impl Execution<'_> {
         }
     }
 
+    fn host_callback(
+        &mut self,
+        id: usize,
+        args: &[Value],
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        let capture_len = self.vm.callback_capture_len(id)?;
+        let units = args
+            .len()
+            .checked_add(capture_len)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(VmError::ArithmeticOverflow)?;
+        if !self.charge_native_work(units)? {
+            return Ok(RegularCallAction::Aborted);
+        }
+        let (callback, captures, capture_ticket) = self.vm.callback_snapshot(id)?;
+        let action = callback(&mut CallbackContext::new(&captures), args);
+        drop(captures);
+        drop(capture_ticket);
+        self.apply_callback_result(action, destination, mode, tail_return, next, false)
+    }
+
+    fn apply_callback_result(
+        &mut self,
+        action: CallbackResult,
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+        continuation_completion: bool,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        match action {
+            CallbackResult::Return(values) => {
+                if !self.charge_native_work(values.len())? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+                for &value in &values {
+                    if let Value::Object(object) = value {
+                        self.vm.object_kind(object)?;
+                    }
+                }
+                let bytes = checked_bytes(values.capacity(), core::mem::size_of::<Value>())?;
+                let ticket = self.vm.allocation_ledger().reserve(bytes)?;
+                if continuation_completion {
+                    self.complete_basic_continuation_values(
+                        destination,
+                        mode,
+                        tail_return,
+                        next,
+                        values,
+                        Some(ticket),
+                    )
+                } else {
+                    self.complete_builtin_values(
+                        destination,
+                        mode,
+                        tail_return,
+                        next,
+                        values,
+                        Some(ticket),
+                    )
+                }
+            }
+            CallbackResult::Throw(value) => {
+                if !self.charge_native_work(1)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+                if let Value::Object(object) = value {
+                    self.vm.object_kind(object)?;
+                }
+                Err(explicit_error(value, self.frame.pc))
+            }
+            CallbackResult::Call {
+                target,
+                args,
+                continuation,
+            } => {
+                let units = args
+                    .len()
+                    .checked_add(continuation.captures.len())
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(VmError::ArithmeticOverflow)?;
+                if !self.charge_native_work(units)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+                let args_bytes = checked_bytes(args.capacity(), core::mem::size_of::<Value>())?;
+                let captures_bytes = checked_bytes(
+                    continuation.captures.capacity(),
+                    core::mem::size_of::<Value>(),
+                )?;
+                let args_ticket = self.vm.allocation_ledger().reserve(args_bytes)?;
+                let captures_ticket = self.vm.allocation_ledger().reserve(captures_bytes)?;
+                let target_root = if let Value::Object(object) = target {
+                    self.vm.object_kind(object)?;
+                    Some(self.vm.add_root(RootKind::Temporary, object)?)
+                } else {
+                    None
+                };
+                let action = (|| {
+                    let state = HostCallbackPending::new(self.vm, continuation, &args)?;
+                    self.start_basic_callback(
+                        target,
+                        &args,
+                        target,
+                        BasicPending::HostCallback {
+                            state,
+                            outer_mode: mode,
+                            tail_return,
+                        },
+                        destination,
+                        next,
+                    )
+                })();
+                if let Some(root) = target_root {
+                    self.vm.remove_root(root)?;
+                }
+                drop(args);
+                drop(captures_ticket);
+                drop(args_ticket);
+                action
+            }
+            CallbackResult::Resume {
+                coroutine,
+                args,
+                continuation,
+            } => self.apply_coroutine_callback_action(
+                Builtin::CoroutineResume,
+                Some(coroutine),
+                args,
+                continuation,
+                destination,
+                mode,
+                tail_return,
+                next,
+            ),
+            CallbackResult::Yield {
+                values,
+                continuation,
+            } => {
+                if self.vm.debug_hook_running() && self.pending_ops.contains_debug_hook() {
+                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                }
+                if self.vm.finalizer_running() || self.active_coroutine.is_none() {
+                    return Err(RuntimeError::new(RuntimeErrorKind::CoroutineYield));
+                }
+                self.apply_coroutine_callback_action(
+                    Builtin::CoroutineYield,
+                    None,
+                    values,
+                    continuation,
+                    destination,
+                    mode,
+                    tail_return,
+                    next,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_coroutine_callback_action(
+        &mut self,
+        builtin: Builtin,
+        leading: Option<Value>,
+        args: Vec<Value>,
+        continuation: crate::callback::CallbackContinuation,
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        let count = args
+            .len()
+            .checked_add(usize::from(leading.is_some()))
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let units = count
+            .checked_add(continuation.captures.len())
+            .and_then(|n| n.checked_add(1))
+            .ok_or(VmError::ArithmeticOverflow)?;
+        if !self.charge_native_work(units)? {
+            return Ok(RegularCallAction::Aborted);
+        }
+        let args_ticket = self.vm.allocation_ledger().reserve(checked_bytes(
+            args.capacity(),
+            core::mem::size_of::<Value>(),
+        )?)?;
+        let captures_ticket = self.vm.allocation_ledger().reserve(checked_bytes(
+            continuation.captures.capacity(),
+            core::mem::size_of::<Value>(),
+        )?)?;
+        let mut input = Vec::new();
+        let input_ticket = reserve_vec(
+            self.vm.allocation_ledger(),
+            &mut input,
+            count,
+            FailPoint::WorkReserve,
+        )?;
+        if let Some(value) = leading {
+            input.push(value);
+        }
+        input.extend_from_slice(&args);
+        let mut state = HostCallbackPending::new(self.vm, continuation, &input)?;
+        let target = match self.vm.allocate_callback_action_builtin(builtin) {
+            Ok(target) => target,
+            Err(error) => {
+                state.clear_roots(self.vm)?;
+                return Err(error.into());
+            }
+        };
+        let target_root = match self.vm.add_root(RootKind::Temporary, target) {
+            Ok(root) => root,
+            Err(error) => {
+                state.clear_roots(self.vm)?;
+                self.vm.reclaim(target)?;
+                return Err(error.into());
+            }
+        };
+        let result = self.start_basic_callback(
+            Value::Object(target),
+            &input,
+            Value::Object(target),
+            BasicPending::HostCallback {
+                state,
+                outer_mode: mode,
+                tail_return,
+            },
+            destination,
+            next,
+        );
+        self.vm.remove_root(target_root)?;
+        drop(input);
+        drop(args);
+        drop(input_ticket);
+        drop(captures_ticket);
+        drop(args_ticket);
+        result
+    }
+
     fn string_builtin(
         &mut self,
         kind: StringBuiltin,
@@ -4713,6 +5562,9 @@ impl Execution<'_> {
         tail_return: bool,
         next: usize,
     ) -> Result<RegularCallAction, RuntimeError> {
+        if kind == StringBuiltin::Dump {
+            return self.string_dump(args, destination, mode, tail_return, next);
+        }
         let available = if self.vm.finalizer_running() {
             1_000_000_u64.saturating_sub(self.finalizer_steps)
         } else {
@@ -4773,6 +5625,98 @@ impl Execution<'_> {
             return self.advance_string_format(state, None, destination, mode, tail_return, next);
         }
         let (values, ticket) = string_lib::execute(self.vm, kind, args)?;
+        self.complete_builtin_values(destination, mode, tail_return, next, values, ticket)
+    }
+
+    fn string_dump(
+        &mut self,
+        args: &[Value],
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        let capability = self.vm.dump_capability();
+        if !capability.allowed {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyStringDump));
+        }
+        let Value::Object(closure) = string_lib::arg(args, 0)? else {
+            return Err(RuntimeError::new(RuntimeErrorKind::StringArgument));
+        };
+        if self.vm.object_kind(closure)? != ObjectKind::Closure {
+            return Err(RuntimeError::new(RuntimeErrorKind::StringArgument));
+        }
+        let strip = !matches!(args.get(1), None | Some(Value::Nil | Value::Boolean(false)));
+        let limits = capability.limits;
+        let work_limit = u64::try_from(limits.max_work_units)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostDumpBudget))?;
+        if !self.charge_native_work(limits.max_work_units)? {
+            return Ok(RegularCallAction::Aborted);
+        }
+        let finalizer_running = self.vm.finalizer_running();
+        let mut work = OfficialWorkBudget::new(work_limit);
+        let result = (|| -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
+            let temporary = self
+                .vm
+                .allocation_ledger()
+                .reserve(limits.max_temporary_bytes)?;
+            let (module_ref, selected) = self
+                .vm
+                .with_closure(closure, |payload| (payload.module(), payload.prototype()))?;
+            let mut chunk_limits = OfficialChunkLimits::default();
+            chunk_limits.max_bytes = chunk_limits.max_bytes.min(limits.max_encoded_bytes);
+            chunk_limits.max_allocated_bytes = chunk_limits
+                .max_allocated_bytes
+                .min(limits.max_temporary_bytes);
+            let bytes = emit_official_chunk(
+                self.vm.module(module_ref)?,
+                selected,
+                self.vm.language_profile(),
+                strip,
+                &chunk_limits,
+                &mut work,
+            )
+            .map_err(|error| {
+                let kind = match error.kind {
+                    OfficialExportErrorKind::WorkExhausted
+                    | OfficialExportErrorKind::LimitExceeded => RuntimeErrorKind::HostDumpBudget,
+                    OfficialExportErrorKind::AllocationFailed => {
+                        RuntimeErrorKind::Heap(VmError::AllocationFailed)
+                    }
+                    OfficialExportErrorKind::Unsupported => RuntimeErrorKind::HostUnsupported,
+                    OfficialExportErrorKind::ProfileMismatch
+                    | OfficialExportErrorKind::InvalidPrototype
+                    | OfficialExportErrorKind::Codec => RuntimeErrorKind::StringArgument,
+                };
+                RuntimeError::new(kind)
+            })?;
+            work.charge(bytes.len(), selected, 0)
+                .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostDumpBudget))?;
+            let output = self.vm.allocate_byte_string(&bytes)?;
+            let values = match string_lib::values(self.vm, &[Value::Object(output)]) {
+                Ok(values) => values,
+                Err(error) => {
+                    self.vm.reclaim(output)?;
+                    return Err(error);
+                }
+            };
+            drop(bytes);
+            drop(temporary);
+            Ok(values)
+        })();
+        let refund = work.remaining();
+        if finalizer_running {
+            self.finalizer_steps = self
+                .finalizer_steps
+                .checked_sub(refund)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        } else {
+            self.fuel = self
+                .fuel
+                .checked_add(refund)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        }
+        let (values, ticket) = result?;
         self.complete_builtin_values(destination, mode, tail_return, next, values, ticket)
     }
 
@@ -6189,12 +7133,43 @@ impl Execution<'_> {
             if self.vm.object_kind(function)? != ObjectKind::Closure {
                 return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
             }
-            if self
-                .vm
-                .with_closure(function, |closure| closure.environment().is_some())?
-            {
+            let (module, prototype, has_environment) =
+                self.vm.with_closure(function, |closure| {
+                    (
+                        closure.module(),
+                        closure.prototype(),
+                        closure.environment().is_some(),
+                    )
+                })?;
+            let official_artifact = self.vm.module(module)?.official_artifact_shared();
+            if has_environment && official_artifact.is_none() {
                 return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
             }
+            let debug_limit = self.vm.debug_capability().limits().max_work_units;
+            let mut debug_work = 1_usize;
+            let candidates = if self.vm.module(module)?.official_execution().is_some() {
+                let candidates = self.vm.module(module)?.module().prototypes.len();
+                debug_work = debug_work
+                    .checked_add(candidates)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                if debug_work > debug_limit {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+                }
+                if !self.charge_native_work(candidates)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+                candidates
+            } else {
+                0
+            };
+            let official_guest_count = match self.vm.module(module)?.official_execution() {
+                Some(plan) => Some(usize::from(
+                    plan.upvalue_map(prototype)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+                        .guest_count,
+                )),
+                None => None,
+            };
             let index_value = args
                 .get(1)
                 .copied()
@@ -6202,7 +7177,10 @@ impl Execution<'_> {
             if let Value::Object(object) = index_value {
                 if self.vm.object_kind(object)? == ObjectKind::ByteString {
                     let len = self.vm.with_byte_string(object, |text| text.len())?;
-                    if len > self.vm.debug_capability().limits().max_work_units {
+                    debug_work = debug_work
+                        .checked_add(len)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                    if debug_work > debug_limit {
                         return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
                     }
                     if !self.charge_native_work(len)? {
@@ -6216,8 +7194,12 @@ impl Execution<'_> {
                 .checked_sub(1)
                 .and_then(|index| usize::try_from(index).ok())
             {
-                self.vm
-                    .with_closure(function, |closure| closure.upvalue(index))?
+                if official_guest_count.is_some_and(|count| index >= count) {
+                    None
+                } else {
+                    self.vm
+                        .with_closure(function, |closure| closure.upvalue(index))?
+                }
             } else {
                 None
             };
@@ -6264,12 +7246,46 @@ impl Execution<'_> {
                         )?
                         .saturating_add(self.resume_stack.len())
                 };
-                if frame_work > self.vm.debug_capability().limits().max_work_units {
+                debug_work = debug_work
+                    .checked_add(frame_work)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                if debug_work > debug_limit {
                     return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
                 }
                 if !self.charge_native_work(frame_work)? {
                     return Ok(RegularCallAction::Aborted);
                 }
+            }
+            if official_artifact.is_some() {
+                debug_work = debug_work
+                    .checked_add(candidates)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                if debug_work > debug_limit {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+                }
+                if !self.charge_native_work(candidates)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+            }
+            let name_bytes = official_artifact
+                .as_ref()
+                .and_then(|artifact| artifact.prototype(prototype))
+                .and_then(|proto| {
+                    index
+                        .checked_sub(1)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .and_then(|index| proto.debug.upvalue_names.get(index))
+                })
+                .and_then(|name| name.as_deref())
+                .unwrap_or(b"(no name)");
+            debug_work = debug_work
+                .checked_add(name_bytes.len())
+                .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+            if debug_work > debug_limit {
+                return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+            }
+            if !self.charge_native_work(name_bytes.len())? {
+                return Ok(RegularCallAction::Aborted);
             }
             let value = self
                 .read_upvalue(upvalue)
@@ -6285,7 +7301,7 @@ impl Execution<'_> {
                 _ => None,
             };
             let output = (|| {
-                let name = self.vm.allocate_byte_string(b"(no name)")?;
+                let name = self.vm.allocate_byte_string(name_bytes)?;
                 math_lib::values(self.vm, &[Value::Object(name), value])
             })();
             if let Some(root) = value_root {
@@ -6332,35 +7348,110 @@ impl Execution<'_> {
                 if !self.charge_native_work(mask_len)? {
                     return Ok(RegularCallAction::Aborted);
                 }
-                let (supported, has_u, has_f) = self.vm.with_byte_string(mask, |string| {
-                    let bytes = string.as_bytes();
-                    (
-                        bytes.iter().all(|byte| matches!(byte, b'u' | b'f')),
-                        bytes.contains(&b'u'),
-                        bytes.contains(&b'f'),
-                    )
-                })?;
+                let official = if object_kind == ObjectKind::Closure {
+                    let module = self.vm.with_closure(object, |closure| closure.module())?;
+                    self.vm.module(module)?.official_artifact_shared()
+                } else {
+                    None
+                };
+                let (supported, has_u, has_f, has_s, has_l) =
+                    self.vm.with_byte_string(mask, |string| {
+                        let bytes = string.as_bytes();
+                        (
+                            bytes.iter().all(|byte| {
+                                matches!(byte, b'u' | b'f')
+                                    || (official.is_some() && matches!(byte, b'S' | b'l'))
+                            }),
+                            bytes.contains(&b'u'),
+                            bytes.contains(&b'f'),
+                            bytes.contains(&b'S'),
+                            bytes.contains(&b'l'),
+                        )
+                    })?;
                 if !supported || (has_u && object_kind == ObjectKind::Builtin) {
                     return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                 }
                 if has_u
                     && object_kind == ObjectKind::Closure
+                    && official.is_none()
                     && self
                         .vm
                         .with_closure(object, |closure| closure.environment().is_some())?
                 {
                     return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                 }
+                let mut debug_work = mask_len;
                 if has_u {
                     let module = self.vm.with_closure(object, |closure| closure.module())?;
                     let candidates = self.vm.module(module)?.module().prototypes.len();
-                    if candidates > self.vm.debug_capability().limits().max_work_units {
+                    let searches = if self.vm.module(module)?.official_execution().is_some() {
+                        2
+                    } else {
+                        1
+                    };
+                    let lookup_work = candidates
+                        .checked_mul(searches)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                    debug_work = debug_work
+                        .checked_add(lookup_work)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                    if debug_work > self.vm.debug_capability().limits().max_work_units {
                         return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
                     }
-                    if !self.charge_native_work(candidates)? {
+                    if !self.charge_native_work(lookup_work)? {
                         return Ok(RegularCallAction::Aborted);
                     }
                 }
+                let source_metadata = if has_s {
+                    let (module, prototype) = self
+                        .vm
+                        .with_closure(object, |closure| (closure.module(), closure.prototype()))?;
+                    let artifact = official
+                        .as_ref()
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                    let candidates = self.vm.module(module)?.module().prototypes.len();
+                    let lookup_work = candidates
+                        .checked_mul(2)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                    debug_work = debug_work
+                        .checked_add(lookup_work)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                    if debug_work > self.vm.debug_capability().limits().max_work_units {
+                        return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+                    }
+                    if !self.charge_native_work(lookup_work)? {
+                        return Ok(RegularCallAction::Aborted);
+                    }
+                    let guest = artifact
+                        .prototype(prototype)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                    let source = artifact.effective_source(prototype).unwrap_or(b"=?");
+                    let copy_work = source
+                        .len()
+                        .checked_mul(3)
+                        .and_then(|units| units.checked_add(128))
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                    debug_work = debug_work
+                        .checked_add(copy_work)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                    if debug_work > self.vm.debug_capability().limits().max_work_units {
+                        return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+                    }
+                    if !self.charge_native_work(copy_work)? {
+                        return Ok(RegularCallAction::Aborted);
+                    }
+                    let (short, short_len) = official_short_source(source);
+                    Some((
+                        source,
+                        short,
+                        short_len,
+                        guest.line_defined,
+                        guest.last_line_defined,
+                        prototype.0 == 0,
+                    ))
+                } else {
+                    None
+                };
                 let info = self.vm.allocate_table()?;
                 let info_root = self.vm.add_root(RootKind::Temporary, info)?;
                 let built = (|| {
@@ -6376,7 +7467,19 @@ impl Execution<'_> {
                             .iter()
                             .find(|entry| entry.id == prototype)
                             .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
-                        let nups = i64::try_from(proto.upvalues.len())
+                        let upvalue_count = if official.is_some() {
+                            usize::from(
+                                self.vm
+                                    .module(module)?
+                                    .official_execution()
+                                    .and_then(|plan| plan.upvalue_map(prototype))
+                                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+                                    .guest_count,
+                            )
+                        } else {
+                            proto.upvalues.len()
+                        };
+                        let nups = i64::try_from(upvalue_count)
                             .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
                         let nparams = i64::from(proto.parameter_count);
                         let isvararg = proto.is_variadic;
@@ -6386,6 +7489,44 @@ impl Execution<'_> {
                             .set_string_field(info, b"nparams", Value::Integer(nparams))?;
                         self.vm
                             .set_string_field(info, b"isvararg", Value::Boolean(isvararg))?;
+                    }
+                    if let Some((
+                        source,
+                        short,
+                        short_len,
+                        line_defined,
+                        last_line_defined,
+                        is_main,
+                    )) = source_metadata
+                    {
+                        let source_value = self.vm.allocate_byte_string(source)?;
+                        self.vm
+                            .set_string_field(info, b"source", Value::Object(source_value))?;
+                        let short_value = self.vm.allocate_byte_string(&short[..short_len])?;
+                        self.vm
+                            .set_string_field(info, b"short_src", Value::Object(short_value))?;
+                        self.vm.set_string_field(
+                            info,
+                            b"linedefined",
+                            Value::Integer(i64::from(line_defined)),
+                        )?;
+                        self.vm.set_string_field(
+                            info,
+                            b"lastlinedefined",
+                            Value::Integer(i64::from(last_line_defined)),
+                        )?;
+                        let what = if is_main {
+                            b"main".as_slice()
+                        } else {
+                            b"Lua".as_slice()
+                        };
+                        let what_value = self.vm.allocate_byte_string(what)?;
+                        self.vm
+                            .set_string_field(info, b"what", Value::Object(what_value))?;
+                    }
+                    if has_l {
+                        self.vm
+                            .set_string_field(info, b"currentline", Value::Integer(-1))?;
                     }
                     if has_f {
                         self.vm.set_string_field(info, b"func", function)?;
@@ -6480,18 +7621,44 @@ impl Execution<'_> {
             None => number_len,
         };
         let limits = self.vm.debug_capability().limits();
-        // 兩次 traversal 都會掃過 native/module=None frame；先按候選總數預付。
+        // 預檢來源查找與兩次輸出 traversal 都會掃過 native/module=None frame。
         let traversal_work = self
             .callers
             .len()
             .checked_add(1)
-            .and_then(|count| count.checked_mul(2))
+            .and_then(|count| count.checked_mul(3))
             .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+        if traversal_work > limits.max_work_units {
+            return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+        }
+        if !self.charge_native_work(traversal_work)? {
+            return Ok(RegularCallAction::Aborted);
+        }
+        let mut lookup_work = 0_usize;
+        for frame in core::iter::once(&self.frame)
+            .chain(self.callers.iter().rev())
+            .filter(|frame| frame.module.is_some())
+        {
+            let module = frame
+                .module
+                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+            if self.vm.module(module)?.official_artifact().is_some() {
+                let candidates = self.vm.module(module)?.module().prototypes.len();
+                lookup_work = lookup_work
+                    .checked_add(
+                        candidates
+                            .checked_mul(2)
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?,
+                    )
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+            }
+        }
         let remaining_work = limits
             .max_work_units
             .checked_sub(traversal_work)
+            .and_then(|remaining| remaining.checked_sub(lookup_work))
             .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
-        if !self.charge_native_work(traversal_work)? {
+        if !self.charge_native_work(lookup_work)? {
             return Ok(RegularCallAction::Aborted);
         }
         let mut frame_count = 0_usize;
@@ -6523,6 +7690,32 @@ impl Execution<'_> {
                 .prototypes
                 .get(frame.prototype)
                 .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+            if let Some(artifact) = self.vm.module(module)?.official_artifact() {
+                let source = artifact.effective_source(prototype.id).unwrap_or(b"?");
+                let source = source.strip_prefix(b"@").unwrap_or(source);
+                let source_pc = frame
+                    .pc
+                    .saturating_sub(usize::from(!core::ptr::eq(frame, &self.frame)));
+                let pc = u32::try_from(source_pc)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                let line = artifact
+                    .pc_map(prototype.id)
+                    .and_then(|map| map.line_at_rvlu(InstructionOffset(pc)))
+                    .unwrap_or(0);
+                total = total
+                    .checked_add(
+                        b"\t".len()
+                            + source.len()
+                            + b":".len()
+                            + debug_lib::decimal_len(line as usize)
+                            + b"\n".len(),
+                    )
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                if total > limits.max_trace_bytes {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+                }
+                continue;
+            }
             let id = usize::try_from(prototype.id.0)
                 .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
             let line = b"\t[RVLU prototype ".len()
@@ -6577,6 +7770,25 @@ impl Execution<'_> {
                 .prototypes
                 .get(frame.prototype)
                 .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+            if let Some(artifact) = self.vm.module(module)?.official_artifact() {
+                let source = artifact.effective_source(prototype.id).unwrap_or(b"?");
+                let source = source.strip_prefix(b"@").unwrap_or(source);
+                let source_pc = frame
+                    .pc
+                    .saturating_sub(usize::from(!core::ptr::eq(frame, &self.frame)));
+                let pc = u32::try_from(source_pc)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                let line = artifact
+                    .pc_map(prototype.id)
+                    .and_then(|map| map.line_at_rvlu(InstructionOffset(pc)))
+                    .unwrap_or(0);
+                output.push(b'\t');
+                output.extend_from_slice(source);
+                output.push(b':');
+                debug_lib::append_decimal(&mut output, line as usize);
+                output.push(b'\n');
+                continue;
+            }
             let id = usize::try_from(prototype.id.0)
                 .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
             output.extend_from_slice(b"\t[RVLU prototype ");
@@ -8991,106 +10203,337 @@ impl Execution<'_> {
         if !binary && !mode.text {
             return self.load_diagnostic(b"attempt to load a text chunk");
         }
+        if is_official_binary(source) {
+            if !self.vm.load_allows_official_bytecode() {
+                return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyLoad));
+            }
+            let version = match self.vm.language_profile() {
+                LuaProfile::Lua54 => 0x54,
+                LuaProfile::Lua55 => 0x55,
+            };
+            if source.get(4) != Some(&version) {
+                return self.load_diagnostic(b"official Lua profile mismatch");
+            }
+            return self.create_loaded_official_function(source, environment);
+        }
+        if classify_input(source) == InputFormat::UnsupportedBinary {
+            return self.load_diagnostic(b"unsupported binary chunk");
+        }
         if binary && !self.vm.load_allows_bytecode() {
             return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyLoad));
         }
-        if !binary && !self.vm.host_compiler_available() {
+        if binary {
+            return self.create_loaded_raw_function(source, environment);
+        }
+        if !self.vm.host_compiler_available() {
             return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyLoad));
         }
-        // decode/verify 會走訪 bytes、指令和控制流程；以來源長度保守入場，
-        // 暫存另涵蓋 decode 與 verifier 的中介結構，module 本身另計 retained。
-        let required_work = source.len().saturating_mul(64).saturating_add(128);
-        let required_temporary = source.len().saturating_mul(64).saturating_add(4096);
-        let required_retained = source.len().saturating_mul(1024).saturating_add(4096);
-        if binary
-            && (required_work > limits.max_work_units
-                || required_temporary > limits.max_temporary_bytes
-                || required_retained > limits.max_module_allocation_bytes)
-        {
+        // compiler 按階段在實際工作與配置前申報；這裡只提供政策上限，
+        // fuel 與 ledger 由既有 metered budget 逐筆扣除。
+        let mut budget = LoadBudget::metered(
+            limits.max_work_units,
+            limits.max_temporary_bytes,
+            &mut self.fuel,
+            &mut self.finalizer_steps,
+            self.vm.finalizer_running(),
+            self.vm.allocation_ledger().clone(),
+        )
+        .with_module_limit(limits.max_module_allocation_bytes);
+        let attempt = match budget.spend_work(1) {
+            Ok(()) => self.vm.host_compile(source, chunkname, &mut budget),
+            Err(error) => Err(LoadServiceError::Host(error)),
+        }
+        .map_err(|error| match error {
+            LoadServiceError::PolicyDenied => (RuntimeErrorKind::HostPolicyLoad, Vec::new()),
+            LoadServiceError::Host(error) => {
+                let kind = match error.kind {
+                    HostLoadErrorKind::PolicyDenied => RuntimeErrorKind::HostPolicyLoad,
+                    HostLoadErrorKind::Failed => RuntimeErrorKind::HostLoadFailed,
+                    HostLoadErrorKind::Compile => RuntimeErrorKind::LoadCompile,
+                    HostLoadErrorKind::Budget => RuntimeErrorKind::HostLoadBudget,
+                };
+                (kind, error.diagnostic)
+            }
+        });
+        if let Some(stop) = budget.stop() {
+            drop(attempt);
+            drop(budget);
+            return match stop {
+                LoadBudgetStop::Limit => Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget)),
+                LoadBudgetStop::Fuel => Ok(None),
+                LoadBudgetStop::Allocation(error) => Err(error.into()),
+                LoadBudgetStop::Terminal => {
+                    Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution))
+                }
+            };
+        }
+        let module = match attempt {
+            Ok(module) => module,
+            Err((kind, message)) => {
+                if message.capacity() > budget.claimed_temporary() {
+                    return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
+                }
+                let diagnostic_charge = budget.take_temporary_charge();
+                drop(budget);
+                let result = if matches!(
+                    kind,
+                    RuntimeErrorKind::LoadCompile | RuntimeErrorKind::LoadBytecode
+                ) {
+                    let bytes = if message.is_empty() {
+                        b"load failed".as_slice()
+                    } else {
+                        &message
+                    };
+                    self.load_diagnostic(bytes)
+                } else if message.is_empty() {
+                    Err(RuntimeError::new(kind))
+                } else {
+                    if !self.charge_native_work(message.len().saturating_add(1))? {
+                        return Ok(None);
+                    }
+                    let value = self.vm.allocate_byte_string(&message)?;
+                    Err(RuntimeError {
+                        value: Value::Object(value),
+                        ..RuntimeError::new(kind)
+                    })
+                };
+                drop(diagnostic_charge);
+                return result;
+            }
+        };
+        if module.format_version() != RVLU_V2 || module.profile() != self.vm.language_profile() {
+            drop(module);
+            drop(budget);
+            return self.load_diagnostic(b"RVLU format or profile mismatch");
+        }
+        let measurement_work = verified_module_measurement_work(&module)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostLoadBudget))?;
+        let measurement = budget.spend_work(measurement_work);
+        if let Some(stop) = budget.stop() {
+            drop(module);
+            drop(budget);
+            return match stop {
+                LoadBudgetStop::Limit => Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget)),
+                LoadBudgetStop::Fuel => Ok(None),
+                LoadBudgetStop::Allocation(error) => Err(error.into()),
+                LoadBudgetStop::Terminal => {
+                    Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution))
+                }
+            };
+        }
+        measurement.map_err(|_| RuntimeError::new(RuntimeErrorKind::HostLoadBudget))?;
+        let actual = module_allocation_bytes(&module)?;
+        if actual > budget.module_claimed() {
             return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
         }
-        let work = required_work.min(limits.max_work_units);
-        let temporary = required_temporary.min(limits.max_temporary_bytes);
-        let retained = required_retained.min(limits.max_module_allocation_bytes);
-        if work == 0 || temporary == 0 || retained == 0 {
+        let temporary_charge = budget.take_temporary_charge();
+        let mut module_charge = budget
+            .take_module_charge()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostLoadBudget))?;
+        drop(budget);
+        module_charge.transfer(actual)?;
+        let charge = ModuleCharge::new(self.vm, actual);
+        let loaded = self.vm.loaded_chunk_closure(module, environment, charge);
+        drop(temporary_charge);
+        let (value, root) = loaded?;
+        Ok(Some(LoadCreated {
+            value,
+            root,
+            diagnostic: false,
+        }))
+    }
+
+    fn create_loaded_raw_function(
+        &mut self,
+        source: &[u8],
+        environment: Value,
+    ) -> Result<Option<LoadCreated>, RuntimeError> {
+        let limits = self.vm.load_limits();
+        let mut input_limits = TransportLimits::default();
+        input_limits.verify = self.vm.load_verify_limits();
+        input_limits.verify.max_module_bytes = input_limits
+            .verify
+            .max_module_bytes
+            .min(limits.max_encoded_bytes);
+        input_limits.max_work = limits.max_work_units as u64;
+        input_limits.max_temporary_bytes = limits.max_temporary_bytes;
+        input_limits.max_retained_bytes = limits.max_module_allocation_bytes;
+
+        let scan = input_scan_admission(source.len(), InputFormat::RawRvlu)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostLoadBudget))?;
+        let scan_work = usize::try_from(scan.work)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostLoadBudget))?;
+        if scan_work > limits.max_work_units {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
+        }
+        if !self.charge_native_work(scan_work)? {
+            return Ok(None);
+        }
+        let preflight =
+            match preflight_input_module(source, self.vm.language_profile(), &input_limits) {
+                Ok(preflight) => preflight,
+                Err(error) => return self.input_load_failure(error.kind, error.detail),
+            };
+        let admission = preflight.admission();
+        let subsequent = usize::try_from(admission.subsequent_work)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostLoadBudget))?;
+        if subsequent > limits.max_work_units - scan_work {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
+        }
+        if !self.charge_native_work(subsequent)? {
+            return Ok(None);
+        }
+        let admitted = admission
+            .temporary_bytes
+            .checked_add(admission.retained_bytes)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let ticket = self.vm.allocation_ledger().reserve(admitted)?;
+        let module = match decode_input_module(preflight) {
+            Ok(module) => module,
+            Err(error) => return self.input_load_failure(error.kind, error.detail),
+        };
+        let actual = module_allocation_bytes(&module)?;
+        if actual > admission.retained_bytes {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
+        }
+        ticket.commit()?;
+        self.vm.allocation_ledger().refund(admitted - actual)?;
+        let charge = ModuleCharge::new(self.vm, actual);
+        let (value, root) = self.vm.loaded_chunk_closure(module, environment, charge)?;
+        Ok(Some(LoadCreated {
+            value,
+            root,
+            diagnostic: false,
+        }))
+    }
+
+    fn input_load_failure(
+        &mut self,
+        kind: InputErrorKind,
+        detail: &'static str,
+    ) -> Result<Option<LoadCreated>, RuntimeError> {
+        match kind {
+            InputErrorKind::LimitExceeded => {
+                Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget))
+            }
+            InputErrorKind::AllocationFailed => Err(RuntimeError::new(RuntimeErrorKind::Heap(
+                VmError::AllocationFailed,
+            ))),
+            InputErrorKind::InvalidFormat => self.load_diagnostic(detail.as_bytes()),
+        }
+    }
+
+    fn create_loaded_official_function(
+        &mut self,
+        source: &[u8],
+        environment: Value,
+    ) -> Result<Option<LoadCreated>, RuntimeError> {
+        let limits = self.vm.load_limits();
+        let mut verify = self.vm.load_verify_limits();
+        verify.max_module_bytes = verify.max_module_bytes.min(limits.max_encoded_bytes);
+        let mut official = OfficialChunkLimits::default();
+        official.max_bytes = official.max_bytes.min(limits.max_encoded_bytes);
+        official.max_prototypes = official.max_prototypes.min(verify.max_prototypes);
+        official.max_instructions = official.max_instructions.min(verify.max_instructions);
+        official.max_constants = official.max_constants.min(verify.max_constants);
+        official.max_allocated_bytes = official.max_allocated_bytes.min(limits.max_temporary_bytes);
+
+        // 掃描本身線性走訪輸入與 opcode／line marker，先扣除其上界。
+        let prescan_work = source
+            .len()
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostLoadBudget))?;
+        if prescan_work > limits.max_work_units {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
+        }
+        if !self.charge_native_work(prescan_work)? {
+            return Ok(None);
+        }
+        let stats = match preflight_official_chunk(
+            source,
+            self.vm.language_profile(),
+            &official,
+            &verify,
+        ) {
+            Ok(stats) => stats,
+            Err(error) => {
+                return match error.kind {
+                    OfficialChunkErrorKind::LimitExceeded
+                    | OfficialChunkErrorKind::WorkExhausted => {
+                        Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget))
+                    }
+                    OfficialChunkErrorKind::AllocationFailed => Err(RuntimeError::new(
+                        RuntimeErrorKind::Heap(VmError::AllocationFailed),
+                    )),
+                    OfficialChunkErrorKind::InvalidFormat
+                    | OfficialChunkErrorKind::Truncated
+                    | OfficialChunkErrorKind::Overflow => {
+                        self.load_diagnostic(error.detail.as_bytes())
+                    }
+                };
+            }
+        };
+        official.max_allocated_bytes = official.max_allocated_bytes.min(stats.decoded_bytes);
+        let work = usize::try_from(stats.subsequent_work)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostLoadBudget))?;
+        if work > limits.max_work_units - prescan_work
+            || stats.temporary_bytes > limits.max_temporary_bytes
+            || stats.retained_bytes > limits.max_module_allocation_bytes
+        {
             return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
         }
         if !self.charge_native_work(work)? {
             return Ok(None);
         }
-        let admission_bytes = temporary
-            .checked_add(retained)
+        let admission_bytes = stats
+            .temporary_bytes
+            .checked_add(stats.retained_bytes)
             .ok_or(VmError::ArithmeticOverflow)?;
         let admission = self.vm.allocation_ledger().reserve(admission_bytes)?;
-        let mut budget = LoadBudget::new(work, temporary, retained);
-        let attempt = if binary {
-            let mut verify = self.vm.load_verify_limits();
-            verify.max_module_bytes = verify.max_module_bytes.min(limits.max_encoded_bytes);
-            decode_module(source, self.vm.language_profile(), &verify)
-                .map_err(|error| (RuntimeErrorKind::LoadBytecode, error.message.into_bytes()))
-        } else {
-            self.vm
-                .host_compile(source, chunkname, &mut budget)
-                .map_err(|error| match error {
-                    LoadServiceError::PolicyDenied => {
-                        (RuntimeErrorKind::HostPolicyLoad, Vec::new())
+        let decoded = match decode_official_chunk(source, self.vm.language_profile(), &official) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                return match error.kind {
+                    OfficialChunkErrorKind::LimitExceeded
+                    | OfficialChunkErrorKind::WorkExhausted => {
+                        Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget))
                     }
-                    LoadServiceError::Host(error) => {
-                        let kind = match error.kind {
-                            HostLoadErrorKind::PolicyDenied => RuntimeErrorKind::HostPolicyLoad,
-                            HostLoadErrorKind::Failed => RuntimeErrorKind::HostLoadFailed,
-                            HostLoadErrorKind::Compile => RuntimeErrorKind::LoadCompile,
-                            HostLoadErrorKind::Budget => RuntimeErrorKind::HostLoadBudget,
-                        };
-                        (kind, error.diagnostic)
+                    OfficialChunkErrorKind::AllocationFailed => Err(RuntimeError::new(
+                        RuntimeErrorKind::Heap(VmError::AllocationFailed),
+                    )),
+                    OfficialChunkErrorKind::InvalidFormat
+                    | OfficialChunkErrorKind::Truncated
+                    | OfficialChunkErrorKind::Overflow => {
+                        self.load_diagnostic(error.detail.as_bytes())
                     }
-                })
-        };
-        if budget.stop().is_some() {
-            return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
-        }
-        if !binary
-            && attempt
-                .as_ref()
-                .err()
-                .is_some_and(|(_, diagnostic)| diagnostic.capacity() > budget.claimed_temporary())
-        {
-            return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
-        }
-        let module = match attempt {
-            Ok(module) => module,
-            Err((RuntimeErrorKind::LoadCompile | RuntimeErrorKind::LoadBytecode, message)) => {
-                let message = if message.is_empty() {
-                    b"load failed".as_slice()
-                } else {
-                    &message
                 };
-                return self.load_diagnostic(message);
-            }
-            Err((kind, message)) => {
-                if message.is_empty() {
-                    return Err(RuntimeError::new(kind));
-                }
-                if message.len() > limits.max_temporary_bytes {
-                    return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
-                }
-                if !self.charge_native_work(message.len().saturating_add(1))? {
-                    return Ok(None);
-                }
-                let value = self.vm.allocate_byte_string(&message)?;
-                return Err(RuntimeError {
-                    value: Value::Object(value),
-                    ..RuntimeError::new(kind)
-                });
             }
         };
-        if module.format_version() != RVLU_V2 || module.profile() != self.vm.language_profile() {
-            return self.load_diagnostic(b"RVLU format or profile mismatch");
-        }
+        let mut translation_work = OfficialWorkBudget::new(stats.subsequent_work);
+        let translated =
+            match translate_official_chunk_with_work(&decoded, &verify, &mut translation_work) {
+                Ok(translated) => translated,
+                Err(error) => {
+                    return if translation_work.exhausted()
+                        || error.kind == OfficialTranslationErrorKind::LimitExceeded
+                    {
+                        Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget))
+                    } else if error.kind == OfficialTranslationErrorKind::AllocationFailed {
+                        Err(RuntimeError::new(RuntimeErrorKind::Heap(
+                            VmError::AllocationFailed,
+                        )))
+                    } else {
+                        self.load_diagnostic(b"invalid official Lua chunk")
+                    };
+                }
+            };
+        let module = translated.into_verified();
         let actual = module_allocation_bytes(&module)?;
-        if actual > retained {
+        if actual > stats.retained_bytes {
             return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
         }
+        drop(decoded);
         admission.commit()?;
         self.vm
             .allocation_ledger()
@@ -9600,8 +11043,13 @@ impl Execution<'_> {
                 let charge = budget.take_temporary_charge();
                 drop(budget);
                 let format_matches = match found.format {
-                    LoadFormat::Source => !is_rivet_binary(&found.data),
-                    LoadFormat::RivetBytecode => is_rivet_binary(&found.data),
+                    LoadFormat::Source => classify_input(&found.data) == InputFormat::Source,
+                    LoadFormat::RivetBytecode => {
+                        classify_input(&found.data) == InputFormat::RawRvlu
+                    }
+                    LoadFormat::OfficialBytecode => {
+                        classify_input(&found.data) == InputFormat::Official
+                    }
                 };
                 if !format_matches {
                     return Err(RuntimeError::new(RuntimeErrorKind::LoadBytecode));
@@ -9612,6 +11060,10 @@ impl Execution<'_> {
                         binary: false,
                     },
                     LoadFormat::RivetBytecode => package_lib::LoadMode {
+                        text: false,
+                        binary: true,
+                    },
+                    LoadFormat::OfficialBytecode => package_lib::LoadMode {
                         text: false,
                         binary: true,
                     },
@@ -9627,7 +11079,9 @@ impl Execution<'_> {
                         self.vm.remove_root(created.root)?;
                         let kind = match found.format {
                             LoadFormat::Source => RuntimeErrorKind::LoadCompile,
-                            LoadFormat::RivetBytecode => RuntimeErrorKind::LoadBytecode,
+                            LoadFormat::RivetBytecode | LoadFormat::OfficialBytecode => {
+                                RuntimeErrorKind::LoadBytecode
+                            }
                         };
                         Err(RuntimeError {
                             value: Value::Object(created.value),
@@ -10995,6 +12449,7 @@ impl Execution<'_> {
             }
         }
         let callback_mode = match basic {
+            BasicPending::HostCallback { .. } => ResultMode::All,
             BasicPending::DoFile { .. } => ResultMode::All,
             BasicPending::Require { ref state, .. }
                 if state.phase == RequirePhase::SearcherCall =>
@@ -11069,6 +12524,18 @@ impl Execution<'_> {
         };
         let prior_depth = self.pending_ops.len();
         self.pending_ops.push_prepared(prepared, pending);
+        if matches!(
+            self.pending_ops
+                .last()
+                .and_then(|pending| pending.basic.as_ref()),
+            Some(BasicPending::HostCallback { .. })
+        ) {
+            self.pending_ops
+                .last_mut()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?
+                .stage = ResumeStage::ReadyToInvoke;
+            return Ok(RegularCallAction::Completed(DispatchResult::Continue));
+        }
         let action = self.enter_callable_values(event, args, destination, callback_mode, next);
         match action {
             Ok(RegularCallAction::Entered) => Ok(RegularCallAction::Entered),
@@ -11109,6 +12576,7 @@ impl Execution<'_> {
         mut pending: PendingOp,
     ) -> Result<RegularCallAction, RuntimeError> {
         let valid_mode = match pending.basic.as_ref() {
+            Some(BasicPending::HostCallback { .. }) => pending.result_mode == ResultMode::All,
             Some(BasicPending::DoFile { .. }) => pending.result_mode == ResultMode::All,
             Some(BasicPending::Require { state, .. })
                 if state.phase == RequirePhase::SearcherCall =>
@@ -11131,6 +12599,53 @@ impl Execution<'_> {
             && pending.caller_module == self.frame.module;
         let basic = pending.basic.take();
         let value = self.frame.read(pending.destination);
+        if let Some(BasicPending::HostCallback {
+            mut state,
+            outer_mode,
+            tail_return,
+        }) = basic
+        {
+            let result = (|| {
+                if !valid {
+                    return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
+                }
+                let first = self.frame.index(pending.destination)?;
+                let end = self.frame.dynamic_top;
+                if end < first || end > self.frame.register_limit {
+                    return Err(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds));
+                }
+                let units = (end - first)
+                    .checked_add(state.capture_len())
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(VmError::ArithmeticOverflow)?;
+                if !self.charge_native_work(units)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+                let mut values = Vec::new();
+                let ticket = reserve_vec(
+                    self.vm.allocation_ledger(),
+                    &mut values,
+                    end - first,
+                    FailPoint::ReturnReserve,
+                )?;
+                values.extend_from_slice(&self.frame.registers[first..end]);
+                let action = state.invoke(&values);
+                let result = self.apply_callback_result(
+                    action,
+                    pending.destination,
+                    outer_mode,
+                    tail_return,
+                    pending.resume_pc,
+                    true,
+                );
+                drop(values);
+                drop(ticket);
+                result
+            })();
+            state.clear_roots(self.vm)?;
+            pending.clear(self.vm)?;
+            return result;
+        }
         if let Some(BasicPending::DebugHook { original }) = basic {
             pending.clear(self.vm)?;
             self.vm.set_debug_hook_running(false);
@@ -11482,6 +12997,9 @@ impl Execution<'_> {
         }
         let value = value?;
         match basic.ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))? {
+            BasicPending::HostCallback { .. } => {
+                Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))
+            }
             BasicPending::OsCalendarTime { .. } => {
                 Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))
             }
@@ -12826,6 +14344,58 @@ impl Execution<'_> {
                 .is_some_and(|caller| Some(caller.child) == self.active_coroutine)
     }
 
+    fn host_call_bootstrap_active(&self) -> bool {
+        self.host_call_bootstrap
+            && self.frame.module.is_none()
+            && self.frame.closure.is_none()
+            && self.active_coroutine.is_none()
+            && !self.vm.finalizer_running()
+    }
+
+    fn dispatch_host_call_bootstrap(&mut self) -> Result<DispatchResult, RuntimeError> {
+        match self.frame.pc {
+            0 => {
+                let target = self.frame.read(Register(0))?;
+                let count = self
+                    .frame
+                    .dynamic_top
+                    .checked_sub(1)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?;
+                let mut args = Vec::new();
+                let ticket = reserve_vec(
+                    self.vm.allocation_ledger(),
+                    &mut args,
+                    count,
+                    FailPoint::WorkReserve,
+                )?;
+                args.extend_from_slice(&self.frame.registers[1..self.frame.dynamic_top]);
+                let action =
+                    self.enter_callable_values(target, &args, Register(0), ResultMode::All, 1);
+                drop(ticket);
+                match action? {
+                    RegularCallAction::Entered => Ok(DispatchResult::Continue),
+                    RegularCallAction::Aborted => Ok(DispatchResult::Aborted),
+                    RegularCallAction::Completed(action) => Ok(action),
+                }
+            }
+            1 => {
+                let count = self.frame.dynamic_top;
+                let mut values = Vec::new();
+                let ticket = reserve_vec(
+                    self.vm.allocation_ledger(),
+                    &mut values,
+                    count,
+                    FailPoint::ReturnReserve,
+                )?;
+                values.extend_from_slice(&self.frame.registers[..count]);
+                Ok(DispatchResult::Returned(values, Some(ticket)))
+            }
+            _ => Err(RuntimeError::new(
+                RuntimeErrorKind::ProgramCounterOutOfBounds,
+            )),
+        }
+    }
+
     fn dispatch_basic_bootstrap(&mut self) -> Result<DispatchResult, RuntimeError> {
         match self.frame.pc {
             0 => {
@@ -12847,6 +14417,9 @@ impl Execution<'_> {
                 )?;
                 args.extend_from_slice(&self.frame.registers[1..self.frame.dynamic_top]);
                 let action = match builtin {
+                    Builtin::HostCallback(id) => {
+                        self.host_callback(id, &args, Register(0), ResultMode::All, false, 1)
+                    }
                     Builtin::Basic(kind) => {
                         self.basic_builtin(kind, &args, Register(0), ResultMode::All, false, 1)
                     }
@@ -12937,6 +14510,7 @@ impl Execution<'_> {
                 && self.frame.module.is_none()
                 && self.frame.closure.is_none()
                 && !self.basic_bootstrap_active()
+                && !self.host_call_bootstrap_active()
                 && !self.vm.finalizer_running()
                 && self.vm.pending_finalizer()?.is_none()
                 && deferred.is_none()
@@ -12954,9 +14528,23 @@ impl Execution<'_> {
                     && pending.caller_module == self.frame.module
                     && pending.resume_pc == self.frame.pc
             });
+            let callback_invoke_at_boundary = self.pending_ops.last().is_some_and(|pending| {
+                pending.kind == PendingKind::Basic
+                    && pending.stage == ResumeStage::ReadyToInvoke
+                    && matches!(
+                        pending.basic.as_ref(),
+                        Some(BasicPending::HostCallback { .. })
+                    )
+                    && pending.caller_depth == self.callers.len()
+                    && pending.caller_stack_base == self.frame.stack_base
+                    && pending.caller_prototype == self.frame.prototype
+                    && pending.caller_module == self.frame.module
+            });
             if !resume_deferred
                 && !self.basic_bootstrap_active()
+                && !self.host_call_bootstrap_active()
                 && !basic_ready_at_boundary
+                && !callback_invoke_at_boundary
                 && self.frame.pc >= self.prototype().instructions.len()
             {
                 if self.vm.finalizer_running()
@@ -13006,7 +14594,11 @@ impl Execution<'_> {
                         Some(RegularCallAction::Entered) => Ok(DispatchResult::Continue),
                         Some(RegularCallAction::Aborted) => Ok(DispatchResult::Aborted),
                         Some(RegularCallAction::Completed(action)) => Ok(action),
+                        None if callback_invoke_at_boundary => self.invoke_ready_host_callback(),
                         None if resume_close => self.advance_close_unwind(),
+                        None if self.host_call_bootstrap_active() => {
+                            self.dispatch_host_call_bootstrap()
+                        }
                         None if self.basic_bootstrap_active() => self.dispatch_basic_bootstrap(),
                         None => self.dispatch_with_debug_hook(),
                     })
@@ -14696,6 +16288,364 @@ mod tests {
     };
 
     #[test]
+    fn p13_string_dump_copy_work_limit_and_byte_string_failure_refund() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+        let source = b"return function() end";
+        let lexical = lex(source, LanguageProfile::Lua55, &CompileLimits::default()).unwrap();
+        let parsed = parse(&lexical, LanguageProfile::Lua55, &CompileLimits::default()).unwrap();
+        let resolved = resolve(
+            &parsed,
+            &lexical,
+            LanguageProfile::Lua55,
+            &CompileLimits::default(),
+        )
+        .unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let verified = emit(&ir, &VerifyLimits::default())
+            .unwrap()
+            .verified()
+            .clone();
+        let selected = verified
+            .module()
+            .prototypes
+            .iter()
+            .find(|p| p.parent == Some(ProtoId(0)))
+            .unwrap()
+            .id;
+        let chunk_limits = OfficialChunkLimits {
+            max_bytes: 256 * 1024,
+            max_allocated_bytes: 256 * 1024,
+            ..OfficialChunkLimits::default()
+        };
+        let mut offline = OfficialWorkBudget::new(u64::MAX);
+        let encoded = emit_official_chunk(
+            &verified,
+            selected,
+            LuaProfile::Lua55,
+            true,
+            &chunk_limits,
+            &mut offline,
+        )
+        .unwrap();
+        let copy_edge = offline.consumed() + encoded.len() as u64 - 1;
+        let capability = crate::DumpCapability::deny_all()
+            .with_official_bytecode(true)
+            .with_limits(crate::DumpLimits {
+                max_work_units: copy_edge as usize,
+                max_temporary_bytes: 256 * 1024,
+                max_encoded_bytes: 256 * 1024,
+            });
+        let mut vm = Vm::new_with_services(
+            LuaProfile::Lua55,
+            HostServices::deny_all().and_dump(capability),
+        )
+        .unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let root = vm.add_root(RootKind::Host, environment).unwrap();
+        let RunOutcome::Returned(values) = vm
+            .load_with_environment(verified.clone(), Value::Object(environment))
+            .unwrap()
+            .run()
+            .unwrap()
+        else {
+            panic!("child closure 須返回")
+        };
+        let Value::Object(closure) = values[0] else {
+            panic!("child 須為 closure")
+        };
+        let closure_root = vm.add_root(RootKind::Host, closure).unwrap();
+        let mut execution = vm
+            .load_with_environment(
+                module(
+                    vec![Instruction::Return {
+                        base: Register(0),
+                        result_mode: ResultMode::Fixed(0),
+                    }],
+                    vec![],
+                ),
+                Value::Object(environment),
+            )
+            .unwrap();
+        let roots = execution.vm.roots().total_count();
+        let reserved = execution.vm.ledger_snapshot().reserved;
+        execution.set_fuel(copy_edge - 1).unwrap();
+        assert!(matches!(
+            execution.string_dump(
+                &[Value::Object(closure), Value::Boolean(true)],
+                Register(0),
+                ResultMode::Fixed(1),
+                false,
+                0,
+            ),
+            Ok(RegularCallAction::Aborted)
+        ));
+        assert_eq!(execution.fuel_remaining(), 0);
+        assert_eq!(execution.vm.roots().total_count(), roots);
+        assert_eq!(execution.vm.ledger_snapshot().reserved, reserved);
+        execution.set_fuel(1_000_000).unwrap();
+        let before = execution.fuel_remaining();
+        assert_eq!(
+            execution
+                .string_dump(
+                    &[Value::Object(closure), Value::Boolean(true)],
+                    Register(0),
+                    ResultMode::Fixed(1),
+                    false,
+                    0,
+                )
+                .err()
+                .unwrap()
+                .kind,
+            RuntimeErrorKind::HostDumpBudget,
+        );
+        assert_eq!(before - execution.fuel_remaining(), offline.consumed());
+        assert_eq!(execution.vm.roots().total_count(), roots);
+        assert_eq!(execution.vm.ledger_snapshot().reserved, reserved);
+        drop(execution);
+        vm.remove_root(closure_root).unwrap();
+        vm.remove_root(root).unwrap();
+
+        let capability = crate::DumpCapability::deny_all()
+            .with_official_bytecode(true)
+            .with_limits(crate::DumpLimits {
+                max_work_units: (copy_edge + 1) as usize,
+                max_temporary_bytes: 256 * 1024,
+                max_encoded_bytes: 256 * 1024,
+            });
+        let mut vm = Vm::new_with_services(
+            LuaProfile::Lua55,
+            HostServices::deny_all().and_dump(capability),
+        )
+        .unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let root = vm.add_root(RootKind::Host, environment).unwrap();
+        let RunOutcome::Returned(values) = vm
+            .load_with_environment(verified, Value::Object(environment))
+            .unwrap()
+            .run()
+            .unwrap()
+        else {
+            panic!("child closure 須返回")
+        };
+        let Value::Object(closure) = values[0] else {
+            panic!("child 須為 closure")
+        };
+        let closure_root = vm.add_root(RootKind::Host, closure).unwrap();
+        let mut execution = vm
+            .load_with_environment(
+                module(
+                    vec![Instruction::Return {
+                        base: Register(0),
+                        result_mode: ResultMode::Fixed(0),
+                    }],
+                    vec![],
+                ),
+                Value::Object(environment),
+            )
+            .unwrap();
+        let roots = execution.vm.roots().total_count();
+        let reserved = execution.vm.ledger_snapshot().reserved;
+        let fuel_before = execution.fuel_remaining();
+        let committed = execution.vm.ledger_snapshot().committed;
+        execution
+            .vm
+            .set_allocation_limit(committed + 256 * 1024 - 1);
+        assert_eq!(
+            execution
+                .string_dump(
+                    &[Value::Object(closure), Value::Boolean(true)],
+                    Register(0),
+                    ResultMode::Fixed(1),
+                    false,
+                    0,
+                )
+                .err()
+                .unwrap()
+                .kind,
+            RuntimeErrorKind::Heap(VmError::AllocationFailed),
+        );
+        assert_eq!(execution.fuel_remaining(), fuel_before);
+        assert_eq!(execution.vm.roots().total_count(), roots);
+        assert_eq!(execution.vm.ledger_snapshot().reserved, reserved);
+        execution.vm.set_allocation_limit(usize::MAX);
+        execution
+            .vm
+            .inject_failure_once(FailPoint::StringBytesReserve);
+        assert_eq!(
+            execution
+                .string_dump(
+                    &[Value::Object(closure), Value::Boolean(true)],
+                    Register(0),
+                    ResultMode::Fixed(1),
+                    false,
+                    0,
+                )
+                .err()
+                .unwrap()
+                .kind,
+            RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::StringBytesReserve)),
+        );
+        assert_eq!(execution.vm.roots().total_count(), roots);
+        assert_eq!(execution.vm.ledger_snapshot().reserved, reserved);
+        assert!(
+            execution
+                .string_dump(
+                    &[Value::Object(closure), Value::Boolean(true)],
+                    Register(0),
+                    ResultMode::Fixed(1),
+                    false,
+                    0,
+                )
+                .is_ok()
+        );
+        assert_eq!(execution.vm.ledger_snapshot().reserved, reserved);
+        let target = execution.vm.allocate_table().unwrap();
+        let metatable = execution.vm.allocate_table().unwrap();
+        let gc_key = execution.vm.allocate_byte_string(b"__gc").unwrap();
+        execution
+            .vm
+            .raw_set(metatable, Value::Object(gc_key), Value::Object(closure))
+            .unwrap();
+        execution.vm.set_metatable(target, Some(metatable)).unwrap();
+        execution.vm.set_execution_running(true);
+        execution.vm.collect().unwrap();
+        execution.vm.set_execution_running(false);
+        execution.vm.start_finalizer(target).unwrap();
+        execution.set_fuel(0).unwrap();
+        let steps = execution.finalizer_steps;
+        assert!(
+            execution
+                .string_dump(
+                    &[Value::Object(closure), Value::Boolean(true)],
+                    Register(0),
+                    ResultMode::Fixed(1),
+                    false,
+                    0,
+                )
+                .is_ok()
+        );
+        assert_eq!(execution.fuel_remaining(), 0);
+        assert_eq!(
+            execution.finalizer_steps - steps,
+            offline.consumed() + encoded.len() as u64
+        );
+        let steps = execution.finalizer_steps;
+        execution
+            .vm
+            .inject_failure_once(FailPoint::StringBytesReserve);
+        assert_eq!(
+            execution
+                .string_dump(
+                    &[Value::Object(closure), Value::Boolean(true)],
+                    Register(0),
+                    ResultMode::Fixed(1),
+                    false,
+                    0,
+                )
+                .err()
+                .unwrap()
+                .kind,
+            RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::StringBytesReserve)),
+        );
+        assert_eq!(execution.fuel_remaining(), 0);
+        assert_eq!(
+            execution.finalizer_steps - steps,
+            offline.consumed() + encoded.len() as u64
+        );
+        assert_eq!(execution.vm.ledger_snapshot().reserved, reserved);
+        execution.vm.finish_finalizer(target).unwrap();
+        drop(execution);
+        vm.remove_root(closure_root).unwrap();
+        vm.remove_root(root).unwrap();
+    }
+
+    #[test]
+    fn p13_official_load_prescan_and_postscan_fuel_edges_are_exact_and_retryable() {
+        for (profile, source) in [
+            (
+                LuaProfile::Lua54,
+                include_bytes!("../../tests/official_chunk_fixtures/lua54-list-flow.luac")
+                    .as_slice(),
+            ),
+            (
+                LuaProfile::Lua55,
+                include_bytes!("../../tests/official_chunk_fixtures/lua55-list-flow.luac")
+                    .as_slice(),
+            ),
+        ] {
+            let mut candidate = module(
+                vec![Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(1),
+                }],
+                vec![],
+            )
+            .module()
+            .clone();
+            candidate.profile = profile;
+            let module = verify_module(candidate, profile, &VerifyLimits::default()).unwrap();
+            let mut vm = Vm::new_with_services(
+                profile,
+                HostServices::deny_all().and_load(
+                    crate::LoadCapability::deny_all()
+                        .with_official_bytecode(true)
+                        .with_limits(crate::LoadLimits {
+                            max_work_units: 200_000,
+                            ..crate::LoadLimits::default()
+                        }),
+                ),
+            )
+            .unwrap();
+            let environment = vm.allocate_table().unwrap();
+            let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+            let stats = preflight_official_chunk(
+                source,
+                profile,
+                &OfficialChunkLimits::default(),
+                &VerifyLimits::default(),
+            )
+            .unwrap();
+            let prescan = (source.len() * 2 + 1) as u64;
+            assert!(stats.subsequent_work > 1);
+            let mut execution = vm
+                .load_with_environment(module, Value::Object(environment))
+                .unwrap();
+            let baseline_roots = execution.vm.roots().total_count();
+            let baseline_reserved = execution.vm.ledger_snapshot().reserved;
+
+            for fuel in [prescan - 1, prescan + stats.subsequent_work - 1] {
+                execution.set_fuel(fuel).unwrap();
+                let result = execution
+                    .create_loaded_official_function(source, Value::Object(environment))
+                    .unwrap();
+                assert!(result.is_none(), "{profile:?}, fuel={fuel}");
+                assert_eq!(execution.fuel_remaining(), 0);
+                assert_eq!(execution.vm.roots().total_count(), baseline_roots);
+                assert_eq!(execution.vm.ledger_snapshot().reserved, baseline_reserved);
+
+                execution.set_fuel(1_000_000).unwrap();
+                let created = execution
+                    .create_loaded_official_function(source, Value::Object(environment))
+                    .unwrap()
+                    .unwrap();
+                assert!(!created.diagnostic);
+                execution.vm.remove_root(created.root).unwrap();
+                assert_eq!(execution.vm.roots().total_count(), baseline_roots);
+                assert_eq!(execution.vm.ledger_snapshot().reserved, baseline_reserved);
+            }
+            drop(execution);
+            assert_eq!(vm.roots().total_count(), 1);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            vm.remove_root(environment_root).unwrap();
+            vm.collect().unwrap();
+            assert_eq!(vm.roots().total_count(), 0);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
     fn p13_h_hook_callback_start_failure_and_abort_clear_running_state() {
         for abort in [false, true] {
             let mut vm = Vm::new().unwrap();
@@ -14797,7 +16747,7 @@ mod tests {
     }
 
     #[test]
-    fn p13_h_traceback_prepays_native_frame_traversal_before_formatting() {
+    fn p13_h_traceback_rejects_native_frame_traversal_before_fuel_or_formatting() {
         let debug = crate::DebugCapability::deny_all()
             .allow(crate::DebugPermission::Traceback)
             .with_limits(crate::DebugLimits {
@@ -14851,7 +16801,7 @@ mod tests {
                 .kind,
             RuntimeErrorKind::DebugBudget,
         );
-        assert_eq!(fuel_before - execution.fuel_remaining(), 42);
+        assert_eq!(fuel_before - execution.fuel_remaining(), 0);
         drop(execution);
         assert_eq!(vm.roots().total_count(), 0);
         assert_eq!(vm.ledger_snapshot().reserved, 0);

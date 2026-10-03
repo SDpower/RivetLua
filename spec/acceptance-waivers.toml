@@ -1,0 +1,108 @@
+# 使用者明確授權的 P21／P24 Cortex-M 實板驗收豁免。
+# USER_WAIVED 是驗收狀態，不代表實測 PASS，也不授予 Supported 部署狀態。
+schema_version = 1
+record_count = 6
+allowed_case_ids = ["PLAT-003", "PLAT-004", "DOWN-007", "REL-007", "R10-006", "R10-007"]
+
+[policy]
+reason = "user-authorized"
+status = "USER_WAIVED"
+counts_as_test_pass = false
+counts_as_hardware_evidence = false
+target_scope = "只限 P21 選定的 Cortex-M 目標之實板燒錄、啟動、實際執行與硬體量測子條件"
+deployment_status_without_board_evidence = ["BuildOnly", "Experimental"]
+forbidden_deployment_status = "Supported"
+always_required = [
+  "所有必要建置、格式檢查與鎖定依賴測試",
+  "Lua 5.5.1 與 Lua 5.4.9 的數值、語意及 profile 驗收",
+  "runtime-only 依賴稽核、產物載入與執行驗收",
+  "AOT 建置、載入、完整性、provenance 與語意驗收",
+  "全部安全 policy、sandbox 與 escape matrix 驗收",
+  "桌面、非 Cortex-M 及其餘 target matrix 驗收",
+  "P24 套件、下游 API、registry、license 與 release evidence 驗收",
+  "P24 package name、registry owner 與 publish rights 查核"
+]
+
+[[waivers]]
+case_id = "PLAT-003"
+subcondition = "cortex_m_board_physical_flash_boot_and_runtime_execution"
+reason = "user-authorized"
+status = "USER_WAIVED"
+scope = "只豁免指定 Cortex-M board 實際燒錄、硬體啟動及板上 runtime-only bytecode 執行見證。目標描述、runtime-only 產物建置、P05 驗證、dependency/symbol audit、profile 與數值驗收仍須完成。"
+requirements_not_waived = [
+  "交叉編譯與 target/BoardConfig 身分核對",
+  "runtime-only feature graph、依賴 SBOM、binary symbol/size audit",
+  "RVLU_V2 VerifiedModule、profile、numeric config 與 AOT/runtime loader 驗收",
+  "fuel、配置失敗、GC、安全中止與錯誤路徑測試",
+  "無實板證據時 Cortex-M 狀態只能是 BuildOnly 或 Experimental，不得為 Supported"
+]
+
+[[waivers]]
+case_id = "PLAT-004"
+subcondition = "cortex_m_board_physical_resource_and_abort_measurements"
+reason = "user-authorized"
+status = "USER_WAIVED"
+scope = "只豁免 Cortex-M 實板的 Flash、靜態 RAM、peak RAM、Lua heap、native/code cache、執行時間、GC、正常執行、fuel/host abort 與重啟狀態之硬體量測。桌面及其他 target 的 matrix 量測與語意結果仍須完成。"
+requirements_not_waived = [
+  "桌面及非 Cortex-M target 的 Flash/RAM/時間/GC/abort matrix 證據",
+  "容量限制不得降低 i64/f64 精度或跳過 Lua 5.5.1/5.4.9 語意",
+  "runtime-only audit、AOT loader/provenance、fuel 與 allocation failure 驗收",
+  "可取得的交叉建置資料、linker map 與 target descriptor 必須如實記錄",
+  "板上量測缺席不得以模擬值或桌面數值填補，Cortex-M 不得標 Supported"
+]
+
+[[waivers]]
+case_id = "DOWN-007"
+subcondition = "cortex_m_board_physical_startup_execution_and_measurement"
+reason = "user-authorized"
+status = "USER_WAIVED"
+scope = "只豁免 P24 DOWN-007 中 P21 指定 Cortex-M board 的實際燒錄、啟動、板上執行及 Flash/RAM/time/GC/abort/target identity 實測。"
+requirements_not_waived = [
+  "runtime-only bytecode artifact 的建置、hash、profile、numeric config、ABI 與 provenance",
+  "P05 VerifiedModule 驗證、runtime-only dependency/symbol audit 與相關主機側語意測試",
+  "P21 target/BoardConfig、交叉編譯與 loader mismatch rejection",
+  "P24 DOWN-007 fixture、package/registry closure、公開 API 與 report schema",
+  "其他六個 DOWN-001～DOWN-006 下游案例及所有非實板條件"
+]
+
+[[waivers]]
+case_id = "REL-007"
+subcondition = "cortex_m_board_physical_success_and_measurement_evidence"
+reason = "user-authorized"
+status = "USER_WAIVED"
+scope = "只豁免 REL-007 對應 DOWN-007 的 Cortex-M 指定 board 實板成功證據及其 Flash/RAM/time/abort 實測；交叉編譯結果只能記 BuildOnly，不能記成實板成功。"
+requirements_not_waived = [
+  "DOWN-007 runtime-only artifact、target identity、package 與公開 consumer 流程",
+  "P21 兩 profile、數值、runtime-only、AOT、loader、安全與其他 target 驗收",
+  "其餘 REL-001～REL-006、REL-008～REL-010 release checks",
+  "P24 套件 name、owner、publish rights、license、notice 與 clean registry evidence",
+  "無實板證據時 Cortex-M 狀態只能是 BuildOnly 或 Experimental，不得為 Supported"
+]
+
+[[waivers]]
+case_id = "R10-006"
+subcondition = "cortex_m_board_real_hardware_evidence"
+reason = "user-authorized"
+status = "USER_WAIVED"
+scope = "只豁免 R10-006 中 Cortex-M board configuration 必須由實板啟動、板上執行與硬體量測證明的子條件。"
+requirements_not_waived = [
+  "runtime-only build、dependency/symbol audit、bytecode load/execute 與資源/中止測試",
+  "AOT build、load、integrity、provenance、兩 profile 數值及安全驗收",
+  "全部桌面、非 Cortex-M 與其他 cross-platform configurations",
+  "所有可以交叉編譯或主機測試驗證的 target/board 配置與 matrix",
+  "無實板證據時 Cortex-M 狀態只能是 BuildOnly 或 Experimental，不得為 Supported"
+]
+
+[[waivers]]
+case_id = "R10-007"
+subcondition = "DOWN-007_cortex_m_physical_board_execution"
+reason = "user-authorized"
+status = "USER_WAIVED"
+scope = "只豁免七個下游案例中 DOWN-007 的 Cortex-M 實板執行見證與板上資源/abort 實測，不豁免 DOWN-007 的封裝、artifact 或公開 consumer 驗收。"
+requirements_not_waived = [
+  "DOWN-001～DOWN-007 全部下游案例的公開 API、封裝與無 workspace/private dependency 驗收",
+  "DOWN-007 runtime-only artifact 的建置、hash、profile、ABI、provenance、載入與主機側語意檢查",
+  "其他六個下游案例及 R10-001～R10-006、R10-008、R10-009 的所有非實板條件",
+  "P24 package name、registry owner、publish rights、license 與 security evidence",
+  "無實板證據時 Cortex-M 狀態只能是 BuildOnly 或 Experimental，不得為 Supported"
+]

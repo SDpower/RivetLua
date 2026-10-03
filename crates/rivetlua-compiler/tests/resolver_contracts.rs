@@ -599,6 +599,155 @@ fn public_resolver_keeps_lua54_environment_and_lua55_implicit_global() {
 }
 
 #[test]
+fn public_resolver_lua55_lexical_environment_shadows_implicit_global() {
+    let (module, chunk) = parsed(
+        b"local before=x; do local _ENV={x=72}; return before, x end",
+        LanguageProfile::Lua55,
+    );
+    let resolved = resolve(
+        &module,
+        &chunk,
+        LanguageProfile::Lua55,
+        &CompileLimits::default(),
+    )
+    .unwrap();
+    let ResolvedStmt::Local { values, .. } = &resolved.root.statements[0] else {
+        panic!("前置 implicit global 必須存在");
+    };
+    let [
+        ResolvedExpr::Name {
+            resolution: ResolvedName::Global(prior_global),
+            ..
+        },
+    ] = values.as_slice()
+    else {
+        panic!("前置 x 必須是獨立 implicit global");
+    };
+    let Some(ResolvedStmt::Do { body, .. }) = resolved
+        .root
+        .statements
+        .iter()
+        .find(|statement| matches!(statement, ResolvedStmt::Do { .. }))
+    else {
+        panic!("詞法 _ENV scope 必須存在");
+    };
+    let ResolvedStmt::Local { bindings, .. } = &body.statements[0] else {
+        panic!("local _ENV 必須存在");
+    };
+    let lexical_env = bindings[0];
+    let Some(ResolvedStmt::Return { values, .. }) = body
+        .statements
+        .iter()
+        .find(|statement| matches!(statement, ResolvedStmt::Return { .. }))
+    else {
+        panic!("return 必須存在");
+    };
+    assert_ne!(*prior_global, lexical_env);
+    assert!(matches!(values.as_slice(),
+        [ResolvedExpr::Name { resolution: ResolvedName::Local(_), .. },
+         ResolvedExpr::Name { resolution: ResolvedName::EnvField { env, name }, .. }]
+            if *env == lexical_env && name == b"x"));
+}
+
+#[test]
+fn public_resolver_lua55_child_captures_lexical_environment() {
+    let (module, chunk) = parsed(
+        b"local _ENV={x=72}; local function f() return x end; return f()",
+        LanguageProfile::Lua55,
+    );
+    let resolved = resolve(
+        &module,
+        &chunk,
+        LanguageProfile::Lua55,
+        &CompileLimits::default(),
+    )
+    .unwrap();
+    let ResolvedStmt::Local { bindings, .. } = &resolved.root.statements[0] else {
+        panic!("local _ENV 必須存在");
+    };
+    let lexical_env = bindings[0];
+    let Some(ResolvedStmt::LocalFunction { body, .. }) = resolved
+        .root
+        .statements
+        .iter()
+        .find(|statement| matches!(statement, ResolvedStmt::LocalFunction { .. }))
+    else {
+        panic!("f 必須存在");
+    };
+    let Some(ResolvedStmt::Return { values, .. }) = body
+        .body
+        .statements
+        .iter()
+        .find(|statement| matches!(statement, ResolvedStmt::Return { .. }))
+    else {
+        panic!("f return 必須存在");
+    };
+    assert!(matches!(values.as_slice(),
+        [ResolvedExpr::Name { resolution: ResolvedName::EnvField { env, name }, .. }]
+            if *env == lexical_env && name == b"x"));
+    let function = resolved
+        .functions
+        .iter()
+        .find(|function| function.id == body.function)
+        .unwrap();
+    assert!(matches!(function.upvalues.as_slice(),
+        [rivetlua_compiler::UpvalueSource::ParentLocal(binding)] if *binding == lexical_env));
+}
+
+#[test]
+fn public_resolver_lua55_global_declarations_keep_lexical_environment_target() {
+    for source in [
+        b"global x; do local _ENV={x=72}; return x end".as_slice(),
+        b"global *; do local _ENV={x=72}; return x end".as_slice(),
+    ] {
+        let (module, chunk) = parsed(source, LanguageProfile::Lua55);
+        let resolved = resolve(
+            &module,
+            &chunk,
+            LanguageProfile::Lua55,
+            &CompileLimits::default(),
+        )
+        .unwrap();
+        let Some(ResolvedStmt::Do { body, .. }) = resolved
+            .root
+            .statements
+            .iter()
+            .find(|statement| matches!(statement, ResolvedStmt::Do { .. }))
+        else {
+            panic!("global 宣告後的詞法 scope 必須存在");
+        };
+        let ResolvedStmt::Local { bindings, .. } = &body.statements[0] else {
+            panic!("local _ENV 必須存在");
+        };
+        let Some(ResolvedStmt::Return { values, .. }) = body
+            .statements
+            .iter()
+            .find(|statement| matches!(statement, ResolvedStmt::Return { .. }))
+        else {
+            panic!("return 必須存在");
+        };
+        assert!(matches!(values.as_slice(),
+            [ResolvedExpr::Name { resolution: ResolvedName::EnvField { env, name }, .. }]
+                if *env == bindings[0] && name == b"x"));
+    }
+    let (module, chunk) = parsed(
+        b"global x; do local _ENV={y=72}; return y end",
+        LanguageProfile::Lua55,
+    );
+    assert_eq!(
+        resolve(
+            &module,
+            &chunk,
+            LanguageProfile::Lua55,
+            &CompileLimits::default()
+        )
+        .unwrap_err()
+        .code,
+        DiagnosticCode::Resolve
+    );
+}
+
+#[test]
 fn public_resolver_gives_lua55_implicit_globals_distinct_stable_bindings() {
     let (module, chunk) = parsed(
         b"do return alpha, alpha, beta end; do return beta end; local alpha; return alpha",

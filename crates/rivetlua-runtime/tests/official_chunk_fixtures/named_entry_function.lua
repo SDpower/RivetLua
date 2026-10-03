@@ -1,0 +1,3 @@
+return function(a, ... args)
+  return a, args.n, args[1], args[2], ...
+end
