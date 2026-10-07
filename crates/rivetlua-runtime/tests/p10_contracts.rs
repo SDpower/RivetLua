@@ -1,7 +1,7 @@
 use rivetlua_compiler::{
     CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
 };
-use rivetlua_core::{ObjectRef, Value, VerifyLimits};
+use rivetlua_core::{LuaProfile, ObjectRef, Value, VerifyLimits};
 use rivetlua_runtime::{
     FailPoint, HostHandle, LuaError, MetamethodEvent, RunOutcome, Table, Vm, VmError,
 };
@@ -739,7 +739,11 @@ fn p10_4_metamethod_events() {
         "lua54-i64f64" => LanguageProfile::Lua54,
         _ => panic!("P10 profile 無效"),
     };
-    let mut vm = Vm::new().unwrap();
+    let runtime_profile = match profile {
+        LanguageProfile::Lua55 => LuaProfile::Lua55,
+        LanguageProfile::Lua54 => LuaProfile::Lua54,
+    };
+    let mut vm = Vm::new_with_profile(runtime_profile).unwrap();
     let env = vm.allocate_table().unwrap();
     let env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let target = vm.allocate_table().unwrap();
@@ -807,13 +811,21 @@ fn p10_4_metamethod_events() {
         .load_with_environment(compile_p10(b"return t(3,4)", profile), Value::Object(env))
         .unwrap();
     execution.set_fuel(40).unwrap();
-    assert_eq!(
-        execution.run(),
-        Ok(RunOutcome::Aborted(
-            rivetlua_runtime::AbortReason::FuelExhausted
-        ))
-    );
+    let outcome = execution.run().unwrap();
     drop(execution);
+    match profile {
+        LanguageProfile::Lua55 => {
+            let RunOutcome::LuaError(error) = outcome else {
+                panic!("Lua 5.5 的第 16 次 __call 鏈須回報受控錯誤")
+            };
+            assert_eq!(error.diagnostic_id, "E_METATABLE_CHAIN_LIMIT");
+            release_implicit_error(&mut vm, error, roots_before_abort);
+        }
+        LanguageProfile::Lua54 => assert_eq!(
+            outcome,
+            RunOutcome::Aborted(rivetlua_runtime::AbortReason::FuelExhausted)
+        ),
+    }
     assert_eq!(vm.roots().total_count(), roots_before_abort);
     drop(target_root);
     drop(env_root);

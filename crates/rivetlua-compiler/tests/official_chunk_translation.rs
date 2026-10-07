@@ -6,6 +6,7 @@ use rivetlua_core::bytecode::official::{
     OfficialChunk, OfficialChunkLimits, OfficialConstant, OfficialDebug, OfficialPrototype,
     OfficialUpvalue, decode_official_chunk, encode_official_chunk,
 };
+use rivetlua_core::bytecode::official_export::emit_official_chunk;
 use rivetlua_core::{
     BytecodeBindingId, BytecodeClosePath, BytecodeConstant, BytecodeUpvalueSource,
     OfficialPlanBuiltin, OfficialPlanCall, OfficialPlanCandidate, OfficialWorkBudget, Register,
@@ -423,6 +424,125 @@ fn lua55_table_vararg_keeps_open_setlist_producer_adjacent_to_consumer() {
             ..
         }
     ));
+}
+
+#[test]
+fn nested_open_call_with_table_restore_roundtrips_official_translation() {
+    let source = b"local function f(...) return ... end; return {f(f(41,42))}";
+    for (language, profile) in [
+        (rivetlua_compiler::LanguageProfile::Lua54, LuaProfile::Lua54),
+        (rivetlua_compiler::LanguageProfile::Lua55, LuaProfile::Lua55),
+    ] {
+        let limits = rivetlua_compiler::CompileLimits::default();
+        let lexed = rivetlua_compiler::lex(source, language, &limits).unwrap();
+        let parsed = rivetlua_compiler::parse(&lexed, language, &limits).unwrap();
+        let resolved = rivetlua_compiler::resolve(&parsed, &lexed, language, &limits).unwrap();
+        let ir =
+            rivetlua_compiler::lower(&resolved, &rivetlua_compiler::IrLimits::default()).unwrap();
+        let module = rivetlua_compiler::emit(&ir, &VerifyLimits::default()).unwrap();
+        let mut work = OfficialWorkBudget::new(64 * 1024 * 1024);
+        let bytes = emit_official_chunk(
+            module.verified(),
+            rivetlua_core::ProtoId(0),
+            profile,
+            false,
+            &OfficialChunkLimits::default(),
+            &mut work,
+        )
+        .unwrap();
+        let decoded =
+            decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
+        assert!(
+            decoded.main.code.windows(4).any(|window| {
+                window.iter().map(|word| word & 0x7f).eq([68, 0, 68, 78])
+                    && (window[0] >> 24) & 0xff == 0
+                    && (window[2] >> 16) & 0xff == 0
+                    && (window[2] >> 24) & 0xff == 0
+                    && (window[3] >> 16) & 0x3f == 0
+            }),
+            "{profile:?} 必須輸出 CALL All → MOVE → CALL B0/C0 → SETLIST B0"
+        );
+        let translated = translate_official_chunk(&decoded, &VerifyLimits::default())
+            .unwrap_or_else(|error| panic!("{profile:?} nested open list: {error:?}"));
+        assert_eq!(translated.verified().profile(), profile);
+        assert!(translated.internal_calls().iter().any(|call| {
+            call.builtin() == OfficialFixedBuiltin::RawListWrite && call.open_tail().is_some()
+        }));
+    }
+}
+
+#[test]
+fn crafted_open_list_table_restore_is_planned_before_first_producer() {
+    for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+        let extra = if profile == LuaProfile::Lua54 { 82 } else { 84 };
+        let mut source = chunk(
+            profile,
+            vec![
+                abc(19, 3, 0, 0),
+                abc(extra, 0, 0, 0),
+                abc(8, 4, 0, 0),
+                abc(8, 5, 0, 0),
+                abc(68, 5, 1, 0),
+                abc(0, 0, 3, 0),
+                abc(68, 4, 0, 0),
+                abc(78, 0, 0, 0),
+                abc(71, 0, 0, 0),
+            ],
+        );
+        source.main.max_stack_size = 7;
+        let translated = translate_official_chunk(&source, &VerifyLimits::default())
+            .unwrap_or_else(|error| panic!("{profile:?} crafted table restore: {error:?}"));
+        let call = translated
+            .internal_calls()
+            .iter()
+            .find(|call| call.builtin() == OfficialFixedBuiltin::RawListWrite)
+            .unwrap();
+        assert!(call.open_tail().is_some());
+
+        for (label, malformed) in [
+            ("nontransparent table overwrite", {
+                let mut malformed = source.clone();
+                malformed.main.code[5] = abc(8, 0, 0, 0);
+                malformed
+            }),
+            ("source in first open tail", {
+                let mut malformed = source.clone();
+                malformed.main.code[5] = abc(0, 0, 5, 0);
+                malformed
+            }),
+            ("source overwritten by dynamic consumer", {
+                let mut malformed = source.clone();
+                malformed.main.code[5] = abc(0, 0, 4, 0);
+                malformed
+            }),
+            ("MOVE writes dynamic function", {
+                let mut malformed = source.clone();
+                malformed.main.code[5] = abc(0, 4, 3, 0);
+                malformed.main.code[7] = abc(78, 4, 0, 0);
+                malformed
+            }),
+            ("jump entry into open segment", {
+                let mut malformed = source.clone();
+                malformed.main.code[3] = jump(1);
+                malformed
+            }),
+            ("invalid MOVE source register", {
+                let mut malformed = source.clone();
+                malformed.main.code[5] = abc(0, 0, 7, 0);
+                malformed
+            }),
+            ("overlapping open sink", {
+                let mut malformed = source.clone();
+                malformed.main.code.insert(8, abc(78, 0, 0, 0));
+                malformed
+            }),
+        ] {
+            assert!(
+                translate_official_chunk(&malformed, &VerifyLimits::default()).is_err(),
+                "{profile:?} {label} 必須拒絕"
+            );
+        }
+    }
 }
 
 #[test]
@@ -927,6 +1047,110 @@ fn candidate_from_translation(translation: &OfficialTranslation) -> OfficialPlan
                 builtin: plan_builtin_for_test(call.builtin()),
             })
             .collect(),
+    }
+}
+
+#[test]
+fn native_raw_list_write_allows_assignment_cleanup_after_private_call() {
+    for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+        let language = match profile {
+            LuaProfile::Lua54 => rivetlua_compiler::LanguageProfile::Lua54,
+            LuaProfile::Lua55 => rivetlua_compiler::LanguageProfile::Lua55,
+        };
+        let limits = rivetlua_compiler::CompileLimits::default();
+        let lexed = rivetlua_compiler::lex(
+            b"local a = {}; local function f(x,y) return x,y end; a[{f(1,2)}] = 1; return a",
+            language,
+            &limits,
+        )
+        .unwrap();
+        let parsed = rivetlua_compiler::parse(&lexed, language, &limits).unwrap();
+        let resolved = rivetlua_compiler::resolve(&parsed, &lexed, language, &limits).unwrap();
+        let ir =
+            rivetlua_compiler::lower(&resolved, &rivetlua_compiler::IrLimits::default()).unwrap();
+        assert_eq!(ir.profile, profile);
+        assert_eq!(
+            ir.prototypes
+                .iter()
+                .map(|prototype| prototype.native_list_writes.len())
+                .sum::<usize>(),
+            1,
+            "{profile:?} 必須走 native RawListWrite"
+        );
+        let encoded = rivetlua_compiler::emit(&ir, &VerifyLimits::default())
+            .unwrap_or_else(|error| panic!("{profile:?} assignment cleanup: {error:?}"));
+        let call = encoded.verified().official_execution().unwrap().calls()[0].clone();
+        let prototype = encoded
+            .verified()
+            .module()
+            .prototypes
+            .iter()
+            .position(|prototype| prototype.id == call.prototype)
+            .unwrap();
+        let pc = call.call_pc.0 as usize;
+        let base = call.function_register;
+        let instructions = &encoded.verified().module().prototypes[prototype].instructions;
+        let load_pc = (0..pc)
+            .rev()
+            .find(|&position| {
+                matches!(instructions[position].instruction,
+                    Instruction::GetUpvalue { dest, .. } if dest == base)
+            })
+            .unwrap();
+        let cleanup_pc = (pc + 2..instructions.len())
+            .find(|&position| {
+                matches!(instructions[position].instruction,
+                    Instruction::LoadNil { start, count }
+                    if start.0 <= base.0 + 1 && base.0 + 1 < start.0 + count)
+            })
+            .unwrap();
+        assert!(load_pc + 4 < pc - 1, "{profile:?} 測試須含 private 區段");
+
+        for (label, position, instruction) in [
+            (
+                "post-call private read",
+                cleanup_pc,
+                Instruction::Move {
+                    dest: base,
+                    src: Register(base.0 + 1),
+                },
+            ),
+            (
+                "post-call non-nil write",
+                cleanup_pc,
+                Instruction::NewTable {
+                    dest: Register(base.0 + 1),
+                },
+            ),
+            (
+                "private-interval extra nil",
+                load_pc + 4,
+                Instruction::LoadNil {
+                    start: Register(base.0 + 1),
+                    count: 1,
+                },
+            ),
+        ] {
+            let mut forged = encoded.verified().module().clone();
+            forged.prototypes[prototype].instructions[position].instruction = instruction;
+            let structurally_verified = verify_module(forged, profile, &VerifyLimits::default())
+                .unwrap_or_else(|error| panic!("{profile:?} {label} structural: {error:?}"));
+            let candidate = rivetlua_core::native_builtin_candidate_from_calls(
+                encoded.verified(),
+                vec![call.clone()],
+            )
+            .unwrap();
+            let error = rivetlua_core::verify_native_builtin_plan(
+                structurally_verified,
+                candidate,
+                &VerifyLimits::default(),
+            )
+            .expect_err(label);
+            assert!(
+                error.message.contains("private register"),
+                "{profile:?} {label}: {error:?}"
+            );
+        }
     }
 }
 

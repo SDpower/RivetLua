@@ -856,14 +856,83 @@ pub fn verify_official_execution_plan(
                     .ok_or_else(|| invalid("RawListWrite skip 常數無效"))?;
                 let _ = first;
                 if let Some(tail) = call.open_tail {
-                    if skip == 0
-                        || usize::from(table.0) != usize::from(mapping.guest_start.0) + skip - 1
-                        || call.inputs.get(3).copied() != Some(mapping.guest_start)
-                        || usize::from(tail.0) < usize::from(mapping.guest_start.0) + skip
-                        || !matches!(proto.instructions.get(pc.wrapping_sub(1)).map(|entry| &entry.instruction),
-                            Some(Instruction::Vararg { base, result_mode: ResultMode::All })
-                                | Some(Instruction::Call { base, result_mode: ResultMode::All, .. })
-                                    if *base == tail)
+                    let value_start = usize::from(mapping.guest_start.0)
+                        .checked_add(skip)
+                        .filter(|_| skip != 0)
+                        .ok_or_else(|| invalid("開放 RawListWrite skip 溢位"))?;
+                    let sink_table = value_start
+                        .checked_sub(1)
+                        .and_then(|register| u16::try_from(register).ok())
+                        .map(Register)
+                        .ok_or_else(|| invalid("開放 RawListWrite table register 溢位"))?;
+                    let setup_pc = last_writer(call.inputs[0])
+                        .ok_or_else(|| invalid("開放 RawListWrite table setup 缺失"))?
+                        .0;
+                    let mut cursor = pc
+                        .checked_sub(1)
+                        .ok_or_else(|| invalid("開放 RawListWrite producer 缺失"))?;
+                    let mut expected = tail;
+                    let mut traced_table = sink_table;
+                    let mut lowest_producer = u16::MAX;
+                    loop {
+                        let current = &proto.instructions[cursor].instruction;
+                        let dynamic = match current {
+                            Instruction::Call {
+                                base,
+                                arg_count,
+                                result_mode: ResultMode::All,
+                            } if *base == expected => {
+                                lowest_producer = lowest_producer.min(base.0);
+                                *arg_count == u16::MAX
+                            }
+                            Instruction::Vararg {
+                                base,
+                                result_mode: ResultMode::All,
+                            } if *base == expected => {
+                                lowest_producer = lowest_producer.min(base.0);
+                                false
+                            }
+                            _ => return Err(invalid("開放 RawListWrite producer 鏈無效")),
+                        };
+                        if !dynamic {
+                            break;
+                        }
+                        cursor = cursor
+                            .checked_sub(1)
+                            .ok_or_else(|| invalid("開放 RawListWrite 動態 CALL 缺少 producer"))?;
+                        if let Instruction::Move { dest, src } =
+                            proto.instructions[cursor].instruction
+                        {
+                            if dest != traced_table || dest.0 >= expected.0 || src.0 >= expected.0 {
+                                return Err(invalid("開放 RawListWrite table copy 鏈無效"));
+                            }
+                            traced_table = src;
+                            cursor = cursor
+                                .checked_sub(1)
+                                .ok_or_else(|| invalid("開放 RawListWrite MOVE 前缺少 producer"))?;
+                        }
+                        expected = match proto.instructions[cursor].instruction {
+                            Instruction::Call {
+                                base,
+                                result_mode: ResultMode::All,
+                                ..
+                            }
+                            | Instruction::Vararg {
+                                base,
+                                result_mode: ResultMode::All,
+                            } if base.0 > expected.0 => base,
+                            _ => return Err(invalid("開放 RawListWrite producer 順序無效")),
+                        };
+                    }
+                    if call.inputs.get(3).copied() != Some(mapping.guest_start)
+                        || usize::from(tail.0) < value_start
+                        || setup_pc >= cursor
+                        || traced_table != table
+                        || sink_table.0 >= lowest_producer
+                        || table.0 >= lowest_producer
+                        || (setup_pc + 1..cursor).any(|between| {
+                            writes_register(&proto.instructions[between].instruction, table)
+                        })
                     {
                         return Err(invalid("開放 RawListWrite producer/skip 來源無效"));
                     }
@@ -1437,7 +1506,10 @@ pub(crate) fn verify_native_builtin_plan_metered(
                     || position == load_pc + 2 && private.0 == slots[2]
                     || position == load_pc + 3 && private.0 == slots[3]
                     || position == pc && private == base
-                    || position == pc + 1 && private == base;
+                    || position == pc + 1 && private == base
+                    // 賦值語句完成後可清空暫存；private 區段內仍只能由 setup/call 寫入。
+                    || position > pc + 1
+                        && matches!(entry.instruction, Instruction::LoadNil { .. });
                 if position >= load_pc
                     && (reads_register(&entry.instruction, private) && !permitted_read
                         || writes_register(&entry.instruction, private) && !permitted_write)
@@ -1647,4 +1719,95 @@ pub(crate) fn native_builtin_candidate_from_calls_metered(
         return Err(limited("native helper mapping 超出預准入"));
     }
     Ok((candidate, extra_bytes, resident_extra_bytes))
+}
+
+#[cfg(test)]
+mod open_list_source_tests {
+    use super::{OfficialPlanBuiltin, OfficialPlanCandidate, verify_official_execution_plan};
+    use crate::bytecode::official::{
+        OfficialChunk, OfficialConstant, OfficialDebug, OfficialPrototype,
+    };
+    use crate::bytecode::official_translation::translate_official_chunk;
+    use crate::bytecode::{Instruction, LuaProfile, Register, VerifyLimits, verify_module};
+
+    fn abc(opcode: u32, a: u32, b: u32, c: u32) -> u32 {
+        opcode | (a << 7) | (b << 16) | (c << 24)
+    }
+
+    #[test]
+    fn open_raw_list_table_source_follows_restore_move() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let extra = if profile == LuaProfile::Lua54 { 82 } else { 84 };
+            let source = OfficialChunk {
+                profile,
+                root_upvalues: 0,
+                main: OfficialPrototype {
+                    source: None,
+                    line_defined: 0,
+                    last_line_defined: 0,
+                    num_params: 0,
+                    flags: 0,
+                    max_stack_size: 7,
+                    code: vec![
+                        abc(19, 3, 0, 0),
+                        abc(extra, 0, 0, 0),
+                        abc(8, 4, 0, 0),
+                        abc(8, 5, 0, 0),
+                        abc(68, 5, 1, 0),
+                        abc(0, 0, 3, 0),
+                        abc(68, 4, 0, 0),
+                        abc(78, 0, 0, 0),
+                        abc(71, 0, 0, 0),
+                    ],
+                    constants: vec![OfficialConstant::Integer(7)],
+                    upvalues: vec![],
+                    children: vec![],
+                    debug: OfficialDebug::default(),
+                },
+            };
+            let translated = translate_official_chunk(&source, &VerifyLimits::default())
+                .unwrap_or_else(|error| panic!("{profile:?} table restore: {error:?}"));
+            let plan = translated.verified().official_execution().unwrap();
+            let call = plan
+                .calls()
+                .iter()
+                .find(|call| call.builtin == OfficialPlanBuiltin::RawListWrite)
+                .unwrap();
+            let prototype = translated
+                .verified()
+                .module()
+                .prototypes
+                .iter()
+                .position(|prototype| prototype.id == call.prototype)
+                .unwrap();
+            let mut forged = translated.verified().module().clone();
+            let writer = (0..call.call_pc.0 as usize)
+                .find(|&pc| {
+                    matches!(forged.prototypes[prototype].instructions[pc].instruction,
+                        Instruction::Move { dest, .. } if dest == call.inputs[0])
+                })
+                .unwrap();
+            let Instruction::Move { dest, src } =
+                forged.prototypes[prototype].instructions[writer].instruction
+            else {
+                unreachable!()
+            };
+            forged.prototypes[prototype].instructions[writer].instruction = Instruction::Move {
+                dest,
+                src: Register(src.0 - 1),
+            };
+            let verified = verify_module(forged, profile, &VerifyLimits::default()).unwrap();
+            let candidate = OfficialPlanCandidate {
+                root_bindings: plan.root_bindings.clone(),
+                upvalue_maps: plan.upvalue_maps.clone(),
+                frame_inputs: plan.frame_inputs.clone(),
+                calls: plan.calls.clone(),
+            };
+            assert!(
+                verify_official_execution_plan(verified, candidate, &VerifyLimits::default())
+                    .is_err(),
+                "{profile:?} forged private table source 須拒絕"
+            );
+        }
+    }
 }

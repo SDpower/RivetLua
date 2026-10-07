@@ -168,6 +168,11 @@ fn p11_3_function_implicit_return_closes_root_binding() {
 #[test]
 fn p09_2_scope_close_producer_preserves_exit_and_tail_paths() {
     let (profile, bytecode_profile, _) = selected_profile();
+    let nil_covers = |instruction: &Instruction, register: Register| {
+        matches!(instruction, Instruction::LoadNil { start, count }
+            if u32::from(start.0) <= u32::from(register.0)
+                && u32::from(register.0) < u32::from(start.0) + u32::from(*count))
+    };
     for source in [
         b"local f; while true do local x=7; f=function() return x end; break end; return f"
             .as_slice(),
@@ -175,11 +180,41 @@ fn p09_2_scope_close_producer_preserves_exit_and_tail_paths() {
     ] {
         let output = encoded(source, profile);
         let root = &output.verified().module().prototypes[0];
-        assert!(root.instructions.windows(2).any(|window| {
-            matches!(window[0].instruction, Instruction::Close { count: 0, .. })
-                && window[0].close_path.is_none()
-                && matches!(window[1].instruction, Instruction::Jump { .. })
-        }));
+        let exits = root
+            .instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(close_pc, entry)| {
+                let Instruction::Close { base, count: 0 } = entry.instruction else {
+                    return None;
+                };
+                if entry.close_path.is_some() {
+                    return None;
+                }
+                let jump_pc = (close_pc + 1..root.instructions.len()).find(|&pc| {
+                    !matches!(
+                        root.instructions[pc].instruction,
+                        Instruction::LoadNil { .. }
+                    )
+                })?;
+                matches!(root.instructions[jump_pc].instruction,
+                    Instruction::Jump { target } if target.0 as usize > jump_pc)
+                .then_some((close_pc, jump_pc, base))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exits.len(), 1, "break/goto 須有唯一 captured close 與 jump");
+        let (close_pc, jump_pc, base) = exits[0];
+        assert!(close_pc + 1 < jump_pc, "離開 scope 前須清 captured binding");
+        assert!(
+            root.instructions[close_pc + 1..jump_pc]
+                .iter()
+                .all(|entry| matches!(entry.instruction, Instruction::LoadNil { .. }))
+        );
+        assert!(
+            root.instructions[close_pc + 1..jump_pc]
+                .iter()
+                .any(|entry| nil_covers(&entry.instruction, base))
+        );
         decode_module(output.bytes(), bytecode_profile, &VerifyLimits::default()).unwrap();
     }
 
@@ -188,10 +223,42 @@ fn p09_2_scope_close_producer_preserves_exit_and_tail_paths() {
         profile,
     );
     let root = &output.verified().module().prototypes[0];
-    assert!(root.instructions.windows(2).any(|window| {
-        matches!(window[0].instruction, Instruction::Close { count: 0, .. })
-            && matches!(window[1].instruction, Instruction::Return { .. })
-    }));
+    let (close_pc, return_pc, closed) = root
+        .instructions
+        .iter()
+        .enumerate()
+        .find_map(|(close_pc, entry)| {
+            let Instruction::Close { base, count: 0 } = entry.instruction else {
+                return None;
+            };
+            let return_pc = close_pc + 1;
+            matches!(
+                root.instructions
+                    .get(return_pc)
+                    .map(|entry| &entry.instruction),
+                Some(Instruction::Return { .. })
+            )
+            .then_some((close_pc, return_pc, base))
+        })
+        .expect("非 tail return 須先 close captured binding，再直接 Return");
+    let Instruction::Return {
+        base: return_base,
+        result_mode: ResultMode::Fixed(return_count),
+    } = root.instructions[return_pc].instruction
+    else {
+        panic!("此 return f 案例須回傳固定值");
+    };
+    assert_eq!(return_pc, close_pc + 1);
+    assert_eq!(return_count, 1);
+    for offset in 0..return_count {
+        let result = Register(return_base.0 + offset);
+        assert_ne!(
+            result, closed,
+            "return payload R{} 不可與 closed local 重疊",
+            result.0
+        );
+    }
+    decode_module(output.bytes(), bytecode_profile, &VerifyLimits::default()).unwrap();
 
     let output = encoded(
         b"local f=function() return 7 end; do local x=7; local g=function() return x end; return f() end",
@@ -208,12 +275,41 @@ fn p09_2_scope_close_producer_preserves_exit_and_tail_paths() {
         profile,
     );
     let root = &output.verified().module().prototypes[0];
-    assert!(root.instructions.windows(2).any(|window| {
-        matches!(window[0].instruction, Instruction::Close { count: 0, .. })
-            && window[0].close_path.is_none()
-            && matches!(window[1].instruction, Instruction::Close { count: 1, .. })
-            && window[1].close_path.is_some()
-    }));
+    let (captured_pc, captured, closer) = root
+        .instructions
+        .windows(2)
+        .enumerate()
+        .find_map(
+            |(pc, window)| match (&window[0].instruction, &window[1].instruction) {
+                (
+                    Instruction::Close {
+                        base: captured,
+                        count: 0,
+                    },
+                    Instruction::Close {
+                        base: closer,
+                        count: 1,
+                    },
+                ) if window[0].close_path.is_none() && window[1].close_path.is_some() => {
+                    Some((pc, *captured, *closer))
+                }
+                _ => None,
+            },
+        )
+        .expect("captured close 須先於 <close> callback");
+    let cleanup = &root.instructions[captured_pc + 2..];
+    let cleanup_len = cleanup
+        .iter()
+        .take_while(|entry| matches!(entry.instruction, Instruction::LoadNil { .. }))
+        .count();
+    assert!(cleanup_len > 0);
+    for register in [captured, closer] {
+        assert!(
+            cleanup[..cleanup_len]
+                .iter()
+                .any(|entry| nil_covers(&entry.instruction, register))
+        );
+    }
 }
 
 #[test]

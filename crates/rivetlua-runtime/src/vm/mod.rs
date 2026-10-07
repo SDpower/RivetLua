@@ -3,26 +3,28 @@
 mod numeric_for;
 mod ops;
 
+use rivetlua_core::bytecode::native_debug::NativeSemanticUpvalue;
 use rivetlua_core::bytecode::official_export::{OfficialExportErrorKind, emit_official_chunk};
 use rivetlua_core::{
     BinaryOperation, BytecodeConstant, BytecodePrototype, BytecodeUpvalueSource, CoreError,
     CoreErrorKind, EnvironmentSource, InputErrorKind, InputFormat, Instruction, InstructionOffset,
-    LuaProfile, ObjectRef, OfficialChunkErrorKind, OfficialChunkLimits, OfficialPlanBuiltin,
-    OfficialPlanRootSource, OfficialTranslationErrorKind, OfficialWorkBudget, Opcode, RVLU_V2,
-    Register, ResultMode, TransportLimits, UnaryOperation, UpvalueId, Value, VerifiedModule, VmId,
-    classify_input, decode_input_module, decode_official_chunk, input_scan_admission,
-    preflight_input_module, preflight_official_chunk, translate_official_chunk_with_work,
-    verified_module_measurement_work,
+    LuaProfile, NativePrototypeDebug, ObjectRef, OfficialChunkErrorKind, OfficialChunkLimits,
+    OfficialPlanBuiltin, OfficialPlanRootSource, OfficialRvluPc, OfficialTranslationErrorKind,
+    OfficialWorkBudget, Opcode, RVLU_V2, Register, ResultMode, TransportLimits, UnaryOperation,
+    UpvalueId, Value, VerifiedModule, VmId, classify_input, decode_input_module,
+    decode_official_chunk, input_scan_admission, preflight_input_module, preflight_official_chunk,
+    translate_official_chunk_with_work, verified_module_measurement_work,
 };
 
 use crate::alloc::{AllocationLedger, FailPoint, Reservation, checked_bytes, reserve_vec};
 use crate::call::{CallFrame, OfficialFrameRegisters, PendingCloseSnapshot, VarargPayloads};
 use crate::callback::{CallbackContext, CallbackResult};
 use crate::closure::Closure;
-use crate::coroutine::{CoroutineState, ThreadContext, YieldSite, root_coroutine};
+use crate::coroutine::{CoroutineState, ParkedLocalSlot, ThreadContext, YieldSite, root_coroutine};
 use crate::errors::{Builtin, ProtectedBoundary, ProtectedStage, explicit_error};
 use crate::gc::trace::{ActiveRootKind, trace_native};
 use crate::heap::module_allocation_bytes;
+use crate::host::DebugPermission;
 use crate::host::{
     FileOperation, FileReadFormat, FileSeekOrigin, HostCalendar, HostFileLease, HostOsOperation,
     HostOsValue, HostResourceError, HostResourceErrorKind, LoadTemporaryCharge, PathEncoding,
@@ -30,8 +32,8 @@ use crate::host::{
 };
 use crate::host::{HostLoadErrorKind, LoadBudget, LoadBudgetStop, LoadFormat, LoadServiceError};
 use crate::pending_op::{
-    BasicPending, HostCallbackPending, PendingKind, PendingOp, PendingStack, PendingTableKind,
-    PrintArguments, ResumeStage,
+    BasicPending, DebugBuiltinReturn, DebugTransfer, HostCallbackPending, PendingKind, PendingOp,
+    PendingStack, PendingTableKind, PrintArguments, ResumeStage,
 };
 use crate::stdlib::basic::{self, BasicBuiltin};
 use crate::stdlib::debug::{self as debug_lib, DebugBuiltin, DebugHook};
@@ -54,6 +56,12 @@ use crate::stdlib::utf8::{self as utf8_lib, Prepared as Utf8Prepared, Utf8Builti
 use crate::unwind::{CloseFinish, CloseUnwind};
 use crate::upvalue::{Upvalue, UpvalueState};
 use crate::{MetamethodEvent, ObjectKind, RootId, RootKind, Vm, VmError};
+
+#[derive(Clone, Copy)]
+enum DebugVarargSlot {
+    Frame(usize),
+    OfficialRaw { table: ObjectRef, key: i64 },
+}
 
 pub(crate) fn basic_number_bytes(
     value: Value,
@@ -99,6 +107,223 @@ fn official_short_source(source: &[u8]) -> ([u8; 60], usize) {
     result[end..end + 3].copy_from_slice(b"...");
     result[end + 3..end + 5].copy_from_slice(b"\"]");
     (result, end + 5)
+}
+
+fn debug_branch_enters_between(prototype: &BytecodePrototype, first: usize, call: usize) -> bool {
+    prototype.instructions.iter().any(|entry| {
+        let enters = |target: InstructionOffset| {
+            let pc = target.0 as usize;
+            pc > first && pc <= call
+        };
+        match entry.instruction {
+            Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } => {
+                enters(target)
+            }
+            Instruction::NumericForPrepare { exit, .. } => enters(exit),
+            Instruction::NumericForNext { target, exit, .. } => enters(target) || enters(exit),
+            _ => false,
+        }
+    })
+}
+
+fn debug_writes_register(instruction: &Instruction, register: Register) -> bool {
+    match instruction {
+        Instruction::LoadConst { dest, .. }
+        | Instruction::Move { dest, .. }
+        | Instruction::GetUpvalue { dest, .. }
+        | Instruction::NewTable { dest }
+        | Instruction::GetTable { dest, .. }
+        | Instruction::UnaryOp { dest, .. }
+        | Instruction::BinaryOp { dest, .. }
+        | Instruction::Closure { dest, .. } => *dest == register,
+        Instruction::LoadNil { start, count } => {
+            register.0 >= start.0 && register.0 < start.0.saturating_add(*count)
+        }
+        Instruction::Call { base, .. }
+        | Instruction::TailCall { base, .. }
+        | Instruction::Vararg { base, .. } => register.0 >= base.0,
+        Instruction::NumericForPrepare {
+            control, visible, ..
+        }
+        | Instruction::NumericForNext {
+            control, visible, ..
+        } => *control == register || *visible == register,
+        _ => false,
+    }
+}
+
+fn debug_last_definition(
+    prototype: &BytecodePrototype,
+    register: Register,
+    before: usize,
+) -> Option<usize> {
+    (before.saturating_sub(128)..before).rev().find(|pc| {
+        prototype
+            .instructions
+            .get(*pc)
+            .is_some_and(|entry| debug_writes_register(&entry.instruction, register))
+    })
+}
+
+fn debug_native_call_name<'a>(
+    prototype: &'a BytecodePrototype,
+    debug: &'a NativePrototypeDebug,
+    caller: &CallFrame,
+    target: Value,
+    call_pc: usize,
+) -> Option<(&'a [u8], &'static [u8])> {
+    let (Instruction::Call { base, .. } | Instruction::TailCall { base, .. }) =
+        prototype.instructions.get(call_pc)?.instruction
+    else {
+        return None;
+    };
+    if caller.read(base).ok()? != target {
+        return None;
+    }
+    let local = |register: Register| {
+        debug.locals.iter().find(|local| {
+            local.register == register
+                && local.start_pc as usize <= call_pc
+                && call_pc < local.end_pc as usize
+                && caller.read(register).ok() == Some(target)
+        })
+    };
+    if let Some(local) = local(base) {
+        return Some((&local.name, b"local"));
+    }
+    let move_pc = debug_last_definition(prototype, base, call_pc)?;
+    let Instruction::Move { dest, src } = prototype.instructions.get(move_pc)?.instruction else {
+        return None;
+    };
+    if dest != base || debug_branch_enters_between(prototype, move_pc, call_pc) {
+        return None;
+    }
+    if let Some(local) = local(src) {
+        return Some((&local.name, b"local"));
+    }
+    let get_pc = debug_last_definition(prototype, src, move_pc)?;
+    let Instruction::GetTable { dest, key, .. } = prototype.instructions.get(get_pc)?.instruction
+    else {
+        return None;
+    };
+    if dest != src || debug_branch_enters_between(prototype, get_pc, call_pc) {
+        return None;
+    }
+    let key_pc = debug_last_definition(prototype, key, get_pc)?;
+    let Instruction::LoadConst { dest, constant } = prototype.instructions.get(key_pc)?.instruction
+    else {
+        return None;
+    };
+    if dest != key || debug_branch_enters_between(prototype, key_pc, call_pc) {
+        return None;
+    }
+    match prototype.constants.get(constant.0 as usize)? {
+        BytecodeConstant::Name(name) | BytecodeConstant::String(name) => Some((name, b"field")),
+        _ => None,
+    }
+}
+
+fn debug_official_call_name<'a>(
+    verified: &'a VerifiedModule,
+    prototype: &'a BytecodePrototype,
+    caller: &CallFrame,
+    target: Value,
+    call_pc: usize,
+) -> Option<(&'a [u8], &'static [u8])> {
+    let (Instruction::Call { base, .. } | Instruction::TailCall { base, .. }) =
+        prototype.instructions.get(call_pc)?.instruction
+    else {
+        return None;
+    };
+    if caller.read(base).ok()? != target {
+        return None;
+    }
+    let artifact = verified.official_artifact()?;
+    let pc_map = artifact.pc_map(prototype.id)?;
+    let OfficialRvluPc::Anchor(official_call_pc) = *pc_map.rvlu_to_official().get(call_pc)? else {
+        return None;
+    };
+    let guest = artifact.prototype(prototype.id)?;
+    let mapping = verified.official_execution()?.upvalue_map(prototype.id)?;
+    let word = *guest.code.get(official_call_pc as usize)?;
+    if !matches!(word & 0x7f, 68 | 69)
+        || mapping
+            .guest_start
+            .0
+            .checked_add(((word >> 7) & 0xff) as u16)?
+            != base.0
+    {
+        return None;
+    }
+    let mut active_locals: [Option<&[u8]>; 256] = [None; 256];
+    let mut active_count = 0_usize;
+    for entry in &guest.debug.locals {
+        if entry.start_pc <= official_call_pc && official_call_pc < entry.end_pc {
+            if let Some(slot) = active_locals.get_mut(active_count) {
+                *slot = entry.name.as_deref();
+            }
+            active_count = active_count.saturating_add(1);
+        }
+    }
+    let local = |register: Register| {
+        let slot = register.0.checked_sub(mapping.guest_start.0)?;
+        if slot >= mapping.guest_register_count || caller.read(register).ok()? != target {
+            return None;
+        }
+        active_locals.get(usize::from(slot)).copied().flatten()
+    };
+
+    let mut register = base;
+    let mut before = call_pc;
+    loop {
+        if let Some(name) = local(register) {
+            if before == call_pc || !debug_branch_enters_between(prototype, before, call_pc) {
+                return Some((name, b"local"));
+            }
+            return None;
+        }
+        let definition = debug_last_definition(prototype, register, before)?;
+        if definition >= before {
+            return None;
+        }
+        pc_map.rvlu_to_official().get(definition)?.source_pc()?;
+        match prototype.instructions.get(definition)?.instruction {
+            Instruction::Move { dest, src } if dest == register => {
+                if caller.read(src).ok()? != target {
+                    return None;
+                }
+                register = src;
+                before = definition;
+            }
+            Instruction::GetTable { dest, key, .. } if dest == register => {
+                let key_pc = debug_last_definition(prototype, key, definition)?;
+                if key_pc >= definition {
+                    return None;
+                }
+                pc_map.rvlu_to_official().get(key_pc)?.source_pc()?;
+                if debug_branch_enters_between(prototype, key_pc, call_pc) {
+                    return None;
+                }
+                let Instruction::LoadConst {
+                    dest: key_dest,
+                    constant,
+                } = prototype.instructions.get(key_pc)?.instruction
+                else {
+                    return None;
+                };
+                if key_dest != key {
+                    return None;
+                }
+                return match prototype.constants.get(constant.0 as usize)? {
+                    BytecodeConstant::Name(name) | BytecodeConstant::String(name) => {
+                        Some((name, b"field"))
+                    }
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// VM 內部錯誤；不建立 Lua 字串，P08／P11 可用診斷 ID 映射可見錯誤值。
@@ -658,6 +883,9 @@ pub struct Execution<'vm> {
     fuel: u64,
     finalizer_steps: u64,
     debug_hook_skip_once: bool,
+    debug_hook_c_call_pending: Option<(ObjectRef, RootId)>,
+    debug_builtin_capture: bool,
+    debug_builtin_result: Option<DebugBuiltinReturn>,
     host_call_bootstrap: bool,
     deferred_roots: Vec<RootId>,
     deferred_charge: usize,
@@ -957,7 +1185,7 @@ impl Vm {
                         let root = match self.add_root(RootKind::Temporary, object) {
                             Ok(root) => root,
                             Err(error) => {
-                                self.reclaim(object)?;
+                                self.reclaim_unpublished_object(object)?;
                                 return Err(error.into());
                             }
                         };
@@ -971,7 +1199,7 @@ impl Vm {
                 let root = match self.add_root(RootKind::Temporary, object) {
                     Ok(root) => root,
                     Err(error) => {
-                        self.reclaim(object)?;
+                        self.reclaim_unpublished_object(object)?;
                         return Err(error.into());
                     }
                 };
@@ -989,7 +1217,7 @@ impl Vm {
             let root = match self.add_root(RootKind::Stack, object) {
                 Ok(root) => root,
                 Err(error) => {
-                    self.reclaim(object)?;
+                    self.reclaim_unpublished_object(object)?;
                     return Err(error.into());
                 }
             };
@@ -1000,7 +1228,7 @@ impl Vm {
         }
         if result.is_err() {
             for &(object, _) in created.iter().rev() {
-                self.reclaim(object)?;
+                self.reclaim_unpublished_object(object)?;
             }
         }
         drop(created_ticket);
@@ -1130,14 +1358,23 @@ impl Vm {
             }
         }
         let has_official_plan = module.official_execution().is_some();
+        let has_native_debug =
+            module.profile() == LuaProfile::Lua55 && module.native_debug().is_some();
         let parameter_count = usize::from(data.prototypes[entry_index].parameter_count);
         let is_variadic = data.prototypes[entry_index].is_variadic;
         let needs_module_payload = has_official_plan
+            || has_native_debug
             || data.prototypes.iter().any(|prototype| {
                 prototype
                     .instructions
                     .iter()
                     .any(|entry| matches!(entry.instruction, Instruction::Closure { .. }))
+                    || prototype.constants.iter().any(|constant| {
+                        matches!(
+                            constant,
+                            BytecodeConstant::Name(_) | BytecodeConstant::String(_)
+                        )
+                    })
             });
         for &value in args {
             if let Value::Object(object) = value {
@@ -1175,7 +1412,7 @@ impl Vm {
                     let root = match self.add_root(RootKind::Temporary, module_ref) {
                         Ok(root) => root,
                         Err(error) => {
-                            self.reclaim(module_ref)?;
+                            self.reclaim_unpublished_module(module_ref)?;
                             return Err(error.into());
                         }
                     };
@@ -1188,7 +1425,7 @@ impl Vm {
                         Ok(frame) => frame,
                         Err(error) => {
                             self.remove_root(root)?;
-                            self.reclaim(module_ref)?;
+                            self.reclaim_unpublished_module(module_ref)?;
                             return Err(error);
                         }
                     };
@@ -1210,7 +1447,7 @@ impl Vm {
                         if let Some(root) = module_root {
                             self.remove_root(root)?;
                             if let Some(reference) = frame.module {
-                                self.reclaim(reference)?;
+                                self.reclaim_unpublished_module(reference)?;
                             }
                         }
                         return Err(error);
@@ -1233,11 +1470,37 @@ impl Vm {
                             frame.clear_roots(self)?;
                             if let Some(root) = module_root {
                                 self.remove_root(root)?;
-                                self.reclaim(module_ref)?;
+                                self.reclaim_unpublished_module(module_ref)?;
                             }
                             return Err(error);
                         }
                     }
+                } else if has_native_debug {
+                    let module_ref = frame
+                        .module
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+                    let closure = Closure::new(
+                        module_ref,
+                        entry_id,
+                        &[],
+                        Some(environment.map(Value::Object).unwrap_or(Value::Nil)),
+                        self.allocation_ledger(),
+                    )?;
+                    let object = self.allocate_closure(closure)?;
+                    let root = match self.add_root(RootKind::Stack, object) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            self.reclaim_unpublished_object(object)?;
+                            frame.clear_roots(self)?;
+                            if let Some(root) = module_root {
+                                self.remove_root(root)?;
+                                self.reclaim_unpublished_module(module_ref)?;
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    frame.closure = Some(object);
+                    frame.closure_root = Some(root);
                 }
                 let initialized = (|| {
                     for (offset, value) in args.iter().copied().take(parameter_count).enumerate() {
@@ -1265,7 +1528,7 @@ impl Vm {
                     if let Some(root) = module_root {
                         self.remove_root(root)?;
                         if let Some(reference) = frame.module {
-                            self.reclaim(reference)?;
+                            self.reclaim_unpublished_module(reference)?;
                         }
                     }
                     return Err(error);
@@ -1309,6 +1572,9 @@ impl Vm {
             fuel: 1_000_000,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
+            debug_hook_c_call_pending: None,
+            debug_builtin_capture: false,
+            debug_builtin_result: None,
             host_call_bootstrap: false,
             deferred_roots: Vec::new(),
             deferred_charge: 0,
@@ -1355,7 +1621,10 @@ impl Vm {
             let module_ref = self.allocate_charged_module(module, charge.take())?;
             let module_root = match self.add_root(RootKind::Temporary, module_ref) {
                 Ok(root) => root,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    self.reclaim_unpublished_module(module_ref)?;
+                    return Err(error.into());
+                }
             };
             let closure_result = (|| {
                 if has_official_plan {
@@ -1371,11 +1640,17 @@ impl Vm {
                 let closure_ref = self.allocate_closure(closure)?;
                 let closure_root = match self.add_root(RootKind::Temporary, closure_ref) {
                     Ok(root) => root,
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        self.reclaim_unpublished_object(closure_ref)?;
+                        return Err(error.into());
+                    }
                 };
                 Ok((closure_ref, closure_root))
             })();
             self.remove_root(module_root)?;
+            if closure_result.is_err() {
+                self.reclaim_unpublished_module(module_ref)?;
+            }
             closure_result
         })();
         if let Some(root) = environment_root {
@@ -1383,9 +1658,58 @@ impl Vm {
         }
         result
     }
+
+    fn closed_closure_environment(
+        &self,
+        closure: ObjectRef,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let (value, cell) = self.with_closure(closure, |payload| {
+            (payload.environment(), payload.environment_cell())
+        })?;
+        match cell {
+            Some(cell) => match self.upvalue_state(cell)? {
+                UpvalueState::Closed(value) => Ok(Some(value)),
+                UpvalueState::Open {
+                    thread,
+                    coroutine: Some(owner),
+                    slot,
+                } if thread == self.id()
+                    && self.coroutine_state(owner)? == CoroutineState::Suspended =>
+                {
+                    self.coroutine_stack_read(owner, slot)?
+                        .map(Some)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))
+                }
+                UpvalueState::Open { .. } => {
+                    Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))
+                }
+            },
+            None => Ok(value),
+        }
+    }
 }
 
 impl Execution<'_> {
+    fn closure_environment_value(&self, closure: ObjectRef) -> Result<Option<Value>, RuntimeError> {
+        let (value, cell) = self.vm.with_closure(closure, |payload| {
+            (payload.environment(), payload.environment_cell())
+        })?;
+        match cell {
+            Some(cell) => self.read_upvalue(cell).map(Some),
+            None => Ok(value),
+        }
+    }
+
+    fn read_environment_register(&self, register: Register) -> Result<Value, RuntimeError> {
+        if register == self.prototype().global_environment {
+            if let Some(closure) = self.frame.closure {
+                if let Some(cell) = self.vm.with_closure(closure, Closure::environment_cell)? {
+                    return self.read_upvalue(cell);
+                }
+            }
+        }
+        self.frame.read(register)
+    }
     fn for_native_finalizer(vm: &mut Vm) -> Result<Execution<'_>, RuntimeError> {
         let frame = CallFrame::new_native_finalizer(vm.allocation_ledger())?;
         Ok(Execution {
@@ -1412,6 +1736,9 @@ impl Execution<'_> {
             fuel: 1_000_000,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
+            debug_hook_c_call_pending: None,
+            debug_builtin_capture: false,
+            debug_builtin_result: None,
             host_call_bootstrap: false,
             deferred_roots: Vec::new(),
             deferred_charge: 0,
@@ -1490,6 +1817,7 @@ impl Execution<'_> {
                 resume_pc,
                 false,
                 false,
+                0,
             )
             .map(|()| RegularCallAction::Entered)
         };
@@ -1592,9 +1920,10 @@ impl Execution<'_> {
         target: ObjectRef,
     ) -> Result<Execution<'_>, RuntimeError> {
         let (closure, args, args_ticket) = vm.resolve_finalizer_closure(callback, target)?;
-        let (module, prototype_id, environment) = vm
-            .with_closure(closure, |c| (c.module(), c.prototype(), c.environment()))
+        let (module, prototype_id) = vm
+            .with_closure(closure, |c| (c.module(), c.prototype()))
             .map_err(|_| RuntimeError::new(RuntimeErrorKind::NotCallable))?;
+        let environment = vm.closed_closure_environment(closure)?;
         let index = vm
             .module(module)?
             .module()
@@ -1656,6 +1985,9 @@ impl Execution<'_> {
             fuel: 1_000_000,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
+            debug_hook_c_call_pending: None,
+            debug_builtin_capture: false,
+            debug_builtin_result: None,
             host_call_bootstrap: false,
             deferred_roots: Vec::new(),
             deferred_charge: 0,
@@ -2129,6 +2461,13 @@ impl Execution<'_> {
             }
         };
         if event_kind == ObjectKind::Closure {
+            let call_extraargs = match kind {
+                PendingKind::Call => chain_steps,
+                PendingKind::Value | PendingKind::Boolean { .. } | PendingKind::Close => {
+                    chain_steps.saturating_sub(1)
+                }
+                PendingKind::Table(_) | PendingKind::Basic => 0,
+            };
             if let Err(error) = self.enter_metamethod_call(
                 event,
                 args,
@@ -2137,6 +2476,7 @@ impl Execution<'_> {
                 next,
                 tail_return,
                 false,
+                call_extraargs,
             ) {
                 pending.clear(self.vm)?;
                 return Err(error);
@@ -2368,13 +2708,22 @@ impl Execution<'_> {
         next: usize,
         tail_return: bool,
         reuse_tail_frame: bool,
+        extraargs: usize,
     ) -> Result<(), RuntimeError> {
         const FRAME_LIMIT: usize = 1024;
+        let call_extraargs = if self.vm.language_profile() == LuaProfile::Lua55 {
+            u8::try_from(extraargs)
+                .ok()
+                .filter(|count| *count <= 15)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::MetatableChainLimit))?
+        } else {
+            0
+        };
         let base = self.frame.index(destination)?;
-        let (module_ref, prototype_id, captured_environment) =
-            self.vm.with_closure(event, |closure| {
-                (closure.module(), closure.prototype(), closure.environment())
-            })?;
+        let (module_ref, prototype_id) = self
+            .vm
+            .with_closure(event, |closure| (closure.module(), closure.prototype()))?;
+        let captured_environment = self.closure_environment_value(event)?;
         let child_index = self
             .vm
             .module(module_ref)?
@@ -2436,6 +2785,9 @@ impl Execution<'_> {
         } else {
             result_mode
         };
+        callee.hook_entry = Some(tail_return);
+        callee.tail_called = tail_return;
+        callee.call_extraargs = call_extraargs;
         callee.caller = if reuse_tail_frame {
             self.frame.caller
         } else {
@@ -2543,7 +2895,9 @@ impl Execution<'_> {
                     return Ok(Some((object, final_args, ticket, count)));
                 }
                 ObjectKind::Table => {
-                    if count == MAX_TAG_LOOP {
+                    if count == MAX_TAG_LOOP
+                        || (self.vm.language_profile() == LuaProfile::Lua55 && count == 15)
+                    {
                         return Err(RuntimeError::new(RuntimeErrorKind::MetatableChainLimit));
                     }
                     let event = self.vm.lookup_metamethod(object, MetamethodEvent::Call)?;
@@ -2794,7 +3148,7 @@ impl Execution<'_> {
             let inputs = carried
                 .as_ref()
                 .map_or(args, |(values, _, skip)| &values[*skip..]);
-            let Some((callee, arguments, ticket, _)) =
+            let Some((callee, arguments, ticket, call_extraargs)) =
                 self.resolve_callable_event(target, inputs)?
             else {
                 return Ok(RegularCallAction::Aborted);
@@ -2998,6 +3352,7 @@ impl Execution<'_> {
                         next,
                         false,
                         false,
+                        call_extraargs,
                     );
                     drop(ticket);
                     entered?;
@@ -3348,7 +3703,16 @@ impl Execution<'_> {
             && self.vm.object_kind(event)? == ObjectKind::Closure
         {
             // 尾呼叫沒有本 frame 的回填目的；參數在替換 frame 前取得新 roots。
-            self.enter_metamethod_call(event, &args, base, result_mode, next, true, true)?;
+            self.enter_metamethod_call(
+                event,
+                &args,
+                base,
+                result_mode,
+                next,
+                true,
+                true,
+                chain_steps,
+            )?;
             drop(event_ticket);
             drop(original_ticket);
             return Ok(RegularCallAction::Entered);
@@ -3415,11 +3779,9 @@ impl Execution<'_> {
         let Value::Object(target) = self.frame.read(base)? else {
             return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
         };
-        let (module_ref, prototype_id, captured_environment) = self
+        let (module_ref, prototype_id) = self
             .vm
-            .with_closure(target, |closure| {
-                (closure.module(), closure.prototype(), closure.environment())
-            })
+            .with_closure(target, |closure| (closure.module(), closure.prototype()))
             .map_err(|error| {
                 if error == VmError::WrongObjectType {
                     RuntimeError::new(RuntimeErrorKind::NotCallable)
@@ -3427,6 +3789,7 @@ impl Execution<'_> {
                     error.into()
                 }
             })?;
+        let captured_environment = self.closure_environment_value(target)?;
         let child_index = self
             .vm
             .module(module_ref)?
@@ -3494,6 +3857,8 @@ impl Execution<'_> {
             Some(self.callers.len())
         };
         callee.depth = depth;
+        callee.hook_entry = Some(tail_return);
+        callee.tail_called = tail_return;
         callee.closure_root = Some(self.vm.add_root(RootKind::Stack, target)?);
         if let Some(environment) = captured_environment {
             if let Err(error) = callee.write(self.vm, environment_register, environment) {
@@ -3618,6 +3983,23 @@ impl Execution<'_> {
         finished.close_open(self.vm)?;
         finished.clear_roots(self.vm)?;
         finished.release_storage();
+        // 被呼叫函式返回後，同一呼叫行的後續指令不應再產生 line 事件。
+        if !self.vm.debug_hook_running()
+            && self
+                .vm
+                .debug_hook_for(self.active_coroutine)?
+                .is_some_and(|hook| hook.line)
+        {
+            let call_pc = self.frame.pc.saturating_sub(1);
+            let (source_pc, line) = self.debug_hook_location_at(call_pc)?;
+            self.vm.debug_hook_prime(
+                self.active_coroutine,
+                self.frame.module,
+                self.frame.prototype,
+                source_pc,
+                line,
+            )?;
+        }
         Ok(())
     }
 
@@ -3738,10 +4120,11 @@ impl Execution<'_> {
         let Value::Object(closure) = entry else {
             return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
         };
-        let (module, prototype_id, environment) = self
+        let (module, prototype_id) = self
             .vm
-            .with_closure(closure, |c| (c.module(), c.prototype(), c.environment()))
+            .with_closure(closure, |c| (c.module(), c.prototype()))
             .map_err(|_| RuntimeError::new(RuntimeErrorKind::NotCallable))?;
+        let environment = self.closure_environment_value(closure)?;
         let index = self
             .vm
             .module(module)?
@@ -3822,6 +4205,21 @@ impl Execution<'_> {
         values: Vec<Value>,
         ticket: Option<Reservation>,
     ) -> Result<RegularCallAction, RuntimeError> {
+        if self.debug_builtin_capture {
+            if self.debug_builtin_result.is_some() {
+                return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
+            }
+            let held = PrintArguments::new(self.vm, &values)?;
+            self.debug_builtin_result = Some(DebugBuiltinReturn {
+                values: held,
+                destination,
+                mode,
+                tail_return,
+                next,
+            });
+            drop(ticket);
+            return Ok(RegularCallAction::Completed(DispatchResult::Continue));
+        }
         if tail_return {
             return Ok(RegularCallAction::Completed(
                 self.propagate_tail_result(values, ticket)?,
@@ -5797,6 +6195,7 @@ impl Execution<'_> {
             pattern,
             next: position,
             last,
+            ..
         } = state
         else {
             return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
@@ -7014,6 +7413,2044 @@ impl Execution<'_> {
         }
     }
 
+    fn debug_local_integer(&mut self, value: Value) -> Result<Option<i64>, RuntimeError> {
+        if let Value::Object(object) = value {
+            if self.vm.object_kind(object)? == ObjectKind::ByteString {
+                let len = self.vm.with_byte_string(object, |text| text.len())?;
+                if len > self.vm.debug_capability().limits().max_work_units {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+                }
+                if !self.charge_native_work(len)? {
+                    return Ok(None);
+                }
+            }
+        }
+        let value = basic::number(self.vm, value, None)?;
+        basic::lua_integer(value)
+            .map(Some)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))
+    }
+
+    fn debug_local_result(
+        &mut self,
+        name: Option<&[u8]>,
+        value: Option<Value>,
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        let mut output = [Value::Nil; 2];
+        let mut count = 1;
+        if let Some(name) = name {
+            output[0] = Value::Object(self.vm.allocate_byte_string(name)?);
+            if let Some(value) = value {
+                output[1] = value;
+                count = 2;
+            }
+        }
+        let (values, ticket) = math_lib::values(self.vm, &output[..count])?;
+        self.complete_builtin_values(destination, mode, tail_return, next, values, ticket)
+    }
+
+    fn debug_with_frame<R>(
+        &self,
+        thread: Option<ObjectRef>,
+        level: usize,
+        read: impl FnOnce(&CallFrame) -> R,
+    ) -> Result<R, RuntimeError> {
+        if let Some(thread) = thread {
+            return self.vm.with_coroutine(thread, |co| {
+                if co.state != CoroutineState::Suspended {
+                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                }
+                let frame = co
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.debug_frame(level))
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                Ok(read(frame))
+            })?;
+        }
+        let frame = if level == 1 {
+            &self.frame
+        } else {
+            self.callers
+                .iter()
+                .rev()
+                .nth(level.saturating_sub(2))
+                .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?
+        };
+        Ok(read(frame))
+    }
+
+    fn debug_temporary_pc(
+        &self,
+        thread: Option<ObjectRef>,
+        level: usize,
+        frame_pc: usize,
+    ) -> Result<Option<InstructionOffset>, RuntimeError> {
+        let call_pc = if let Some(thread) = thread.filter(|_| level == 1) {
+            self.vm.with_coroutine(thread, |co| {
+                co.context
+                    .as_ref()
+                    .and_then(|context| context.yield_site)
+                    .filter(|site| !site.tail_return)
+                    .and_then(|site| site.resume_pc.checked_sub(1))
+            })?
+        } else {
+            Some(frame_pc)
+        };
+        Ok(call_pc
+            .and_then(|pc| u32::try_from(pc).ok())
+            .map(InstructionOffset))
+    }
+
+    fn debug_local_visible_pc(
+        frame: &CallFrame,
+        level: usize,
+        return_hook: bool,
+        current_hook_pc: bool,
+    ) -> usize {
+        if level == 1 || (return_hook && frame.hook_exit_fired) || current_hook_pc {
+            frame.pc
+        } else {
+            frame.pc.saturating_sub(1)
+        }
+    }
+
+    fn debug_hook_uses_current_local_pc(&self, thread: Option<ObjectRef>, level: usize) -> bool {
+        thread.is_none()
+            && self.vm.debug_hook_running()
+            && self
+                .pending_ops
+                .current_local_hook_caller_depth()
+                .and_then(|caller_depth| self.callers.len().checked_sub(caller_depth))
+                .and_then(|distance| distance.checked_add(1))
+                == Some(level)
+    }
+
+    fn debug_hook_transfer_value(
+        &self,
+        level: usize,
+        index: i64,
+    ) -> Result<Option<(DebugTransfer, Value)>, RuntimeError> {
+        if level != 2 || index <= 0 || !self.vm.debug_hook_running() {
+            return Ok(None);
+        }
+        let Some(pending) = self
+            .pending_ops
+            .last()
+            .filter(|pending| pending.caller_depth.checked_add(1) == Some(self.callers.len()))
+        else {
+            return Ok(None);
+        };
+        let Some(BasicPending::DebugHook {
+            transfer: Some(transfer),
+            builtin_return,
+            ..
+        }) = pending.basic.as_ref()
+        else {
+            return Ok(None);
+        };
+        let Some(offset) = usize::try_from(index)
+            .ok()
+            .and_then(|ordinal| ordinal.checked_sub(transfer.first))
+            .filter(|offset| *offset < transfer.count)
+        else {
+            return Ok(None);
+        };
+        let value = if let Some(register) = transfer.register {
+            let slot = usize::from(register.0)
+                .checked_add(offset)
+                .and_then(|slot| u16::try_from(slot).ok())
+                .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?;
+            self.debug_with_frame(None, level, |frame| frame.read(Register(slot)))??
+        } else {
+            builtin_return
+                .as_ref()
+                .and_then(|result| result.values.values().get(offset))
+                .copied()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?
+        };
+        Ok(Some((*transfer, value)))
+    }
+
+    fn debug_negative_vararg_slot(
+        &self,
+        thread: Option<ObjectRef>,
+        level: usize,
+        index: i64,
+    ) -> Result<Option<DebugVarargSlot>, RuntimeError> {
+        let Some(position) = index
+            .checked_neg()
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            return Ok(None);
+        };
+        self.debug_with_frame(thread, level, |frame| {
+            if let Some(register) = frame.official_raw_varargs {
+                if position >= frame.official_raw_vararg_count {
+                    return Ok(None);
+                }
+                let Value::Object(table) = frame.read(register)? else {
+                    return Err(VmError::WrongObjectType.into());
+                };
+                let key = i64::try_from(position + 1)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                Ok(Some(DebugVarargSlot::OfficialRaw { table, key }))
+            } else if position < frame.varargs.len() {
+                Ok(Some(DebugVarargSlot::Frame(position)))
+            } else {
+                Ok(None)
+            }
+        })?
+    }
+
+    fn debug_official_positive_local(
+        &self,
+        thread: Option<ObjectRef>,
+        level: usize,
+        index: i64,
+        destination: Register,
+        module: ObjectRef,
+        prototype_index: usize,
+        pc: usize,
+    ) -> Result<Option<(Vec<u8>, Reservation, Register)>, RuntimeError> {
+        let ordinal = usize::try_from(index)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+        let verified = self.vm.module(module)?;
+        let prototype = verified
+            .module()
+            .prototypes
+            .get(prototype_index)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        let artifact = verified
+            .official_artifact()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        let guest = artifact
+            .prototype(prototype.id)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        let mapping = verified
+            .official_execution()
+            .and_then(|plan| plan.upvalue_map(prototype.id))
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        let visible_pc = self
+            .debug_temporary_pc(thread, level, pc)?
+            .map_or(pc, |offset| offset.0 as usize);
+        let origin = artifact
+            .pc_map(prototype.id)
+            .and_then(|map| map.rvlu_to_official().get(visible_pc))
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        let source_pc = origin.source_pc();
+        let active_local = guest
+            .debug
+            .locals
+            .iter()
+            .filter(|local| {
+                local.start_pc <= source_pc.unwrap_or(0) && source_pc.unwrap_or(0) < local.end_pc
+            })
+            .nth(ordinal.saturating_sub(1));
+        let guest_start = usize::from(mapping.guest_start.0);
+        let guest_end = guest_start.saturating_add(usize::from(mapping.guest_register_count));
+        let register_index = guest_start.saturating_add(ordinal.saturating_sub(1));
+        if ordinal == 0 || register_index >= guest_end {
+            return Ok(None);
+        }
+        let register = Register(
+            u16::try_from(register_index)
+                .map_err(|_| RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?,
+        );
+        let temporary_limit = if let Some(thread) = thread.filter(|_| level == 1) {
+            self.vm.with_coroutine(thread, |co| {
+                co.context
+                    .as_ref()
+                    .and_then(|context| context.yield_site)
+                    .map(|site| usize::from(site.destination.0))
+            })?
+        } else if thread.is_none() && level == 1 {
+            Some(usize::from(destination.0))
+        } else if source_pc.is_none() {
+            Some(guest_end)
+        } else {
+            match prototype
+                .instructions
+                .get(visible_pc)
+                .map(|entry| &entry.instruction)
+            {
+                Some(Instruction::Call { base, .. } | Instruction::TailCall { base, .. }) => {
+                    Some(usize::from(base.0))
+                }
+                Some(Instruction::Return { base, .. }) => Some(usize::from(base.0)),
+                _ => None,
+            }
+        };
+        let name = if let Some(local) = active_local.and_then(|local| local.name.as_deref()) {
+            local
+        } else if temporary_limit.is_some_and(|limit| register_index < limit) {
+            b"(temporary)"
+        } else {
+            return Ok(None);
+        };
+        let mut copy = Vec::new();
+        let ticket = reserve_vec(
+            self.vm.allocation_ledger(),
+            &mut copy,
+            name.len(),
+            FailPoint::WorkReserve,
+        )?;
+        copy.extend_from_slice(name);
+        Ok(Some((copy, ticket, register)))
+    }
+
+    fn debug_getlocal(
+        &mut self,
+        args: &[Value],
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        let offset = match args.first().copied() {
+            Some(Value::Object(object))
+                if self.vm.object_kind(object)? == ObjectKind::Coroutine =>
+            {
+                1
+            }
+            _ => 0,
+        };
+        let thread = if offset == 1 {
+            match args[0] {
+                Value::Object(thread) => Some(thread),
+                _ => return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument)),
+            }
+        } else {
+            None
+        };
+        let selector = args
+            .get(offset)
+            .copied()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+        let index = args
+            .get(offset + 1)
+            .copied()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+        let Some(index) = self.debug_local_integer(index)? else {
+            return Ok(RegularCallAction::Aborted);
+        };
+        let ledger = self.vm.allocation_ledger().clone();
+        let mut answer: Option<(Vec<u8>, Reservation, Option<Value>)> = None;
+        let function = match selector {
+            Value::Object(object) => match self.vm.object_kind(object)? {
+                ObjectKind::Closure => Some(object),
+                ObjectKind::Builtin => {
+                    return self.debug_local_result(
+                        None,
+                        None,
+                        destination,
+                        mode,
+                        tail_return,
+                        next,
+                    );
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(function) = function {
+            if index > 0 {
+                let ordinal = usize::try_from(index)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                let (module, prototype) = self
+                    .vm
+                    .with_closure(function, |closure| (closure.module(), closure.prototype()))?;
+                let work = {
+                    let verified = self.vm.module(module)?;
+                    let proto = verified
+                        .module()
+                        .prototypes
+                        .iter()
+                        .find(|entry| entry.id == prototype)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                    verified
+                        .native_debug()
+                        .and_then(|debug| debug.prototype(proto.id))
+                        .map(|debug| debug.locals.len())
+                        .or_else(|| {
+                            verified
+                                .official_artifact()
+                                .and_then(|artifact| artifact.prototype(proto.id))
+                                .map(|guest| guest.debug.locals.len())
+                        })
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                };
+                if work > self.vm.debug_capability().limits().max_work_units {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+                }
+                if !self.charge_native_work(work)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+                let verified = self.vm.module(module)?;
+                let proto = verified
+                    .module()
+                    .prototypes
+                    .iter()
+                    .find(|entry| entry.id == prototype)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                if ordinal <= usize::from(proto.parameter_count) {
+                    let name = if let Some(debug) = verified.native_debug() {
+                        let debug = debug
+                            .prototype(proto.id)
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                        debug
+                            .locals
+                            .iter()
+                            .find(|local| {
+                                usize::from(local.slot) + 1 == ordinal
+                                    && local.initialized_pc == 0
+                                    && local.start_pc == 0
+                            })
+                            .map(|local| local.name.as_slice())
+                    } else if let Some(artifact) = verified.official_artifact() {
+                        artifact
+                            .prototype(proto.id)
+                            .and_then(|guest| guest.debug.locals.get(ordinal - 1))
+                            .filter(|local| local.start_pc == 0)
+                            .and_then(|local| local.name.as_deref())
+                    } else {
+                        return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                    };
+                    if let Some(name) = name {
+                        let mut copy = Vec::new();
+                        let ticket =
+                            reserve_vec(&ledger, &mut copy, name.len(), FailPoint::WorkReserve)?;
+                        copy.extend_from_slice(name);
+                        answer = Some((copy, ticket, None));
+                    }
+                }
+            }
+        } else {
+            let Some(level) = self.debug_local_integer(selector)? else {
+                return Ok(RegularCallAction::Aborted);
+            };
+            let level = usize::try_from(level)
+                .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+            if level > self.vm.debug_capability().limits().max_frames {
+                return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+            }
+            if thread.is_some() && level == 0 {
+                return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+            }
+            if level > 0 {
+                self.debug_with_frame(thread, level, |_| ())?;
+            }
+            if !self.charge_native_work(level.saturating_add(1))? {
+                return Ok(RegularCallAction::Aborted);
+            }
+            if level == 0 {
+                if let Some(position) = index
+                    .checked_sub(1)
+                    .and_then(|position| usize::try_from(position).ok())
+                {
+                    if let Some(value) = args.get(position).copied() {
+                        let name = b"(C temporary)";
+                        let mut copy = Vec::new();
+                        let ticket =
+                            reserve_vec(&ledger, &mut copy, name.len(), FailPoint::WorkReserve)?;
+                        copy.extend_from_slice(name);
+                        answer = Some((copy, ticket, Some(value)));
+                    }
+                }
+            } else {
+                let transfer = if thread.is_none() {
+                    self.debug_hook_transfer_value(level, index)?
+                } else {
+                    None
+                };
+                if let Some((_, value)) = transfer.filter(|(transfer, _)| transfer.builtin) {
+                    let name = b"(C temporary)";
+                    let mut copy = Vec::new();
+                    let ticket =
+                        reserve_vec(&ledger, &mut copy, name.len(), FailPoint::WorkReserve)?;
+                    copy.extend_from_slice(name);
+                    answer = Some((copy, ticket, Some(value)));
+                } else if index < 0 {
+                    if let Some(slot) = self.debug_negative_vararg_slot(thread, level, index)? {
+                        let value = match slot {
+                            DebugVarargSlot::Frame(position) => {
+                                self.debug_with_frame(thread, level, |frame| {
+                                    frame.varargs[position]
+                                })?
+                            }
+                            DebugVarargSlot::OfficialRaw { table, key } => {
+                                self.vm.raw_get(table, Value::Integer(key))?
+                            }
+                        };
+                        let name = b"(vararg)";
+                        let mut copy = Vec::new();
+                        let ticket =
+                            reserve_vec(&ledger, &mut copy, name.len(), FailPoint::WorkReserve)?;
+                        copy.extend_from_slice(name);
+                        answer = Some((copy, ticket, Some(value)));
+                    }
+                } else if index > 0 {
+                    let return_hook = thread.is_none() && self.vm.debug_hook_running();
+                    let current_hook_pc = self.debug_hook_uses_current_local_pc(thread, level);
+                    let (module, prototype_index, pc) =
+                        self.debug_with_frame(thread, level, |frame| {
+                            (
+                                frame.module,
+                                frame.prototype,
+                                Self::debug_local_visible_pc(
+                                    frame,
+                                    level,
+                                    return_hook,
+                                    current_hook_pc,
+                                ),
+                            )
+                        })?;
+                    let module =
+                        module.ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                    let work = {
+                        let verified = self.vm.module(module)?;
+                        let proto = verified
+                            .module()
+                            .prototypes
+                            .get(prototype_index)
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                        if let Some(artifact) = verified.official_artifact() {
+                            artifact
+                                .prototype(proto.id)
+                                .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+                                .debug
+                                .locals
+                                .len()
+                                .saturating_add(1)
+                        } else {
+                            let debug = verified
+                                .native_debug()
+                                .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                            debug
+                                .prototype(proto.id)
+                                .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+                                .locals
+                                .len()
+                                .saturating_add(
+                                    debug
+                                        .temporaries_for(proto.id)
+                                        .map_or(0, |entries| entries.len()),
+                                )
+                                .saturating_add(
+                                    debug
+                                        .initializer_temporaries_for(proto.id)
+                                        .map_or(0, |entries| entries.len()),
+                                )
+                                .saturating_add(1)
+                        }
+                    };
+                    if work > self.vm.debug_capability().limits().max_work_units {
+                        return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+                    }
+                    if !self.charge_native_work(work)? {
+                        return Ok(RegularCallAction::Aborted);
+                    }
+                    if self.vm.module(module)?.official_artifact().is_some() {
+                        if let Some((name, ticket, register)) = self.debug_official_positive_local(
+                            thread,
+                            level,
+                            index,
+                            destination,
+                            module,
+                            prototype_index,
+                            pc,
+                        )? {
+                            let value = self
+                                .debug_with_frame(thread, level, |frame| frame.read(register))??;
+                            answer = Some((name, ticket, Some(value)));
+                        }
+                    } else {
+                        let temporary_pc = self.debug_temporary_pc(thread, level, pc)?;
+                        let visible_pc = temporary_pc.map_or(pc, |call_pc| call_pc.0 as usize);
+                        let verified = self.vm.module(module)?;
+                        let proto = verified
+                            .module()
+                            .prototypes
+                            .get(prototype_index)
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                        let debug = verified
+                            .native_debug()
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                        let locals = debug
+                            .prototype(proto.id)
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                        let storage = debug
+                            .storage_for(proto.id)
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                        let synthetic = self.vm.language_profile() == LuaProfile::Lua55
+                            && proto.id.0 != 0
+                            && proto.is_variadic
+                            && proto.named_vararg.is_none();
+                        let synthetic_ordinal = usize::from(proto.parameter_count) + 1;
+                        if synthetic && usize::try_from(index).ok() == Some(synthetic_ordinal) {
+                            let name = b"(vararg table)";
+                            let value = self.debug_with_frame(thread, level, |frame| {
+                                frame.debug_vararg_table
+                            })?;
+                            let mut copy = Vec::new();
+                            let ticket = reserve_vec(
+                                &ledger,
+                                &mut copy,
+                                name.len(),
+                                FailPoint::WorkReserve,
+                            )?;
+                            copy.extend_from_slice(name);
+                            answer = Some((copy, ticket, Some(value)));
+                        } else {
+                            let ordinal = usize::try_from(index).ok().and_then(|ordinal| {
+                                if synthetic && ordinal > synthetic_ordinal {
+                                    ordinal.checked_sub(1)
+                                } else {
+                                    Some(ordinal)
+                                }
+                            });
+                            let slot = ordinal
+                                .and_then(|ordinal| ordinal.checked_sub(1))
+                                .and_then(|slot| u8::try_from(slot).ok());
+                            let pending_temporary = temporary_pc
+                                .and_then(|call_pc| debug.temporaries_at(proto.id, call_pc))
+                                .and_then(|entries| {
+                                    let active = locals
+                                        .locals
+                                        .iter()
+                                        .zip(storage)
+                                        .filter(|(local, storage)| {
+                                            local.start_pc as usize <= visible_pc
+                                                && visible_pc < local.end_pc as usize
+                                                && storage.start_pc as usize <= visible_pc
+                                                && visible_pc < storage.end_pc as usize
+                                        })
+                                        .count();
+                                    usize::try_from(index)
+                                        .ok()
+                                        .and_then(|index| {
+                                            index.checked_sub(active + usize::from(synthetic))
+                                        })
+                                        .and_then(|ordinal| {
+                                            entries
+                                                .iter()
+                                                .find(|entry| usize::from(entry.ordinal) == ordinal)
+                                        })
+                                });
+                            if let Some((local, storage)) = slot.and_then(|slot| {
+                                locals.locals.iter().zip(storage).find(|(local, storage)| {
+                                    local.slot == slot
+                                        && local.start_pc as usize <= visible_pc
+                                        && visible_pc < local.end_pc as usize
+                                        && storage.start_pc as usize <= visible_pc
+                                        && visible_pc < storage.end_pc as usize
+                                        && local.register == storage.register
+                                        && local.binding == storage.binding
+                                })
+                            }) {
+                                let value = self.debug_with_frame(thread, level, |frame| {
+                                    frame.read(storage.register)
+                                })??;
+                                let mut copy = Vec::new();
+                                let ticket = reserve_vec(
+                                    &ledger,
+                                    &mut copy,
+                                    local.name.len(),
+                                    FailPoint::WorkReserve,
+                                )?;
+                                copy.extend_from_slice(&local.name);
+                                answer = Some((copy, ticket, Some(value)));
+                            } else if let Some(temporary) = pending_temporary {
+                                let value = self.debug_with_frame(thread, level, |frame| {
+                                    frame.read(temporary.register)
+                                })??;
+                                let name = b"(temporary)";
+                                let mut copy = Vec::new();
+                                let ticket = reserve_vec(
+                                    &ledger,
+                                    &mut copy,
+                                    name.len(),
+                                    FailPoint::WorkReserve,
+                                )?;
+                                copy.extend_from_slice(name);
+                                answer = Some((copy, ticket, Some(value)));
+                            } else if let Some(initializer) = slot.and_then(|slot| {
+                                debug
+                                    .initializer_temporaries_for(proto.id)?
+                                    .iter()
+                                    .find(|entry| {
+                                        entry.slot == slot
+                                            && entry.start_pc as usize <= visible_pc
+                                            && visible_pc < entry.end_pc as usize
+                                    })
+                            }) {
+                                let value = self.debug_with_frame(thread, level, |frame| {
+                                    frame.read(initializer.register)
+                                })??;
+                                let name = b"(temporary)";
+                                let mut copy = Vec::new();
+                                let ticket = reserve_vec(
+                                    &ledger,
+                                    &mut copy,
+                                    name.len(),
+                                    FailPoint::WorkReserve,
+                                )?;
+                                copy.extend_from_slice(name);
+                                answer = Some((copy, ticket, Some(value)));
+                            }
+                        }
+                    }
+                }
+                if let Some((_, value)) = transfer.filter(|(transfer, _)| !transfer.builtin) {
+                    if let Some((_, _, answer_value)) = answer.as_mut() {
+                        *answer_value = Some(value);
+                    } else {
+                        let name = b"(temporary)";
+                        let mut copy = Vec::new();
+                        let ticket =
+                            reserve_vec(&ledger, &mut copy, name.len(), FailPoint::WorkReserve)?;
+                        copy.extend_from_slice(name);
+                        answer = Some((copy, ticket, Some(value)));
+                    }
+                }
+            }
+        }
+        if let Some((name, _, _)) = &answer {
+            if name.len() > self.vm.debug_capability().limits().max_work_units {
+                return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+            }
+            if !self.charge_native_work(name.len())? {
+                return Ok(RegularCallAction::Aborted);
+            }
+        }
+        let name = answer.as_ref().map(|(name, _, _)| name.as_slice());
+        let value = answer.as_ref().and_then(|(_, _, value)| *value);
+        self.debug_local_result(name, value, destination, mode, tail_return, next)
+    }
+
+    fn debug_setlocal(
+        &mut self,
+        args: &[Value],
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        #[derive(Clone, Copy)]
+        enum Slot {
+            Register(Register),
+            Vararg(usize),
+            OfficialRawVararg { table: ObjectRef, key: i64 },
+            VarargTable,
+            Temporary,
+        }
+        let offset = match args.first().copied() {
+            Some(Value::Object(object))
+                if self.vm.object_kind(object)? == ObjectKind::Coroutine =>
+            {
+                1
+            }
+            _ => 0,
+        };
+        let thread = if offset == 1 {
+            match args[0] {
+                Value::Object(thread) => Some(thread),
+                _ => return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument)),
+            }
+        } else {
+            None
+        };
+        let level = args
+            .get(offset)
+            .copied()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+        let index = args
+            .get(offset + 1)
+            .copied()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+        let value = args.get(offset + 2).copied().unwrap_or(Value::Nil);
+        let Some(level) = self.debug_local_integer(level)? else {
+            return Ok(RegularCallAction::Aborted);
+        };
+        let Some(index) = self.debug_local_integer(index)? else {
+            return Ok(RegularCallAction::Aborted);
+        };
+        let level = usize::try_from(level)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+        if level > self.vm.debug_capability().limits().max_frames {
+            return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+        }
+        if thread.is_some() && level == 0 {
+            return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+        }
+        if level > 0 {
+            self.debug_with_frame(thread, level, |_| ())?;
+        }
+        if !self.charge_native_work(level.saturating_add(1))? {
+            return Ok(RegularCallAction::Aborted);
+        }
+        let ledger = self.vm.allocation_ledger().clone();
+        let mut selected: Option<(Vec<u8>, Reservation, Slot)> = None;
+        if level == 0 {
+            if let Some(position) = index
+                .checked_sub(1)
+                .and_then(|position| usize::try_from(position).ok())
+            {
+                if args.get(position).is_some() {
+                    let name = b"(C temporary)";
+                    let mut copy = Vec::new();
+                    let ticket =
+                        reserve_vec(&ledger, &mut copy, name.len(), FailPoint::WorkReserve)?;
+                    copy.extend_from_slice(name);
+                    selected = Some((copy, ticket, Slot::Temporary));
+                }
+            }
+        } else if index < 0 {
+            if let Some(vararg) = self.debug_negative_vararg_slot(thread, level, index)? {
+                let name = b"(vararg)";
+                let mut copy = Vec::new();
+                let ticket = reserve_vec(&ledger, &mut copy, name.len(), FailPoint::WorkReserve)?;
+                copy.extend_from_slice(name);
+                let slot = match vararg {
+                    DebugVarargSlot::Frame(position) => Slot::Vararg(position),
+                    DebugVarargSlot::OfficialRaw { table, key } => {
+                        Slot::OfficialRawVararg { table, key }
+                    }
+                };
+                selected = Some((copy, ticket, slot));
+            }
+        } else if index > 0 {
+            let return_hook = thread.is_none() && self.vm.debug_hook_running();
+            let current_hook_pc = self.debug_hook_uses_current_local_pc(thread, level);
+            let (module, prototype_index, pc) = self.debug_with_frame(thread, level, |frame| {
+                (
+                    frame.module,
+                    frame.prototype,
+                    Self::debug_local_visible_pc(frame, level, return_hook, current_hook_pc),
+                )
+            })?;
+            let module = module.ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+            let work = {
+                let verified = self.vm.module(module)?;
+                let proto = verified
+                    .module()
+                    .prototypes
+                    .get(prototype_index)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                if let Some(artifact) = verified.official_artifact() {
+                    artifact
+                        .prototype(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+                        .debug
+                        .locals
+                        .len()
+                        .saturating_add(1)
+                } else {
+                    let debug = verified
+                        .native_debug()
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                    debug
+                        .prototype(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+                        .locals
+                        .len()
+                        .saturating_add(
+                            debug
+                                .temporaries_for(proto.id)
+                                .map_or(0, |entries| entries.len()),
+                        )
+                        .saturating_add(
+                            debug
+                                .initializer_temporaries_for(proto.id)
+                                .map_or(0, |entries| entries.len()),
+                        )
+                        .saturating_add(1)
+                }
+            };
+            if work > self.vm.debug_capability().limits().max_work_units {
+                return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+            }
+            if !self.charge_native_work(work)? {
+                return Ok(RegularCallAction::Aborted);
+            }
+            if self.vm.module(module)?.official_artifact().is_some() {
+                if let Some((name, ticket, register)) = self.debug_official_positive_local(
+                    thread,
+                    level,
+                    index,
+                    destination,
+                    module,
+                    prototype_index,
+                    pc,
+                )? {
+                    selected = Some((name, ticket, Slot::Register(register)));
+                }
+            } else {
+                let temporary_pc = self.debug_temporary_pc(thread, level, pc)?;
+                let visible_pc = temporary_pc.map_or(pc, |call_pc| call_pc.0 as usize);
+                let verified = self.vm.module(module)?;
+                let proto = verified
+                    .module()
+                    .prototypes
+                    .get(prototype_index)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                let debug = verified
+                    .native_debug()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                let locals = debug
+                    .prototype(proto.id)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                let storage = debug
+                    .storage_for(proto.id)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                let synthetic = self.vm.language_profile() == LuaProfile::Lua55
+                    && proto.id.0 != 0
+                    && proto.is_variadic
+                    && proto.named_vararg.is_none();
+                let synthetic_ordinal = usize::from(proto.parameter_count) + 1;
+                if synthetic && usize::try_from(index).ok() == Some(synthetic_ordinal) {
+                    let name = b"(vararg table)";
+                    let mut copy = Vec::new();
+                    let ticket =
+                        reserve_vec(&ledger, &mut copy, name.len(), FailPoint::WorkReserve)?;
+                    copy.extend_from_slice(name);
+                    selected = Some((copy, ticket, Slot::VarargTable));
+                } else {
+                    let ordinal = usize::try_from(index).ok().and_then(|ordinal| {
+                        if synthetic && ordinal > synthetic_ordinal {
+                            ordinal.checked_sub(1)
+                        } else {
+                            Some(ordinal)
+                        }
+                    });
+                    let slot = ordinal
+                        .and_then(|ordinal| ordinal.checked_sub(1))
+                        .and_then(|slot| u8::try_from(slot).ok());
+                    let pending_temporary = temporary_pc
+                        .and_then(|call_pc| debug.temporaries_at(proto.id, call_pc))
+                        .and_then(|entries| {
+                            let active = locals
+                                .locals
+                                .iter()
+                                .zip(storage)
+                                .filter(|(local, storage)| {
+                                    local.start_pc as usize <= visible_pc
+                                        && visible_pc < local.end_pc as usize
+                                        && storage.start_pc as usize <= visible_pc
+                                        && visible_pc < storage.end_pc as usize
+                                })
+                                .count();
+                            usize::try_from(index)
+                                .ok()
+                                .and_then(|index| {
+                                    index.checked_sub(active + usize::from(synthetic))
+                                })
+                                .and_then(|ordinal| {
+                                    entries
+                                        .iter()
+                                        .find(|entry| usize::from(entry.ordinal) == ordinal)
+                                })
+                        });
+                    if let Some((local, storage)) = slot.and_then(|slot| {
+                        locals.locals.iter().zip(storage).find(|(local, storage)| {
+                            local.slot == slot
+                                && local.start_pc as usize <= visible_pc
+                                && visible_pc < local.end_pc as usize
+                                && storage.start_pc as usize <= visible_pc
+                                && visible_pc < storage.end_pc as usize
+                                && local.register == storage.register
+                                && local.binding == storage.binding
+                        })
+                    }) {
+                        let mut copy = Vec::new();
+                        let ticket = reserve_vec(
+                            &ledger,
+                            &mut copy,
+                            local.name.len(),
+                            FailPoint::WorkReserve,
+                        )?;
+                        copy.extend_from_slice(&local.name);
+                        selected = Some((copy, ticket, Slot::Register(storage.register)));
+                    } else if let Some(temporary) = pending_temporary {
+                        let name = b"(temporary)";
+                        let mut copy = Vec::new();
+                        let ticket =
+                            reserve_vec(&ledger, &mut copy, name.len(), FailPoint::WorkReserve)?;
+                        copy.extend_from_slice(name);
+                        selected = Some((copy, ticket, Slot::Register(temporary.register)));
+                    } else if let Some(initializer) = slot.and_then(|slot| {
+                        debug
+                            .initializer_temporaries_for(proto.id)?
+                            .iter()
+                            .find(|entry| {
+                                entry.slot == slot
+                                    && entry.start_pc as usize <= visible_pc
+                                    && visible_pc < entry.end_pc as usize
+                            })
+                    }) {
+                        let name = b"(temporary)";
+                        let mut copy = Vec::new();
+                        let ticket =
+                            reserve_vec(&ledger, &mut copy, name.len(), FailPoint::WorkReserve)?;
+                        copy.extend_from_slice(name);
+                        selected = Some((copy, ticket, Slot::Register(initializer.register)));
+                    }
+                }
+            }
+        }
+        let Some((name, _name_ticket, slot)) = selected else {
+            return self.debug_local_result(None, None, destination, mode, tail_return, next);
+        };
+        if name.len() > self.vm.debug_capability().limits().max_work_units {
+            return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+        }
+        if !self.charge_native_work(name.len())? {
+            return Ok(RegularCallAction::Aborted);
+        }
+        let name_object = self.vm.allocate_byte_string(&name)?;
+        let (values, ticket) = math_lib::values(self.vm, &[Value::Object(name_object)])?;
+        if matches!(slot, Slot::Temporary) {
+            return self.complete_builtin_values(
+                destination,
+                mode,
+                tail_return,
+                next,
+                values,
+                ticket,
+            );
+        }
+        if let Slot::OfficialRawVararg { table, key } = slot {
+            // 原始 vararg table 是唯一權威；完成 builtin 回傳所需配置後才提交，
+            // 任何配置、尾呼叫或 failpoint 失敗都不會先改動原始引數。
+            let table_root = self.vm.add_root(RootKind::Temporary, table)?;
+            let value_root = if let Value::Object(object) = value {
+                match self.vm.add_root(RootKind::Temporary, object) {
+                    Ok(root) => Some(root),
+                    Err(error) => {
+                        self.vm.remove_root(table_root)?;
+                        return Err(error.into());
+                    }
+                }
+            } else {
+                None
+            };
+            let completed =
+                self.complete_builtin_values(destination, mode, tail_return, next, values, ticket);
+            let result = completed.and_then(|action| {
+                self.vm.raw_set(table, Value::Integer(key), value)?;
+                Ok(action)
+            });
+            if let Some(root) = value_root {
+                self.vm.remove_root(root)?;
+            }
+            self.vm.remove_root(table_root)?;
+            return result;
+        }
+        if let Some(thread) = thread {
+            let parked_slot = match slot {
+                Slot::Register(register) => ParkedLocalSlot::Register(register),
+                Slot::Vararg(index) => ParkedLocalSlot::Vararg(index),
+                Slot::VarargTable => ParkedLocalSlot::VarargTable,
+                Slot::OfficialRawVararg { .. } => {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+                }
+                Slot::Temporary => return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument)),
+            };
+            let thread_root = self.vm.add_root(RootKind::Temporary, thread)?;
+            let name_root = match self.vm.add_root(RootKind::Temporary, name_object) {
+                Ok(root) => root,
+                Err(error) => {
+                    self.vm.remove_root(thread_root)?;
+                    return Err(error.into());
+                }
+            };
+            // 回傳位置預先完成所有可能失敗的 root 配置；在下一次指令前
+            // 才以 coroutine write barrier 提交 parked slot，失敗時原值未動。
+            let completed =
+                self.complete_builtin_values(destination, mode, tail_return, next, values, ticket);
+            let result = completed.and_then(|action| {
+                if self
+                    .vm
+                    .coroutine_debug_local_write(thread, level, parked_slot, value)?
+                {
+                    Ok(action)
+                } else {
+                    Err(RuntimeError::new(RuntimeErrorKind::DebugArgument))
+                }
+            });
+            self.vm.remove_root(name_root)?;
+            self.vm.remove_root(thread_root)?;
+            return result;
+        }
+        let caller = if level == 1 {
+            None
+        } else {
+            Some(
+                self.callers
+                    .len()
+                    .checked_sub(level - 1)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?,
+            )
+        };
+        let write = {
+            let frame = match caller {
+                Some(index) => &mut self.callers[index],
+                None => &mut self.frame,
+            };
+            match slot {
+                Slot::Register(register) => {
+                    frame.begin_debug_register_write(self.vm, register, value)?
+                }
+                Slot::Vararg(index) => frame.begin_debug_vararg_write(self.vm, index, value)?,
+                Slot::VarargTable => frame.begin_debug_vararg_table_write(self.vm, value)?,
+                Slot::OfficialRawVararg { .. } => {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+                }
+                Slot::Temporary => unreachable!("temporary 不寫入 Lua frame"),
+            }
+        };
+        let caller_depth_before_completion = self.callers.len();
+        let completed =
+            self.complete_builtin_values(destination, mode, tail_return, next, values, ticket);
+        match completed {
+            Ok(action) => {
+                write.commit(self.vm)?;
+                Ok(action)
+            }
+            Err(error) => {
+                if tail_return && self.callers.len() < caller_depth_before_completion {
+                    // 尾呼叫已清除原 frame；其新 root 隨 frame 退出，舊 root 由交易收尾。
+                    write.commit(self.vm)?;
+                    return Err(error);
+                }
+                let frame = match caller {
+                    Some(index) => &mut self.callers[index],
+                    None => &mut self.frame,
+                };
+                frame.rollback_debug_write(self.vm, write)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn debug_getinfo(
+        &mut self,
+        args: &[Value],
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        let limit = self.vm.debug_capability().limits();
+        let mut spent = 0_usize;
+        macro_rules! spend {
+            ($units:expr) => {{
+                let units = $units;
+                spent = spent
+                    .checked_add(units)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                if spent > limit.max_work_units {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+                }
+                if !self.charge_native_work(units)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+            }};
+        }
+
+        let argument = args.first().copied().unwrap_or(Value::Integer(1));
+        let mut frame_pc = None;
+        let mut stack_level = None;
+        let mut module_ref = None;
+        let mut prototype_index = None;
+        let mut is_tail_call = false;
+        let mut call_extraargs = 0_i64;
+        let mut function = argument;
+        let object_kind = match argument {
+            Value::Integer(level) => {
+                if !self
+                    .vm
+                    .debug_capability()
+                    .allows(DebugPermission::StackInspection)
+                {
+                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                }
+                let Ok(level) = usize::try_from(level) else {
+                    let (values, ticket) = math_lib::values(self.vm, &[Value::Nil])?;
+                    return self.complete_builtin_values(
+                        destination,
+                        mode,
+                        tail_return,
+                        next,
+                        values,
+                        ticket,
+                    );
+                };
+                if level > self.callers.len().saturating_add(1) {
+                    let (values, ticket) = math_lib::values(self.vm, &[Value::Nil])?;
+                    return self.complete_builtin_values(
+                        destination,
+                        mode,
+                        tail_return,
+                        next,
+                        values,
+                        ticket,
+                    );
+                }
+                if level > limit.max_frames {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+                }
+                spend!(level.saturating_add(1));
+                if level == 0 {
+                    function = self.frame.read(destination)?;
+                    Some(ObjectKind::Builtin)
+                } else {
+                    stack_level = Some(level);
+                    let synthetic = (level == 2)
+                        .then(|| {
+                            self.pending_ops.last().and_then(|pending| {
+                                if pending.caller_depth.checked_add(1) == Some(self.callers.len()) {
+                                    match pending.basic {
+                                        Some(BasicPending::DebugHook { target, .. }) => target,
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .flatten();
+                    if let Some(target) = synthetic {
+                        function = Value::Object(target);
+                        Some(ObjectKind::Builtin)
+                    } else {
+                        let frame = if level == 1 {
+                            Some(&self.frame)
+                        } else {
+                            self.callers.iter().rev().nth(level - 2)
+                        };
+                        if let Some(frame) = frame {
+                            is_tail_call = frame.tail_called;
+                            call_extraargs = i64::from(frame.call_extraargs);
+                            function = frame.closure.map(Value::Object).unwrap_or(Value::Nil);
+                            module_ref = frame.module;
+                            prototype_index = Some(frame.prototype);
+                            frame_pc = Some(if level == 1 {
+                                frame.pc
+                            } else {
+                                frame.pc.saturating_sub(1)
+                            });
+                            Some(ObjectKind::Closure)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+            Value::Object(object) => {
+                let kind = self.vm.object_kind(object)?;
+                if !matches!(kind, ObjectKind::Closure | ObjectKind::Builtin) {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+                }
+                if kind == ObjectKind::Closure {
+                    let (module, prototype) = self
+                        .vm
+                        .with_closure(object, |closure| (closure.module(), closure.prototype()))?;
+                    module_ref = Some(module);
+                    let verified = self.vm.module(module)?;
+                    prototype_index = verified
+                        .module()
+                        .prototypes
+                        .iter()
+                        .position(|entry| entry.id == prototype);
+                }
+                Some(kind)
+            }
+            _ => return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument)),
+        };
+        let Some(object_kind) = object_kind else {
+            let (values, ticket) = math_lib::values(self.vm, &[Value::Nil])?;
+            return self.complete_builtin_values(
+                destination,
+                mode,
+                tail_return,
+                next,
+                values,
+                ticket,
+            );
+        };
+        let inspect_mask = |mask: &[u8]| {
+            (
+                mask.iter().all(|byte| {
+                    matches!(byte, b'f' | b'l' | b'n' | b'S' | b'u' | b'L' | b't' | b'r')
+                }),
+                mask.len(),
+                mask.contains(&b'f'),
+                mask.contains(&b'l'),
+                mask.contains(&b'n'),
+                mask.contains(&b'S'),
+                mask.contains(&b'u'),
+                mask.contains(&b'L'),
+                mask.contains(&b't'),
+                mask.contains(&b'r'),
+            )
+        };
+        let (valid_mask, mask_len, has_f, has_l, has_n, has_s, has_u, has_active, has_t, has_r) =
+            match args.get(1).copied() {
+                None | Some(Value::Nil) => inspect_mask(b"flnSrtu"),
+                Some(Value::Object(object))
+                    if self.vm.object_kind(object)? == ObjectKind::ByteString =>
+                {
+                    self.vm
+                        .with_byte_string(object, |string| inspect_mask(string.as_bytes()))?
+                }
+                _ => return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument)),
+            };
+        if !valid_mask {
+            return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+        }
+        spend!(mask_len);
+
+        let mut inferred_name = Vec::new();
+        let mut inferred_ticket = None;
+        let mut inferred_kind: &[u8] = b"";
+        if has_n {
+            if let Some(level) = stack_level {
+                if level == 1
+                    && self.pending_ops.last().is_some_and(|pending| {
+                        matches!(pending.basic, Some(BasicPending::DebugHook { .. }))
+                            && pending.caller_depth.checked_add(1) == Some(self.callers.len())
+                    })
+                {
+                    inferred_kind = b"hook";
+                }
+                if let Some(caller_index) = self.callers.len().checked_sub(level) {
+                    let (caller_module, caller_prototype, caller_pc) = {
+                        let caller = &self.callers[caller_index];
+                        (caller.module, caller.prototype, caller.pc.checked_sub(1))
+                    };
+                    if let (Some(module), Some(call_pc)) = (caller_module, caller_pc) {
+                        let candidate_work = self
+                            .vm
+                            .module(module)?
+                            .module()
+                            .prototypes
+                            .get(caller_prototype)
+                            .map(|proto| proto.instructions.len())
+                            .unwrap_or(0);
+                        spend!(candidate_work);
+                        let metadata_work = self
+                            .vm
+                            .module(module)?
+                            .module()
+                            .prototypes
+                            .len()
+                            .saturating_mul(2);
+                        spend!(metadata_work);
+                        let additional_work = {
+                            let verified = self.vm.module(module)?;
+                            let prototype = verified.module().prototypes.get(caller_prototype);
+                            prototype.map(|prototype| {
+                                if let Some(debug) = verified
+                                    .native_debug()
+                                    .and_then(|debug| debug.prototype(prototype.id))
+                                {
+                                    candidate_work
+                                        .saturating_mul(3)
+                                        .saturating_add(384)
+                                        .saturating_add(debug.locals.len().saturating_mul(2))
+                                } else if let Some(artifact) = verified.official_artifact() {
+                                    let local_count = artifact
+                                        .prototype(prototype.id)
+                                        .map(|guest| guest.debug.locals.len())
+                                        .unwrap_or(0);
+                                    candidate_work.saturating_add(local_count)
+                                } else {
+                                    0
+                                }
+                            })
+                        };
+                        if let Some(additional_work) = additional_work {
+                            spend!(additional_work);
+                        }
+                        let verified = self.vm.module(module)?;
+                        if let Some(prototype) = verified.module().prototypes.get(caller_prototype)
+                        {
+                            if let Some(debug) = verified
+                                .native_debug()
+                                .and_then(|debug| debug.prototype(prototype.id))
+                            {
+                                if let Some((name, kind)) = debug_native_call_name(
+                                    prototype,
+                                    debug,
+                                    &self.callers[caller_index],
+                                    function,
+                                    call_pc,
+                                ) {
+                                    inferred_ticket = Some(reserve_vec(
+                                        self.vm.allocation_ledger(),
+                                        &mut inferred_name,
+                                        name.len(),
+                                        FailPoint::WorkReserve,
+                                    )?);
+                                    inferred_name.extend_from_slice(name);
+                                    inferred_kind = kind;
+                                }
+                            } else if verified.official_artifact().is_some() {
+                                if let Some((name, kind)) = debug_official_call_name(
+                                    verified,
+                                    prototype,
+                                    &self.callers[caller_index],
+                                    function,
+                                    call_pc,
+                                ) {
+                                    inferred_ticket = Some(reserve_vec(
+                                        self.vm.allocation_ledger(),
+                                        &mut inferred_name,
+                                        name.len(),
+                                        FailPoint::WorkReserve,
+                                    )?);
+                                    inferred_name.extend_from_slice(name);
+                                    inferred_kind = kind;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut source = Vec::new();
+        let mut source_ticket = None;
+        let mut lines = Vec::new();
+        let mut lines_ticket = None;
+        let mut line_defined = 0_i64;
+        let mut last_line_defined = 0_i64;
+        let mut main = false;
+        let mut nups = 0_i64;
+        let mut nparams = 0_i64;
+        let mut isvararg = false;
+        let mut currentline = -1_i64;
+        let mut native_debug_source = false;
+        if object_kind == ObjectKind::Closure {
+            let index =
+                prototype_index.ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+            let verified = if let Some(module) = module_ref {
+                self.vm.module(module)?
+            } else {
+                self.module
+                    .as_ref()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+            };
+            let proto = verified
+                .module()
+                .prototypes
+                .get(index)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+            main = proto.id.0 == 0;
+            nparams = i64::from(proto.parameter_count);
+            isvararg = proto.is_variadic;
+            nups = if verified.native_debug().is_some() && verified.official_artifact().is_none() {
+                let debug = verified
+                    .native_debug()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                i64::try_from(
+                    debug
+                        .semantic_upvalue_count(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?,
+                )
+                .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugBudget))?
+            } else if let Some(plan) = verified.official_execution() {
+                i64::from(
+                    plan.upvalue_map(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+                        .guest_count,
+                )
+            } else {
+                i64::try_from(proto.upvalues.len())
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugBudget))?
+            };
+            if has_s || has_active || has_l || has_n || has_u {
+                if let Some(artifact) = verified.official_artifact() {
+                    let guest = artifact
+                        .prototype(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                    let bytes = artifact.effective_source(proto.id).unwrap_or(b"=?");
+                    source_ticket = Some(reserve_vec(
+                        self.vm.allocation_ledger(),
+                        &mut source,
+                        bytes.len(),
+                        FailPoint::WorkReserve,
+                    )?);
+                    source.extend_from_slice(bytes);
+                    line_defined = i64::from(guest.line_defined);
+                    last_line_defined = i64::from(guest.last_line_defined);
+                    if has_active {
+                        let map = artifact
+                            .pc_map(proto.id)
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                        lines_ticket = Some(reserve_vec(
+                            self.vm.allocation_ledger(),
+                            &mut lines,
+                            map.rvlu_to_official().len(),
+                            FailPoint::WorkReserve,
+                        )?);
+                        for pc in 0..map.rvlu_to_official().len() {
+                            lines.push(
+                                u32::try_from(pc)
+                                    .ok()
+                                    .and_then(|pc| map.line_at_rvlu(InstructionOffset(pc)))
+                                    .unwrap_or(0),
+                            );
+                        }
+                    }
+                    if let Some(pc) = frame_pc {
+                        currentline = u32::try_from(pc)
+                            .ok()
+                            .and_then(|pc| {
+                                artifact
+                                    .pc_map(proto.id)?
+                                    .line_at_rvlu(InstructionOffset(pc))
+                            })
+                            .map(i64::from)
+                            .unwrap_or(-1);
+                    }
+                } else if let Some(debug) = verified.native_debug() {
+                    native_debug_source = true;
+                    let proto_debug = debug
+                        .prototype(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                    let bytes = debug.source_name();
+                    source_ticket = Some(reserve_vec(
+                        self.vm.allocation_ledger(),
+                        &mut source,
+                        bytes.len(),
+                        FailPoint::WorkReserve,
+                    )?);
+                    source.extend_from_slice(bytes);
+                    line_defined = i64::from(proto_debug.line_defined);
+                    last_line_defined = i64::from(proto_debug.last_line_defined);
+                    if has_active {
+                        lines_ticket = Some(reserve_vec(
+                            self.vm.allocation_ledger(),
+                            &mut lines,
+                            proto_debug.lines.len(),
+                            FailPoint::WorkReserve,
+                        )?);
+                        lines.extend_from_slice(&proto_debug.lines);
+                    }
+                    if let Some(pc) = frame_pc {
+                        currentline = proto_debug
+                            .lines
+                            .get(pc)
+                            .copied()
+                            .filter(|line| *line > 0)
+                            .map(i64::from)
+                            .unwrap_or(-1);
+                    }
+                } else if has_s || has_active || has_l || has_n {
+                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                }
+            }
+            if has_u && source_ticket.is_none() {
+                let Value::Object(object) = function else {
+                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                };
+                if self.vm.with_closure(object, Closure::has_environment)? {
+                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                }
+            }
+        }
+        spend!(
+            source
+                .len()
+                .saturating_mul(3)
+                .saturating_add(lines.len())
+                .saturating_add(32)
+        );
+        let info = self.vm.allocate_table()?;
+        let info_root = self.vm.add_root(RootKind::Temporary, info)?;
+        let output = (|| {
+            if has_s {
+                let (what, source_bytes, short, defined, last) = if object_kind
+                    == ObjectKind::Builtin
+                {
+                    (
+                        b"C".as_slice(),
+                        b"=[C]".as_slice(),
+                        b"[C]".as_slice(),
+                        -1,
+                        -1,
+                    )
+                } else {
+                    let (short, size) = official_short_source(&source);
+                    let what = if main {
+                        b"main".as_slice()
+                    } else {
+                        b"Lua".as_slice()
+                    };
+                    let source_value = self.vm.allocate_byte_string(&source)?;
+                    self.vm
+                        .set_string_field(info, b"source", Value::Object(source_value))?;
+                    let short_value = self.vm.allocate_byte_string(&short[..size])?;
+                    self.vm
+                        .set_string_field(info, b"short_src", Value::Object(short_value))?;
+                    let what_value = self.vm.allocate_byte_string(what)?;
+                    self.vm
+                        .set_string_field(info, b"what", Value::Object(what_value))?;
+                    self.vm
+                        .set_string_field(info, b"linedefined", Value::Integer(line_defined))?;
+                    self.vm.set_string_field(
+                        info,
+                        b"lastlinedefined",
+                        Value::Integer(last_line_defined),
+                    )?;
+                    (b"".as_slice(), b"".as_slice(), b"".as_slice(), 0, 0)
+                };
+                if object_kind == ObjectKind::Builtin {
+                    let source_value = self.vm.allocate_byte_string(source_bytes)?;
+                    self.vm
+                        .set_string_field(info, b"source", Value::Object(source_value))?;
+                    let short_value = self.vm.allocate_byte_string(short)?;
+                    self.vm
+                        .set_string_field(info, b"short_src", Value::Object(short_value))?;
+                    let what_value = self.vm.allocate_byte_string(what)?;
+                    self.vm
+                        .set_string_field(info, b"what", Value::Object(what_value))?;
+                    self.vm
+                        .set_string_field(info, b"linedefined", Value::Integer(defined))?;
+                    self.vm
+                        .set_string_field(info, b"lastlinedefined", Value::Integer(last))?;
+                }
+            }
+            if has_u {
+                self.vm
+                    .set_string_field(info, b"nups", Value::Integer(nups))?;
+                self.vm
+                    .set_string_field(info, b"nparams", Value::Integer(nparams))?;
+                self.vm
+                    .set_string_field(info, b"isvararg", Value::Boolean(isvararg))?;
+            }
+            if has_l {
+                self.vm
+                    .set_string_field(info, b"currentline", Value::Integer(currentline))?;
+            }
+            if has_f && function != Value::Nil {
+                self.vm.set_string_field(info, b"func", function)?;
+            }
+            if has_t {
+                self.vm
+                    .set_string_field(info, b"istailcall", Value::Boolean(is_tail_call))?;
+                if self.vm.language_profile() == LuaProfile::Lua55 {
+                    self.vm
+                        .set_string_field(info, b"extraargs", Value::Integer(call_extraargs))?;
+                }
+            }
+            if has_r {
+                let transfer = (stack_level == Some(2) && self.vm.debug_hook_running())
+                    .then(|| self.pending_ops.last())
+                    .flatten()
+                    .filter(|pending| {
+                        pending.caller_depth.checked_add(1) == Some(self.callers.len())
+                    })
+                    .and_then(|pending| match pending.basic.as_ref() {
+                        Some(BasicPending::DebugHook { transfer, .. }) => *transfer,
+                        _ => None,
+                    })
+                    .filter(|transfer| {
+                        self.vm.language_profile() != LuaProfile::Lua54 || transfer.count > 0
+                    });
+                let (first, count) =
+                    transfer.map_or((0, 0), |transfer| (transfer.first, transfer.count));
+                let first = i64::try_from(first)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                let count = i64::try_from(count)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
+                self.vm
+                    .set_string_field(info, b"ftransfer", Value::Integer(first))?;
+                self.vm
+                    .set_string_field(info, b"ntransfer", Value::Integer(count))?;
+            }
+            if has_n {
+                let namewhat = self.vm.allocate_byte_string(inferred_kind)?;
+                self.vm
+                    .set_string_field(info, b"namewhat", Value::Object(namewhat))?;
+                if !inferred_name.is_empty() {
+                    let name = self.vm.allocate_byte_string(&inferred_name)?;
+                    self.vm
+                        .set_string_field(info, b"name", Value::Object(name))?;
+                }
+            }
+            if has_active && object_kind == ObjectKind::Closure {
+                let active = self.vm.allocate_table()?;
+                let active_root = self.vm.add_root(RootKind::Temporary, active)?;
+                let result = (|| {
+                    for line in &lines {
+                        if *line > 0 {
+                            self.vm.raw_set(
+                                active,
+                                Value::Integer(i64::from(*line)),
+                                Value::Boolean(true),
+                            )?;
+                        }
+                    }
+                    if native_debug_source && last_line_defined > 0 {
+                        self.vm.raw_set(
+                            active,
+                            Value::Integer(last_line_defined),
+                            Value::Boolean(true),
+                        )?;
+                    }
+                    self.vm
+                        .set_string_field(info, b"activelines", Value::Object(active))?;
+                    Ok::<(), RuntimeError>(())
+                })();
+                self.vm.remove_root(active_root)?;
+                result?;
+            }
+            let (values, ticket) = math_lib::values(self.vm, &[Value::Object(info)])?;
+            self.complete_builtin_values(destination, mode, tail_return, next, values, ticket)
+        })();
+        self.vm.remove_root(info_root)?;
+        drop(lines_ticket);
+        drop(source_ticket);
+        drop(inferred_ticket);
+        output
+    }
+
+    fn debug_upvalue_slot(
+        &mut self,
+        function: ObjectRef,
+        index: i64,
+    ) -> Result<Option<(ObjectRef, ObjectRef, rivetlua_core::ProtoId, usize)>, RuntimeError> {
+        if self.vm.object_kind(function)? != ObjectKind::Closure {
+            return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+        }
+        let (module, prototype, has_environment) = self.vm.with_closure(function, |closure| {
+            (
+                closure.module(),
+                closure.prototype(),
+                closure.has_environment(),
+            )
+        })?;
+        let verified = self.vm.module(module)?;
+        if has_environment
+            && verified.official_artifact().is_none()
+            && verified.native_debug().is_none()
+        {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+        }
+        let proto = verified
+            .module()
+            .prototypes
+            .get(
+                usize::try_from(prototype.0)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?,
+            )
+            .filter(|proto| proto.id == prototype)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        let count = if verified.native_debug().is_some() && verified.official_artifact().is_none() {
+            verified
+                .native_debug()
+                .and_then(|debug| debug.semantic_upvalue_count(prototype))
+                .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+        } else if let Some(plan) = verified.official_execution() {
+            usize::from(
+                plan.upvalue_map(prototype)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+                    .guest_count,
+            )
+        } else {
+            proto.upvalues.len()
+        };
+        let Some(index) = index
+            .checked_sub(1)
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < count)
+        else {
+            return Ok(None);
+        };
+        let semantic = if verified.official_artifact().is_none() {
+            verified
+                .native_debug()
+                .and_then(|debug| debug.semantic_upvalue(prototype, index))
+        } else {
+            None
+        };
+        let upvalue = match semantic {
+            Some(NativeSemanticUpvalue::Environment) => {
+                Some(self.vm.closure_environment_cell(function, None)?)
+            }
+            Some(NativeSemanticUpvalue::Closure(physical)) => self
+                .vm
+                .with_closure(function, |closure| closure.upvalue(usize::from(physical.0)))?,
+            None => self
+                .vm
+                .with_closure(function, |closure| closure.upvalue(index))?,
+        };
+        let Some(upvalue) = upvalue else {
+            return Ok(None);
+        };
+        if let UpvalueState::Open {
+            thread, coroutine, ..
+        } = self.vm.upvalue_state(upvalue)?
+        {
+            if thread != self.vm_id {
+                return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+            }
+            if coroutine != self.active_coroutine {
+                let owner =
+                    coroutine.ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                if self.vm.coroutine_state(owner)? != CoroutineState::Suspended {
+                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                }
+            }
+        }
+        Ok(Some((upvalue, module, prototype, index)))
+    }
+
+    fn debug_upvalue_name(
+        &mut self,
+        module: ObjectRef,
+        prototype: rivetlua_core::ProtoId,
+        index: usize,
+    ) -> Result<Option<ObjectRef>, RuntimeError> {
+        let name = {
+            let verified = self.vm.module(module)?;
+            verified
+                .official_artifact()
+                .and_then(|artifact| artifact.prototype(prototype))
+                .and_then(|proto| proto.debug.upvalue_names.get(index))
+                .or_else(|| {
+                    verified
+                        .native_debug()
+                        .and_then(|debug| debug.prototype(prototype))
+                        .and_then(|proto| proto.upvalue_names.get(index))
+                })
+                .and_then(|name| name.as_deref())
+                .unwrap_or(b"(no name)")
+        };
+        if name.len() > self.vm.debug_capability().limits().max_work_units {
+            return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
+        }
+        let mut copied = Vec::new();
+        let ticket = reserve_vec(
+            self.vm.allocation_ledger(),
+            &mut copied,
+            name.len(),
+            FailPoint::WorkReserve,
+        )?;
+        copied.extend_from_slice(name);
+        if !self.charge_native_work(copied.len())? {
+            return Ok(None);
+        }
+        let result = self.vm.allocate_byte_string(&copied)?;
+        drop(ticket);
+        Ok(Some(result))
+    }
+
+    fn debug_upvalue_builtin(
+        &mut self,
+        kind: DebugBuiltin,
+        args: &[Value],
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        let function = match args.first().copied() {
+            Some(Value::Object(object)) => object,
+            _ => return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument)),
+        };
+        let index_value = args
+            .get(1)
+            .copied()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+        let Some(index) = self.debug_local_integer(index_value)? else {
+            return Ok(RegularCallAction::Aborted);
+        };
+        if self.vm.object_kind(function)? == ObjectKind::Builtin {
+            if kind != DebugBuiltin::UpvalueId {
+                return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+            }
+            let identity = match index
+                .checked_sub(1)
+                .and_then(|index| usize::try_from(index).ok())
+            {
+                Some(index) => match self.vm.string_iterator_upvalue(function, index) {
+                    Ok(found) => found.map(|(_, identity)| identity),
+                    Err(VmError::WrongObjectType) => None,
+                    Err(error) => return Err(error.into()),
+                },
+                None => None,
+            };
+            let value = identity.map(Value::Object).unwrap_or(Value::Nil);
+            let root = match identity {
+                Some(identity) => Some(self.vm.add_root(RootKind::Temporary, identity)?),
+                None => None,
+            };
+            let result = (|| {
+                let (values, ticket) = math_lib::values(self.vm, &[value])?;
+                self.complete_builtin_values(destination, mode, tail_return, next, values, ticket)
+            })();
+            if let Some(root) = root {
+                self.vm.remove_root(root)?;
+            }
+            return result;
+        }
+        let target = self.debug_upvalue_slot(function, index)?;
+        match kind {
+            DebugBuiltin::SetUpvalue => {
+                let value = args
+                    .get(2)
+                    .copied()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                let Some((upvalue, module, prototype, slot)) = target else {
+                    let (values, ticket) = math_lib::values(self.vm, &[])?;
+                    return self.complete_builtin_values(
+                        destination,
+                        mode,
+                        tail_return,
+                        next,
+                        values,
+                        ticket,
+                    );
+                };
+                let Some(name) = self.debug_upvalue_name(module, prototype, slot)? else {
+                    return Ok(RegularCallAction::Aborted);
+                };
+                let objects = [
+                    Some(upvalue),
+                    Some(name),
+                    match value {
+                        Value::Object(object) => Some(object),
+                        _ => None,
+                    },
+                ];
+                let mut roots = [None; 3];
+                let result = (|| {
+                    for (root, object) in roots.iter_mut().zip(objects) {
+                        if let Some(object) = object {
+                            *root = Some(self.vm.add_root(RootKind::Temporary, object)?);
+                        }
+                    }
+                    let (values, ticket) = math_lib::values(self.vm, &[Value::Object(name)])?;
+                    let action = self.complete_builtin_values(
+                        destination,
+                        mode,
+                        tail_return,
+                        next,
+                        values,
+                        ticket,
+                    )?;
+                    self.write_upvalue(upvalue, value)?;
+                    Ok(action)
+                })();
+                for root in roots.into_iter().flatten() {
+                    self.vm.remove_root(root)?;
+                }
+                result
+            }
+            DebugBuiltin::UpvalueId => {
+                let value = if let Some((upvalue, ..)) = target {
+                    Value::Object(self.vm.upvalue_identity(upvalue)?)
+                } else {
+                    Value::Nil
+                };
+                let root = match value {
+                    Value::Object(object) => Some(self.vm.add_root(RootKind::Temporary, object)?),
+                    _ => None,
+                };
+                let result = (|| {
+                    let (values, ticket) = math_lib::values(self.vm, &[value])?;
+                    self.complete_builtin_values(
+                        destination,
+                        mode,
+                        tail_return,
+                        next,
+                        values,
+                        ticket,
+                    )
+                })();
+                if let Some(root) = root {
+                    self.vm.remove_root(root)?;
+                }
+                result
+            }
+            DebugBuiltin::UpvalueJoin => {
+                let Some((_, target_module, target_prototype, slot)) = target else {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+                };
+                let source_function = match args.get(2).copied() {
+                    Some(Value::Object(object)) => object,
+                    _ => return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument)),
+                };
+                let source_index = args
+                    .get(3)
+                    .copied()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                let Some(source_index) = self.debug_local_integer(source_index)? else {
+                    return Ok(RegularCallAction::Aborted);
+                };
+                let Some((source_upvalue, ..)) =
+                    self.debug_upvalue_slot(source_function, source_index)?
+                else {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+                };
+                let target_root = self.vm.add_root(RootKind::Temporary, function)?;
+                let result = (|| {
+                    let source_root = self.vm.add_root(RootKind::Temporary, source_upvalue)?;
+                    let joined = (|| {
+                        let (values, ticket) = math_lib::values(self.vm, &[])?;
+                        let action = self.complete_builtin_values(
+                            destination,
+                            mode,
+                            tail_return,
+                            next,
+                            values,
+                            ticket,
+                        )?;
+                        let verified = self.vm.module(target_module)?;
+                        let semantic = if verified.official_artifact().is_none() {
+                            verified
+                                .native_debug()
+                                .and_then(|debug| debug.semantic_upvalue(target_prototype, slot))
+                        } else {
+                            None
+                        };
+                        match semantic {
+                            Some(NativeSemanticUpvalue::Environment) => self
+                                .vm
+                                .replace_closure_environment_cell(function, source_upvalue)?,
+                            Some(NativeSemanticUpvalue::Closure(physical)) => {
+                                self.vm.replace_closure_upvalue(
+                                    function,
+                                    usize::from(physical.0),
+                                    source_upvalue,
+                                )?
+                            }
+                            None => {
+                                self.vm
+                                    .replace_closure_upvalue(function, slot, source_upvalue)?
+                            }
+                        }
+                        Ok(action)
+                    })();
+                    self.vm.remove_root(source_root)?;
+                    joined
+                })();
+                self.vm.remove_root(target_root)?;
+                result
+            }
+            _ => unreachable!("此入口只處理 upvalue 寫入與身分"),
+        }
+    }
+
     fn debug_builtin(
         &mut self,
         kind: DebugBuiltin,
@@ -7023,14 +9460,106 @@ impl Execution<'_> {
         tail_return: bool,
         next: usize,
     ) -> Result<RegularCallAction, RuntimeError> {
-        let Some(permission) = kind.permission() else {
-            return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
-        };
-        if !self.vm.debug_capability().allows(permission) {
-            return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+        if matches!(kind, DebugBuiltin::SetHook | DebugBuiltin::GetHook) {
+            if !self
+                .vm
+                .debug_capability()
+                .allows(DebugPermission::CountHook)
+                && !self
+                    .vm
+                    .debug_capability()
+                    .allows(DebugPermission::EventHook)
+            {
+                return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+            }
+        } else {
+            let Some(permission) = kind.permission() else {
+                return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+            };
+            if !self.vm.debug_capability().allows(permission) {
+                return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+            }
         }
         if !self.charge_native_work(1)? {
             return Ok(RegularCallAction::Aborted);
+        }
+        if kind == DebugBuiltin::GetInfo {
+            return self.debug_getinfo(args, destination, mode, tail_return, next);
+        }
+        if kind == DebugBuiltin::GetLocal {
+            return self.debug_getlocal(args, destination, mode, tail_return, next);
+        }
+        if kind == DebugBuiltin::SetLocal {
+            return self.debug_setlocal(args, destination, mode, tail_return, next);
+        }
+        if matches!(
+            kind,
+            DebugBuiltin::SetUpvalue | DebugBuiltin::UpvalueId | DebugBuiltin::UpvalueJoin
+        ) {
+            return self.debug_upvalue_builtin(kind, args, destination, mode, tail_return, next);
+        }
+        if kind == DebugBuiltin::GetRegistry {
+            let registry = self.vm.debug_registry()?;
+            let (values, ticket) = math_lib::values(self.vm, &[Value::Object(registry)])?;
+            return self.complete_builtin_values(
+                destination,
+                mode,
+                tail_return,
+                next,
+                values,
+                ticket,
+            );
+        }
+        if matches!(
+            kind,
+            DebugBuiltin::GetUserValue | DebugBuiltin::SetUserValue
+        ) {
+            let number_at = if kind == DebugBuiltin::GetUserValue {
+                1
+            } else {
+                2
+            };
+            let number = match args.get(number_at).copied() {
+                None | Some(Value::Nil) => 1,
+                Some(number) => match self.debug_local_integer(number)? {
+                    Some(number) => number,
+                    None => return Ok(RegularCallAction::Aborted),
+                },
+            };
+            let index = usize::try_from(number).ok().filter(|index| *index > 0);
+            let target = match args.first().copied() {
+                Some(Value::Object(object)) => Some((object, self.vm.object_kind(object)?)),
+                _ => None,
+            };
+            if kind == DebugBuiltin::SetUserValue {
+                if !matches!(target, Some((_, ObjectKind::File))) || args.get(1).is_none() {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+                }
+            }
+            let _index = index;
+            // File 沒有 uservalue slot；讀取和合法設定皆回傳一個 nil。
+            let slot: Option<Value> = None;
+            let mut output = [Value::Nil; 2];
+            let mut count = 1;
+            if kind == DebugBuiltin::GetUserValue {
+                if let Some(value) = slot {
+                    output = [value, Value::Boolean(true)];
+                    count = 2;
+                }
+            } else if slot.is_some() {
+                if let Some((object, _)) = target {
+                    output[0] = Value::Object(object);
+                }
+            }
+            let (values, ticket) = math_lib::values(self.vm, &output[..count])?;
+            return self.complete_builtin_values(
+                destination,
+                mode,
+                tail_return,
+                next,
+                values,
+                ticket,
+            );
         }
         if kind == DebugBuiltin::Traceback {
             return self.debug_traceback(args, destination, mode, tail_return, next);
@@ -7053,7 +9582,10 @@ impl Execution<'_> {
                         let Value::Object(function) = function else {
                             return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
                         };
-                        if self.vm.object_kind(function)? != ObjectKind::Closure {
+                        if !matches!(
+                            self.vm.object_kind(function)?,
+                            ObjectKind::Closure | ObjectKind::Builtin
+                        ) {
                             return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                         }
                         let mask = args
@@ -7063,15 +9595,30 @@ impl Execution<'_> {
                         let Value::Object(mask) = mask else {
                             return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                         };
-                        if self.vm.object_kind(mask)? != ObjectKind::ByteString
-                            || !self.vm.with_byte_string(mask, |text| text.is_empty())?
+                        if self.vm.object_kind(mask)? != ObjectKind::ByteString {
+                            return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                        }
+                        let (valid, line, call, ret) = self.vm.with_byte_string(mask, |text| {
+                            (
+                                text.as_bytes()
+                                    .iter()
+                                    .all(|byte| matches!(byte, b'c' | b'r' | b'l')),
+                                text.as_bytes().contains(&b'l'),
+                                text.as_bytes().contains(&b'c'),
+                                text.as_bytes().contains(&b'r'),
+                            )
+                        })?;
+                        if !valid
+                            || ((line || call || ret)
+                                && !self
+                                    .vm
+                                    .debug_capability()
+                                    .allows(DebugPermission::EventHook))
                         {
                             return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                         }
-                        let count_value = args
-                            .get(offset + 2)
-                            .copied()
-                            .ok_or_else(|| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                        let count_value =
+                            args.get(offset + 2).copied().unwrap_or(Value::Integer(0));
                         if let Value::Object(object) = count_value {
                             if self.vm.object_kind(object)? == ObjectKind::ByteString {
                                 let len = self.vm.with_byte_string(object, |text| text.len())?;
@@ -7086,18 +9633,45 @@ impl Execution<'_> {
                         let count = basic::lua_integer(basic::number(self.vm, count_value, None)?)
                             .and_then(|count| usize::try_from(count).ok())
                             .ok_or_else(|| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
-                        if count == 0 || count > self.vm.debug_capability().limits().max_hook_count
+                        if count > self.vm.debug_capability().limits().max_hook_count
+                            || (count > 0
+                                && !self
+                                    .vm
+                                    .debug_capability()
+                                    .allows(DebugPermission::CountHook))
                         {
                             return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                         }
-                        self.vm
-                            .set_debug_hook(thread, Some(DebugHook::new(function, count)))?;
+                        let mut hook = DebugHook::with_line(function, count, line);
+                        hook.call = call;
+                        hook.ret = ret;
+                        if line && thread == self.active_coroutine {
+                            let (source_pc, current_line) =
+                                self.debug_hook_location_at(self.frame.pc)?;
+                            hook.prime(
+                                self.frame.module,
+                                self.frame.prototype,
+                                source_pc,
+                                current_line,
+                            );
+                        }
+                        self.vm.set_debug_hook(thread, Some(hook))?;
                     }
                     math_lib::values(self.vm, &[])?
                 }
                 DebugBuiltin::GetHook => match self.vm.debug_hook_for(thread)? {
                     Some(hook) => {
-                        let mask = self.vm.allocate_byte_string(b"")?;
+                        let mut mask = [0_u8; 3];
+                        let mut mask_len = 0;
+                        for (enabled, byte) in
+                            [(hook.call, b'c'), (hook.ret, b'r'), (hook.line, b'l')]
+                        {
+                            if enabled {
+                                mask[mask_len] = byte;
+                                mask_len += 1;
+                            }
+                        }
+                        let mask = self.vm.allocate_byte_string(&mask[..mask_len])?;
                         let count = i64::try_from(hook.count)
                             .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
                         math_lib::values(
@@ -7130,6 +9704,60 @@ impl Execution<'_> {
             else {
                 return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
             };
+            if self.vm.object_kind(function)? == ObjectKind::Builtin {
+                let index_value = args
+                    .get(1)
+                    .copied()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                let Some(index) = self.debug_local_integer(index_value)? else {
+                    return Ok(RegularCallAction::Aborted);
+                };
+                let found = match index
+                    .checked_sub(1)
+                    .and_then(|index| usize::try_from(index).ok())
+                {
+                    Some(index) => match self.vm.string_iterator_upvalue(function, index) {
+                        Ok(found) => found,
+                        Err(VmError::WrongObjectType) => None,
+                        Err(error) => return Err(error.into()),
+                    },
+                    None => None,
+                };
+                let Some((value, _)) = found else {
+                    let (values, ticket) = math_lib::values(self.vm, &[])?;
+                    return self.complete_builtin_values(
+                        destination,
+                        mode,
+                        tail_return,
+                        next,
+                        values,
+                        ticket,
+                    );
+                };
+                let mut roots = [None; 3];
+                let result = (|| {
+                    roots[0] = Some(self.vm.add_root(RootKind::Temporary, function)?);
+                    if let Value::Object(object) = value {
+                        roots[1] = Some(self.vm.add_root(RootKind::Temporary, object)?);
+                    }
+                    let name = self.vm.allocate_byte_string(b"")?;
+                    roots[2] = Some(self.vm.add_root(RootKind::Temporary, name)?);
+                    let (values, ticket) =
+                        math_lib::values(self.vm, &[Value::Object(name), value])?;
+                    self.complete_builtin_values(
+                        destination,
+                        mode,
+                        tail_return,
+                        next,
+                        values,
+                        ticket,
+                    )
+                })();
+                for root in roots.into_iter().flatten() {
+                    self.vm.remove_root(root)?;
+                }
+                return result;
+            }
             if self.vm.object_kind(function)? != ObjectKind::Closure {
                 return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
             }
@@ -7138,11 +9766,14 @@ impl Execution<'_> {
                     (
                         closure.module(),
                         closure.prototype(),
-                        closure.environment().is_some(),
+                        closure.has_environment(),
                     )
                 })?;
             let official_artifact = self.vm.module(module)?.official_artifact_shared();
-            if has_environment && official_artifact.is_none() {
+            if has_environment
+                && official_artifact.is_none()
+                && self.vm.module(module)?.native_debug().is_none()
+            {
                 return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
             }
             let debug_limit = self.vm.debug_capability().limits().max_work_units;
@@ -7161,14 +9792,6 @@ impl Execution<'_> {
                 candidates
             } else {
                 0
-            };
-            let official_guest_count = match self.vm.module(module)?.official_execution() {
-                Some(plan) => Some(usize::from(
-                    plan.upvalue_map(prototype)
-                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
-                        .guest_count,
-                )),
-                None => None,
             };
             let index_value = args
                 .get(1)
@@ -7190,20 +9813,7 @@ impl Execution<'_> {
             }
             let index = basic::lua_integer(basic::number(self.vm, index_value, None)?)
                 .ok_or_else(|| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
-            let upvalue = if let Some(index) = index
-                .checked_sub(1)
-                .and_then(|index| usize::try_from(index).ok())
-            {
-                if official_guest_count.is_some_and(|count| index >= count) {
-                    None
-                } else {
-                    self.vm
-                        .with_closure(function, |closure| closure.upvalue(index))?
-                }
-            } else {
-                None
-            };
-            let Some(upvalue) = upvalue else {
+            let Some((upvalue, _, _, _)) = self.debug_upvalue_slot(function, index)? else {
                 let (values, ticket) = math_lib::values(self.vm, &[])?;
                 return self.complete_builtin_values(
                     destination,
@@ -7267,6 +9877,7 @@ impl Execution<'_> {
                     return Ok(RegularCallAction::Aborted);
                 }
             }
+            let verified_for_name = self.vm.module(module)?;
             let name_bytes = official_artifact
                 .as_ref()
                 .and_then(|artifact| artifact.prototype(prototype))
@@ -7276,6 +9887,17 @@ impl Execution<'_> {
                         .and_then(|index| usize::try_from(index).ok())
                         .and_then(|index| proto.debug.upvalue_names.get(index))
                 })
+                .or_else(|| {
+                    verified_for_name
+                        .native_debug()
+                        .and_then(|debug| debug.prototype(prototype))
+                        .and_then(|proto| {
+                            index
+                                .checked_sub(1)
+                                .and_then(|index| usize::try_from(index).ok())
+                                .and_then(|index| proto.upvalue_names.get(index))
+                        })
+                })
                 .and_then(|name| name.as_deref())
                 .unwrap_or(b"(no name)");
             debug_work = debug_work
@@ -7284,7 +9906,15 @@ impl Execution<'_> {
             if debug_work > debug_limit {
                 return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
             }
-            if !self.charge_native_work(name_bytes.len())? {
+            let mut name_copy = Vec::new();
+            let name_ticket = reserve_vec(
+                self.vm.allocation_ledger(),
+                &mut name_copy,
+                name_bytes.len(),
+                FailPoint::WorkReserve,
+            )?;
+            name_copy.extend_from_slice(name_bytes);
+            if !self.charge_native_work(name_copy.len())? {
                 return Ok(RegularCallAction::Aborted);
             }
             let value = self
@@ -7301,13 +9931,14 @@ impl Execution<'_> {
                 _ => None,
             };
             let output = (|| {
-                let name = self.vm.allocate_byte_string(name_bytes)?;
+                let name = self.vm.allocate_byte_string(&name_copy)?;
                 math_lib::values(self.vm, &[Value::Object(name), value])
             })();
             if let Some(root) = value_root {
                 self.vm.remove_root(root)?;
             }
             let (values, ticket) = output?;
+            drop(name_ticket);
             return self.complete_builtin_values(
                 destination,
                 mode,
@@ -7318,225 +9949,7 @@ impl Execution<'_> {
             );
         }
         let result = match kind {
-            DebugBuiltin::GetInfo => {
-                let function = args
-                    .first()
-                    .copied()
-                    .ok_or_else(|| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
-                let Value::Object(object) = function else {
-                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
-                };
-                let object_kind = self.vm.object_kind(object)?;
-                if !matches!(object_kind, ObjectKind::Closure | ObjectKind::Builtin) {
-                    return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
-                }
-                let mask = match args.get(1).copied() {
-                    None | Some(Value::Nil) => {
-                        return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
-                    }
-                    Some(Value::Object(name))
-                        if self.vm.object_kind(name)? == ObjectKind::ByteString =>
-                    {
-                        name
-                    }
-                    _ => return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument)),
-                };
-                let mask_len = self.vm.with_byte_string(mask, |string| string.len())?;
-                if mask_len > self.vm.debug_capability().limits().max_work_units {
-                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
-                }
-                if !self.charge_native_work(mask_len)? {
-                    return Ok(RegularCallAction::Aborted);
-                }
-                let official = if object_kind == ObjectKind::Closure {
-                    let module = self.vm.with_closure(object, |closure| closure.module())?;
-                    self.vm.module(module)?.official_artifact_shared()
-                } else {
-                    None
-                };
-                let (supported, has_u, has_f, has_s, has_l) =
-                    self.vm.with_byte_string(mask, |string| {
-                        let bytes = string.as_bytes();
-                        (
-                            bytes.iter().all(|byte| {
-                                matches!(byte, b'u' | b'f')
-                                    || (official.is_some() && matches!(byte, b'S' | b'l'))
-                            }),
-                            bytes.contains(&b'u'),
-                            bytes.contains(&b'f'),
-                            bytes.contains(&b'S'),
-                            bytes.contains(&b'l'),
-                        )
-                    })?;
-                if !supported || (has_u && object_kind == ObjectKind::Builtin) {
-                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
-                }
-                if has_u
-                    && object_kind == ObjectKind::Closure
-                    && official.is_none()
-                    && self
-                        .vm
-                        .with_closure(object, |closure| closure.environment().is_some())?
-                {
-                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
-                }
-                let mut debug_work = mask_len;
-                if has_u {
-                    let module = self.vm.with_closure(object, |closure| closure.module())?;
-                    let candidates = self.vm.module(module)?.module().prototypes.len();
-                    let searches = if self.vm.module(module)?.official_execution().is_some() {
-                        2
-                    } else {
-                        1
-                    };
-                    let lookup_work = candidates
-                        .checked_mul(searches)
-                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
-                    debug_work = debug_work
-                        .checked_add(lookup_work)
-                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
-                    if debug_work > self.vm.debug_capability().limits().max_work_units {
-                        return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
-                    }
-                    if !self.charge_native_work(lookup_work)? {
-                        return Ok(RegularCallAction::Aborted);
-                    }
-                }
-                let source_metadata = if has_s {
-                    let (module, prototype) = self
-                        .vm
-                        .with_closure(object, |closure| (closure.module(), closure.prototype()))?;
-                    let artifact = official
-                        .as_ref()
-                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
-                    let candidates = self.vm.module(module)?.module().prototypes.len();
-                    let lookup_work = candidates
-                        .checked_mul(2)
-                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
-                    debug_work = debug_work
-                        .checked_add(lookup_work)
-                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
-                    if debug_work > self.vm.debug_capability().limits().max_work_units {
-                        return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
-                    }
-                    if !self.charge_native_work(lookup_work)? {
-                        return Ok(RegularCallAction::Aborted);
-                    }
-                    let guest = artifact
-                        .prototype(prototype)
-                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
-                    let source = artifact.effective_source(prototype).unwrap_or(b"=?");
-                    let copy_work = source
-                        .len()
-                        .checked_mul(3)
-                        .and_then(|units| units.checked_add(128))
-                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
-                    debug_work = debug_work
-                        .checked_add(copy_work)
-                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
-                    if debug_work > self.vm.debug_capability().limits().max_work_units {
-                        return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
-                    }
-                    if !self.charge_native_work(copy_work)? {
-                        return Ok(RegularCallAction::Aborted);
-                    }
-                    let (short, short_len) = official_short_source(source);
-                    Some((
-                        source,
-                        short,
-                        short_len,
-                        guest.line_defined,
-                        guest.last_line_defined,
-                        prototype.0 == 0,
-                    ))
-                } else {
-                    None
-                };
-                let info = self.vm.allocate_table()?;
-                let info_root = self.vm.add_root(RootKind::Temporary, info)?;
-                let built = (|| {
-                    if has_u {
-                        let (module, prototype) = self.vm.with_closure(object, |closure| {
-                            (closure.module(), closure.prototype())
-                        })?;
-                        let proto = self
-                            .vm
-                            .module(module)?
-                            .module()
-                            .prototypes
-                            .iter()
-                            .find(|entry| entry.id == prototype)
-                            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
-                        let upvalue_count = if official.is_some() {
-                            usize::from(
-                                self.vm
-                                    .module(module)?
-                                    .official_execution()
-                                    .and_then(|plan| plan.upvalue_map(prototype))
-                                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
-                                    .guest_count,
-                            )
-                        } else {
-                            proto.upvalues.len()
-                        };
-                        let nups = i64::try_from(upvalue_count)
-                            .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
-                        let nparams = i64::from(proto.parameter_count);
-                        let isvararg = proto.is_variadic;
-                        self.vm
-                            .set_string_field(info, b"nups", Value::Integer(nups))?;
-                        self.vm
-                            .set_string_field(info, b"nparams", Value::Integer(nparams))?;
-                        self.vm
-                            .set_string_field(info, b"isvararg", Value::Boolean(isvararg))?;
-                    }
-                    if let Some((
-                        source,
-                        short,
-                        short_len,
-                        line_defined,
-                        last_line_defined,
-                        is_main,
-                    )) = source_metadata
-                    {
-                        let source_value = self.vm.allocate_byte_string(source)?;
-                        self.vm
-                            .set_string_field(info, b"source", Value::Object(source_value))?;
-                        let short_value = self.vm.allocate_byte_string(&short[..short_len])?;
-                        self.vm
-                            .set_string_field(info, b"short_src", Value::Object(short_value))?;
-                        self.vm.set_string_field(
-                            info,
-                            b"linedefined",
-                            Value::Integer(i64::from(line_defined)),
-                        )?;
-                        self.vm.set_string_field(
-                            info,
-                            b"lastlinedefined",
-                            Value::Integer(i64::from(last_line_defined)),
-                        )?;
-                        let what = if is_main {
-                            b"main".as_slice()
-                        } else {
-                            b"Lua".as_slice()
-                        };
-                        let what_value = self.vm.allocate_byte_string(what)?;
-                        self.vm
-                            .set_string_field(info, b"what", Value::Object(what_value))?;
-                    }
-                    if has_l {
-                        self.vm
-                            .set_string_field(info, b"currentline", Value::Integer(-1))?;
-                    }
-                    if has_f {
-                        self.vm.set_string_field(info, b"func", function)?;
-                    }
-                    Ok::<(), RuntimeError>(())
-                })();
-                self.vm.remove_root(info_root)?;
-                built?;
-                Value::Object(info)
-            }
+            DebugBuiltin::GetInfo => unreachable!(),
             DebugBuiltin::GetMetatable => {
                 let Value::Object(object) = args
                     .first()
@@ -7560,7 +9973,7 @@ impl Execution<'_> {
                 else {
                     return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
                 };
-                if self.vm.object_kind(table)? != ObjectKind::Table {
+                if !matches!(self.vm.object_kind(table)?, ObjectKind::Table) {
                     return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                 }
                 let metatable = match args.get(1).copied() {
@@ -7662,6 +10075,10 @@ impl Execution<'_> {
             return Ok(RegularCallAction::Aborted);
         }
         let mut frame_count = 0_usize;
+        let hook_frame = self.pending_ops.last().is_some_and(|pending| {
+            matches!(pending.basic, Some(BasicPending::DebugHook { .. }))
+                && pending.caller_depth.checked_add(1) == Some(self.callers.len())
+        });
         let mut total = b"stack traceback:\n"
             .len()
             .checked_add(message_len)
@@ -7670,9 +10087,10 @@ impl Execution<'_> {
         if total > limits.max_trace_bytes {
             return Err(RuntimeError::new(RuntimeErrorKind::DebugBudget));
         }
-        for frame in core::iter::once(&self.frame)
+        for (frame_index, frame) in core::iter::once(&self.frame)
             .chain(self.callers.iter().rev())
-            .filter(|frame| frame.module.is_some())
+            .enumerate()
+            .filter(|(_, frame)| frame.module.is_some())
         {
             frame_count = frame_count
                 .checked_add(1)
@@ -7708,6 +10126,11 @@ impl Execution<'_> {
                             + source.len()
                             + b":".len()
                             + debug_lib::decimal_len(line as usize)
+                            + if hook_frame && frame_index == 0 {
+                                b" in hook".len()
+                            } else {
+                                0
+                            }
                             + b"\n".len(),
                     )
                     .ok_or(RuntimeError::new(RuntimeErrorKind::DebugBudget))?;
@@ -7722,6 +10145,11 @@ impl Execution<'_> {
                 + debug_lib::decimal_len(id)
                 + b" pc ".len()
                 + debug_lib::decimal_len(frame.pc)
+                + if hook_frame && frame_index == 0 {
+                    b" in hook".len()
+                } else {
+                    0
+                }
                 + b"]\n".len();
             total = total
                 .checked_add(line)
@@ -7756,9 +10184,10 @@ impl Execution<'_> {
             output.push(b'\n');
         }
         output.extend_from_slice(b"stack traceback:\n");
-        for frame in core::iter::once(&self.frame)
+        for (frame_index, frame) in core::iter::once(&self.frame)
             .chain(self.callers.iter().rev())
-            .filter(|frame| frame.module.is_some())
+            .enumerate()
+            .filter(|(_, frame)| frame.module.is_some())
         {
             let module = frame
                 .module
@@ -7786,6 +10215,9 @@ impl Execution<'_> {
                 output.extend_from_slice(source);
                 output.push(b':');
                 debug_lib::append_decimal(&mut output, line as usize);
+                if hook_frame && frame_index == 0 {
+                    output.extend_from_slice(b" in hook");
+                }
                 output.push(b'\n');
                 continue;
             }
@@ -7795,6 +10227,9 @@ impl Execution<'_> {
             debug_lib::append_decimal(&mut output, id);
             output.extend_from_slice(b" pc ");
             debug_lib::append_decimal(&mut output, frame.pc);
+            if hook_frame && frame_index == 0 {
+                output.extend_from_slice(b" in hook");
+            }
             output.extend_from_slice(b"]\n");
         }
         let string = self.vm.allocate_byte_string(&output);
@@ -7804,30 +10239,497 @@ impl Execution<'_> {
         self.complete_builtin_values(destination, mode, tail_return, next, values, returned)
     }
 
+    fn debug_hook_location_at(&self, pc: usize) -> Result<(usize, Option<u32>), RuntimeError> {
+        let Some(module) = self.frame.module else {
+            return Ok((pc, None));
+        };
+        let verified = self.vm.module(module)?;
+        let prototype = verified
+            .module()
+            .prototypes
+            .get(self.frame.prototype)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+        if let Some(artifact) = verified.official_artifact() {
+            let map = artifact.pc_map(prototype.id);
+            let origin = map
+                .and_then(|map| map.rvlu_to_official().get(pc))
+                .and_then(|origin| origin.source_pc());
+            let line = origin.and_then(|pc| map.and_then(|map| map.line_at_official(pc)));
+            Ok((origin.map(|pc| pc as usize).unwrap_or(pc), line))
+        } else {
+            let line = verified
+                .native_debug()
+                .and_then(|debug| debug.prototype(prototype.id))
+                .and_then(|debug| debug.lines.get(pc))
+                .copied()
+                .filter(|line| *line > 0);
+            Ok((pc, line))
+        }
+    }
+
+    fn debug_hook_counted_at(&self, pc: usize) -> Result<bool, RuntimeError> {
+        let Some(module) = self.frame.module else {
+            return Ok(true);
+        };
+        let verified = self.vm.module(module)?;
+        let proto = verified
+            .module()
+            .prototypes
+            .get(self.frame.prototype)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+        if let Some(artifact) = verified.official_artifact() {
+            let origin = artifact
+                .pc_map(proto.id)
+                .and_then(|map| map.rvlu_to_official().get(pc))
+                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+            Ok(matches!(origin, OfficialRvluPc::Anchor(_)))
+        } else {
+            let offset = u32::try_from(pc)
+                .map_err(|_| RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+            Ok(!verified
+                .native_debug()
+                .is_some_and(|debug| debug.is_non_counted_pc(proto.id, InstructionOffset(offset))))
+        }
+    }
+
     fn dispatch_with_debug_hook(&mut self) -> Result<DispatchResult, RuntimeError> {
         if self.vm.finalizer_running() {
             return self.dispatch_one();
         }
         if self.debug_hook_skip_once {
             self.debug_hook_skip_once = false;
+            if let Some((target, root)) = self.debug_hook_c_call_pending.take() {
+                return self.dispatch_debug_builtin_call(target, root);
+            }
+            if let Some(target) = self.debug_direct_builtin_call()? {
+                if let Some(hook) = self.vm.debug_hook_for(self.active_coroutine)? {
+                    if !self.vm.debug_hook_running() && (hook.call || hook.ret) {
+                        return self.start_debug_builtin_call(target, hook);
+                    }
+                }
+            }
             return self.dispatch_one();
         }
-        let Some(function) = self.vm.debug_hook_tick(self.active_coroutine)? else {
+        let Some(hook) = self.vm.debug_hook_for(self.active_coroutine)? else {
+            if let Some(target) = self.debug_direct_builtin_call()? {
+                if matches!(
+                    self.vm.builtin(target)?,
+                    Builtin::Debug(DebugBuiltin::SetHook)
+                ) {
+                    let root = self.vm.add_root(RootKind::Temporary, target)?;
+                    return self.dispatch_debug_builtin_call(target, root);
+                }
+            }
             return self.dispatch_one();
         };
-        let event = self.vm.allocate_byte_string(b"count")?;
-        let event_root = self.vm.add_root(RootKind::Temporary, event)?;
-        let original = self.frame.read(Register(0))?;
+        if !self.vm.debug_hook_running() {
+            if let Some(tail) = self.frame.hook_entry.take() {
+                if hook.call {
+                    let count = usize::from(self.prototype().parameter_count);
+                    return self.start_debug_hook_event(
+                        hook.function,
+                        if tail { b"tail call" } else { b"call" },
+                        None,
+                        false,
+                        false,
+                        None,
+                        Some(DebugTransfer {
+                            first: 1,
+                            count,
+                            register: Some(Register(1)),
+                            builtin: false,
+                        }),
+                        None,
+                    );
+                }
+            }
+            if hook.ret
+                && !self.frame.hook_exit_fired
+                && matches!(
+                    self.prototype().instructions.get(self.frame.pc),
+                    Some(entry) if matches!(entry.instruction, Instruction::Return { .. })
+                )
+            {
+                let (base, result_mode) =
+                    match self.prototype().instructions[self.frame.pc].instruction {
+                        Instruction::Return { base, result_mode } => (base, result_mode),
+                        _ => return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint)),
+                    };
+                let count = match result_mode {
+                    ResultMode::Fixed(count) => usize::from(count),
+                    ResultMode::All => self
+                        .frame
+                        .dynamic_top
+                        .checked_sub(usize::from(base.0))
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?,
+                };
+                self.frame.hook_exit_fired = true;
+                return self.start_debug_hook_event(
+                    hook.function,
+                    b"return",
+                    None,
+                    false,
+                    false,
+                    None,
+                    Some(DebugTransfer {
+                        first: usize::from(base.0),
+                        count,
+                        register: Some(base),
+                        builtin: false,
+                    }),
+                    None,
+                );
+            }
+        }
+        let (source_pc, mut line) = if hook.line {
+            self.debug_hook_location_at(self.frame.pc)?
+        } else {
+            (self.frame.pc, None)
+        };
+        let instruction = self
+            .prototype()
+            .instructions
+            .get(self.frame.pc)
+            .map(|entry| entry.instruction.clone());
+        match instruction {
+            Some(Instruction::Jump { .. }) => {
+                // break/goto 的來源行在前一指令之後才出現；CFG 回邊與
+                // 跳過 else 的合成 Jump 則沿用區塊起點，不重送舊行事件。
+                if let Some(previous) = self.frame.pc.checked_sub(1) {
+                    let (_, previous_line) = self.debug_hook_location_at(previous)?;
+                    if previous_line
+                        .zip(line)
+                        .is_some_and(|(previous_line, line)| line <= previous_line)
+                    {
+                        line = None;
+                    }
+                }
+            }
+            Some(Instruction::LoadNil { count: 1, .. }) => {
+                // 合成 CFG anchor 在向前 PC 上不得倒退到區塊起始行。
+                if hook.last_prototype
+                    == self
+                        .frame
+                        .module
+                        .map(|module| (module, self.frame.prototype))
+                    && hook.last_pc.is_some_and(|previous| source_pc > previous)
+                    && hook
+                        .last_line
+                        .zip(line)
+                        .is_some_and(|(previous, line)| line < previous)
+                {
+                    line = None;
+                }
+            }
+            _ => {}
+        }
+        let counted = self.debug_hook_counted_at(self.frame.pc)?;
+        let event = self.vm.debug_hook_event(
+            self.active_coroutine,
+            self.frame.module,
+            self.frame.prototype,
+            source_pc,
+            line,
+            counted,
+        )?;
+        if let Some((function, event_line)) = event {
+            return self.start_debug_hook_event(
+                function,
+                if event_line.is_some() {
+                    b"line"
+                } else {
+                    b"count"
+                },
+                event_line,
+                true,
+                true,
+                None,
+                None,
+                None,
+            );
+        }
+        if let Some(target) = self.debug_direct_builtin_call()? {
+            if !self.vm.debug_hook_running() && (hook.call || hook.ret) {
+                return self.start_debug_builtin_call(target, hook);
+            }
+        }
+        self.dispatch_one()
+    }
+
+    fn debug_direct_builtin_call(&self) -> Result<Option<ObjectRef>, RuntimeError> {
+        let base = match self.prototype().instructions.get(self.frame.pc) {
+            Some(entry) => match entry.instruction {
+                Instruction::Call { base, .. } | Instruction::TailCall { base, .. } => base,
+                _ => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        let Value::Object(target) = self.frame.read(base)? else {
+            return Ok(None);
+        };
+        Ok((self.vm.object_kind(target)? == ObjectKind::Builtin).then_some(target))
+    }
+
+    fn start_debug_builtin_call(
+        &mut self,
+        target: ObjectRef,
+        hook: DebugHook,
+    ) -> Result<DispatchResult, RuntimeError> {
+        let transfer = if hook.call {
+            let (base, arg_count) = match self.prototype().instructions.get(self.frame.pc) {
+                Some(entry) => match entry.instruction {
+                    Instruction::Call {
+                        base, arg_count, ..
+                    }
+                    | Instruction::TailCall {
+                        base, arg_count, ..
+                    } => (base, arg_count),
+                    _ => return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint)),
+                },
+                None => return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint)),
+            };
+            let start = self
+                .frame
+                .index(base)?
+                .checked_add(1)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?;
+            let end = if arg_count == u16::MAX {
+                self.frame.dynamic_top
+            } else {
+                start
+                    .checked_add(usize::from(arg_count))
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?
+            };
+            if end < start || end > self.frame.register_limit {
+                return Err(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds));
+            }
+            let register = Register(
+                u16::try_from(start)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?,
+            );
+            Some(DebugTransfer {
+                first: 1,
+                count: end - start,
+                register: Some(register),
+                builtin: true,
+            })
+        } else {
+            None
+        };
+        let root = self.vm.add_root(RootKind::Temporary, target)?;
+        if hook.call {
+            self.debug_hook_c_call_pending = Some((target, root));
+            let event = self.start_debug_hook_event(
+                hook.function,
+                b"call",
+                None,
+                false,
+                true,
+                Some(target),
+                transfer,
+                None,
+            );
+            if event.is_err() || matches!(event, Ok(DispatchResult::Aborted)) {
+                if let Some((_, root)) = self.debug_hook_c_call_pending.take() {
+                    self.vm.remove_root(root)?;
+                }
+            }
+            event
+        } else {
+            self.dispatch_debug_builtin_call(target, root)
+        }
+    }
+
+    fn dispatch_debug_builtin_call(
+        &mut self,
+        target: ObjectRef,
+        root: RootId,
+    ) -> Result<DispatchResult, RuntimeError> {
+        let depth = self.callers.len();
+        let stack_base = self.frame.stack_base;
+        let pending_count = self.pending_ops.len();
+        let target_is_sethook = match self.vm.builtin(target) {
+            Ok(builtin) => matches!(builtin, Builtin::Debug(DebugBuiltin::SetHook)),
+            Err(error) => {
+                self.vm.remove_root(root)?;
+                return Err(error.into());
+            }
+        };
+        self.debug_builtin_capture = match self.vm.debug_hook_for(self.active_coroutine) {
+            Ok(hook) => hook.is_some_and(|hook| hook.ret) || target_is_sethook,
+            Err(error) => {
+                self.vm.remove_root(root)?;
+                return Err(error.into());
+            }
+        };
+        let dispatched = self.dispatch_one();
+        self.debug_builtin_capture = false;
+        let completed = matches!(dispatched, Ok(DispatchResult::Continue))
+            && self.callers.len() == depth
+            && self.frame.stack_base == stack_base
+            && self.pending_ops.len() == pending_count;
+        let hook = if completed && !self.vm.debug_hook_running() {
+            self.vm.debug_hook_for(self.active_coroutine)
+        } else {
+            Ok(None)
+        };
+        let captured = self.debug_builtin_result.take();
+        let result = match (dispatched, hook, captured) {
+            (Ok(DispatchResult::Continue), Ok(Some(hook)), Some(captured)) if hook.ret => {
+                let count = captured.values.values().len();
+                self.start_debug_hook_event(
+                    hook.function,
+                    b"return",
+                    None,
+                    false,
+                    true,
+                    Some(target),
+                    Some(DebugTransfer {
+                        first: 1,
+                        count,
+                        register: None,
+                        builtin: true,
+                    }),
+                    Some(captured),
+                )
+            }
+            (Ok(DispatchResult::Continue), Ok(_), Some(captured)) => {
+                self.finish_debug_builtin_return(captured)
+            }
+            (Ok(DispatchResult::Continue), Ok(Some(hook)), None) if hook.ret => self
+                .start_debug_hook_event(
+                    hook.function,
+                    b"return",
+                    None,
+                    false,
+                    true,
+                    Some(target),
+                    None,
+                    None,
+                ),
+            (result, hook, Some(mut captured)) => {
+                captured.values.clear_roots(self.vm)?;
+                match hook {
+                    Ok(_) => result,
+                    Err(error) => Err(error.into()),
+                }
+            }
+            (result, Ok(_), _) => result,
+            (_, Err(error), _) => Err(error.into()),
+        };
+        self.vm.remove_root(root)?;
+        result
+    }
+
+    fn finish_debug_builtin_return(
+        &mut self,
+        mut captured: DebugBuiltinReturn,
+    ) -> Result<DispatchResult, RuntimeError> {
+        let result = (|| {
+            if captured.tail_return {
+                let mut values = Vec::new();
+                let ticket = reserve_vec(
+                    self.vm.allocation_ledger(),
+                    &mut values,
+                    captured.values.values().len(),
+                    FailPoint::ReturnReserve,
+                )?;
+                values.extend_from_slice(captured.values.values());
+                self.propagate_tail_result(values, Some(ticket))
+            } else {
+                self.write_call_values(
+                    captured.destination,
+                    captured.mode,
+                    captured.next,
+                    captured.values.values(),
+                )?;
+                Ok(DispatchResult::Continue)
+            }
+        })();
+        captured.values.clear_roots(self.vm)?;
+        result
+    }
+
+    fn start_debug_hook_event(
+        &mut self,
+        function: ObjectRef,
+        event_name: &[u8],
+        event_line: Option<u32>,
+        local_current_pc: bool,
+        resume_instruction: bool,
+        target: Option<ObjectRef>,
+        transfer: Option<DebugTransfer>,
+        mut builtin_return: Option<DebugBuiltinReturn>,
+    ) -> Result<DispatchResult, RuntimeError> {
+        let original = match self.frame.read(Register(0)) {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(result) = builtin_return.as_mut() {
+                    result.values.clear_roots(self.vm)?;
+                }
+                return Err(error);
+            }
+        };
+        let dynamic_top = self.frame.dynamic_top;
+        let event = match self.vm.allocate_byte_string(event_name) {
+            Ok(event) => event,
+            Err(error) => {
+                if let Some(result) = builtin_return.as_mut() {
+                    result.values.clear_roots(self.vm)?;
+                }
+                return Err(error.into());
+            }
+        };
+        let event_root = match self.vm.add_root(RootKind::Temporary, event) {
+            Ok(root) => root,
+            Err(error) => {
+                if let Some(result) = builtin_return.as_mut() {
+                    result.values.clear_roots(self.vm)?;
+                }
+                return Err(error.into());
+            }
+        };
+        let target_root = match target {
+            Some(target) => match self.vm.add_root(RootKind::Temporary, target) {
+                Ok(root) => Some(root),
+                Err(error) => {
+                    self.vm.remove_root(event_root)?;
+                    if let Some(result) = builtin_return.as_mut() {
+                        result.values.clear_roots(self.vm)?;
+                    }
+                    return Err(error.into());
+                }
+            },
+            None => None,
+        };
         self.vm.set_debug_hook_running(true);
         let call = self.start_basic_callback(
             Value::Object(function),
-            &[Value::Object(event), Value::Nil],
+            &[
+                Value::Object(event),
+                event_line
+                    .map(|line| Value::Integer(i64::from(line)))
+                    .unwrap_or(Value::Nil),
+            ],
             original,
-            BasicPending::DebugHook { original },
+            BasicPending::DebugHook {
+                original,
+                dynamic_top,
+                resume_instruction,
+                local_current_pc,
+                target,
+                target_root,
+                transfer,
+                builtin_return: builtin_return.take(),
+            },
             Register(0),
             self.frame.pc,
         );
-        self.vm.remove_root(event_root)?;
+        let removed = self.vm.remove_root(event_root);
+        if call.is_err() || removed.is_err() {
+            self.vm.set_debug_hook_running(false);
+        }
+        removed?;
         match call? {
             RegularCallAction::Entered => Ok(DispatchResult::Continue),
             RegularCallAction::Aborted => Ok(DispatchResult::Aborted),
@@ -12646,16 +15548,39 @@ impl Execution<'_> {
             pending.clear(self.vm)?;
             return result;
         }
-        if let Some(BasicPending::DebugHook { original }) = basic {
-            pending.clear(self.vm)?;
+        if let Some(BasicPending::DebugHook {
+            original,
+            dynamic_top,
+            resume_instruction,
+            target_root,
+            mut builtin_return,
+            ..
+        }) = basic
+        {
+            let cleared = pending.clear(self.vm);
             self.vm.set_debug_hook_running(false);
-            if !valid {
-                return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
+            let target_cleared = target_root
+                .map(|root| self.vm.remove_root(root))
+                .transpose();
+            let result = (|| {
+                cleared?;
+                target_cleared?;
+                if !valid {
+                    return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
+                }
+                self.frame.write(self.vm, pending.destination, original)?;
+                self.frame.dynamic_top = dynamic_top;
+                self.debug_hook_skip_once = resume_instruction;
+                if let Some(result) = builtin_return.take() {
+                    return self.finish_debug_builtin_return(result);
+                }
+                self.frame.pc = pending.resume_pc;
+                Ok(DispatchResult::Continue)
+            })();
+            if let Some(mut result) = builtin_return {
+                result.values.clear_roots(self.vm)?;
             }
-            self.frame.write(self.vm, pending.destination, original)?;
-            self.frame.pc = pending.resume_pc;
-            self.debug_hook_skip_once = true;
-            return Ok(RegularCallAction::Completed(DispatchResult::Continue));
+            return result.map(RegularCallAction::Completed);
         }
         if let Some(BasicPending::OsCalendarTime {
             mut state,
@@ -15282,6 +18207,13 @@ impl Execution<'_> {
     }
 
     fn finish(&mut self) -> Result<(), RuntimeError> {
+        if let Some(mut result) = self.debug_builtin_result.take() {
+            result.values.clear_roots(self.vm)?;
+        }
+        self.debug_builtin_capture = false;
+        if let Some((_, root)) = self.debug_hook_c_call_pending.take() {
+            self.vm.remove_root(root)?;
+        }
         self.clear_deferred_roots()?;
         self.close_unwind = None;
         self.finalizer_saved_close = None;
@@ -15377,8 +18309,6 @@ impl Execution<'_> {
             Instruction::LoadConst { dest, constant } => {
                 self.frame.index(dest)?;
                 let next = self.next_pc()?;
-                let mut string_bytes = Vec::new();
-                let mut string_ticket = None;
                 let value = match self.current_module()?.module().prototypes[self.frame.prototype]
                     .constants
                     .get(constant.0 as usize)
@@ -15386,31 +18316,18 @@ impl Execution<'_> {
                     Some(BytecodeConstant::Integer(value)) => Value::Integer(*value),
                     Some(BytecodeConstant::FloatBits(bits)) => Value::Float(f64::from_bits(*bits)),
                     Some(BytecodeConstant::Boolean(value)) => Value::Boolean(*value),
-                    Some(BytecodeConstant::Name(bytes) | BytecodeConstant::String(bytes)) => {
-                        let ticket = reserve_vec(
-                            self.vm.allocation_ledger(),
-                            &mut string_bytes,
-                            bytes.len(),
-                            FailPoint::StringBytesReserve,
-                        )?;
-                        string_bytes.extend_from_slice(bytes);
-                        string_ticket = Some(ticket);
-                        Value::Nil
-                    }
+                    Some(BytecodeConstant::Name(_) | BytecodeConstant::String(_)) => Value::Object(
+                        self.vm.module_constant(
+                            self.frame
+                                .module
+                                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?,
+                            self.frame.prototype,
+                            constant.0 as usize,
+                        )?,
+                    ),
                     _ => return Err(RuntimeError::new(RuntimeErrorKind::UnsupportedConstant)),
                 };
-                let value = if string_ticket.is_some() {
-                    Value::Object(self.vm.allocate_byte_string(&string_bytes)?)
-                } else {
-                    value
-                };
-                drop(string_ticket);
-                if let Err(error) = self.frame.write(self.vm, dest, value) {
-                    if let Value::Object(object) = value {
-                        self.vm.reclaim(object)?;
-                    }
-                    return Err(error);
-                }
+                self.frame.write(self.vm, dest, value)?;
                 self.frame.pc = next;
             }
             Instruction::NewTable { dest } => {
@@ -15424,7 +18341,7 @@ impl Execution<'_> {
                 self.frame.pc = next;
             }
             Instruction::GetTable { dest, table, key } => {
-                let table = self.frame.read(table)?;
+                let table = self.read_environment_register(table)?;
                 let key = self.frame.read(key)?;
                 self.frame.index(dest)?;
                 let next = self.next_pc()?;
@@ -15459,7 +18376,7 @@ impl Execution<'_> {
                 }
             }
             Instruction::SetTable { table, key, value } => {
-                let target = self.frame.read(table)?;
+                let target = self.read_environment_register(table)?;
                 let key = self.frame.read(key)?;
                 let value = self.frame.read(value)?;
                 let next = self.next_pc()?;
@@ -15497,9 +18414,31 @@ impl Execution<'_> {
                     .filter(|end| *end <= self.frame.register_limit)
                     .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?;
                 let next = self.next_pc()?;
+                let static_limit = usize::from(self.prototype().register_count);
+                let dynamic_extension_start = self
+                    .frame
+                    .pc
+                    .checked_sub(1)
+                    .and_then(|pc| self.prototype().instructions.get(pc))
+                    .and_then(|entry| match entry.instruction {
+                        Instruction::Call {
+                            base,
+                            arg_count: u16::MAX,
+                            result_mode: ResultMode::Fixed(0),
+                        } if first <= usize::from(base.0)
+                            && usize::from(base.0) < end
+                            && end == static_limit =>
+                        {
+                            Some(end)
+                        }
+                        _ => None,
+                    });
                 for index in first..end {
                     self.frame
                         .write(self.vm, Register(index as u16), Value::Nil)?;
+                }
+                if let Some(start) = dynamic_extension_start {
+                    self.frame.clear_dynamic_extension_from(self.vm, start)?;
                 }
                 self.frame.pc = next;
             }
@@ -15544,24 +18483,43 @@ impl Execution<'_> {
                     EnvironmentSource::ParentFrame { parent, register }
                         if parent == self.prototype().id =>
                     {
-                        Some(self.frame.read(register)?)
+                        Some(self.read_environment_register(register)?)
                     }
                     EnvironmentSource::ParentFrame { .. } => {
                         return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
                     }
                     _ => None,
                 };
+                let environment_cell =
+                    if matches!(environment_source, EnvironmentSource::ParentFrame { .. })
+                        && self.current_module()?.native_debug().is_some()
+                    {
+                        if let Some(owner) = self.frame.closure {
+                            Some(self.vm.closure_environment_cell(owner, environment)?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                 let (captures, ticket, original) = self.capture_upvalues(child_index)?;
                 let result = (|| {
-                    let closure = Closure::new(
+                    let mut closure = Closure::new(
                         self.frame
                             .module
                             .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?,
                         proto,
                         &captures,
-                        environment,
+                        if environment_cell.is_some() {
+                            None
+                        } else {
+                            environment
+                        },
                         self.vm.allocation_ledger(),
                     )?;
+                    if let Some(cell) = environment_cell {
+                        closure.set_environment_cell(cell);
+                    }
                     let object = self.vm.allocate_closure(closure)?;
                     if let Err(error) = self.frame.write(self.vm, dest, Value::Object(object)) {
                         self.vm.reclaim(object)?;
@@ -15714,7 +18672,7 @@ impl Execution<'_> {
                     UnaryOperation::Not => None,
                     UnaryOperation::Length => {
                         if let Value::Object(object) = value {
-                            if self.vm.object_kind(object)? == ObjectKind::Table {
+                            if matches!(self.vm.object_kind(object)?, ObjectKind::Table) {
                                 let event = self.lookup_value_event(value, MetamethodEvent::Len)?;
                                 if event != Value::Nil {
                                     Some(event)
@@ -15780,9 +18738,14 @@ impl Execution<'_> {
                 let raw = match op {
                     B::Equal | B::NotEqual => {
                         let equal = ops::raw_equal(self.vm, left, right)?;
-                        if !equal
-                            && matches!((left, right), (Value::Object(a), Value::Object(b)) if a != b && self.vm.object_kind(a)? == ObjectKind::Table && self.vm.object_kind(b)? == ObjectKind::Table)
-                        {
+                        let same_metatable_kind = match (left, right) {
+                            (Value::Object(a), Value::Object(b)) if a != b => {
+                                let kind = self.vm.object_kind(a)?;
+                                matches!(kind, ObjectKind::Table) && self.vm.object_kind(b)? == kind
+                            }
+                            _ => false,
+                        };
+                        if !equal && same_metatable_kind {
                             event_request =
                                 Some((MetamethodEvent::Eq, left, right, op == B::NotEqual));
                             None
@@ -16288,6 +19251,76 @@ mod tests {
     };
 
     #[test]
+    fn p13_h_official_count_eligibility_uses_pc_origin_and_rejects_missing_pc() {
+        for (profile, bytes) in [
+            (
+                LuaProfile::Lua54,
+                include_bytes!("../../tests/official_chunk_fixtures/lua54-parameter-abi.luac")
+                    .as_slice(),
+            ),
+            (
+                LuaProfile::Lua55,
+                include_bytes!("../../tests/official_chunk_fixtures/lua55-parameter-abi.luac")
+                    .as_slice(),
+            ),
+        ] {
+            let chunk =
+                decode_official_chunk(bytes, profile, &OfficialChunkLimits::default()).unwrap();
+            let translated =
+                rivetlua_core::translate_official_chunk(&chunk, &VerifyLimits::default()).unwrap();
+            let origins: Vec<_> = translated
+                .verified()
+                .module()
+                .prototypes
+                .iter()
+                .enumerate()
+                .map(|(index, proto)| {
+                    (
+                        index,
+                        translated
+                            .verified()
+                            .official_artifact()
+                            .unwrap()
+                            .pc_map(proto.id)
+                            .unwrap()
+                            .rvlu_to_official()
+                            .to_vec(),
+                    )
+                })
+                .collect();
+            assert!(
+                origins
+                    .iter()
+                    .flat_map(|(_, map)| map)
+                    .any(|origin| { matches!(origin, OfficialRvluPc::Prologue) }),
+                "{profile:?}"
+            );
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let environment = vm.allocate_table().unwrap();
+            let root = vm.add_root(RootKind::Host, environment).unwrap();
+            let mut execution = vm
+                .load_with_environment(translated.into_verified(), Value::Object(environment))
+                .unwrap();
+            for (index, map) in origins {
+                execution.frame.prototype = index;
+                for (pc, origin) in map.iter().enumerate() {
+                    assert_eq!(
+                        execution.debug_hook_counted_at(pc).unwrap(),
+                        matches!(origin, OfficialRvluPc::Anchor(_)),
+                        "{profile:?} prototype={index} pc={pc} origin={origin:?}"
+                    );
+                }
+                assert_eq!(
+                    execution.debug_hook_counted_at(map.len()).unwrap_err().kind,
+                    RuntimeErrorKind::MissingEntryPoint,
+                );
+            }
+            drop(execution);
+            vm.remove_root(root).unwrap();
+        }
+    }
+
+    #[test]
     fn p13_string_dump_copy_work_limit_and_byte_string_failure_refund() {
         use rivetlua_compiler::{
             CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
@@ -16692,6 +19725,58 @@ mod tests {
     }
 
     #[test]
+    fn p13_h_transfer_hook_start_failure_releases_saved_result_roots() {
+        let mut vm = Vm::new().unwrap();
+        let hook = vm.allocate_basic_builtin(BasicBuiltin::Type).unwrap();
+        let value = vm.allocate_table().unwrap();
+        let module = module(
+            vec![Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            }],
+            vec![],
+        );
+        let mut execution = vm.load(module).unwrap();
+        let original_roots = execution.vm.roots().total_count();
+        let original_ledger = execution.vm.ledger_snapshot().reserved;
+        let captured = DebugBuiltinReturn {
+            values: PrintArguments::new(execution.vm, &[Value::Object(value)]).unwrap(),
+            destination: Register(0),
+            mode: ResultMode::Fixed(0),
+            tail_return: false,
+            next: 1,
+        };
+        assert_eq!(execution.vm.roots().total_count(), original_roots + 1);
+        execution.vm.inject_failure_once(FailPoint::RootReserve);
+        let error = execution
+            .start_debug_hook_event(
+                hook,
+                b"return",
+                None,
+                false,
+                true,
+                None,
+                Some(DebugTransfer {
+                    first: 1,
+                    count: 1,
+                    register: None,
+                    builtin: true,
+                }),
+                Some(captured),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::RootReserve))
+        );
+        assert_eq!(execution.vm.roots().total_count(), original_roots);
+        assert_eq!(execution.vm.ledger_snapshot().reserved, original_ledger);
+        assert!(!execution.vm.debug_hook_running());
+        assert!(execution.pending_ops.is_empty());
+    }
+
+    #[test]
     fn p13_h_hook_callback_return_restore_failure_and_abort_clear_running_state() {
         for abort in [false, true] {
             let mut vm = Vm::new().unwrap();
@@ -16847,9 +19932,13 @@ mod tests {
             let Value::Object(function) = values[0] else {
                 panic!("函式須為 closure")
             };
-            let (separate, captured) = vm
+            let (separate, environment_cell, captured) = vm
                 .with_closure(function, |closure| {
-                    (closure.environment(), closure.upvalue(0))
+                    (
+                        closure.environment(),
+                        closure.environment_cell(),
+                        closure.upvalue(0),
+                    )
                 })
                 .unwrap();
             match profile {
@@ -16861,6 +19950,7 @@ mod tests {
                         }
                     );
                     assert_eq!(separate, None);
+                    assert_eq!(environment_cell, None);
                     let upvalue = captured.expect("Lua54 的 _ENV 須為實際捕捉 upvalue");
                     assert_eq!(
                         vm.upvalue_state(upvalue).unwrap(),
@@ -16875,7 +19965,15 @@ mod tests {
                             ..
                         }
                     ));
-                    assert_eq!(separate, Some(Value::Object(environment)));
+                    if let Some(cell) = environment_cell {
+                        assert_eq!(separate, None);
+                        assert_eq!(
+                            vm.upvalue_state(cell).unwrap(),
+                            UpvalueState::Closed(Value::Object(environment))
+                        );
+                    } else {
+                        assert_eq!(separate, Some(Value::Object(environment)));
+                    }
                     assert_eq!(captured, None);
                 }
             }
@@ -20663,7 +23761,12 @@ mod tests {
         assert_eq!(snapshot.next_register, path.registers[0]);
         assert_eq!(snapshot.return_mode, Some(ResultMode::All));
         assert_eq!(snapshot.result_count, 3);
-        assert!(snapshot.retained_root_count >= 3);
+        let roots_at_close = execution.vm.roots().total_count();
+        assert!(roots_at_close > 0);
+        assert_eq!(snapshot.retained_root_count, roots_at_close);
+        execution.vm.collect().unwrap();
+        assert_eq!(execution.vm.roots().total_count(), roots_at_close);
+        assert_eq!(execution.close_snapshot(), Ok(snapshot));
         let base = snapshot.return_base.unwrap();
         assert_eq!(execution.frame.read(base), Ok(Value::Nil));
         assert_eq!(
@@ -21005,6 +24108,325 @@ mod tests {
         verify_module(candidate, LuaProfile::Lua55, &VerifyLimits::default()).unwrap()
     }
 
+    #[test]
+    fn p15_module_string_constant_is_ready_before_dispatch_and_reused() {
+        let verified = module(
+            vec![
+                Instruction::LoadConst {
+                    dest: Register(0),
+                    constant: ConstId(0),
+                },
+                Instruction::LoadConst {
+                    dest: Register(1),
+                    constant: ConstId(1),
+                },
+                Instruction::LoadNil {
+                    start: Register(0),
+                    count: 2,
+                },
+                Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(0),
+                },
+            ],
+            vec![
+                BytecodeConstant::Name(b"same".to_vec()),
+                BytecodeConstant::String(b"same".to_vec()),
+            ],
+        );
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        let probe = vm.ledger_probe();
+        let mut execution = vm.load(verified).unwrap();
+        assert!(execution.frame.module.is_some(), "字串常量須由 module 持有");
+        let before = execution.vm.ledger_snapshot().lua_heap_bytes;
+        assert!(matches!(
+            execution.dispatch_one(),
+            Ok(DispatchResult::Continue)
+        ));
+        let first = execution.frame.read(Register(0)).unwrap();
+        assert_eq!(execution.vm.ledger_snapshot().lua_heap_bytes, before);
+        assert!(matches!(
+            execution.dispatch_one(),
+            Ok(DispatchResult::Continue)
+        ));
+        let second = execution.frame.read(Register(1)).unwrap();
+        assert!(ops::raw_equal(execution.vm, first, second).unwrap());
+        assert_eq!(execution.vm.ledger_snapshot().lua_heap_bytes, before);
+        execution
+            .frame
+            .write(execution.vm, Register(0), Value::Nil)
+            .unwrap();
+        execution.frame.pc = 0;
+        assert!(matches!(
+            execution.dispatch_one(),
+            Ok(DispatchResult::Continue)
+        ));
+        assert_eq!(execution.frame.read(Register(0)), Ok(first));
+        assert_eq!(execution.vm.ledger_snapshot().lua_heap_bytes, before);
+        drop(execution);
+        vm.collect().unwrap();
+        drop(vm);
+        assert_eq!(probe.snapshot().committed, 0);
+        assert_eq!(probe.snapshot().reserved, 0);
+    }
+
+    #[test]
+    fn p15_nested_prototype_constant_lives_with_module_and_refunds() {
+        use rivetlua_compiler::{
+            CompileBudgetSink, CompileLimits, IrLimits, LanguageProfile, compile_with_budget,
+        };
+        struct Unlimited;
+        impl CompileBudgetSink for Unlimited {
+            type Error = ();
+            fn spend_work(&mut self, _: usize) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn claim_temporary(&mut self, _: usize) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn claim_module_allocation(&mut self, _: usize) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+        let verified = compile_with_budget(
+            b"return function() return 'child' end, 'root'",
+            b"=module-constants",
+            LanguageProfile::Lua55,
+            &CompileLimits::default(),
+            &IrLimits::default(),
+            &VerifyLimits::default(),
+            &mut Unlimited,
+        )
+        .unwrap();
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        let probe = vm.ledger_probe();
+        let RunOutcome::Returned(root_values) = vm.load(verified).unwrap().run().unwrap() else {
+            panic!("root chunk 應返回 closure 與常量")
+        };
+        let [Value::Object(closure), Value::Object(root_string)] = root_values.as_slice() else {
+            panic!("root chunk 回傳格式錯誤：{root_values:?}")
+        };
+        let closure = *closure;
+        let root_string = *root_string;
+        let closure_root = vm.add_root(RootKind::Host, closure).unwrap();
+        let module = vm.with_closure(closure, |c| c.module()).unwrap();
+        let before = vm.ledger_snapshot().lua_heap_bytes;
+        let RunOutcome::Returned(child_values) =
+            vm.call(Value::Object(closure), &[]).unwrap().run().unwrap()
+        else {
+            panic!("nested prototype 應返回常量")
+        };
+        let [Value::Object(child_string)] = child_values.as_slice() else {
+            panic!("nested prototype 回傳格式錯誤：{child_values:?}")
+        };
+        let child_string = *child_string;
+        assert_eq!(
+            vm.ledger_snapshot().lua_heap_bytes,
+            before,
+            "nested 首次 LoadConst 不得配置"
+        );
+        assert_eq!(
+            vm.with_byte_string(root_string, |s| s.as_bytes().to_vec()),
+            Ok(b"root".to_vec())
+        );
+        assert_eq!(
+            vm.with_byte_string(child_string, |s| s.as_bytes().to_vec()),
+            Ok(b"child".to_vec())
+        );
+        let string_root = vm.add_root(RootKind::Host, child_string).unwrap();
+        vm.remove_root(closure_root).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(module), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(child_string), Ok(ObjectKind::ByteString));
+        vm.remove_root(string_root).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(child_string), Err(VmError::StaleObject));
+        drop(vm);
+        assert_eq!(probe.snapshot().committed, 0);
+        assert_eq!(probe.snapshot().reserved, 0);
+    }
+
+    #[test]
+    fn p15_open_statement_load_nil_clears_dynamic_roots_and_reuses_storage() {
+        let verified = module(
+            vec![
+                Instruction::Call {
+                    base: Register(2),
+                    arg_count: 0,
+                    result_mode: ResultMode::All,
+                },
+                Instruction::Call {
+                    base: Register(1),
+                    arg_count: u16::MAX,
+                    result_mode: ResultMode::Fixed(0),
+                },
+                Instruction::LoadNil {
+                    start: Register(1),
+                    count: 2,
+                },
+                Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(0),
+                },
+            ],
+            vec![],
+        );
+        let mut vm = Vm::new().unwrap();
+        let mut execution = vm.load(verified).unwrap();
+        let live = execution.vm.allocate_table().unwrap();
+        execution
+            .frame
+            .write(execution.vm, Register(0), Value::Object(live))
+            .unwrap();
+        let long = execution.vm.allocate_table().unwrap();
+        execution.frame.grow_for_open_results(6).unwrap();
+        execution
+            .frame
+            .write(execution.vm, Register(5), Value::Object(long))
+            .unwrap();
+        let frame_charge = execution.frame.charge;
+        let roots_before = execution.vm.roots().total_count();
+        let static_roots = execution.frame.roots[1..3]
+            .iter()
+            .filter(|root| root.is_some())
+            .count();
+        execution.frame.pc = 2;
+        assert!(matches!(
+            execution.dispatch_one(),
+            Ok(DispatchResult::Continue)
+        ));
+        assert_eq!(execution.frame.read(Register(0)), Ok(Value::Object(live)));
+        assert_eq!(execution.frame.read(Register(5)), Ok(Value::Nil));
+        assert_eq!(
+            execution.vm.roots().total_count(),
+            roots_before - static_roots - 1
+        );
+        assert_eq!(execution.frame.register_limit, 6);
+        assert_eq!(execution.frame.charge, frame_charge);
+
+        let short = execution.vm.allocate_table().unwrap();
+        execution.frame.grow_for_open_results(4).unwrap();
+        assert_eq!(execution.frame.charge, frame_charge);
+        execution
+            .frame
+            .write(execution.vm, Register(3), Value::Object(short))
+            .unwrap();
+        execution.frame.pc = 2;
+        assert!(matches!(
+            execution.dispatch_one(),
+            Ok(DispatchResult::Continue)
+        ));
+        assert_eq!(execution.frame.read(Register(3)), Ok(Value::Nil));
+        assert_eq!(execution.frame.read(Register(0)), Ok(Value::Object(live)));
+        assert_eq!(
+            execution.vm.roots().total_count(),
+            roots_before - static_roots - 1
+        );
+        assert_eq!(execution.frame.register_limit, 6);
+        assert_eq!(execution.frame.charge, frame_charge);
+        assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+    }
+
+    #[test]
+    fn p15_load_nil_dynamic_cleanup_requires_exact_open_call_sequence() {
+        for (producer, previous, start, count) in [
+            (
+                None,
+                Instruction::Move {
+                    dest: Register(0),
+                    src: Register(0),
+                },
+                Register(1),
+                2,
+            ),
+            (
+                None,
+                Instruction::Call {
+                    base: Register(1),
+                    arg_count: 0,
+                    result_mode: ResultMode::Fixed(0),
+                },
+                Register(1),
+                2,
+            ),
+            (
+                Some(Instruction::Call {
+                    base: Register(2),
+                    arg_count: 0,
+                    result_mode: ResultMode::All,
+                }),
+                Instruction::Call {
+                    base: Register(1),
+                    arg_count: u16::MAX,
+                    result_mode: ResultMode::Fixed(0),
+                },
+                Register(2),
+                1,
+            ),
+            (
+                Some(Instruction::Call {
+                    base: Register(2),
+                    arg_count: 0,
+                    result_mode: ResultMode::All,
+                }),
+                Instruction::Call {
+                    base: Register(1),
+                    arg_count: u16::MAX,
+                    result_mode: ResultMode::Fixed(0),
+                },
+                Register(1),
+                1,
+            ),
+        ] {
+            let mut instructions = Vec::new();
+            if let Some(producer) = producer {
+                instructions.push(producer);
+            }
+            instructions.push(previous);
+            let load_pc = instructions.len();
+            instructions.push(Instruction::LoadNil { start, count });
+            instructions.push(Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            });
+            let verified = module(instructions, vec![]);
+            let mut vm = Vm::new().unwrap();
+            let mut execution = vm.load(verified).unwrap();
+            let live = execution.vm.allocate_table().unwrap();
+            execution
+                .frame
+                .write(execution.vm, Register(0), Value::Object(live))
+                .unwrap();
+            let extension = execution.vm.allocate_table().unwrap();
+            execution.frame.grow_for_open_results(6).unwrap();
+            execution
+                .frame
+                .write(execution.vm, Register(5), Value::Object(extension))
+                .unwrap();
+            let roots_before = execution.vm.roots().total_count();
+            let first = usize::from(start.0);
+            let end = first + usize::from(count);
+            let static_roots = execution.frame.roots[first..end]
+                .iter()
+                .filter(|root| root.is_some())
+                .count();
+            execution.frame.pc = load_pc;
+            assert!(matches!(
+                execution.dispatch_one(),
+                Ok(DispatchResult::Continue)
+            ));
+            assert_eq!(
+                execution.frame.read(Register(5)),
+                Ok(Value::Object(extension))
+            );
+            assert_eq!(execution.frame.read(Register(0)), Ok(Value::Object(live)));
+            assert_eq!(
+                execution.vm.roots().total_count(),
+                roots_before - static_roots
+            );
+        }
+    }
+
     fn numeric_for_candidate(
         instructions: Vec<Instruction>,
         constants: Vec<BytecodeConstant>,
@@ -21117,7 +24539,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(vm.roots().total_count(), 0);
-        assert_eq!(vm.collect().unwrap(), 1);
+        assert_eq!(vm.collect().unwrap(), 2);
     }
 
     #[test]
@@ -21180,7 +24602,7 @@ mod tests {
         vm.remove_root(root).unwrap();
         assert_eq!(vm.roots().count(RootKind::Host), 1);
         drop(error);
-        assert_eq!(vm.collect().unwrap(), 4);
+        assert_eq!(vm.collect().unwrap(), 5);
         assert_eq!(vm.roots().total_count(), 0);
     }
 
@@ -21242,6 +24664,7 @@ mod tests {
                 vec![BytecodeConstant::String(vec![0, 0x80])],
             ),
         ] {
+            let cached_constant = !constants.is_empty();
             let verified = module(
                 vec![
                     instruction,
@@ -21259,14 +24682,26 @@ mod tests {
                 execution.dispatch_one().err().unwrap().kind,
                 RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::RootReserve))
             );
-            assert_eq!(execution.vm.roots().total_count(), 0);
             assert_eq!(
-                execution.vm.slot_state(rivetlua_core::SlotId::new(0)),
-                Some(crate::SlotState::Free)
+                execution.vm.roots().total_count(),
+                usize::from(cached_constant)
             );
+            if cached_constant {
+                let module = execution.frame.module.unwrap();
+                let constant = execution.vm.module_constant(module, 0, 0).unwrap();
+                assert_eq!(
+                    execution.vm.object_kind(constant),
+                    Ok(ObjectKind::ByteString)
+                );
+            } else {
+                assert_eq!(
+                    execution.vm.slot_state(rivetlua_core::SlotId::new(0)),
+                    Some(crate::SlotState::Free)
+                );
+            }
             assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
             drop(execution);
-            assert_eq!(vm.collect().unwrap(), 0);
+            assert_eq!(vm.collect().unwrap(), if cached_constant { 2 } else { 0 });
         }
     }
 
@@ -21787,6 +25222,70 @@ mod tests {
             assert_eq!(trace.young + trace.survivor + trace.old, 0);
         }
         assert!(failures > 2);
+    }
+
+    #[test]
+    fn p15_loaded_chunk_string_cache_failures_reclaim_and_retry() {
+        let verified = module(
+            vec![
+                Instruction::LoadConst {
+                    dest: Register(0),
+                    constant: ConstId(0),
+                },
+                Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(1),
+                },
+            ],
+            vec![BytecodeConstant::String(b"cached".to_vec())],
+        );
+        let setup = || {
+            let mut vm = Vm::new().unwrap();
+            let seed = vm.allocate_table().unwrap();
+            let seed_root = vm.add_root(RootKind::Host, seed).unwrap();
+            vm.collect().unwrap();
+            vm.incremental_step(1).unwrap();
+            (vm, seed_root)
+        };
+        let (mut dry, dry_seed_root) = setup();
+        let start = dry.allocation_trace().next_ordinal;
+        let (_, closure_root) = dry
+            .loaded_chunk_closure(verified.clone(), Value::Nil, ModuleCharge::new(&dry, 0))
+            .unwrap();
+        dry.remove_root(closure_root).unwrap();
+        dry.remove_root(dry_seed_root).unwrap();
+        let attempts = dry.allocation_trace().next_ordinal - start;
+        assert!(attempts > 2);
+
+        for offset in 0..attempts {
+            let (mut vm, seed_root) = setup();
+            assert_eq!(vm.allocation_trace().next_ordinal, start);
+            vm.inject_allocation_failure_at(start + offset);
+            let result =
+                vm.loaded_chunk_closure(verified.clone(), Value::Nil, ModuleCharge::new(&vm, 0));
+            assert!(result.is_err(), "offset={offset}");
+            assert_eq!(vm.roots().total_count(), 1, "offset={offset}");
+            vm.collect()
+                .unwrap_or_else(|error| panic!("offset={offset} collect={error:?}"));
+            assert_eq!(
+                vm.gc_trace().young + vm.gc_trace().survivor + vm.gc_trace().old,
+                1,
+                "offset={offset}"
+            );
+            assert_eq!(vm.ledger_snapshot().reserved, 0, "offset={offset}");
+            let (_, closure_root) = vm
+                .loaded_chunk_closure(verified.clone(), Value::Nil, ModuleCharge::new(&vm, 0))
+                .unwrap();
+            vm.remove_root(closure_root).unwrap();
+            vm.remove_root(seed_root).unwrap();
+            vm.collect().unwrap();
+            assert_eq!(
+                vm.gc_trace().young + vm.gc_trace().survivor + vm.gc_trace().old,
+                0,
+                "offset={offset}"
+            );
+            assert_eq!(vm.ledger_snapshot().reserved, 0, "offset={offset}");
+        }
     }
 
     #[test]
@@ -23004,6 +26503,7 @@ mod tests {
                 Ok(DispatchResult::Continue)
             ));
         }
+        execution.vm.collect().unwrap();
         let before = execution.vm.ledger_snapshot();
         let roots_before = execution.vm.roots().total_count();
         execution
@@ -24079,6 +27579,831 @@ mod tests {
             );
             drop(execution);
             assert_eq!(vm.roots().total_count(), 0);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn p13_h_step2_setlocal_failure_and_fuel_preserve_vararg_root() {
+        let verified = module(
+            vec![Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            }],
+            vec![],
+        );
+        for point in [FailPoint::ReturnReserve, FailPoint::RootReserve] {
+            let mut vm = Vm::new().unwrap();
+            let mut execution = vm.load(verified.clone()).unwrap();
+            let old = execution.vm.allocate_table().unwrap();
+            execution
+                .frame
+                .set_varargs(execution.vm, &[Value::Object(old)])
+                .unwrap();
+            let before_roots = execution.vm.roots().total_count();
+            execution.vm.inject_failure_once(point);
+            assert_eq!(
+                execution
+                    .debug_setlocal(
+                        &[Value::Integer(1), Value::Integer(-1), Value::Integer(9)],
+                        Register(0),
+                        ResultMode::Fixed(1),
+                        false,
+                        1,
+                    )
+                    .err()
+                    .map(|error| error.kind),
+                Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(point)))
+            );
+            assert_eq!(execution.frame.varargs, [Value::Object(old)]);
+            assert_eq!(execution.vm.roots().total_count(), before_roots);
+            execution.vm.collect().unwrap();
+            assert_eq!(execution.vm.object_kind(old), Ok(ObjectKind::Table));
+            assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+            drop(execution);
+            assert_eq!(vm.roots().total_count(), 0);
+            vm.collect().unwrap();
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+
+        let mut vm = Vm::new().unwrap();
+        let mut execution = vm.load(verified).unwrap();
+        let old = execution.vm.allocate_table().unwrap();
+        execution
+            .frame
+            .set_varargs(execution.vm, &[Value::Object(old)])
+            .unwrap();
+        execution.set_fuel(0).unwrap();
+        assert!(matches!(
+            execution
+                .debug_setlocal(
+                    &[Value::Integer(1), Value::Integer(-1), Value::Integer(9)],
+                    Register(0),
+                    ResultMode::Fixed(1),
+                    false,
+                    1,
+                )
+                .unwrap(),
+            RegularCallAction::Aborted
+        ));
+        assert_eq!(execution.frame.varargs, [Value::Object(old)]);
+        execution.vm.collect().unwrap();
+        assert_eq!(execution.vm.object_kind(old), Ok(ObjectKind::Table));
+        assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+        drop(execution);
+        assert_eq!(vm.roots().total_count(), 0);
+    }
+
+    #[test]
+    fn p13_h_step3_setupvalue_root_reserve_and_fuel_abort_leave_closed_value_unchanged() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit_with_native_debug, lex, lower, parse,
+            resolve,
+        };
+
+        let source = b"local x=1; return function() return x end";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let verified = emit_with_native_debug(
+            &ir,
+            &resolved,
+            source,
+            b"@step3-upvalue.lua",
+            &VerifyLimits::default(),
+        )
+        .unwrap()
+        .verified()
+        .clone();
+        let trivial = module(
+            vec![Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            }],
+            vec![],
+        );
+        for point in [FailPoint::RootReserve, FailPoint::ReturnReserve] {
+            let mut vm = Vm::new().unwrap();
+            let mut initial = vm.load(verified.clone()).unwrap();
+            let Ok(RunOutcome::Returned(values)) = initial.run() else {
+                panic!("初始 closure 必須可返回")
+            };
+            let Value::Object(function) = values[0] else {
+                panic!("初始值必須為 closure")
+            };
+            drop(initial);
+            let function_root = vm.add_root(RootKind::Host, function).unwrap();
+            let upvalue = vm
+                .with_closure(function, |closure| closure.upvalue(0))
+                .unwrap()
+                .unwrap();
+            let mut execution = vm.load(trivial.clone()).unwrap();
+            let before_roots = execution.vm.roots().total_count();
+            execution.vm.inject_failure_once(point);
+            assert_eq!(
+                execution
+                    .debug_upvalue_builtin(
+                        DebugBuiltin::SetUpvalue,
+                        &[
+                            Value::Object(function),
+                            Value::Integer(1),
+                            Value::Integer(2)
+                        ],
+                        Register(0),
+                        ResultMode::Fixed(1),
+                        false,
+                        1,
+                    )
+                    .err()
+                    .map(|error| error.kind),
+                Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(point))),
+            );
+            assert_eq!(
+                execution.vm.upvalue_state(upvalue),
+                Ok(UpvalueState::Closed(Value::Integer(1)))
+            );
+            assert_eq!(execution.vm.roots().total_count(), before_roots);
+            assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+            execution.set_fuel(0).unwrap();
+            assert!(matches!(
+                execution
+                    .debug_upvalue_builtin(
+                        DebugBuiltin::SetUpvalue,
+                        &[
+                            Value::Object(function),
+                            Value::Integer(1),
+                            Value::Integer(3)
+                        ],
+                        Register(0),
+                        ResultMode::Fixed(1),
+                        false,
+                        1,
+                    )
+                    .unwrap(),
+                RegularCallAction::Aborted
+            ));
+            assert_eq!(
+                execution.vm.upvalue_state(upvalue),
+                Ok(UpvalueState::Closed(Value::Integer(1)))
+            );
+            assert_eq!(execution.vm.roots().total_count(), before_roots);
+            drop(execution);
+            vm.remove_root(function_root).unwrap();
+            vm.collect().unwrap();
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn p13_h_step3_virtual_environment_setupvalue_failures_preserve_shared_cell() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit_with_native_debug, lex, lower, parse,
+            resolve,
+        };
+
+        let source = b"return function() return marker end";
+        let limits = CompileLimits::default();
+        let tokens = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&tokens, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &tokens, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let verified = emit_with_native_debug(
+            &ir,
+            &resolved,
+            source,
+            b"@step3-environment.lua",
+            &VerifyLimits::default(),
+        )
+        .unwrap()
+        .verified()
+        .clone();
+        let trivial = module(
+            vec![Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            }],
+            vec![],
+        );
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        let old = vm.allocate_table().unwrap();
+        let old_root = vm.add_root(RootKind::Host, old).unwrap();
+        let mut initial = vm
+            .load_with_environment(verified, Value::Object(old))
+            .unwrap();
+        let Ok(RunOutcome::Returned(values)) = initial.run() else {
+            panic!("初始 closure 須返回")
+        };
+        let Value::Object(function) = values[0] else {
+            panic!("虛擬環境函式須為 closure")
+        };
+        drop(initial);
+        let function_root = vm.add_root(RootKind::Host, function).unwrap();
+        let cell = vm
+            .with_closure(function, Closure::environment_cell)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            vm.upvalue_state(cell),
+            Ok(UpvalueState::Closed(Value::Object(old)))
+        );
+        let replacement = vm.allocate_table().unwrap();
+        let replacement_root = vm.add_root(RootKind::Host, replacement).unwrap();
+        for point in [FailPoint::RootReserve, FailPoint::ReturnReserve] {
+            let mut execution = vm.load(trivial.clone()).unwrap();
+            let roots_before = execution.vm.roots().total_count();
+            execution.vm.inject_failure_once(point);
+            assert_eq!(
+                execution
+                    .debug_upvalue_builtin(
+                        DebugBuiltin::SetUpvalue,
+                        &[
+                            Value::Object(function),
+                            Value::Integer(1),
+                            Value::Object(replacement)
+                        ],
+                        Register(0),
+                        ResultMode::Fixed(1),
+                        false,
+                        1,
+                    )
+                    .err()
+                    .map(|error| error.kind),
+                Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(point))),
+            );
+            assert_eq!(
+                execution.vm.upvalue_state(cell),
+                Ok(UpvalueState::Closed(Value::Object(old)))
+            );
+            assert_eq!(execution.vm.roots().total_count(), roots_before);
+            assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+            execution.set_fuel(0).unwrap();
+            assert!(matches!(
+                execution
+                    .debug_upvalue_builtin(
+                        DebugBuiltin::SetUpvalue,
+                        &[
+                            Value::Object(function),
+                            Value::Integer(1),
+                            Value::Object(replacement)
+                        ],
+                        Register(0),
+                        ResultMode::Fixed(1),
+                        false,
+                        1,
+                    )
+                    .unwrap(),
+                RegularCallAction::Aborted
+            ));
+            assert_eq!(
+                execution.vm.upvalue_state(cell),
+                Ok(UpvalueState::Closed(Value::Object(old)))
+            );
+            drop(execution);
+        }
+        vm.remove_root(replacement_root).unwrap();
+        vm.remove_root(function_root).unwrap();
+        vm.remove_root(old_root).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+
+    #[test]
+    fn p13_h_step2_tail_setlocal_error_after_frame_exit_releases_old_root() {
+        let verified = module(
+            vec![Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            }],
+            vec![],
+        );
+        let mut vm = Vm::new().unwrap();
+        let mut execution = vm.load(verified.clone()).unwrap();
+        let old = execution.vm.allocate_table().unwrap();
+        let ledger = execution.vm.allocation_ledger().clone();
+        let mut callee = CallFrame::new(
+            &verified.module().prototypes[0],
+            0,
+            execution.frame.module,
+            &ledger,
+        )
+        .unwrap();
+        callee.caller = Some(0);
+        callee.return_destination = Some(Register(0));
+        callee.return_mode = ResultMode::Fixed(1);
+        callee
+            .set_varargs(execution.vm, &[Value::Object(old)])
+            .unwrap();
+        let caller = core::mem::replace(&mut execution.frame, callee);
+        execution.callers.push(caller);
+        // 回傳已移除 callee 後，模擬 hook 查詢失敗以覆蓋尾呼叫清理路徑。
+        execution.active_coroutine = Some(ObjectRef::new_opaque().unwrap());
+        let error = execution
+            .debug_setlocal(
+                &[Value::Integer(1), Value::Integer(-1), Value::Integer(9)],
+                Register(0),
+                ResultMode::Fixed(1),
+                true,
+                1,
+            )
+            .err()
+            .expect("尾呼叫退出後應回傳 hook 錯誤");
+        assert_eq!(error.kind, RuntimeErrorKind::Heap(VmError::StaleObject));
+        assert!(execution.callers.is_empty());
+        execution.active_coroutine = None;
+        assert_eq!(execution.vm.roots().count(RootKind::Stack), 1);
+        assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+        execution.finish().unwrap();
+        drop(execution);
+        assert_eq!(vm.roots().total_count(), 0);
+        vm.collect().unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+
+    #[test]
+    fn p13_h_step2_parked_setlocal_failpoint_and_abort_leave_context_intact() {
+        let verified = module(
+            vec![Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            }],
+            vec![],
+        );
+        let mut vm = Vm::new().unwrap();
+        let coroutine = vm.allocate_coroutine(Value::Nil).unwrap();
+        let coroutine_root = vm.add_root(RootKind::Host, coroutine).unwrap();
+        let ledger = vm.allocation_ledger().clone();
+        let mut frame = CallFrame::new(&verified.module().prototypes[0], 0, None, &ledger).unwrap();
+        frame.set_varargs(&mut vm, &[Value::Integer(7)]).unwrap();
+        let mut context = ThreadContext::new(frame, &ledger);
+        context.park_roots(&mut vm).unwrap();
+        vm.prepare_coroutine_context_write(coroutine, &context)
+            .unwrap();
+        vm.with_coroutine_mut(coroutine, &[], |co| co.context = Some(context))
+            .unwrap();
+        let mut execution = vm.load(verified).unwrap();
+        let args = [
+            Value::Object(coroutine),
+            Value::Integer(1),
+            Value::Integer(-1),
+            Value::Integer(9),
+        ];
+        execution.vm.inject_failure_once(FailPoint::RootReserve);
+        assert_eq!(
+            execution
+                .debug_setlocal(&args, Register(0), ResultMode::Fixed(1), false, 1)
+                .err()
+                .map(|error| error.kind),
+            Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                FailPoint::RootReserve
+            )))
+        );
+        assert_eq!(
+            execution
+                .vm
+                .with_coroutine(coroutine, |co| co.context.as_ref().unwrap().frame.varargs
+                    [0]),
+            Ok(Value::Integer(7))
+        );
+        assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+
+        execution.set_fuel(0).unwrap();
+        assert!(matches!(
+            execution
+                .debug_setlocal(&args, Register(0), ResultMode::Fixed(1), false, 1)
+                .unwrap(),
+            RegularCallAction::Aborted
+        ));
+        assert_eq!(
+            execution
+                .vm
+                .with_coroutine(coroutine, |co| co.context.as_ref().unwrap().frame.varargs
+                    [0]),
+            Ok(Value::Integer(7))
+        );
+
+        execution.set_fuel(100_000).unwrap();
+        execution
+            .vm
+            .set_gc_mode(crate::gc::GcMode::Generational)
+            .unwrap();
+        execution.vm.set_gc_promotion_survivals(1).unwrap();
+        execution.vm.stop_automatic_gc();
+        execution.vm.collect_major().unwrap();
+        let young = execution.vm.allocate_table().unwrap();
+        let young_root = execution.vm.add_root(RootKind::Temporary, young).unwrap();
+        let args = [args[0], args[1], args[2], Value::Object(young)];
+        execution
+            .vm
+            .inject_failure_once(FailPoint::RememberedReserve);
+        assert_eq!(
+            execution
+                .debug_setlocal(&args, Register(0), ResultMode::Fixed(1), false, 1)
+                .err()
+                .map(|error| error.kind),
+            Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                FailPoint::RememberedReserve
+            )))
+        );
+        assert_eq!(
+            execution
+                .vm
+                .with_coroutine(coroutine, |co| co.context.as_ref().unwrap().frame.varargs
+                    [0]),
+            Ok(Value::Integer(7))
+        );
+        assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+        assert!(matches!(
+            execution
+                .debug_setlocal(&args, Register(0), ResultMode::Fixed(1), false, 1)
+                .unwrap(),
+            RegularCallAction::Completed(DispatchResult::Continue)
+        ));
+        execution.vm.remove_root(young_root).unwrap();
+        execution.vm.collect_minor().unwrap();
+        assert_eq!(execution.vm.object_kind(young), Ok(ObjectKind::Table));
+        assert_eq!(
+            execution
+                .vm
+                .with_coroutine(coroutine, |co| co.context.as_ref().unwrap().frame.varargs
+                    [0]),
+            Ok(Value::Object(young))
+        );
+        assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+        execution.finish().unwrap();
+        drop(execution);
+        vm.remove_root(coroutine_root).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.roots().total_count(), 0);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+
+    #[test]
+    fn p15_official_raw_vararg_setlocal_failures_leave_authoritative_table_unchanged() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+
+        let source = b"local function f(a, ...) return ... end; return f";
+        let limits = CompileLimits::default();
+        let lexical = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&lexical, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &lexical, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let native = emit(&ir, &VerifyLimits::default())
+            .unwrap()
+            .verified()
+            .clone();
+        let child = native
+            .module()
+            .prototypes
+            .iter()
+            .find(|prototype| prototype.parent == Some(ProtoId(0)))
+            .unwrap()
+            .id;
+        let mut work = OfficialWorkBudget::new(u64::MAX);
+        let encoded = emit_official_chunk(
+            &native,
+            child,
+            LuaProfile::Lua55,
+            false,
+            &OfficialChunkLimits::default(),
+            &mut work,
+        )
+        .unwrap();
+        let decoded =
+            decode_official_chunk(&encoded, LuaProfile::Lua55, &OfficialChunkLimits::default())
+                .unwrap();
+        let imported = rivetlua_core::translate_official_chunk(&decoded, &VerifyLimits::default())
+            .unwrap()
+            .into_verified();
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+        let mut execution = vm
+            .load_with_environment_and_args(
+                imported,
+                Value::Object(environment),
+                &[Value::Integer(7), Value::Integer(8)],
+            )
+            .unwrap();
+        execution.set_fuel(1_000_000).unwrap();
+        let raw_register = execution.frame.official_raw_varargs.unwrap();
+        let Value::Object(raw_table) = execution.frame.read(raw_register).unwrap() else {
+            panic!("官方原始 vararg 未保留 table");
+        };
+        assert_eq!(execution.frame.official_raw_vararg_count, 1);
+        let original = || Value::Integer(8);
+        let key = Value::Integer(1);
+        assert_eq!(execution.vm.raw_get(raw_table, key), Ok(original()));
+        let baseline_roots = execution.vm.roots().total_count();
+        for point in [FailPoint::RootReserve, FailPoint::ReturnReserve] {
+            execution.vm.inject_failure_once(point);
+            assert_eq!(
+                execution
+                    .debug_setlocal(
+                        &[Value::Integer(1), Value::Integer(-1), Value::Integer(9)],
+                        Register(0),
+                        ResultMode::Fixed(1),
+                        false,
+                        0,
+                    )
+                    .err()
+                    .map(|error| error.kind),
+                Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(point)))
+            );
+            assert_eq!(execution.vm.raw_get(raw_table, key), Ok(original()));
+            assert_eq!(execution.vm.roots().total_count(), baseline_roots);
+            assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+        }
+
+        execution
+            .vm
+            .set_gc_mode(crate::gc::GcMode::Generational)
+            .unwrap();
+        execution.vm.set_gc_promotion_survivals(1).unwrap();
+        execution.vm.stop_automatic_gc();
+        execution.vm.collect_major().unwrap();
+        let young = execution.vm.allocate_table().unwrap();
+        let young_root = execution.vm.add_root(RootKind::Temporary, young).unwrap();
+        execution
+            .vm
+            .inject_failure_once(FailPoint::RememberedReserve);
+        let object_args = [Value::Integer(1), Value::Integer(-1), Value::Object(young)];
+        assert_eq!(
+            execution
+                .debug_setlocal(&object_args, Register(0), ResultMode::Fixed(1), false, 0)
+                .err()
+                .map(|error| error.kind),
+            Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                FailPoint::RememberedReserve
+            )))
+        );
+        assert_eq!(execution.vm.raw_get(raw_table, key), Ok(original()));
+        assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+        assert!(matches!(
+            execution
+                .debug_setlocal(&object_args, Register(0), ResultMode::Fixed(1), false, 0)
+                .unwrap(),
+            RegularCallAction::Completed(DispatchResult::Continue)
+        ));
+        assert_eq!(
+            execution.vm.raw_get(raw_table, key),
+            Ok(Value::Object(young))
+        );
+        execution.vm.remove_root(young_root).unwrap();
+        execution.vm.collect_minor().unwrap();
+        assert_eq!(execution.vm.object_kind(young), Ok(ObjectKind::Table));
+        let raw_table_root = execution.vm.add_root(RootKind::Host, raw_table).unwrap();
+        execution.vm.inject_failure_once(FailPoint::ReturnReserve);
+        assert_eq!(
+            execution
+                .debug_setlocal(
+                    &[Value::Integer(1), Value::Integer(-1), Value::Integer(44)],
+                    Register(0),
+                    ResultMode::Fixed(1),
+                    true,
+                    0,
+                )
+                .err()
+                .map(|error| error.kind),
+            Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                FailPoint::ReturnReserve
+            )))
+        );
+        assert_eq!(
+            execution.vm.raw_get(raw_table, key),
+            Ok(Value::Object(young))
+        );
+        execution
+            .debug_setlocal(
+                &[Value::Integer(1), Value::Integer(-1), Value::Integer(44)],
+                Register(0),
+                ResultMode::Fixed(1),
+                true,
+                0,
+            )
+            .unwrap();
+        assert_eq!(execution.vm.raw_get(raw_table, key), Ok(Value::Integer(44)));
+        execution.finish().unwrap();
+        drop(execution);
+        vm.remove_root(raw_table_root).unwrap();
+        vm.remove_root(environment_root).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+
+    #[test]
+    fn p13_h_step3_temporary_setlocal_failpoint_and_fuel_leave_caller_unchanged() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit_with_native_debug, lex, lower, parse,
+            resolve,
+        };
+
+        let source = b"local function f() return 20 end; local function g(a,b) return (a+1)+f() end; return g(0,0)";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let verified = emit_with_native_debug(
+            &ir,
+            &resolved,
+            source,
+            b"@temporary-rollback.lua",
+            &VerifyLimits::default(),
+        )
+        .unwrap()
+        .verified()
+        .clone();
+
+        for point in [FailPoint::RootReserve, FailPoint::ReturnReserve] {
+            let mut vm = Vm::new().unwrap();
+            let mut execution = vm.load(verified.clone()).unwrap();
+            loop {
+                let at_temporary_call = execution.callers.last().is_some_and(|caller| {
+                    let proto = &verified.module().prototypes[caller.prototype];
+                    caller.pc.checked_sub(1).is_some_and(|pc| {
+                        verified
+                            .native_debug()
+                            .unwrap()
+                            .temporaries_at(proto.id, InstructionOffset(pc as u32))
+                            .is_some_and(|entries| !entries.is_empty())
+                    })
+                });
+                if at_temporary_call {
+                    break;
+                }
+                assert!(matches!(
+                    execution.dispatch_one(),
+                    Ok(DispatchResult::Continue)
+                ));
+            }
+            let caller = execution.callers.last().unwrap();
+            let proto = &verified.module().prototypes[caller.prototype];
+            let register = verified
+                .native_debug()
+                .unwrap()
+                .temporaries_at(proto.id, InstructionOffset((caller.pc - 1) as u32))
+                .unwrap()[0]
+                .register;
+            assert_eq!(caller.read(register), Ok(Value::Integer(1)));
+            let before_roots = execution.vm.roots().total_count();
+            execution.vm.inject_failure_once(point);
+            assert_eq!(
+                execution
+                    .debug_setlocal(
+                        &[Value::Integer(2), Value::Integer(3), Value::Integer(10)],
+                        Register(0),
+                        ResultMode::Fixed(1),
+                        false,
+                        execution.frame.pc,
+                    )
+                    .err()
+                    .map(|error| error.kind),
+                Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(point)))
+            );
+            assert_eq!(
+                execution.callers.last().unwrap().read(register),
+                Ok(Value::Integer(1))
+            );
+            assert_eq!(execution.vm.roots().total_count(), before_roots);
+            assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+
+            execution.set_fuel(0).unwrap();
+            assert!(matches!(
+                execution
+                    .debug_setlocal(
+                        &[Value::Integer(2), Value::Integer(3), Value::Integer(10)],
+                        Register(0),
+                        ResultMode::Fixed(1),
+                        false,
+                        execution.frame.pc,
+                    )
+                    .unwrap(),
+                RegularCallAction::Aborted
+            ));
+            assert_eq!(
+                execution.callers.last().unwrap().read(register),
+                Ok(Value::Integer(1))
+            );
+            assert_eq!(execution.vm.roots().total_count(), before_roots);
+            assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+            drop(execution);
+            assert_eq!(vm.roots().total_count(), 0);
+            vm.collect().unwrap();
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn p13_h_initializer_setlocal_failure_rolls_back_and_retry_roots_object() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit_with_native_debug, lex, lower, parse,
+            resolve,
+        };
+
+        let source = b"local A=function() return 7 end; return A";
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            let limits = CompileLimits::default();
+            let tokens = lex(source, profile, &limits).unwrap();
+            let ast = parse(&tokens, profile, &limits).unwrap();
+            let resolved = resolve(&ast, &tokens, profile, &limits).unwrap();
+            let ir = lower(&resolved, &IrLimits::default()).unwrap();
+            let verified = emit_with_native_debug(
+                &ir,
+                &resolved,
+                source,
+                b"@initializer-rollback.lua",
+                &VerifyLimits::default(),
+            )
+            .unwrap()
+            .verified()
+            .clone();
+            let register = verified
+                .native_debug()
+                .unwrap()
+                .initializer_temporaries_for(ProtoId(0))
+                .unwrap()[0]
+                .register;
+            for point in [FailPoint::RootReserve, FailPoint::ReturnReserve] {
+                let mut vm = Vm::new_with_profile(match profile {
+                    LanguageProfile::Lua54 => LuaProfile::Lua54,
+                    LanguageProfile::Lua55 => LuaProfile::Lua55,
+                })
+                .unwrap();
+                vm.set_collect_every_allocation(true);
+                let mut execution = vm.load(verified.clone()).unwrap();
+                let replacement = execution.vm.allocate_table().unwrap();
+                let replacement_root = execution.vm.add_root(RootKind::Host, replacement).unwrap();
+                let baseline_roots = execution.vm.roots().total_count();
+                assert_eq!(execution.frame.read(register), Ok(Value::Nil));
+                let args = [
+                    Value::Integer(1),
+                    Value::Integer(1),
+                    Value::Object(replacement),
+                ];
+                execution.vm.inject_failure_once(point);
+                assert_eq!(
+                    execution
+                        .debug_setlocal(&args, Register(0), ResultMode::Fixed(1), false, 0)
+                        .err()
+                        .map(|error| error.kind),
+                    Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(point))),
+                    "{profile:?}, {point:?}",
+                );
+                assert_eq!(execution.frame.read(register), Ok(Value::Nil));
+                assert_eq!(execution.vm.roots().total_count(), baseline_roots);
+                assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
+
+                assert!(matches!(
+                    execution
+                        .debug_setlocal(&args, Register(0), ResultMode::Fixed(1), false, 0)
+                        .unwrap(),
+                    RegularCallAction::Completed(DispatchResult::Continue)
+                ));
+                assert_eq!(
+                    execution.frame.read(register),
+                    Ok(Value::Object(replacement))
+                );
+                execution.vm.remove_root(replacement_root).unwrap();
+                execution.vm.collect().unwrap();
+                assert_eq!(execution.vm.object_kind(replacement), Ok(ObjectKind::Table));
+                assert!(matches!(execution.run().unwrap(), RunOutcome::Returned(_)));
+                drop(execution);
+                vm.collect().unwrap();
+                assert_eq!(vm.object_kind(replacement), Err(VmError::StaleObject));
+                assert_eq!(vm.roots().total_count(), 0);
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn p13_h_step2_debug_registry_initialization_failure_retries_without_roots() {
+        for point in [
+            FailPoint::ObjectReserve,
+            FailPoint::RootReserve,
+            FailPoint::StringBytesReserve,
+            FailPoint::TableInsert,
+        ] {
+            let mut vm = Vm::new().unwrap();
+            vm.set_collect_every_allocation(true);
+            assert_eq!(vm.roots().total_count(), 0);
+            vm.inject_failure_once(point);
+            assert_eq!(
+                vm.debug_registry().err(),
+                Some(VmError::InjectedFailure(point))
+            );
+            assert_eq!(vm.roots().total_count(), 0);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            vm.collect().unwrap();
+            let registry = vm.debug_registry().unwrap();
+            assert_eq!(vm.roots().count(RootKind::Registry), 1);
+            assert_eq!(vm.debug_registry(), Ok(registry));
+            vm.collect().unwrap();
+            assert_eq!(vm.object_kind(registry), Ok(ObjectKind::Table));
             assert_eq!(vm.ledger_snapshot().reserved, 0);
         }
     }

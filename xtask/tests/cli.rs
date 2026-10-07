@@ -3803,10 +3803,11 @@ if args[0]=='run':
     selected=args[-1]; record('example-'+selected)
     print(f'P14_EXAMPLE:{selected}:PASS')
     raise SystemExit(0)
-if '--test' not in args:
-    record('filter-'+args[-1])
+if '--exact' not in args:
+    selector=args[args.index('--')+1]
+    record('filter-'+selector)
     if scenario=='filter-zero': count=0
-    else: count=2
+    else: count={'sdk':52,'wrapper':13,'cli':38}[selector]
     print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured')
     raise SystemExit(0)
 name=args[args.index('--test')+2]

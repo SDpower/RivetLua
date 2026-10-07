@@ -13,6 +13,7 @@ pub enum FailPoint {
     SlotReserve,
     ObjectReserve,
     ObjectInitialize,
+    ModuleConstantsReserve,
     StringBytesReserve,
     TableArrayReserve,
     TableHashReserve,
@@ -45,6 +46,7 @@ impl FailPoint {
         match self {
             Self::SlotReserve
             | Self::ObjectReserve
+            | Self::ModuleConstantsReserve
             | Self::StringBytesReserve
             | Self::TableArrayReserve
             | Self::TableHashReserve

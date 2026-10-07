@@ -1,0 +1,25 @@
+schema = "rivetlua-p15-source-v1"
+source_recorded_date = "2026-09-21"
+runner_version = "p15-basic-v2"
+
+[lua55-i64f64]
+release = "5.5.1"
+url = "https://www.lua.org/tests/lua-5.5.1-tests.tar.gz"
+tarball = "vendor/lua55/tests.tar.gz"
+tarball_sha256 = "da07b543872dc0bb2ff12aabd0c248578d78df3eb6b67efdc537a46d455c7f31"
+suite = "vendor/lua55/lua-5.5.1-tests"
+all_lua_sha256 = "f1b8b8075a71e7abc40260f6b9112e8d2a1057772f26374df4bc800d10296309"
+binary_recipe = "cargo build --locked -p rivetlua-cli --bin rivetlua"
+binary_features = "default"
+version = "RivetLua 0.0.0 (Lua 5.5.1)"
+
+[lua54-i64f64]
+release = "5.4.9"
+url = "https://www.lua.org/tests/lua-5.4.9-tests.tar.gz"
+tarball = "vendor/lua54/tests.tar.gz"
+tarball_sha256 = "7d971845f545ffc09fbb3128a86b2c6524161c70d0fdf0154a16e8c00c343fca"
+suite = "vendor/lua54/lua-5.4.9-tests"
+all_lua_sha256 = "3e296dd2b26ac6891ccba1ebaa62d40f1816ac93c7efdeaddc05aaa064e7311c"
+binary_recipe = "cargo build --locked -p rivetlua-cli --bin rivetlua --features default-lua54"
+binary_features = "default-lua54"
+version = "RivetLua 0.0.0 (Lua 5.4.9)"

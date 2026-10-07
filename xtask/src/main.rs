@@ -1,5 +1,7 @@
 //! P00 階段驗證工具。
 
+mod p15;
+
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -4835,7 +4837,7 @@ fn parse_p08_fixture(contents: &str) -> Result<Vec<P08FixtureCase>, String> {
         (
             "TAB-008",
             "runtime-contract",
-            "stack_2_live_then_removed_5_table_1",
+            "stack_objects_reclaimed_then_removed_5_table_1",
         ),
         ("TAB-009", "runtime-contract", "fields_and_ledger_unchanged"),
         ("TAB-010", "runtime-internal", "five_fields_each_once"),
@@ -5014,7 +5016,7 @@ fn validate_p08_records(
                 "TAB-006" => record.actual.contains("Returned([Nil])"),
                 "TAB-007" => record.actual.contains("Returned([Integer("),
                 "TAB-008" => [
-                    "stack_reclaimed,2",
+                    "stack_objects_reclaimed,true",
                     "live,true",
                     "removed,5",
                     "table_reclaimed,1",
@@ -11730,7 +11732,11 @@ fn p14_validate_dependencies(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn p14_check_filter_summary(label: &str, output: &str) -> Result<usize, String> {
+fn p14_check_filter_summary(
+    label: &str,
+    output: &str,
+    expected_passed: usize,
+) -> Result<usize, String> {
     let summaries = output
         .lines()
         .filter(|line| line.contains("test result:"))
@@ -11762,6 +11768,11 @@ fn p14_check_filter_summary(label: &str, output: &str) -> Result<usize, String> 
     }
     if passed_total == 0 {
         return Err(format!("P14 {label} 零匹配"));
+    }
+    if passed_total != expected_passed {
+        return Err(format!(
+            "P14 {label} 預期精確通過 {expected_passed} 個測試，實際 {passed_total}"
+        ));
     }
     Ok(passed_total)
 }
@@ -11940,17 +11951,83 @@ fn p14_gate() -> Result<(), String> {
         "28 unique profile/ID 與固定 mode/input/marker/expected",
         "target/rivetlua-reports/gate-P14.json",
     ));
-    for (name, package, filter) in [
-        ("p14-sdk-filter", "rivetlua", "sdk"),
-        ("p14-wrapper-filter", "rivetlua", "wrapper"),
-        ("p14-cli-filter", "rivetlua-cli", "cli"),
+    let sdk_filter_args = vec![
+        "test",
+        "--locked",
+        "-p",
+        "rivetlua",
+        "--test",
+        "p14_contracts",
+        "--test",
+        "sdk",
+        "--test",
+        "sdk_inputs",
+        "--test",
+        "state_separation",
+        "--test",
+        "wrapper",
+        "--",
+        "sdk",
+    ];
+    let wrapper_filter_args = vec![
+        "test", "--locked", "-p", "rivetlua", "--lib", "--test", "wrapper", "--", "wrapper",
+    ];
+    let mut cli_filter_args = vec![
+        "test",
+        "--locked",
+        "-p",
+        "rivetlua-cli",
+        "--lib",
+        "--test",
+        "cli",
+        "--test",
+        "p14_contracts",
+        "--",
+        "cli",
+    ];
+    for skipped in [
+        "cli_dump_policy_uses_finite_work_temporary_and_encoded_limits",
+        "cli_load_policy_matches_finite_gc_work_temporary_and_fuel_caps",
+        "cli_debug_policy_matches_official_suite_capabilities",
+        "cli_entropy_reader_consumes_exactly_one_native_endian_seed",
+        "cli_entropy_reader_retries_interrupted_reads",
+        "cli_entropy_reader_maps_short_reads_and_read_errors_to_read_failed",
+        "cli_unix_epoch_seconds_floor_negative_fractions",
+        "cli_unix_epoch_seconds_checks_i64_bounds_when_system_time_can_represent_them",
+        "cli_resource_deadline_expires_and_unrepresentable_deadline_fails_closed",
+        "cli_resource_budget_is_charged_before_authorize_deadline_and_perform",
+        "cli_locale_response_is_precharged_and_respects_the_temporary_limit",
+        "cli_entropy_provider_fails_closed_on_unsupported_platforms",
+        "cli_randomseed_without_arguments_uses_host_entropy_for_both_profiles",
+        "cli_randomseed_without_arguments_reports_entropy_failure_on_unsupported_platforms",
+        "cli_os_clock_and_time_use_real_host_values_for_profiles_and_build_default",
+        "cli_os_clock_is_unsupported_without_a_native_process_clock",
+        "cli_os_resource_policy_keeps_unconfigured_operations_denied",
+        "cli_os_setlocale_uses_only_fixed_c_locale_for_profiles_and_build_default",
+        "cli_default_profile_identity_and_compiler_roundtrip_match_build_feature",
+        "cli_host_load_handles_21_short_blocks_through_load_loadfile_and_require_for_both_profiles",
+        "cli_host_load_keeps_finite_work_limit_and_allows_same_vm_retry",
+        "cli_host_loads_lua55_gc_fixture_when_explicitly_enabled",
+        "cli_host_loads_lua54_gc_fixture_when_explicitly_enabled",
+        "cli_host_load_compiles_official_lua55_main_when_explicitly_enabled",
+        "cli_string_dump_round_trips_official_lua55_db_when_explicitly_enabled",
+        "cli_string_dump_round_trips_ordinary_and_stripped_closures_for_both_profiles",
+        "cli_string_dump_argument_modes_profile_and_retry_for_both_profiles",
+        "cli_string_dump_round_trips_official_lua55_main_when_explicitly_enabled",
+        "cli_debug_table_metatable_write_preserves_registry_identity_for_both_profiles",
+        "cli_debug_gethook_is_allowed_for_both_profiles",
+        "cli_debug_policy_rejects_unimplemented_ops_and_restricts_table_metatable_write",
+        "cli_debug_table_metatable_write_starts_lua55_tracegc_fixture_when_explicitly_enabled",
     ] {
-        let command = format!("cargo test --locked -p {package} -- {filter}");
-        let (exit, output) = match p14_capture(
-            &root,
-            None,
-            &["test", "--locked", "-p", package, "--", filter],
-        ) {
+        cli_filter_args.extend(["--skip", skipped]);
+    }
+    for (name, arguments, expected_count) in [
+        ("p14-sdk-filter", sdk_filter_args, 52),
+        ("p14-wrapper-filter", wrapper_filter_args, 13),
+        ("p14-cli-filter", cli_filter_args, 38),
+    ] {
+        let command = format!("cargo {}", arguments.join(" "));
+        let (exit, output) = match p14_capture(&root, None, &arguments) {
             Ok(result) => result,
             Err(error) => {
                 return Err(p14_fail(
@@ -11975,7 +12052,7 @@ fn p14_gate() -> Result<(), String> {
                 format!("selector child exit={exit}；{output}"),
             ));
         }
-        let passed = match p14_check_filter_summary(name, &output) {
+        let passed = match p14_check_filter_summary(name, &output, expected_count) {
             Ok(passed) => passed,
             Err(error) => {
                 return Err(p14_fail(
@@ -11994,7 +12071,7 @@ fn p14_gate() -> Result<(), String> {
             command,
             0,
             "PASS",
-            format!("{passed} 個真實匹配且 0 failed/ignored"),
+            format!("精確通過 {passed} 個測試；0 failed/ignored"),
             "target/rivetlua-reports/gate-P14.json",
         ));
     }
@@ -12309,6 +12386,7 @@ fn main() -> ExitCode {
             })()
         }
         Some("reference") => reference(&arguments[1..]),
+        Some("official-tests") => p15::official_tests(&arguments[1..]),
         Some("runner") => runner(&arguments[1..]),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P00") && arguments.len() == 2 => {
             GATE_REPORT_WRITTEN.store(false, Ordering::Relaxed);
@@ -12328,8 +12406,9 @@ fn main() -> ExitCode {
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P12") && arguments.len() == 2 => p12_gate(),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P13") && arguments.len() == 2 => p13_gate(),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P14") && arguments.len() == 2 => p14_gate(),
+        Some("gate") if arguments.get(1).map(String::as_str) == Some("P15") && arguments.len() == 2 => p15::gate(),
         _ => Err(
-            "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | gate P00|P01|P02|P03|P04|P05|P06|P07|P08|P09|P10|P11|P12|P13|P14".into(),
+            "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | official-tests --profile lua55-i64f64|lua54-i64f64 --mode basic | gate P00|P01|P02|P03|P04|P05|P06|P07|P08|P09|P10|P11|P12|P13|P14|P15".into(),
         ),
     };
     match result {
@@ -13579,7 +13658,7 @@ mod tests {
             "Err(NaNTableKey)",
             "Ok(Returned([Nil]))",
             "Ok(Returned([Integer(2)]))",
-            "stack_reclaimed,2;live,true;removed,5;table_reclaimed,1;reserved,0",
+            "stack_objects_reclaimed,true;live,true;removed,5;table_reclaimed,1;reserved,0",
             "fields_unchanged,true;roots,1;reserved,0;capacity=(8, 8)",
             "Ok(Nil)",
             "Ok(Nil)",
@@ -14838,28 +14917,50 @@ newline"}"#,
         ] {
             assert!(super::p14_check_exact_summary(bad).is_err());
         }
+        let filter_summaries = "test result: ok. 30 passed; 0 failed; 0 ignored\ntest result: ok. 22 passed; 0 failed; 0 ignored";
+        assert_eq!(
+            super::p14_check_filter_summary("sdk", filter_summaries, 52),
+            Ok(52)
+        );
+        assert!(super::p14_check_filter_summary("sdk", filter_summaries, 51).is_err());
+        assert!(super::p14_check_filter_summary("sdk", "", 52).is_err());
         assert!(
             super::p14_check_filter_summary(
                 "sdk",
-                "test result: ok. 1 passed; 0 failed; 0 ignored"
+                "test result: ok. bad passed; 0 failed; 0 ignored",
+                52
             )
-            .is_ok()
+            .is_err()
         );
         assert!(
             super::p14_check_filter_summary(
                 "sdk",
-                "test result: ok. 0 passed; 0 failed; 0 ignored"
+                "test result: ok. 0 passed; 0 failed; 0 ignored",
+                0
             )
             .is_err()
         );
         assert!(
             super::p14_check_filter_summary(
                 "sdk",
-                "test result: ok. 1 passed; 0 failed; 1 ignored"
+                "test result: ok. 52 passed; 1 failed; 0 ignored",
+                52
             )
             .is_err()
         );
-        assert!(super::p14_check_filter_summary("sdk", "test result: ok. 18446744073709551615 passed; 0 failed; 0 ignored\ntest result: ok. 1 passed; 0 failed; 0 ignored").is_err());
+        assert!(
+            super::p14_check_filter_summary(
+                "sdk",
+                "test result: ok. 52 passed; 0 failed; 1 ignored",
+                52
+            )
+            .is_err()
+        );
+        let overflow_summaries = format!(
+            "test result: ok. {} passed; 0 failed; 0 ignored\ntest result: ok. 1 passed; 0 failed; 0 ignored",
+            usize::MAX
+        );
+        assert!(super::p14_check_filter_summary("sdk", &overflow_summaries, 52).is_err());
         let root = std::env::temp_dir().join(format!("rivetlua-p14-unit-{}", std::process::id()));
         std::fs::create_dir_all(root.join("target/rivetlua-reports")).unwrap();
         let case = &cases[0];

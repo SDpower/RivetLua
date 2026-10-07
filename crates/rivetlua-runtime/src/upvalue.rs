@@ -15,6 +15,7 @@ pub enum UpvalueState {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Upvalue {
     state: UpvalueState,
+    identity: Option<ObjectRef>,
 }
 
 impl Upvalue {
@@ -25,11 +26,20 @@ impl Upvalue {
                 coroutine,
                 slot,
             },
+            identity: None,
         }
     }
 
     pub const fn state(&self) -> UpvalueState {
         self.state
+    }
+
+    pub const fn identity(&self) -> Option<ObjectRef> {
+        self.identity
+    }
+
+    pub(crate) fn set_identity(&mut self, identity: ObjectRef) {
+        self.identity = Some(identity);
     }
 
     pub(crate) fn close(&mut self, value: Value) {

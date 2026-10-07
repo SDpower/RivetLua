@@ -1,6 +1,6 @@
 use rivetlua_compiler::{
     BudgetedCompileError, CompileBudgetSink, CompileLimits, IrLimits, LanguageProfile,
-    compile_with_budget, emit, lex, lower, parse, resolve,
+    compile_with_budget, emit, emit_with_native_debug, lex, lower, parse, resolve,
 };
 use rivetlua_core::{
     LuaProfile, ObjectRef, OfficialChunkErrorKind, OfficialChunkLimits, Value, VerifyLimits,
@@ -39,6 +39,54 @@ fn compile(source: &[u8], language: LanguageProfile) -> rivetlua_core::VerifiedM
         .unwrap()
         .verified()
         .clone()
+}
+
+fn compile_debug(
+    source: &[u8],
+    chunk_name: &[u8],
+    language: LanguageProfile,
+) -> rivetlua_core::VerifiedModule {
+    let limits = CompileLimits::default();
+    let chunk = lex(source, language, &limits).unwrap();
+    let parsed = parse(&chunk, language, &limits).unwrap();
+    let resolved = resolve(&parsed, &chunk, language, &limits).unwrap();
+    let ir = lower(&resolved, &IrLimits::default()).unwrap();
+    emit_with_native_debug(&ir, &resolved, source, chunk_name, &VerifyLimits::default())
+        .unwrap()
+        .verified()
+        .clone()
+}
+
+fn run_with_h_debug(
+    source: &[u8],
+    services: HostServices,
+    fuel: u64,
+    collect: bool,
+) -> (Vm, RunOutcome) {
+    let (_, language, runtime_profile) = profile();
+    let mut vm = Vm::new_with_services(runtime_profile, services).unwrap();
+    vm.set_allocation_limit(64 * 1024 * 1024);
+    let environment = vm.allocate_table().unwrap();
+    let root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_debug_builtins(environment).unwrap();
+    vm.install_string_builtins(environment).unwrap();
+    vm.install_table_builtins(environment).unwrap();
+    vm.install_coroutine_builtins(environment).unwrap();
+    vm.install_io_os_builtins(environment).unwrap();
+    vm.set_collect_every_allocation(collect);
+    let mut execution = vm
+        .load_with_environment(
+            compile_debug(source, b"@p13-h.lua", language),
+            Value::Object(environment),
+        )
+        .unwrap();
+    execution.set_fuel(fuel).unwrap();
+    let outcome = execution.run().unwrap();
+    drop(execution);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    vm.remove_root(root).unwrap();
+    (vm, outcome)
 }
 
 fn run_with_basic_services(
@@ -238,6 +286,345 @@ fn p13_h_count_hook_runs_before_original_instruction_once() {
         panic!("H3 count hook 失敗: {outcome:?}");
     };
     assert_eq!(values, vec![Value::Integer(11), Value::Boolean(true)]);
+}
+
+#[test]
+fn p13_h_step3_count_numeric_for_matches_official_instruction_budget() {
+    let debug = DebugCapability::deny_all().allow(DebugPermission::CountHook);
+    let mut actual = Vec::new();
+    for count in [1, 4, 4000] {
+        let source = format!(
+            "local a=0\nlocal function hook(e) a=a+1 end\ndebug.sethook(hook,'',{count})\na=0\nfor i=1,1000 do end\nlocal measured=a\ndebug.sethook()\nreturn measured"
+        );
+        let (_, outcome) = run_with_h_debug(
+            source.as_bytes(),
+            HostServices::deny_all().and_debug(debug),
+            1_000_000,
+            false,
+        );
+        let RunOutcome::Returned(values) = outcome else {
+            panic!("numeric-for count={count} hook: {outcome:?}");
+        };
+        let [Value::Integer(hits)] = values.as_slice() else {
+            panic!("count={count} 回傳格式: {values:?}");
+        };
+        actual.push(*hits);
+    }
+    let [one, four, large] = actual.as_slice() else {
+        panic!("count hook 計數數量: {actual:?}");
+    };
+    let (_, language, _) = profile();
+    let source = b"local a=0\nlocal function hook(e) a=a+1 end\ndebug.sethook(hook,'',1)\na=0\nfor i=1,1000 do end\nlocal measured=a\ndebug.sethook()\nreturn measured";
+    let module = compile_debug(source, b"@count-hook.lua", language);
+    let loop_ops: Vec<_> = module
+        .module()
+        .prototypes
+        .iter()
+        .find(|proto| {
+            proto.instructions.iter().any(|entry| {
+                matches!(
+                    entry.instruction,
+                    rivetlua_core::Instruction::NumericForPrepare { .. }
+                )
+            })
+        })
+        .into_iter()
+        .flat_map(|proto| proto.instructions.iter().enumerate())
+        .map(|(pc, entry)| format!("{pc}:{:?}", entry.instruction))
+        .collect();
+    assert_eq!(
+        (*one, *four, *large),
+        (1005, 251, 0),
+        "loop bytecode={loop_ops:?}"
+    );
+    assert!(1000 < *one && *one < 1012);
+    assert!(250 < *four && *four < 255);
+}
+
+#[test]
+fn p13_h_step3_count_numeric_for_same_line_assertion_runs_under_hook() {
+    let source = b"local a=0\ndebug.sethook(function (e) a=a+1 end, \"\", 1)\na=0; for i=1,1000 do end; assert(1000 < a and a < 1012)\ndebug.sethook()\nreturn a";
+    let debug = DebugCapability::deny_all().allow(DebugPermission::CountHook);
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        1_000_000,
+        false,
+    );
+    assert!(
+        matches!(outcome, RunOutcome::Returned(_)),
+        "同一行且 hook 持續啟用的官方斷言: {outcome:?}"
+    );
+}
+
+#[test]
+fn p13_h_step3_getinfo_tail_extraargs_follow_profile_and_call_chain() {
+    let source = br#"local direct = debug.getinfo(print, 't').extraargs
+local function plain(...) return debug.getinfo(1, 't').extraargs end
+local inactive = debug.getinfo(plain, 't').extraargs
+local once = setmetatable({}, {__call=function(self) return debug.getinfo(1, 't').extraargs end})
+local target = function(...) return debug.getinfo(1, 't').extraargs end
+for i=1,15 do target=setmetatable({}, {__call=target}) end
+local fifteen = target(9)
+target = setmetatable({}, {__call=target})
+local ok = pcall(target, 9)
+return direct, inactive, plain(1,2), once(), fifteen, ok"#;
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::StackInspection);
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        200_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("getinfo('t') extraargs: {outcome:?}");
+    };
+    let (_, _, runtime_profile) = profile();
+    let expected = match runtime_profile {
+        LuaProfile::Lua55 => vec![
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(1),
+            Value::Integer(15),
+            Value::Boolean(false),
+        ],
+        LuaProfile::Lua54 => vec![
+            Value::Nil,
+            Value::Nil,
+            Value::Nil,
+            Value::Nil,
+            Value::Nil,
+            Value::Boolean(true),
+        ],
+    };
+    assert_eq!(values, expected);
+}
+
+#[test]
+fn p13_h_step3_getinfo_tail_frame_identity_in_default_and_explicit_masks() {
+    let source = br#"local g, g1
+local checks = {}
+local function f(x)
+  if x then
+    local current = debug.getinfo(1, 'ft')
+    local parent_default = debug.getinfo(2)
+    local parent_explicit = debug.getinfo(2, 'ft')
+    checks[1], checks[2] = current.func == f, current.istailcall
+    checks[3], checks[4] = parent_default.func == g1, parent_default.istailcall
+    checks[5], checks[6] = parent_explicit.func == g1, parent_explicit.istailcall
+  end
+end
+g = function(x) return f(x) end
+g1 = function(x) g(x) end
+local function h(x) local target=g1; return target(x) end
+h(true)
+return checks[1], checks[2], checks[3], checks[4], checks[5], checks[6]"#;
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::StackInspection);
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("getinfo tail frame: {outcome:?}");
+    };
+    assert_eq!(values, vec![Value::Boolean(true); 6]);
+}
+
+#[test]
+fn p13_h_step3_count_zero_and_line_events_are_independent() {
+    let source = br#"local zero, counts, body_lines = 0, 0, 0
+local function zero_hook(event) if event == 'count' then zero = zero + 1 end end
+debug.sethook(zero_hook, '', 0)
+for i = 1, 3 do end
+debug.sethook()
+local function both(event, line)
+  if event == 'count' then counts = counts + 1 end
+  if event == 'line' and line == 12 then body_lines = body_lines + 1 end
+end
+debug.sethook(both, 'l', 2)
+for i = 1, 3 do
+  local marker = i
+end
+debug.sethook()
+return zero, counts, body_lines"#;
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::CountHook)
+        .allow(DebugPermission::EventHook);
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("count/line hook: {outcome:?}");
+    };
+    assert_eq!(values[0], Value::Integer(0), "count=0 不得觸發");
+    assert!(
+        matches!(values[1], Value::Integer(count) if count > 0),
+        "count hook: {values:?}"
+    );
+    assert!(
+        matches!(values[2], Value::Integer(lines) if lines > 0),
+        "line hook: {values:?}"
+    );
+}
+
+#[test]
+fn p13_h_step3_official_count_uses_guest_instruction_anchors() {
+    let (_, _, runtime_profile) = profile();
+    let chunk: &[u8] = match runtime_profile {
+        LuaProfile::Lua54 => include_bytes!("official_chunk_fixtures/lua54-list-flow.luac"),
+        LuaProfile::Lua55 => include_bytes!("official_chunk_fixtures/lua55-list-flow.luac"),
+    };
+    let decoded = rivetlua_core::decode_official_chunk(
+        chunk,
+        runtime_profile,
+        &OfficialChunkLimits::default(),
+    )
+    .unwrap();
+    let translated =
+        rivetlua_core::translate_official_chunk(&decoded, &VerifyLimits::default()).unwrap();
+    let origins = translated.pc_mappings()[0].rvlu_to_official();
+    let anchors = origins
+        .iter()
+        .filter(|origin| matches!(origin, rivetlua_core::OfficialRvluPc::Anchor(_)))
+        .count();
+    let expanded = origins
+        .iter()
+        .filter(|origin| matches!(origin, rivetlua_core::OfficialRvluPc::Expanded(_)))
+        .count();
+    assert_eq!(
+        (anchors, expanded),
+        (21, 11),
+        "{runtime_profile:?} map={origins:?}"
+    );
+    let source = official_count_source(
+        chunk,
+        b"local hits=0; debug.sethook(function(e) \
+          if e=='count' and debug.getinfo(2,'f').func==f then hits=hits+1 end end,'',1); \
+          local value=f(); debug.sethook(); return hits,value",
+    );
+    let services = HostServices::deny_all()
+        .and_load(LoadCapability::deny_all().with_official_bytecode(true))
+        .and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::CountHook)
+                .allow(DebugPermission::Info)
+                .allow(DebugPermission::StackInspection),
+        );
+    let (_, outcome) = run_with_h_debug(&source, services, 1_000_000, false);
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![Value::Integer(20), Value::Integer(22)]),
+        "{runtime_profile:?} anchors={anchors} expanded={expanded} map={origins:?}"
+    );
+    assert!(!decoded.main.debug.line_info.is_empty());
+    let source = official_count_source(
+        chunk,
+        b"local counts,lines=0,0; debug.sethook(function(e) \
+          if debug.getinfo(2,'f').func==f then \
+            if e=='count' then counts=counts+1 elseif e=='line' then lines=lines+1 end \
+          end end,'l',1); \
+          local value=f(); debug.sethook(); return counts,lines,value",
+    );
+    let services = HostServices::deny_all()
+        .and_load(LoadCapability::deny_all().with_official_bytecode(true))
+        .and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::CountHook)
+                .allow(DebugPermission::EventHook)
+                .allow(DebugPermission::Info)
+                .allow(DebugPermission::StackInspection),
+        );
+    let (_, outcome) = run_with_h_debug(&source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("official line/count hook: {outcome:?}");
+    };
+    assert_eq!(values[2], Value::Integer(22));
+    assert!(
+        matches!(values[0], Value::Integer(hits) if hits > 0),
+        "{values:?}"
+    );
+    assert!(
+        matches!(values[1], Value::Integer(hits) if hits > 0),
+        "{values:?}"
+    );
+}
+
+fn official_count_source(chunk: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut source = b"local f=assert(load(\"".to_vec();
+    for byte in chunk {
+        source.extend_from_slice(format!("\\{byte:03}").as_bytes());
+    }
+    source.extend_from_slice(b"\",nil,'b')); ");
+    source.extend_from_slice(body);
+    source
+}
+
+#[test]
+fn p13_h_step3_official_count_revisits_loop_anchor() {
+    let (_, _, runtime_profile) = profile();
+    let (dump_vm, dumped_outcome, _) = run_with_string_services(
+        b"return string.dump(function(limit) local sum=0; for i=1,limit do sum=sum+i end; return sum end,false)",
+        HostServices::deny_all().and_dump(DumpCapability::deny_all().with_official_bytecode(true)),
+        None,
+        false,
+    );
+    let RunOutcome::Returned(values) = dumped_outcome else {
+        panic!("official loop dump: {dumped_outcome:?}");
+    };
+    let chunk = bytes(&dump_vm, values[0]);
+    let decoded = rivetlua_core::decode_official_chunk(
+        &chunk,
+        runtime_profile,
+        &OfficialChunkLimits::default(),
+    )
+    .unwrap();
+    let translated =
+        rivetlua_core::translate_official_chunk(&decoded, &VerifyLimits::default()).unwrap();
+    let origins = translated.pc_mappings()[0].rvlu_to_official();
+    let anchors = origins
+        .iter()
+        .filter(|origin| matches!(origin, rivetlua_core::OfficialRvluPc::Anchor(_)))
+        .count();
+    let source = official_count_source(
+        &chunk,
+        b"local hits=0; debug.sethook(function(e) \
+          if e=='count' and debug.getinfo(2,'f').func==f then hits=hits+1 end end,'',1); \
+          local zero=f(0); local first=hits; \
+          local six=f(3); local second=hits-first; \
+          debug.sethook(); return first,second,zero,six",
+    );
+    let services = HostServices::deny_all()
+        .and_load(LoadCapability::deny_all().with_official_bytecode(true))
+        .and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::CountHook)
+                .allow(DebugPermission::Info)
+                .allow(DebugPermission::StackInspection),
+        );
+    let (_, outcome) = run_with_h_debug(&source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("official loop hook: {outcome:?}");
+    };
+    assert_eq!(values[2..], [Value::Integer(0), Value::Integer(6)]);
+    let (Value::Integer(first), Value::Integer(second)) = (values[0], values[1]) else {
+        panic!("count hook results: {values:?}");
+    };
+    assert_eq!(
+        (first, second),
+        (21, 45),
+        "{runtime_profile:?} anchors={anchors}"
+    );
+    assert!(second as usize > anchors, "loop must revisit an Anchor");
 }
 
 #[test]
@@ -4497,6 +4884,57 @@ fn p13_f_official_load_checks_mode_profile_and_full_preflight_budget() {
     }
 }
 
+#[test]
+fn p13_f_nested_open_call_table_restore_roundtrips_guest_values() {
+    let source = b"local function f(...) return ... end; return {f(f(41,42))}";
+    for (language, profile) in [
+        (LanguageProfile::Lua54, LuaProfile::Lua54),
+        (LanguageProfile::Lua55, LuaProfile::Lua55),
+    ] {
+        let module = compile(source, language);
+        let mut work = rivetlua_core::OfficialWorkBudget::new(64 * 1024 * 1024);
+        let chunk = rivetlua_core::bytecode::official_export::emit_official_chunk(
+            &module,
+            rivetlua_core::ProtoId(0),
+            profile,
+            false,
+            &OfficialChunkLimits::default(),
+            &mut work,
+        )
+        .unwrap();
+        let (mut vm, environment, root) = official_load_vm(
+            profile,
+            &chunk,
+            LoadLimits {
+                max_work_units: 64 * 1024 * 1024,
+                max_temporary_bytes: 8 * 1024 * 1024,
+                max_module_allocation_bytes: 8 * 1024 * 1024,
+                ..LoadLimits::default()
+            },
+        );
+        let mut execution = vm
+            .load_with_environment(
+                compile(
+                    b"local t=assert(load(chunk,nil,'b'))(); return t[1],t[2],#t",
+                    language,
+                ),
+                Value::Object(environment),
+            )
+            .unwrap();
+        assert_eq!(
+            execution.run().unwrap(),
+            RunOutcome::Returned(vec![
+                Value::Integer(41),
+                Value::Integer(42),
+                Value::Integer(2)
+            ]),
+            "{profile:?} nested open list roundtrip"
+        );
+        drop(execution);
+        vm.remove_root(root).unwrap();
+    }
+}
+
 fn run_official_load_in_same_vm(
     vm: &mut Vm,
     language: LanguageProfile,
@@ -4560,6 +4998,97 @@ fn official_load_vm(
     vm.raw_set(environment, Value::Object(key), Value::Object(value))
         .unwrap();
     (vm, environment, root)
+}
+
+#[test]
+#[ignore = "需明示固定的 P15 db.lua 官方 chunk 路徑"]
+fn p13_p15_db_official_reload_cli_and_exact_budget_edges() {
+    let path = std::env::var_os("RIVETLUA_P15_DB_CHUNK").expect("官方 chunk 路徑");
+    let chunk = std::fs::read(path).unwrap();
+    assert_eq!(chunk.len(), 132_876);
+    let profile = LuaProfile::Lua55;
+    let stats = preflight_official_chunk(
+        &chunk,
+        profile,
+        &OfficialChunkLimits::default(),
+        &VerifyLimits::default(),
+    )
+    .unwrap();
+    let exact_work = chunk.len() * 2 + 1 + stats.subsequent_work as usize;
+    for (label, work, temporary, module, expected_success) in [
+        (
+            "cli",
+            2 * 1024 * 1024 * 1024,
+            256 * 1024 * 1024,
+            64 * 1024 * 1024,
+            true,
+        ),
+        (
+            "exact",
+            exact_work,
+            stats.temporary_bytes,
+            stats.retained_bytes,
+            true,
+        ),
+        (
+            "work one below",
+            exact_work - 1,
+            stats.temporary_bytes,
+            stats.retained_bytes,
+            false,
+        ),
+        (
+            "temporary one below",
+            exact_work,
+            stats.temporary_bytes - 1,
+            stats.retained_bytes,
+            false,
+        ),
+        (
+            "module one below",
+            exact_work,
+            stats.temporary_bytes,
+            stats.retained_bytes - 1,
+            false,
+        ),
+    ] {
+        let (mut vm, environment, root) = official_load_vm(
+            profile,
+            &chunk,
+            LoadLimits {
+                max_work_units: work,
+                max_temporary_bytes: temporary,
+                max_module_allocation_bytes: module,
+                ..LoadLimits::default()
+            },
+        );
+        let (outcome, _) = run_official_load_in_same_vm(
+            &mut vm,
+            LanguageProfile::Lua55,
+            environment,
+            Some(30_000_000_000),
+        );
+        match (expected_success, outcome.unwrap()) {
+            (true, RunOutcome::Returned(values)) => {
+                assert!(matches!(values.as_slice(), [Value::Object(_)]), "{label}");
+            }
+            (false, RunOutcome::LuaError(error)) => {
+                assert_eq!(error.kind, RuntimeErrorKind::HostLoadBudget, "{label}");
+            }
+            (_, other) => panic!("{label}: 不符預期的載入結果：{other:?}"),
+        }
+        assert_eq!(vm.ledger_snapshot().reserved, 0, "{label}");
+        let retry = vm
+            .load_with_environment(
+                compile(b"return 42", LanguageProfile::Lua55),
+                Value::Object(environment),
+            )
+            .unwrap()
+            .run()
+            .unwrap();
+        assert_eq!(retry, RunOutcome::Returned(vec![Value::Integer(42)]));
+        vm.remove_root(root).unwrap();
+    }
 }
 
 #[test]
@@ -9128,7 +9657,2278 @@ fn p13_a_stdlib_basic_pcall_xpcall_and_assert_preserve_error_boundary() {
     assert_eq!(bytes(&vm, values[5]), b"no");
 }
 
+struct V24FixtureReader {
+    gc: Vec<u8>,
+    db: Vec<u8>,
+}
+
+struct V24CompileSink<'a, 'b> {
+    budget: &'a mut LoadBudget<'b>,
+    work_spent: usize,
+}
+
+impl CompileBudgetSink for V24CompileSink<'_, '_> {
+    type Error = HostLoadError;
+
+    fn spend_work(&mut self, units: usize) -> Result<(), Self::Error> {
+        if let Err(error) = self.budget.spend_work(units) {
+            eprintln!(
+                "v24 compile first rejected claim=work prior_work={} requested={units} kind={:?}",
+                self.work_spent, error.kind,
+            );
+            return Err(error);
+        }
+        self.work_spent += units;
+        Ok(())
+    }
+
+    fn claim_temporary(&mut self, bytes: usize) -> Result<(), Self::Error> {
+        if let Err(error) = self.budget.claim_temporary(bytes) {
+            eprintln!(
+                "v24 compile first rejected claim=temporary prior_work={} requested={bytes} kind={:?}",
+                self.work_spent, error.kind,
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn claim_module_allocation(&mut self, bytes: usize) -> Result<(), Self::Error> {
+        if let Err(error) = self.budget.claim_module_allocation(bytes) {
+            eprintln!(
+                "v24 compile first rejected claim=module prior_work={} requested={bytes} kind={:?}",
+                self.work_spent, error.kind,
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+struct V24Compiler;
+
+impl HostLoadCompiler for V24Compiler {
+    fn compile(
+        &mut self,
+        source: &[u8],
+        chunkname: &[u8],
+        _: LuaProfile,
+        budget: &mut LoadBudget<'_>,
+    ) -> Result<rivetlua_core::VerifiedModule, HostLoadError> {
+        let mut sink = V24CompileSink {
+            budget,
+            work_spent: 0,
+        };
+        let result = compile_with_budget(
+            source,
+            chunkname,
+            LanguageProfile::Lua55,
+            &CompileLimits::default(),
+            &IrLimits::default(),
+            &VerifyLimits::default(),
+            &mut sink,
+        );
+        if source.len() == 26_598 {
+            eprintln!(
+                "v24 compile source_len={} chunkname={:?} work_spent={} result={:?}",
+                source.len(),
+                chunkname,
+                sink.work_spent,
+                result.as_ref().map(|_| ()).map_err(|error| match error {
+                    BudgetedCompileError::Budget(_) => "budget",
+                    _ => "other",
+                }),
+            );
+        }
+        match result {
+            Ok(module) => Ok(module),
+            Err(BudgetedCompileError::Budget(error)) => Err(error),
+            Err(BudgetedCompileError::Frontend(error)) => {
+                budget.spend_work(error.message.len() + 1)?;
+                budget.claim_temporary(error.message.len())?;
+                Err(HostLoadError::new(
+                    HostLoadErrorKind::Compile,
+                    error.message.as_bytes(),
+                ))
+            }
+            Err(
+                BudgetedCompileError::AdmissionOverflow
+                | BudgetedCompileError::AdmissionUnderestimated,
+            ) => Err(HostLoadError::new(HostLoadErrorKind::Budget, Vec::new())),
+            Err(BudgetedCompileError::Ir(_) | BudgetedCompileError::Bytecode(_)) => {
+                const MESSAGE: &[u8] = b"compile failed";
+                budget.spend_work(MESSAGE.len() + 1)?;
+                budget.claim_temporary(MESSAGE.len())?;
+                Err(HostLoadError::new(HostLoadErrorKind::Compile, MESSAGE))
+            }
+        }
+    }
+}
+
+impl HostSourceReader for V24FixtureReader {
+    fn read_path(
+        &mut self,
+        path: &[u8],
+        budget: &mut LoadBudget<'_>,
+    ) -> Result<Vec<u8>, HostLoadError> {
+        let source = match path {
+            b"gc.lua" => &self.gc,
+            b"db.lua" => &self.db,
+            _ => return Err(HostLoadError::new(HostLoadErrorKind::Failed, Vec::new())),
+        };
+        budget.spend_work(path.len() * 2 + 2)?;
+        budget.claim_temporary(source.len())?;
+        let reads = source.len().div_ceil(1024) + 1;
+        budget.spend_work(reads * 1025)?;
+        budget.spend_work(source.len() * 4 + 8)?;
+        Ok(source.clone())
+    }
+
+    fn read_stdin(&mut self, _: &mut LoadBudget<'_>) -> Result<Vec<u8>, HostLoadError> {
+        Err(HostLoadError::new(
+            HostLoadErrorKind::PolicyDenied,
+            Vec::new(),
+        ))
+    }
+}
+
+#[test]
+#[ignore = "需明示 RIVETLUA_V24_FIXTURES、RIVETLUA_V24_FUEL_CASE、RIVETLUA_V24_FUEL_LIMIT"]
+fn p13_v24_gc_db_shared_fuel_diagnostic() {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("RIVETLUA_V24_FIXTURES").expect("指定未修改的官方 fixture 目錄"),
+    );
+    let gc = std::fs::read(directory.join("gc.lua")).unwrap();
+    let db = std::fs::read(directory.join("db.lua")).unwrap();
+    assert_eq!(gc.len(), 19_650);
+    assert_eq!(db.len(), 26_598);
+    let case = std::env::var("RIVETLUA_V24_FUEL_CASE").expect("指定 gc/db/gc_db");
+    let limit = std::env::var("RIVETLUA_V24_FUEL_LIMIT")
+        .expect("指定有限 fuel")
+        .parse::<u64>()
+        .unwrap();
+    let dump_work = std::env::var("RIVETLUA_V24_DUMP_WORK")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(64 * 1024 * 1024);
+    let load_work = std::env::var("RIVETLUA_V24_LOAD_WORK")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(2 * 1024 * 1024 * 1024);
+    let load_temporary = std::env::var("RIVETLUA_V24_LOAD_TEMPORARY")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(256 * 1024 * 1024);
+    let load_module = std::env::var("RIVETLUA_V24_LOAD_MODULE")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(64 * 1024 * 1024);
+    let source: &[u8] = match case.as_str() {
+        "gc" => b"assert(loadfile('gc.lua'))(); print('V24 after gc'); return 1",
+        "db_load" => b"local f=assert(loadfile('db.lua')); print('V24 after db load'); return type(f)",
+        "db_dump" => b"local f=assert(loadfile('db.lua')); print('V24 after db load'); local b=string.dump(f); print('V24 after db dump'); return #b",
+        "db_reload" => b"local f=assert(loadfile('db.lua')); print('V24 after db load'); local b=string.dump(f); print('V24 after db dump'); f=assert(load(b)); print('V24 after db reload'); return type(f)",
+        "db" => b"local f=assert(loadfile('db.lua')); print('V24 after db load'); local b=string.dump(f); print('V24 after db dump'); f=assert(load(b)); print('V24 after db reload'); return f()",
+        "gc_db_reload" => b"assert(loadfile('gc.lua'))(); print('V24 after gc'); local f=assert(loadfile('db.lua')); print('V24 after db load'); local b=string.dump(f); print('V24 after db dump'); f=assert(load(b)); print('V24 after db reload'); return type(f)",
+        "gc_db" => b"assert(loadfile('gc.lua'))(); print('V24 after gc'); local f=assert(loadfile('db.lua')); print('V24 after db load'); local b=string.dump(f); print('V24 after db dump'); f=assert(load(b)); print('V24 after db reload'); return f()",
+        _ => panic!("未知 fuel case"),
+    };
+    let output = Rc::new(RefCell::new(Vec::new()));
+    let load = LoadCapability::deny_all()
+        .and_reader(V24FixtureReader { gc, db })
+        .and_compiler(V24Compiler)
+        .with_bytecode(true)
+        .with_official_bytecode(true)
+        .with_limits(LoadLimits {
+            max_source_bytes: 4 * 1024 * 1024,
+            max_encoded_bytes: 64 * 1024 * 1024,
+            max_module_allocation_bytes: load_module,
+            max_temporary_bytes: load_temporary,
+            max_work_units: load_work,
+            max_reader_chunks: 512,
+            max_path_candidates: 512,
+        });
+    let dump = DumpCapability::deny_all()
+        .with_official_bytecode(true)
+        .with_limits(DumpLimits {
+            max_work_units: dump_work,
+            max_temporary_bytes: 4 * 1024 * 1024,
+            max_encoded_bytes: 1024 * 1024,
+        });
+    let services = HostServices::with_output(TestOutput(output.clone(), false))
+        .and_load(load)
+        .and_dump(dump)
+        .and_debug(DebugCapability::deny_all().allow(DebugPermission::TableMetatableWrite));
+    let mut vm = Vm::new_with_services(LuaProfile::Lua55, services).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_package_builtins(environment).unwrap();
+    vm.install_table_builtins(environment).unwrap();
+    vm.install_math_builtins(environment).unwrap();
+    vm.install_utf8_builtins(environment).unwrap();
+    vm.install_string_builtins(environment).unwrap();
+    vm.install_coroutine_builtins(environment).unwrap();
+    vm.install_debug_builtins(environment).unwrap();
+    vm.install_io_os_builtins(environment).unwrap();
+    let mut execution = vm
+        .load_with_environment(
+            compile(source, LanguageProfile::Lua55),
+            Value::Object(environment),
+        )
+        .unwrap();
+    execution.set_fuel(limit).unwrap();
+    let outcome = execution.run().unwrap();
+    let remaining = execution.fuel_remaining();
+    drop(execution);
+    let output = output.borrow();
+    let tail = &output[output.len().saturating_sub(500)..];
+    eprintln!(
+        "v24 case={case} fuel_limit={limit} dump_work={dump_work} load_work={load_work} load_temporary={load_temporary} load_module={load_module} outcome={outcome:?} fuel_remaining={remaining} fuel_spent={} output_tail={}",
+        limit - remaining,
+        String::from_utf8_lossy(tail),
+    );
+    match std::env::var("RIVETLUA_V24_EXPECT").ok().as_deref() {
+        Some("reload") => {
+            let RunOutcome::Returned(values) = &outcome else {
+                panic!("reload 應返回 function 類型：{outcome:?}")
+            };
+            assert_eq!(bytes(&vm, values[0]), b"function");
+            assert!(
+                output
+                    .windows(b"V24 after db reload".len())
+                    .any(|window| { window == b"V24 after db reload" })
+            );
+        }
+        Some("load_budget") => {
+            let RunOutcome::LuaError(error) = &outcome else {
+                panic!("load 准入應拒絕：{outcome:?}")
+            };
+            assert_eq!(error.kind, RuntimeErrorKind::HostLoadBudget);
+            assert!(
+                output
+                    .windows(b"V24 after db dump".len())
+                    .any(|window| { window == b"V24 after db dump" })
+            );
+            assert!(
+                !output
+                    .windows(b"V24 after db reload".len())
+                    .any(|window| { window == b"V24 after db reload" })
+            );
+        }
+        None => {}
+        other => panic!("未知 V24 預期結果：{other:?}"),
+    }
+    drop(output);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    let retry = vm
+        .load_with_environment(
+            compile(b"return 42", LanguageProfile::Lua55),
+            Value::Object(environment),
+        )
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(retry, RunOutcome::Returned(vec![Value::Integer(42)]));
+    vm.remove_root(root).unwrap();
+}
+
 struct TestOutput(Rc<RefCell<Vec<u8>>>, bool);
+
+#[test]
+#[ignore = "原版 db.lua 前 257 行的有限資源診斷，需明示 RIVETLUA_P13_PROFILE"]
+fn p13_h_official_db_first_segment_diagnostic() {
+    run_official_db_prefix(257);
+}
+
+#[test]
+#[ignore = "原版 db.lua 前 305 行的有限資源診斷，需明示 RIVETLUA_P13_PROFILE"]
+fn p13_h_official_db_local_vararg_segment_diagnostic() {
+    run_official_db_prefix(305);
+}
+
+#[test]
+#[ignore = "原版 db.lua 到 traceback 前的有限資源診斷，需明示 RIVETLUA_P13_PROFILE"]
+fn p13_h_step3_official_db_hook_upvalue_segment_diagnostic() {
+    let (_, _, runtime_profile) = profile();
+    run_official_db_prefix(match runtime_profile {
+        LuaProfile::Lua55 => 702,
+        LuaProfile::Lua54 => 693,
+    });
+}
+
+#[test]
+fn p13_h_step3_official_closure_upvalue_identity_and_join() {
+    let (_, language, runtime_profile) = profile();
+    let original: &[u8] = match runtime_profile {
+        LuaProfile::Lua55 => include_bytes!("../../../vendor/lua55/lua-5.5.1-tests/closure.lua"),
+        LuaProfile::Lua54 => include_bytes!("../../../vendor/lua54/lua-5.4.9-tests/closure.lua"),
+    };
+    let (start, end) = match runtime_profile {
+        LuaProfile::Lua55 => (238, 277),
+        LuaProfile::Lua54 => (239, 278),
+    };
+    let source: Vec<u8> = original
+        .split_inclusive(|byte| *byte == b'\n')
+        .skip(start - 1)
+        .take(end - start + 1)
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(source.iter().filter(|byte| **byte == b'\n').count(), 40);
+    assert!(source.starts_with(b"-- test for debug manipulation of upvalues\n"));
+    assert!(source.ends_with(b"assert(not pcall(debug.upvaluejoin, foo1, 1, print, 1))\n"));
+
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::Upvalues)
+        .allow(DebugPermission::UpvalueMutation)
+        .allow(DebugPermission::UpvalueIdentity);
+    let mut vm =
+        Vm::new_with_services(runtime_profile, HostServices::deny_all().and_debug(debug)).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_package_builtins(environment).unwrap();
+    vm.install_string_builtins(environment).unwrap();
+    vm.install_debug_builtins(environment).unwrap();
+    let module = compile_debug(&source, b"@closure.lua", language);
+    let mut execution = vm
+        .load_with_environment(module, Value::Object(environment))
+        .unwrap();
+    execution.set_fuel(5_000_000).unwrap();
+    let outcome = execution.run().unwrap();
+    drop(execution);
+    assert_eq!(outcome, RunOutcome::Returned(vec![]));
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    vm.remove_root(root).unwrap();
+}
+
+#[test]
+fn p13_h_step3_hook_callback_info_name_and_traceback() {
+    let source = b"local name,trace\nlocal function h() if name==nil then name=debug.getinfo(1).namewhat; trace=debug.traceback(); debug.sethook() end end\ndebug.sethook(h,'l')\nlocal x=1\nreturn name,trace";
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::StackInspection)
+        .allow(DebugPermission::EventHook)
+        .allow(DebugPermission::Traceback);
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        1_000_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("hook name/traceback: {outcome:?}");
+    };
+    assert_eq!(bytes(&vm, values[0]), b"hook");
+    assert!(bytes(&vm, values[1]).windows(4).any(|part| part == b"hook"));
+}
+
+#[test]
+fn p13_h_step3_upvalue_open_closed_write_join_and_gc() {
+    let source = b"local f,g; do local x=1; f=function() return x end; g=function() return x end; assert(debug.upvalueid(f,1)==debug.upvalueid(g,1)); assert(debug.setupvalue(f,1,{n=3})=='x'); assert(g().n==3) end; collectgarbage('collect'); local h=(function() local y=7; return function() return y end end)(); assert(debug.upvalueid(f,1)~=debug.upvalueid(h,1)); debug.upvaluejoin(h,1,f,1); collectgarbage('collect'); assert(h()==g()); assert(debug.setupvalue(h,1,{n=4})=='y'); return f().n,g().n,h().n";
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::Upvalues)
+        .allow(DebugPermission::UpvalueMutation)
+        .allow(DebugPermission::UpvalueIdentity);
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        1_000_000,
+        false,
+    );
+    assert_eq!(outcome, RunOutcome::Returned(vec![Value::Integer(4); 3]),);
+}
+
+#[test]
+fn p13_h_step3_upvalue_permissions_are_independent() {
+    let source = b"local x=1; local f=function() return x end; local ok=pcall(debug.setupvalue,f,1,2); return ok,f()";
+    let (_, read_only) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::Upvalues)),
+        100_000,
+        false,
+    );
+    assert_eq!(
+        read_only,
+        RunOutcome::Returned(vec![Value::Boolean(false), Value::Integer(1)]),
+    );
+    let source = b"local x=1; local f=function() return x end; local ok=pcall(debug.upvalueid,f,1); local name=debug.setupvalue(f,1,2); return ok,name,f()";
+    let (vm, mutate_only) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::UpvalueMutation)),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = mutate_only else {
+        panic!("upvalue mutation 權限: {mutate_only:?}");
+    };
+    assert_eq!(values[0], Value::Boolean(false));
+    assert_eq!(bytes(&vm, values[1]), b"x");
+    assert_eq!(values[2], Value::Integer(2));
+    let source = b"local x=1; local f=function() return x end; local id=debug.upvalueid(f,1); local ok=pcall(debug.setupvalue,f,1,2); return id~=nil,ok,f()";
+    let (_, identity_only) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::UpvalueIdentity)),
+        100_000,
+        false,
+    );
+    assert_eq!(
+        identity_only,
+        RunOutcome::Returned(vec![
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Integer(1),
+        ]),
+    );
+}
+
+#[test]
+fn p13_h_step3_string_iterator_identity_does_not_root_iterator() {
+    let source = b"local first=string.gmatch('x','x'); local second=string.gmatch('x','x'); local id=debug.upvalueid(first,1); return first,second,id,id==debug.upvalueid(first,1),id~=debug.upvalueid(second,1),debug.upvalueid(first,4)==nil";
+    let (mut vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::UpvalueIdentity)),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("C iterator upvalue identity: {outcome:?}");
+    };
+    assert_eq!(&values[3..], &[Value::Boolean(true); 3]);
+    let (Value::Object(first), Value::Object(second), Value::Object(identity)) =
+        (values[0], values[1], values[2])
+    else {
+        panic!("C iterator 身分必須為物件");
+    };
+    let identity_root = vm.add_root(RootKind::Host, identity).unwrap();
+    vm.collect().unwrap();
+    assert_eq!(vm.object_kind(first), Err(VmError::StaleObject));
+    assert_eq!(vm.object_kind(second), Err(VmError::StaleObject));
+    assert_eq!(vm.object_kind(identity), Ok(ObjectKind::Value));
+    vm.remove_root(identity_root).unwrap();
+    vm.collect().unwrap();
+    assert_eq!(vm.object_kind(identity), Err(VmError::StaleObject));
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_h_step3_lua_upvalue_identity_does_not_root_capture() {
+    let source = b"local t={}; local f=function() return t end; local id=debug.upvalueid(f,1); return f,t,id,debug.getupvalue(f,1)";
+    let (mut vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::Upvalues)
+                .allow(DebugPermission::UpvalueIdentity),
+        ),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("Lua upvalue identity GC: {outcome:?}");
+    };
+    assert_eq!(bytes(&vm, values[3]), b"t");
+    assert_eq!(values[4], values[1]);
+    let (Value::Object(function), Value::Object(capture), Value::Object(identity)) =
+        (values[0], values[1], values[2])
+    else {
+        panic!("Lua upvalue 身分必須為物件");
+    };
+    let identity_root = vm.add_root(RootKind::Host, identity).unwrap();
+    vm.collect().unwrap();
+    assert_eq!(vm.object_kind(function), Err(VmError::StaleObject));
+    assert_eq!(vm.object_kind(capture), Err(VmError::StaleObject));
+    assert_eq!(vm.object_kind(identity), Ok(ObjectKind::Value));
+    vm.remove_root(identity_root).unwrap();
+    vm.collect().unwrap();
+    assert_eq!(vm.object_kind(identity), Err(VmError::StaleObject));
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_h_step3_hook_masks_and_large_count_round_trip() {
+    let source = b"local h=function() end; debug.sethook(h,'lrc'); local f,m,c=debug.gethook(); debug.sethook(); return f==h,m,c";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::EventHook)),
+        200_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("hook mask: {outcome:?}");
+    };
+    assert_eq!(values[0], Value::Boolean(true));
+    assert_eq!(bytes(&vm, values[1]), b"crl");
+    assert_eq!(values[2], Value::Integer(0));
+
+    let source = b"debug.sethook(print,'',2^24-1); local f,m,c=debug.gethook(); debug.sethook(); return f==print,m,c";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::CountHook)),
+        200_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("hook large count: {outcome:?}");
+    };
+    assert_eq!(values[0], Value::Boolean(true));
+    assert_eq!(bytes(&vm, values[1]), b"");
+    assert_eq!(values[2], Value::Integer((1 << 24) - 1));
+}
+
+#[test]
+fn p13_h_step3_loaded_local_initializer_line_hook_temporaries() {
+    let source = br#"local co = load[[
+  local A = function ()
+    return x
+  end
+  return
+]]
+local observations = {}
+debug.sethook(function(_, line)
+  if line == 3 or line == 4 then
+    local name, value = debug.getlocal(2, 1)
+    observations[#observations + 1] = {line, name, value}
+  end
+end, 'l')
+co()
+debug.sethook()
+return #observations, observations"#;
+    let services = HostServices::deny_all()
+        .and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::EventHook)
+                .allow(DebugPermission::LocalInspection),
+        )
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("載入 chunk 的 local initializer line hook: {outcome:?}");
+    };
+    assert_eq!(values.len(), 2);
+    let Value::Object(observations) = values[1] else {
+        panic!("line hook 觀察結果須為表格")
+    };
+    let count = match values[0] {
+        Value::Integer(count) => count,
+        other => panic!("line hook 事件數量須為整數: {other:?}"),
+    };
+    let mut actual = Vec::new();
+    for ordinal in 1..=count {
+        let Value::Object(observation) = vm.raw_get(observations, Value::Integer(ordinal)).unwrap()
+        else {
+            panic!("line hook 每筆觀察須為表格")
+        };
+        let line = vm.raw_get(observation, Value::Integer(1)).unwrap();
+        let name = match vm.raw_get(observation, Value::Integer(2)).unwrap() {
+            Value::Object(object) => vm
+                .with_byte_string(object, |string| string.as_bytes().to_vec())
+                .ok(),
+            _ => None,
+        };
+        let value = vm.raw_get(observation, Value::Integer(3)).unwrap();
+        actual.push((line, name, value));
+    }
+    assert_eq!(actual.len(), 2, "actual={actual:?}");
+    assert_eq!(actual[0].0, Value::Integer(3), "actual={actual:?}");
+    assert_eq!(
+        actual[0].1,
+        Some(b"(temporary)".to_vec()),
+        "actual={actual:?}"
+    );
+    assert_eq!(actual[1].0, Value::Integer(4), "actual={actual:?}");
+    assert_eq!(actual[1].1, Some(b"A".to_vec()), "actual={actual:?}");
+}
+
+#[test]
+fn p13_h_step3_initializer_setlocal_is_rooted_then_overwritten_by_closure() {
+    let source = br#"local marker = {}
+local co = load[[
+  local A = function ()
+    return 7
+  end
+  return A
+]]
+local observed = {}
+debug.sethook(function(_, line)
+  if line == 3 then
+    local name, before = debug.getlocal(2, 1)
+    local hidden = debug.getlocal(2, 2)
+    local set_name = debug.setlocal(2, 1, marker)
+    local after_name, after = debug.getlocal(2, 1)
+    observed[1] = name == '(temporary)' and before == nil and hidden == nil
+      and set_name == '(temporary)' and after_name == '(temporary)' and after == marker
+  elseif line == 4 then
+    local name, value = debug.getlocal(2, 1)
+    observed[2] = name == 'A' and type(value) == 'function' and value ~= marker
+  end
+end, 'l')
+local f = co()
+debug.sethook()
+return #observed, observed[1], observed[2], f()"#;
+    let services = HostServices::deny_all()
+        .and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::EventHook)
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation),
+        )
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, true);
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![
+            Value::Integer(2),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Integer(7),
+        ])
+    );
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_h_step3_initializer_normal_call_uses_suspended_call_pc() {
+    let source = br#"local observed = false
+local function probe()
+  local active = debug.getlocal(2, 2)
+  local temporary, value = debug.getlocal(2, 3)
+  local hidden = debug.getlocal(2, 4)
+  observed = active == 'probe' and temporary == '(temporary)' and value == nil and hidden == nil
+  return function() return 7 end
+end
+local A = probe()
+local name = debug.getlocal(1, 3)
+return observed, name == 'A', A()"#;
+    let services = HostServices::deny_all()
+        .and_debug(DebugCapability::deny_all().allow(DebugPermission::LocalInspection));
+    let (_, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Integer(7),
+        ])
+    );
+}
+
+#[test]
+fn p13_h_step3_initializer_line_hook_helper_uses_original_frame_pc() {
+    let source = br#"local co = load[[
+  local A = function ()
+    return 7
+  end
+  return A
+]]
+local observed = {}
+local function inspect() return debug.getlocal(3, 1) end
+debug.sethook(function(_, line)
+  if line == 3 or line == 4 then observed[#observed + 1] = inspect() end
+end, 'l')
+local f = co()
+debug.sethook()
+return #observed, observed[1], observed[2], f()"#;
+    let services = HostServices::deny_all()
+        .and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::EventHook)
+                .allow(DebugPermission::LocalInspection),
+        )
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("line hook helper: {outcome:?}")
+    };
+    assert_eq!(values.len(), 4);
+    assert_eq!(values[0], Value::Integer(2));
+    assert_eq!(bytes(&vm, values[1]), b"(temporary)");
+    assert_eq!(bytes(&vm, values[2]), b"A");
+    assert_eq!(values[3], Value::Integer(7));
+}
+
+#[test]
+fn p13_h_step3_initializer_count_and_return_hooks_use_distinct_pc_modes() {
+    let source = br#"local co = load[[
+  local A = function ()
+    return 7
+  end
+  return A
+]]
+local temporary_count, named_count, returned = 0, 0, false
+debug.sethook(function(event)
+  if debug.getinfo(2, 'f').func == co then
+    local name = debug.getlocal(2, 1)
+    if event == 'count' and name == '(temporary)' then temporary_count = temporary_count + 1 end
+    if event == 'count' and name == 'A' then named_count = named_count + 1 end
+    if event == 'return' then returned = name == 'A' end
+  end
+end, 'r', 1)
+local f = co()
+debug.sethook()
+return temporary_count, named_count, returned, f()"#;
+    let services = HostServices::deny_all()
+        .and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::EventHook)
+                .allow(DebugPermission::CountHook)
+                .allow(DebugPermission::Info)
+                .allow(DebugPermission::StackInspection)
+                .allow(DebugPermission::LocalInspection),
+        )
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (_, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![
+            Value::Integer(1),
+            Value::Integer(2),
+            Value::Boolean(true),
+            Value::Integer(7),
+        ])
+    );
+}
+
+#[test]
+fn p13_h_step3_nested_multiple_missing_and_multivalue_initializers_are_ordered() {
+    let source = br#"local seen = {}
+local function probe(slot, count)
+  local first = debug.getlocal(2, slot)
+  local second = debug.getlocal(2, slot + 1)
+  local hidden = debug.getlocal(2, slot + 2)
+  seen[#seen + 1] = first == '(temporary)' and second == '(temporary)' and hidden == nil
+  if count == 1 then return 5 end
+  return 5, 6
+end
+local outer = 1
+do
+  local a,b = probe(4, 1), 3
+  local c,d = probe(6, 1)
+  local e,f = probe(8, 2)
+  return seen[1], seen[2], seen[3], outer, a, b, c, d, e, f
+end"#;
+    let services = HostServices::deny_all()
+        .and_debug(DebugCapability::deny_all().allow(DebugPermission::LocalInspection));
+    let (_, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Integer(1),
+            Value::Integer(5),
+            Value::Integer(3),
+            Value::Integer(5),
+            Value::Nil,
+            Value::Integer(5),
+            Value::Integer(6),
+        ])
+    );
+}
+
+#[test]
+fn p13_h_step3_parked_initializer_setlocal_keeps_object_alive_until_resume() {
+    let source = br#"local co,d,gc = coroutine,debug,collectgarbage
+local thread = co.create(function()
+  local A = co.yield('pause')
+  return A
+end)
+local ok, first = co.resume(thread)
+local name, before = d.getlocal(thread, 1, 1)
+local marker = {payload=73}
+local written = d.setlocal(thread, 1, 1, marker)
+marker = nil
+gc('collect')
+local after_name, after = d.getlocal(thread, 1, 1)
+local ok2, result = co.resume(thread, 99)
+return ok, first, name, before, written, after_name, after.payload, ok2, result"#;
+    let services = HostServices::deny_all().and_debug(
+        DebugCapability::deny_all()
+            .allow(DebugPermission::LocalInspection)
+            .allow(DebugPermission::LocalMutation),
+    );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, true);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("parked initializer: {outcome:?}")
+    };
+    assert_eq!(values.len(), 9);
+    assert_eq!(values[0], Value::Boolean(true));
+    assert_eq!(bytes(&vm, values[1]), b"pause");
+    assert_eq!(bytes(&vm, values[2]), b"(temporary)");
+    assert_eq!(values[3], Value::Nil);
+    assert_eq!(bytes(&vm, values[4]), b"(temporary)");
+    assert_eq!(bytes(&vm, values[5]), b"(temporary)");
+    assert_eq!(values[6], Value::Integer(73));
+    assert_eq!(values[7], Value::Boolean(true));
+    assert_eq!(values[8], Value::Integer(99));
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_h_step3_hook_official_call_return_tail_order() {
+    let source = br#"local function f(x) if x then return x end end
+local function g(x) return f(x) end
+local function g1(x) g(x) end
+local function h(x) local f=g1; return f(x) end
+local b = {}
+debug.sethook(function(e) table.insert(b, e) end, 'cr')
+h(false)
+debug.sethook()
+return table.concat(b, ','), #b"#;
+    for collect in [false, true] {
+        let (vm, outcome) = run_with_h_debug(
+            source,
+            HostServices::deny_all()
+                .and_debug(DebugCapability::deny_all().allow(DebugPermission::EventHook)),
+            1_000_000,
+            collect,
+        );
+        let RunOutcome::Returned(values) = outcome else {
+            panic!("官方 call/return/tail call 序列 collect={collect}: {outcome:?}");
+        };
+        assert_eq!(
+            bytes(&vm, values[0]),
+            b"return,call,tail call,call,tail call,return,return,call"
+        );
+        assert_eq!(values[1], Value::Integer(8));
+    }
+}
+
+#[test]
+fn p13_h_step3_hook_call_return_tail_and_builtin_frame_visibility() {
+    let source = b"local log={}\nlocal function f(x) local y=x+1; return y end\nlocal function g(x) return f(x) end\nlocal function h(e,l) local i=debug.getinfo(2,'ft'); if i.func==f or i.func==g then if e~='return' then local n,v=debug.getlocal(2,1); assert(n=='x' and v==4) end; assert(l==nil); log[#log+1]=e..':'..(i.func==f and 'f' or 'g'); if e=='tail call' then assert(i.istailcall) end elseif i.func==type then log[#log+1]=e..':type' end end\ndebug.sethook(h,'cr')\nlocal result=g(4)\nlocal kind=type(result)\ndebug.sethook()\nreturn table.concat(log,','),result,kind";
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::EventHook)
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::StackInspection)
+        .allow(DebugPermission::LocalInspection);
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        1_000_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        let detail = match &outcome {
+            RunOutcome::LuaError(error) => match error.value {
+                Value::Object(object) => vm
+                    .with_byte_string(object, |string| string.as_bytes().to_vec())
+                    .ok(),
+                _ => None,
+            },
+            _ => None,
+        };
+        panic!("hook lifecycle: {outcome:?} detail={detail:?}");
+    };
+    assert_eq!(
+        bytes(&vm, values[0]),
+        b"call:g,tail call:f,return:f,call:type,return:type"
+    );
+    assert_eq!(values[1], Value::Integer(5));
+    assert_eq!(bytes(&vm, values[2]), b"number");
+}
+
+fn run_transfer_debug(source: &[u8], collect: bool) -> (Vm, RunOutcome) {
+    let (_, language, runtime_profile) = profile();
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::EventHook)
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::StackInspection)
+        .allow(DebugPermission::LocalInspection);
+    let mut vm =
+        Vm::new_with_services(runtime_profile, HostServices::deny_all().and_debug(debug)).unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_math_builtins(environment).unwrap();
+    vm.install_debug_builtins(environment).unwrap();
+    vm.set_collect_every_allocation(collect);
+    let mut execution = vm
+        .load_with_environment(
+            compile_debug(source, b"@p13-h-transfer.lua", language),
+            Value::Object(environment),
+        )
+        .unwrap();
+    execution.set_fuel(1_000_000).unwrap();
+    let outcome = execution.run().unwrap();
+    drop(execution);
+    assert_eq!(vm.roots().count(RootKind::Stack), 0);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    vm.remove_root(root).unwrap();
+    (vm, outcome)
+}
+
+#[test]
+fn p13_h_step3_transfer_non_hook_info_is_zero() {
+    let source = br#"local function foo(a) return a end
+local a = debug.getinfo(foo, 'r')
+local b = debug.getinfo(1, 'r')
+debug.sethook(function() end, 'cr')
+foo(1)
+debug.sethook()
+local c = debug.getinfo(foo, 'r')
+local d = debug.getinfo(1, 'r')
+return a.ftransfer, a.ntransfer, b.ftransfer, b.ntransfer,
+       c.ftransfer, c.ntransfer, d.ftransfer, d.ntransfer"#;
+    let (_, outcome) = run_transfer_debug(source, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("非 hook r 欄位: {outcome:?}");
+    };
+    assert_eq!(values, vec![Value::Integer(0); 8]);
+}
+
+#[test]
+fn p13_h_step3_transfer_zero_count_matches_profile_hook_state() {
+    let source = br#"local call_first, call_count, return_first, return_count
+local function empty() return end
+local function hook(event)
+  local info = debug.getinfo(2, 'fr')
+  if info.func == empty then
+    if event == 'call' then
+      call_first, call_count = info.ftransfer, info.ntransfer
+    elseif event == 'return' then
+      return_first, return_count = info.ftransfer, info.ntransfer
+    end
+  end
+end
+debug.sethook(hook, 'cr')
+empty()
+debug.sethook()
+return call_first, call_count, return_first, return_count"#;
+    let (_, outcome) = run_transfer_debug(source, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("零 transfer hook: {outcome:?}");
+    };
+    assert_eq!(values[1], Value::Integer(0));
+    assert_eq!(values[3], Value::Integer(0));
+    match profile().2 {
+        LuaProfile::Lua55 => {
+            assert_eq!(values[0], Value::Integer(1));
+            assert!(matches!(values[2], Value::Integer(_)));
+        }
+        LuaProfile::Lua54 => assert_eq!(values, vec![Value::Integer(0); 4]),
+    }
+}
+
+#[test]
+fn p13_h_step3_transfer_lua_call_return_vararg_values() {
+    let source = br#"local calls, returns = 0, 0
+local function foo(a, ...) return a, ... end
+local function hook(event)
+  local info = debug.getinfo(2, 'fr')
+  if info.func == foo then
+    if event == 'call' then
+      assert(info.ftransfer == 1 and info.ntransfer == 1)
+      local name, value = debug.getlocal(2, info.ftransfer)
+      assert(name == 'a' and value == 10)
+      local varname, varvalue = debug.getlocal(2, -1)
+      assert(varname == '(vararg)' and varvalue == 20)
+      calls = calls + 1
+    elseif event == 'return' then
+      assert(info.ftransfer >= 1 and info.ntransfer == 3)
+      local _, a = debug.getlocal(2, info.ftransfer)
+      local _, b = debug.getlocal(2, info.ftransfer + 1)
+      local _, c = debug.getlocal(2, info.ftransfer + 2)
+      assert(a == 10 and b == 20 and c == 30)
+      returns = returns + 1
+    end
+  end
+end
+debug.sethook(hook, 'cr')
+local a, b, c = foo(10, 20, 30)
+debug.sethook()
+return calls, returns, a, b, c"#;
+    let (_, outcome) = run_transfer_debug(source, true);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("Lua call/return transfer: {outcome:?}");
+    };
+    assert_eq!(
+        values,
+        vec![
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(10),
+            Value::Integer(20),
+            Value::Integer(30)
+        ]
+    );
+}
+
+#[test]
+fn p13_h_step3_transfer_builtin_call_return_values() {
+    let source = br#"local sin_call, sin_return, select_call, select_return = 0, 0, 0, 0
+local sin, select = math.sin, select
+local function hook(event)
+  local info = debug.getinfo(2, 'fr')
+  if info.func == sin or info.func == select then
+    local expected = info.func == sin and (event == 'call' and {3} or {sin(3)})
+      or (event == 'call' and {2, 10, 20, 30, 40} or {20, 30, 40})
+    assert(info.ftransfer == 1 and info.ntransfer == #expected)
+    for i = 1, #expected do
+      local name, value = debug.getlocal(2, info.ftransfer + i - 1)
+      assert(name == '(C temporary)' and value == expected[i])
+    end
+    if info.func == sin then
+      if event == 'call' then sin_call = sin_call + 1 else sin_return = sin_return + 1 end
+    else
+      if event == 'call' then select_call = select_call + 1 else select_return = select_return + 1 end
+    end
+  end
+end
+debug.sethook(hook, 'cr')
+sin(3)
+select(2, 10, 20, 30, 40)
+local a = sin(3)
+local b, c, d = select(2, 10, 20, 30, 40)
+debug.sethook()
+return sin_call, sin_return, select_call, select_return, a, b, c, d"#;
+    let (_, outcome) = run_transfer_debug(source, true);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("builtin call/return transfer: {outcome:?}");
+    };
+    assert_eq!(&values[..4], &[Value::Integer(2); 4]);
+    assert_eq!(values[4], Value::Float(3_f64.sin()));
+    assert_eq!(
+        &values[5..],
+        &[Value::Integer(20), Value::Integer(30), Value::Integer(40)]
+    );
+}
+
+#[test]
+fn p13_h_step3_transfer_tail_call_input_and_return_output() {
+    let source = br#"local calls, returns = 0, 0
+local function foo(a, ...) return ... end
+local function wrapper() return foo(20, 10, 0) end
+local function hook(event)
+  local info = debug.getinfo(2, 'frt')
+  if info.func == foo then
+    if event == 'tail call' then
+      assert(info.istailcall and info.ftransfer == 1 and info.ntransfer == 1)
+      local name, value = debug.getlocal(2, info.ftransfer)
+      assert(name == 'a' and value == 20)
+      calls = calls + 1
+    elseif event == 'return' then
+      assert(info.ftransfer >= 1 and info.ntransfer == 2)
+      local _, a = debug.getlocal(2, info.ftransfer)
+      local _, b = debug.getlocal(2, info.ftransfer + 1)
+      assert(a == 10 and b == 0)
+      returns = returns + 1
+    end
+  end
+end
+debug.sethook(hook, 'cr')
+local a, b = wrapper()
+debug.sethook()
+return calls, returns, a, b"#;
+    let (_, outcome) = run_transfer_debug(source, true);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("tail call transfer: {outcome:?}");
+    };
+    assert_eq!(
+        values,
+        vec![
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(10),
+            Value::Integer(0)
+        ]
+    );
+}
+
+#[test]
+fn p13_h_step3_transfer_object_values_survive_hook_gc() {
+    let source = br#"local call_seen, return_seen = 0, 0
+local selected = select
+local function hook(event)
+  local info = debug.getinfo(2, 'fr')
+  if info.func == selected then
+    collectgarbage('collect')
+    if event == 'call' then
+      assert(info.ftransfer == 1 and info.ntransfer == 4, 'call-count')
+      local _, first = debug.getlocal(2, 3)
+      local _, second = debug.getlocal(2, 4)
+      assert(first and second and first.tag == 11 and second.tag == 22, 'call-value')
+      call_seen = call_seen + 1
+    elseif event == 'return' then
+      assert(info.ftransfer == 1 and info.ntransfer == 2,
+        'return-count:' .. info.ftransfer .. ':' .. info.ntransfer)
+      local _, first = debug.getlocal(2, 1)
+      local _, second = debug.getlocal(2, 2)
+      assert(first and second and first.tag == 11 and second.tag == 22, 'return-value')
+      return_seen = return_seen + 1
+    end
+  end
+end
+debug.sethook(hook, 'cr')
+local a, b = selected(2, 0, {tag=11}, {tag=22})
+debug.sethook()
+return call_seen, return_seen, a.tag, b.tag"#;
+    let (vm, outcome) = run_transfer_debug(source, true);
+    let RunOutcome::Returned(values) = outcome else {
+        let detail = match &outcome {
+            RunOutcome::LuaError(error) => match error.value {
+                Value::Object(object) => vm
+                    .with_byte_string(object, |value| value.as_bytes().to_vec())
+                    .ok(),
+                _ => None,
+            },
+            _ => None,
+        };
+        panic!("transfer 物件 GC: {outcome:?}, detail={detail:?}");
+    };
+    assert_eq!(
+        values,
+        vec![
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(11),
+            Value::Integer(22)
+        ]
+    );
+}
+
+#[test]
+fn p13_h_step3_transfer_builtin_return_hook_error_clears_pending_roots() {
+    let source = br#"local selected = select
+local function hook(event)
+  if event == 'return' and debug.getinfo(2, 'f').func == selected then
+    collectgarbage('collect')
+    error('transfer-stop')
+  end
+end
+debug.sethook(hook, 'r')
+selected(2, 0, {tag=11}, {tag=22})"#;
+    let (vm, outcome) = run_transfer_debug(source, true);
+    let RunOutcome::LuaError(error) = outcome else {
+        panic!("return hook 應中止: {outcome:?}");
+    };
+    assert_eq!(bytes(&vm, error.value), b"transfer-stop");
+}
+
+#[test]
+fn p13_h_step3_transfer_builtin_tail_return_values() {
+    let source = br#"local selected = select
+local calls, returns = 0, 0
+local function wrapper() return selected(2, 10, 20, 30) end
+local function hook(event)
+  local info = debug.getinfo(2, 'fr')
+  if info.func == selected then
+    if event == 'call' then
+      assert(info.ftransfer == 1 and info.ntransfer == 4)
+      calls = calls + 1
+    elseif event == 'return' then
+      assert(info.ftransfer == 1 and info.ntransfer == 2)
+      local _, a = debug.getlocal(2, 1)
+      local _, b = debug.getlocal(2, 2)
+      assert(a == 20 and b == 30)
+      returns = returns + 1
+    end
+  end
+end
+debug.sethook(hook, 'cr')
+local a, b = wrapper()
+debug.sethook()
+return calls, returns, a, b"#;
+    let (_, outcome) = run_transfer_debug(source, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("builtin tail transfer: {outcome:?}");
+    };
+    assert_eq!(
+        values,
+        vec![
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(20),
+            Value::Integer(30)
+        ]
+    );
+}
+
+#[test]
+fn p13_h_step3_return_hook_reads_live_local_ordinals_before_exit() {
+    let source = br#"local names, values = {}, {}
+local observed = false
+local function foo(a, b, ...)
+  do local x, y, z = 7, 8, 9 end
+  local c, d = 10, 20
+  return
+end
+local function hook(event)
+  if event == 'return' and debug.getinfo(2, 'f').func == foo then
+    observed = true
+    for i = 1, 6 do
+      local name, value = debug.getlocal(2, i)
+      names[i], values[i] = name or '<missing>', value
+    end
+  end
+end
+debug.sethook(hook, 'r')
+foo(100, 200)
+debug.sethook()
+return observed,
+       names[1], values[1], names[2], values[2],
+       names[3], values[3], names[4], values[4],
+       names[5], values[5], names[6], values[6]"#;
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::EventHook)
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::StackInspection)
+        .allow(DebugPermission::LocalInspection);
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        1_000_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("return hook locals: {outcome:?}");
+    };
+    assert_eq!(values.len(), 13);
+    assert_eq!(values[0], Value::Boolean(true), "未觀測到 foo return hook");
+    let actual: Vec<_> = (0..6)
+        .map(|index| (bytes(&vm, values[index * 2 + 1]), values[index * 2 + 2]))
+        .collect();
+    let expected = match profile().2 {
+        LuaProfile::Lua55 => vec![
+            (b"a".to_vec(), Value::Integer(100)),
+            (b"b".to_vec(), Value::Integer(200)),
+            (b"(vararg table)".to_vec(), Value::Nil),
+            (b"c".to_vec(), Value::Integer(10)),
+            (b"d".to_vec(), Value::Integer(20)),
+            (b"<missing>".to_vec(), Value::Nil),
+        ],
+        LuaProfile::Lua54 => vec![
+            (b"a".to_vec(), Value::Integer(100)),
+            (b"b".to_vec(), Value::Integer(200)),
+            (b"c".to_vec(), Value::Integer(10)),
+            (b"d".to_vec(), Value::Integer(20)),
+            (b"<missing>".to_vec(), Value::Nil),
+            (b"<missing>".to_vec(), Value::Nil),
+        ],
+    };
+    assert_eq!(actual, expected, "return hook 名稱、值或 ordinal 不符");
+}
+
+#[test]
+fn p13_h_step3_return_hook_setlocal_object_survives_gc_and_releases_roots() {
+    let slot = match profile().2 {
+        LuaProfile::Lua55 => 4,
+        LuaProfile::Lua54 => 3,
+    };
+    let source = format!(
+        r#"local seen = {{}}
+local function foo(a, b, ...)
+  do local x, y, z end
+  local c, d = 10, 20
+  return
+end
+local function hook(event)
+  if event == 'return' and debug.getinfo(2, 'f').func == foo then
+    seen[1], seen[2] = debug.getlocal(2, {slot})
+    local replacement = {{payload = 33}}
+    seen[3] = debug.setlocal(2, {slot}, replacement)
+    replacement = nil
+    collectgarbage('collect')
+    local name, value = debug.getlocal(2, {slot})
+    seen[4], seen[5] = name, value.payload
+  end
+end
+debug.sethook(hook, 'r')
+foo(100, 200)
+debug.sethook()
+return seen[1], seen[2], seen[3], seen[4], seen[5]"#
+    );
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::EventHook)
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::StackInspection)
+        .allow(DebugPermission::LocalInspection)
+        .allow(DebugPermission::LocalMutation);
+    let (vm, outcome) = run_with_h_debug(
+        source.as_bytes(),
+        HostServices::deny_all().and_debug(debug),
+        1_000_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("return hook GC/setlocal: {outcome:?}");
+    };
+    assert_eq!(values.len(), 5);
+    assert_eq!(bytes(&vm, values[0]), b"c");
+    assert_eq!(values[1], Value::Integer(10));
+    assert_eq!(bytes(&vm, values[2]), b"c");
+    assert_eq!(bytes(&vm, values[3]), b"c");
+    assert_eq!(values[4], Value::Integer(33));
+    assert_eq!(vm.roots().count(RootKind::Stack), 0);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_h_step3_lua55_vararg_table_local_slot_and_gc() {
+    let (_, _, runtime_profile) = profile();
+    if runtime_profile != LuaProfile::Lua55 {
+        return;
+    }
+    let source = b"local function probe() local n,v=debug.getlocal(2,4); assert(n=='AAAA' and v=='xuxu'); assert(debug.setlocal(2,4,'pera')=='AAAA') end\nlocal function g(...) local arg={...}; local feijao; local AAAA,B='xuxu','abacate'; probe(); local n,v=debug.getlocal(1,1); assert(n=='(vararg table)' and v==nil); assert(debug.setlocal(1,1,{tag=7})=='(vararg table)'); collectgarbage('collect'); local n2,v2=debug.getlocal(1,1); return AAAA,B,n2,v2.tag,... end\nreturn g(42)";
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::LocalInspection)
+        .allow(DebugPermission::LocalMutation);
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        1_000_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("Lua55 vararg table local: {outcome:?}");
+    };
+    assert_eq!(bytes(&vm, values[0]), b"pera");
+    assert_eq!(bytes(&vm, values[1]), b"abacate");
+    assert_eq!(bytes(&vm, values[2]), b"(vararg table)");
+    assert_eq!(values[3], Value::Integer(7));
+    assert_eq!(values[4], Value::Integer(42));
+}
+
+#[test]
+fn p13_h_step3_lua55_virtual_environment_upvalue_minimal() {
+    let source = b"function g() return math.abs(-1) end\nlocal i=debug.getinfo(g,'u')\nlocal n,v=debug.getupvalue(g,1)\nreturn i.nups,n,type(v),g()";
+    let mut vm = Vm::new_with_services(
+        LuaProfile::Lua55,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::Info)
+                .allow(DebugPermission::Upvalues),
+        ),
+    )
+    .unwrap();
+    let environment = vm.allocate_table().unwrap();
+    let root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_math_builtins(environment).unwrap();
+    vm.install_debug_builtins(environment).unwrap();
+    let mut execution = vm
+        .load_with_environment(
+            compile_debug(source, b"@p13-h-env.lua", LanguageProfile::Lua55),
+            Value::Object(environment),
+        )
+        .unwrap();
+    execution.set_fuel(100_000).unwrap();
+    let outcome = execution.run().unwrap();
+    drop(execution);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("Lua55 虛擬 _ENV: {outcome:?}");
+    };
+    assert_eq!(values[0], Value::Integer(1));
+    assert_eq!(bytes(&vm, values[1]), b"_ENV");
+    assert_eq!(bytes(&vm, values[2]), b"table");
+    assert_eq!(values[3], Value::Integer(1));
+    vm.remove_root(root).unwrap();
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_h_step3_lua55_environment_upvalue_order_excludes_hidden_helper() {
+    if profile().2 != LuaProfile::Lua55 {
+        return;
+    }
+    let source = b"local debug = debug\nfunction g(...)\n  local arg = {...}\n  local z = debug.getinfo(g, 'u')\n  do\n    global *\n    global<const> assert\n    assert(z.nups == 2)\n  end\n  return arg[1]\nend\nlocal info = debug.getinfo(g, 'u')\nlocal n1 = debug.getupvalue(g, 1)\nlocal n2, v2 = debug.getupvalue(g, 2)\nlocal n3 = debug.getupvalue(g, 3)\nreturn info.nups, n1, n2, type(v2), g(9), n3";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::Info)
+                .allow(DebugPermission::Upvalues),
+        ),
+        200_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("Lua55 _ENV 與 hidden helper 順序: {outcome:?}");
+    };
+    assert_eq!(values[0], Value::Integer(2));
+    assert_eq!(bytes(&vm, values[1]), b"debug");
+    assert_eq!(bytes(&vm, values[2]), b"_ENV");
+    assert_eq!(bytes(&vm, values[3]), b"table");
+    assert_eq!(values[4], Value::Integer(9));
+    assert_eq!(values[5], Value::Nil);
+}
+
+#[test]
+fn p13_h_step3_lua55_environment_shared_identity_setup_join_and_gc() {
+    let source = b"local d, collect = debug, collectgarbage\nlocal function maker()\n  local function a() return marker end\n  local function b() return marker end\n  return a,b\nend\nlocal a,b=maker()\nlocal same0=d.upvalueid(a,1)==d.upvalueid(b,1)\nlocal name=d.setupvalue(a,1,{marker=31})\nlocal same1=d.upvalueid(a,1)==d.upvalueid(b,1)\nlocal first,second=a(),b()\nlocal v={marker=47}\nlocal function c() return v end\nlocal cname=d.getupvalue(c,1)\nd.upvaluejoin(a,1,c,1)\ncollect('collect')\nreturn same0,same1,name,first,second,a(),b(),d.upvalueid(a,1)==d.upvalueid(c,1),d.upvalueid(a,1)~=d.upvalueid(b,1),cname";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::Info)
+                .allow(DebugPermission::Upvalues)
+                .allow(DebugPermission::UpvalueMutation)
+                .allow(DebugPermission::UpvalueIdentity),
+        ),
+        500_000,
+        true,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("Lua55 共享環境儲存格: {outcome:?}")
+    };
+    assert_eq!(values.len(), 10);
+    assert_eq!(values[0], Value::Boolean(true));
+    assert_eq!(values[1], Value::Boolean(true));
+    assert_eq!(bytes(&vm, values[2]), b"_ENV");
+    assert_eq!(values[3], Value::Integer(31));
+    assert_eq!(values[4], Value::Integer(31));
+    assert_eq!(values[5], Value::Integer(47));
+    assert_eq!(values[6], Value::Integer(31));
+    assert_eq!(values[7], Value::Boolean(true));
+    assert_eq!(values[8], Value::Boolean(true));
+    assert_eq!(bytes(&vm, values[9]), b"v");
+}
+
+#[test]
+fn p13_h_step3_lua55_environment_survives_suspended_coroutine_and_tail_mutation() {
+    let source = b"local d, co, gc = debug, coroutine, collectgarbage\nlocal function worker()\n  local function value() return marker end\n  co.yield(value)\n  return value()\nend\nlocal thread=co.create(worker)\nlocal ok,value=co.resume(thread)\nlocal function change() return d.setupvalue(value,1,{marker=73}) end\nlocal name=change()\ngc('collect')\nlocal resumed,result=co.resume(thread)\nreturn ok,resumed,name,result,value()";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::Upvalues)
+                .allow(DebugPermission::UpvalueMutation),
+        ),
+        500_000,
+        true,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("Lua55 暫停與尾呼叫環境: {outcome:?}")
+    };
+    assert_eq!(values.len(), 5);
+    assert_eq!(values[0], Value::Boolean(true));
+    assert_eq!(values[1], Value::Boolean(true));
+    assert_eq!(bytes(&vm, values[2]), b"_ENV");
+    assert_eq!(values[3], Value::Integer(73));
+    assert_eq!(values[4], Value::Integer(73));
+}
+
+#[test]
+fn p13_h_step3_lua55_environment_nil_scalar_and_object_values() {
+    let source = b"local d,p=debug,pcall\nlocal function f() return marker end\nlocal a=d.setupvalue(f,1,nil)\nlocal n1,v1=d.getupvalue(f,1)\nlocal ok1=p(f)\nlocal b=d.setupvalue(f,1,42)\nlocal n2,v2=d.getupvalue(f,1)\nlocal ok2=p(f)\nlocal c=d.setupvalue(f,1,{marker=8})\nlocal n3,v3=d.getupvalue(f,1)\nreturn a,n1,v1,ok1,b,n2,v2,ok2,c,n3,v3.marker,f()";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::Upvalues)
+                .allow(DebugPermission::UpvalueMutation),
+        ),
+        200_000,
+        true,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("Lua55 環境值邊界: {outcome:?}")
+    };
+    assert_eq!(values.len(), 12);
+    for index in [0, 1, 4, 5, 8, 9] {
+        assert_eq!(bytes(&vm, values[index]), b"_ENV");
+    }
+    assert_eq!(values[2], Value::Nil);
+    assert_eq!(values[3], Value::Boolean(false));
+    assert_eq!(values[6], Value::Integer(42));
+    assert_eq!(values[7], Value::Boolean(false));
+    assert_eq!(values[10], Value::Integer(8));
+    assert_eq!(values[11], Value::Integer(8));
+}
+
+#[test]
+fn p13_h_step3_lua55_active_frame_reads_mutated_environment() {
+    let source = b"local d=debug\nlocal function g(self)\n  local name=d.setupvalue(self,2,{marker=82})\n  return name,marker\nend\nreturn g(g)";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::UpvalueMutation)),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("Lua55 執行中環境: {outcome:?}")
+    };
+    assert_eq!(values.len(), 2);
+    assert_eq!(bytes(&vm, values[0]), b"_ENV");
+    assert_eq!(values[1], Value::Integer(82));
+}
+
+#[test]
+fn p13_h_step3_lua55_loaded_chunks_have_independent_joinable_environments() {
+    let source = b"local d,loader=debug,load\nlocal e1,e2={marker=13},{marker=29}\nlocal a=loader('return function() return marker end','@a','t',e1)()\nlocal b=loader('return function() return marker end','@b','t',e2)()\nlocal before=a()==13 and b()==29 and d.upvalueid(a,1)~=d.upvalueid(b,1)\nd.upvaluejoin(a,1,b,1)\nreturn before,a(),b(),d.upvalueid(a,1)==d.upvalueid(b,1)";
+    let services = HostServices::deny_all()
+        .and_debug(DebugCapability::deny_all().allow(DebugPermission::UpvalueIdentity))
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (_, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![
+            Value::Boolean(true),
+            Value::Integer(29),
+            Value::Integer(29),
+            Value::Boolean(true),
+        ]),
+    );
+}
+
+#[test]
+fn p13_h_step3_temporary_active_caller_exact_call_slot() {
+    let source = b"local observed={}\nfunction f()\n  observed[1],observed[2]=debug.getlocal(2,3)\n  observed[3]=debug.getlocal(2,4)\n  observed[4]=debug.setlocal(2,3,10)\n  return 20\nend\nfunction g(a,b) return (a+1)+f() end\nlocal result=g(0,0)\nreturn observed[1],observed[2],observed[3],observed[4],result";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation),
+        ),
+        200_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("active caller temporary: {outcome:?}")
+    };
+    assert_eq!(values.len(), 5);
+    assert_eq!(bytes(&vm, values[0]), b"(temporary)");
+    assert_eq!(values[1], Value::Integer(1));
+    assert_eq!(values[2], Value::Nil);
+    assert_eq!(bytes(&vm, values[3]), b"(temporary)");
+    assert_eq!(values[4], Value::Integer(30));
+}
+
+#[test]
+fn p13_h_step3_temporary_parked_exact_call_and_stale_pcs() {
+    let source = b"local co,d,gc=coroutine,debug,collectgarbage\nlocal function f() co.yield('inside'); return 20 end\nlocal function g(a,b)\n  co.yield('before')\n  local result=(a+1)+f()\n  co.yield('after')\n  return result\nend\nlocal thread=co.create(function() return g(0,0) end)\nlocal ok1,first=co.resume(thread)\nlocal before=d.getlocal(thread,1,3)\nlocal ok2,second=co.resume(thread)\nlocal name,value=d.getlocal(thread,2,3)\nlocal next_name=d.getlocal(thread,2,4)\nlocal replacement=setmetatable({payload=100},{__add=function(self,right) return self.payload+right end})\nlocal written=d.setlocal(thread,2,3,replacement)\nreplacement=nil\ngc('collect')\nlocal ok3,third=co.resume(thread)\nlocal after=d.getlocal(thread,1,4)\nlocal ok4,result=co.resume(thread)\nreturn ok1,first,before,ok2,second,name,value,next_name,written,ok3,third,after,ok4,result";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation),
+        ),
+        500_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("parked caller temporary: {outcome:?}")
+    };
+    assert_eq!(values.len(), 14);
+    for index in [0, 3, 9, 12] {
+        assert_eq!(values[index], Value::Boolean(true));
+    }
+    assert_eq!(bytes(&vm, values[1]), b"before");
+    assert_eq!(values[2], Value::Nil);
+    assert_eq!(bytes(&vm, values[4]), b"inside");
+    assert_eq!(bytes(&vm, values[5]), b"(temporary)");
+    assert_eq!(values[6], Value::Integer(1));
+    assert_eq!(values[7], Value::Nil);
+    assert_eq!(bytes(&vm, values[8]), b"(temporary)");
+    assert_eq!(bytes(&vm, values[10]), b"after");
+    assert_eq!(values[11], Value::Nil);
+    assert_eq!(values[13], Value::Integer(120));
+}
+
+fn run_official_db_prefix(line_count: usize) {
+    let (profile_name, language, runtime_profile) = profile();
+    let original: &[u8] = match runtime_profile {
+        LuaProfile::Lua55 => include_bytes!("../../../vendor/lua55/lua-5.5.1-tests/db.lua"),
+        LuaProfile::Lua54 => include_bytes!("../../../vendor/lua54/lua-5.4.9-tests/db.lua"),
+    };
+    let source: Vec<u8> = original
+        .split_inclusive(|byte| *byte == b'\n')
+        .take(line_count)
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(
+        source.iter().filter(|byte| **byte == b'\n').count(),
+        line_count
+    );
+    match line_count {
+        257 => assert!(source.ends_with(b"print'+'\n\n") || source.ends_with(b"print'+'\n")),
+        305 => assert!(source.ends_with(b"foo(table.unpack(a))\n\n")),
+        702 | 693 => {
+            assert!(source.ends_with(b"assert(a == 2)   -- ensure all two lines where hooked\n\n"))
+        }
+        _ => panic!("未定義的 db.lua prefix 行數"),
+    }
+    let output = Rc::new(RefCell::new(Vec::new()));
+    let mut debug = DebugCapability::deny_all()
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::StackInspection)
+        .allow(DebugPermission::EventHook);
+    if line_count >= 305 {
+        debug = debug
+            .allow(DebugPermission::LocalInspection)
+            .allow(DebugPermission::LocalMutation);
+    }
+    if line_count > 305 {
+        debug = debug
+            .allow(DebugPermission::RegistryRead)
+            .allow(DebugPermission::UserValueRead)
+            .allow(DebugPermission::UserValueWrite)
+            .allow(DebugPermission::Upvalues)
+            .allow(DebugPermission::UpvalueMutation)
+            .allow(DebugPermission::UpvalueIdentity)
+            .allow(DebugPermission::CountHook)
+            .allow(DebugPermission::Traceback);
+    }
+    let io_state = Rc::new(RefCell::new(GHostState::default()));
+    let services = HostServices::with_output(TestOutput(output.clone(), false))
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_bytecode(true)
+                .with_official_bytecode(true)
+                .with_limits(LoadLimits {
+                    max_source_bytes: 4 * 1024 * 1024,
+                    max_encoded_bytes: 64 * 1024 * 1024,
+                    max_module_allocation_bytes: 256 * 1024 * 1024,
+                    max_temporary_bytes: 768 * 1024 * 1024,
+                    max_work_units: 24_000_000_000,
+                    max_reader_chunks: 512,
+                    max_path_candidates: 512,
+                }),
+        )
+        .and_dump(DumpCapability::deny_all().with_official_bytecode(true))
+        .and_resource(
+            rivetlua_runtime::ResourceCapability::deny_all()
+                .and_io(GIo(io_state.clone()))
+                .and_deadline(GDeadline(io_state)),
+        )
+        .and_debug(debug);
+    let mut vm = Vm::new_with_services(runtime_profile, services).unwrap();
+    vm.set_allocation_limit(512 * 1024 * 1024);
+    let environment = vm.allocate_table().unwrap();
+    let root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_package_builtins(environment).unwrap();
+    vm.install_table_builtins(environment).unwrap();
+    vm.install_math_builtins(environment).unwrap();
+    vm.install_utf8_builtins(environment).unwrap();
+    vm.install_string_builtins(environment).unwrap();
+    vm.install_coroutine_builtins(environment).unwrap();
+    vm.install_debug_builtins(environment).unwrap();
+    vm.install_io_os_builtins(environment).unwrap();
+    let module = compile_debug(&source, b"@db.lua", language);
+    let mut execution = vm
+        .load_with_environment(module, Value::Object(environment))
+        .unwrap();
+    execution.set_fuel(30_000_000_000).unwrap();
+    let outcome = execution.run().unwrap();
+    let remaining = execution.fuel_remaining();
+    drop(execution);
+    let error_text = match &outcome {
+        RunOutcome::LuaError(error) => match error.value {
+            Value::Object(object) => vm
+                .with_byte_string(object, |string| string.as_bytes().to_vec())
+                .ok(),
+            _ => None,
+        },
+        _ => None,
+    };
+    assert!(
+        matches!(outcome, RunOutcome::Returned(_)),
+        "profile={profile_name} outcome={outcome:?} error_text={error_text:?} fuel_spent={} output={}",
+        30_000_000_000_u64 - remaining,
+        String::from_utf8_lossy(&output.borrow()),
+    );
+    let expected_output: &[u8] = if line_count > 305 {
+        b"testing debug library and debug information\n+\ntesting inspection of parameters/returned values\n+\n+\n"
+    } else {
+        b"testing debug library and debug information\n+\n"
+    };
+    assert_eq!(&*output.borrow(), expected_output);
+    assert!(remaining > 0);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+    vm.remove_root(root).unwrap();
+}
+
+#[test]
+fn p13_h_step1_function_info_uses_verified_native_lines_and_builtin_identity() {
+    let source = b"local function f(a, ...)\n  return a\nend\nlocal i=debug.getinfo(f)\nlocal l=debug.getinfo(f,'L')\nlocal c=debug.getinfo(print)\nreturn i.what,i.source,i.short_src,i.linedefined,i.lastlinedefined,i.nparams,i.isvararg,i.currentline,i.func==f,l.activelines[2],c.what,c.short_src,c.currentline";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::Info)),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("function info: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"Lua");
+    assert_eq!(bytes(&vm, values[1]), b"@p13-h.lua");
+    assert_eq!(bytes(&vm, values[2]), b"p13-h.lua");
+    assert_eq!(values[3], Value::Integer(1));
+    assert_eq!(values[4], Value::Integer(3));
+    assert_eq!(values[5], Value::Integer(1));
+    assert_eq!(values[6], Value::Boolean(true));
+    assert_eq!(values[7], Value::Integer(-1));
+    assert_eq!(values[8], Value::Boolean(true));
+    assert_eq!(values[9], Value::Boolean(true));
+    assert_eq!(bytes(&vm, values[10]), b"C");
+    assert_eq!(bytes(&vm, values[11]), b"[C]");
+    assert_eq!(values[12], Value::Integer(-1));
+}
+
+#[test]
+fn p13_h_step1_native_activelines_include_lexical_function_end() {
+    let source = b"local function f()\n  return 1\nend\nlocal i=debug.getinfo(f,'SL')\nreturn i.linedefined,i.lastlinedefined,i.activelines[2],i.activelines[3]";
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::Info)),
+        100_000,
+        false,
+    );
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![
+            Value::Integer(1),
+            Value::Integer(3),
+            Value::Boolean(true),
+            Value::Boolean(true),
+        ]),
+    );
+}
+
+#[test]
+fn p13_h_step3_official_activelines_preserve_unmapped_end_and_vararg_rules() {
+    let source = b"local function f()\n  return 1\nend\nlocal function v(...)\n  return ...\nend\nlocal g=assert(load(string.dump(f,false)))\nlocal h=assert(load(string.dump(v,false)))\nlocal s=assert(load(string.dump(f,true)))\nlocal a=debug.getinfo(g,'SL')\nlocal b=debug.getinfo(h,'SL')\nlocal c=debug.getinfo(s,'SL')\nreturn a.linedefined,a.lastlinedefined,a.activelines[1],a.activelines[2],a.activelines[3],a.activelines[4],b.linedefined,b.lastlinedefined,b.activelines[4],b.activelines[5],b.activelines[6],b.activelines[7],next(c.activelines)";
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_load(LoadCapability::deny_all().with_official_bytecode(true))
+            .and_dump(DumpCapability::deny_all().with_official_bytecode(true))
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::Info)),
+        1_000_000,
+        false,
+    );
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![
+            Value::Integer(1),
+            Value::Integer(3),
+            Value::Nil,
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Nil,
+            Value::Integer(4),
+            Value::Integer(6),
+            Value::Nil,
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Nil,
+            Value::Nil,
+        ]),
+    );
+}
+
+#[test]
+fn p13_h_step3_implicit_and_explicit_return_line_hooks_match_official() {
+    let source = b"local function h()\n  local x=1\nend\nlocal function f()\n  return 1\nend\nlocal a,b={},{}\ndebug.sethook(function(event,line)\n  if event=='line' then\n    local fun=debug.getinfo(2,'f').func\n    if fun==h then a[#a+1]=line elseif fun==f then b[#b+1]=line end\n  end\nend,'l')\nh(); f(); debug.sethook()\nreturn table.concat(a,','),table.concat(b,',')";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::Info)
+                .allow(DebugPermission::StackInspection)
+                .allow(DebugPermission::EventHook),
+        ),
+        1_000_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("return line hooks: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"2,3");
+    assert_eq!(bytes(&vm, values[1]), b"5");
+}
+
+#[test]
+fn p13_h_step1_stack_levels_names_and_invalid_selector() {
+    let source = b"local g={x=function() local a=debug.getinfo(1); return a.name,a.namewhat end}\nlocal f=function() local a=debug.getinfo(1); return a.name,a.namewhat end\nlocal n,w=f(); local n2,w2=g.x(); local main=debug.getinfo(0); local far=debug.getinfo(1000); local neg=debug.getinfo(-1); local ok=pcall(debug.getinfo,print,'X'); return n,w,n2,w2,main.what,far,neg,ok";
+    let debug = DebugCapability::deny_all().allow(DebugPermission::Info);
+    let (_, denied) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        100_000,
+        false,
+    );
+    assert!(
+        matches!(denied, RunOutcome::LuaError(error) if error.kind == RuntimeErrorKind::HostPolicyDebug)
+    );
+    let allowed = debug.allow(DebugPermission::StackInspection);
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(allowed),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("stack info: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"f");
+    assert_eq!(bytes(&vm, values[1]), b"local");
+    assert_eq!(bytes(&vm, values[2]), b"x");
+    assert_eq!(bytes(&vm, values[3]), b"field");
+    assert_eq!(bytes(&vm, values[4]), b"C");
+    assert_eq!(values[5], Value::Nil);
+    assert_eq!(values[6], Value::Nil);
+    assert_eq!(values[7], Value::Boolean(false));
+}
+
+#[test]
+fn p13_h_step1_local_name_survives_branch_and_function_reassignment() {
+    let source = b"local f=function() return 1 end\nfunction f(x,name)\n  local a=debug.getinfo(1)\n  return a.name,a.namewhat\nend\nif 3>4 then return end; local g={}; local n,w=f(g); return n,w";
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::StackInspection);
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("branch name: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"f");
+    assert_eq!(bytes(&vm, values[1]), b"local");
+}
+
+#[test]
+fn p13_h_p15_official_callsite_local_name_survives_roundtrip_but_not_strip() {
+    let source = b"local function chunk()\n  local g=function() local a=debug.getinfo(2); return a.name,a.namewhat end\n  local f=function() local a,b=g(); return a,b end\n  local a,b=f()\n  return a,b\nend\nlocal a,b=chunk()\nlocal c,d=assert(load(string.dump(chunk,false)))()\nlocal e,f=assert(load(string.dump(chunk,true)))()\nreturn a,b,c,d,e,f";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_load(
+                LoadCapability::deny_all()
+                    .with_official_bytecode(true)
+                    .with_limits(LoadLimits {
+                        max_work_units: 100_000_000,
+                        max_temporary_bytes: 16 * 1024 * 1024,
+                        max_module_allocation_bytes: 16 * 1024 * 1024,
+                        ..LoadLimits::default()
+                    }),
+            )
+            .and_dump(DumpCapability::deny_all().with_official_bytecode(true))
+            .and_debug(
+                DebugCapability::deny_all()
+                    .allow(DebugPermission::Info)
+                    .allow(DebugPermission::StackInspection),
+            ),
+        1_000_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("official callsite name: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"f");
+    assert_eq!(bytes(&vm, values[1]), b"local");
+    assert_eq!(bytes(&vm, values[2]), b"f");
+    assert_eq!(bytes(&vm, values[3]), b"local");
+    assert_eq!(values[4], Value::Nil);
+    assert_eq!(bytes(&vm, values[5]), b"");
+}
+
+#[test]
+fn p13_h_p15_official_callsite_field_name_survives_full_and_strip() {
+    let source = b"local function chunk()\n  local g={x=function() local a=debug.getinfo(1); return a.name,a.namewhat end}\n  local a,b=g.x()\n  return a,b\nend\nlocal a,b=chunk()\nlocal c,d=assert(load(string.dump(chunk,false)))()\nlocal e,f=assert(load(string.dump(chunk,true)))()\nreturn a,b,c,d,e,f";
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_load(
+                LoadCapability::deny_all()
+                    .with_official_bytecode(true)
+                    .with_limits(LoadLimits {
+                        max_work_units: 100_000_000,
+                        max_temporary_bytes: 16 * 1024 * 1024,
+                        max_module_allocation_bytes: 16 * 1024 * 1024,
+                        ..LoadLimits::default()
+                    }),
+            )
+            .and_dump(DumpCapability::deny_all().with_official_bytecode(true))
+            .and_debug(
+                DebugCapability::deny_all()
+                    .allow(DebugPermission::Info)
+                    .allow(DebugPermission::StackInspection),
+            ),
+        1_000_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("official field callsite name: {outcome:?}")
+    };
+    for index in [0, 2, 4] {
+        assert_eq!(bytes(&vm, values[index]), b"x");
+        assert_eq!(bytes(&vm, values[index + 1]), b"field");
+    }
+}
+
+#[test]
+fn p13_h_p15_official_callsite_name_crosses_more_than_eight_moves() {
+    let (_, _, runtime_profile) = profile();
+    let source = b"local function chunk()\n  local f=function() local a=debug.getinfo(1); return a.name,a.namewhat end\n  local a,b=f()\n  return a,b\nend\nreturn string.dump(chunk,false),string.dump(chunk,true)";
+    let (mut vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_dump(DumpCapability::deny_all().with_official_bytecode(true))
+            .and_debug(
+                DebugCapability::deny_all()
+                    .allow(DebugPermission::Info)
+                    .allow(DebugPermission::StackInspection),
+            ),
+        1_000_000,
+        false,
+    );
+    let RunOutcome::Returned(dumps) = outcome else {
+        panic!("dump for move chain: {outcome:?}")
+    };
+    for (index, expected_name, expected_kind) in [
+        (0, Some(b"f".as_slice()), b"local".as_slice()),
+        (1, None, b"".as_slice()),
+    ] {
+        let mut chunk = rivetlua_core::decode_official_chunk(
+            &bytes(&vm, dumps[index]),
+            runtime_profile,
+            &OfficialChunkLimits::default(),
+        )
+        .unwrap();
+        let code = &mut chunk.main.code;
+        let call_pc = code
+            .iter()
+            .rposition(|word| word & 0x7f == 68)
+            .expect("chunk 必須有一般 Call");
+        let original_base = ((code[call_pc] >> 7) & 0xff) as u8;
+        let temporary_start = chunk.main.max_stack_size;
+        assert!(temporary_start <= u8::MAX - 10);
+        let mut previous = original_base;
+        let mut moves = Vec::new();
+        for offset in 0..10_u8 {
+            let destination = temporary_start + offset;
+            moves.push(u32::from(destination) << 7 | u32::from(previous) << 16);
+            previous = destination;
+        }
+        moves.push(u32::from(original_base) << 7 | u32::from(previous) << 16);
+        assert_eq!(moves.len(), 11);
+        code.splice(call_pc..call_pc, moves);
+        chunk.main.max_stack_size += 10;
+        if !chunk.main.debug.line_info.is_empty() {
+            chunk.main.debug.line_info.splice(call_pc..call_pc, [0; 11]);
+        }
+        for entry in &mut chunk.main.debug.abs_line_info {
+            if entry.pc as usize >= call_pc {
+                entry.pc += 11;
+            }
+        }
+        for local in &mut chunk.main.debug.locals {
+            if local.start_pc as usize >= call_pc {
+                local.start_pc += 11;
+            }
+            if local.end_pc as usize > call_pc {
+                local.end_pc += 11;
+            }
+        }
+        let encoded =
+            rivetlua_core::encode_official_chunk(&chunk, false, &OfficialChunkLimits::default())
+                .unwrap();
+        let chunk = rivetlua_core::decode_official_chunk(
+            &encoded,
+            runtime_profile,
+            &OfficialChunkLimits::default(),
+        )
+        .unwrap();
+        let translated =
+            rivetlua_core::translate_official_chunk(&chunk, &VerifyLimits::default()).unwrap();
+        let module = translated.verified().clone();
+        let caller_work = module.module().prototypes[0].instructions.len();
+        let mut limited = Vm::new_with_services(
+            runtime_profile,
+            HostServices::deny_all().and_debug(
+                DebugCapability::deny_all()
+                    .allow(DebugPermission::Info)
+                    .allow(DebugPermission::StackInspection)
+                    .with_limits(DebugLimits {
+                        max_work_units: 9 + caller_work + 2 * module.module().prototypes.len(),
+                        ..DebugLimits::default()
+                    }),
+            ),
+        )
+        .unwrap();
+        let limited_environment = limited.allocate_table().unwrap();
+        let limited_root = limited
+            .add_root(RootKind::Host, limited_environment)
+            .unwrap();
+        limited.install_basic_builtins(limited_environment).unwrap();
+        limited.install_debug_builtins(limited_environment).unwrap();
+        let mut limited_execution = limited
+            .load_with_environment(module.clone(), Value::Object(limited_environment))
+            .unwrap();
+        limited_execution.set_fuel(100_000).unwrap();
+        let limited_result = limited_execution.run().unwrap();
+        drop(limited_execution);
+        assert!(
+            matches!(&limited_result, RunOutcome::LuaError(error) if error.kind == RuntimeErrorKind::DebugBudget),
+            "{runtime_profile:?} strip={index}: {limited_result:?}"
+        );
+        limited.remove_root(limited_root).unwrap();
+        assert_eq!(limited.ledger_snapshot().reserved, 0);
+
+        let environment = vm.allocate_table().unwrap();
+        let root = vm.add_root(RootKind::Host, environment).unwrap();
+        vm.install_basic_builtins(environment).unwrap();
+        vm.install_debug_builtins(environment).unwrap();
+        let mut execution = vm
+            .load_with_environment(module, Value::Object(environment))
+            .unwrap();
+        execution.set_fuel(100_000).unwrap();
+        let result = execution.run().unwrap();
+        drop(execution);
+        vm.remove_root(root).unwrap();
+        let RunOutcome::Returned(values) = result else {
+            panic!("{runtime_profile:?} move chain strip={index}: {result:?}")
+        };
+        if let Some(name) = expected_name {
+            assert_eq!(bytes(&vm, values[0]), name);
+        } else {
+            assert_eq!(values[0], Value::Nil);
+        }
+        assert_eq!(bytes(&vm, values[1]), expected_kind);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+}
+
+#[test]
+fn p13_h_step1_line_hook_new_line_and_backward_jump() {
+    let source = b"local lines={}\nlocal function h(event,line) assert(event=='line'); lines[#lines+1]=line end\ndebug.sethook(h,'l')\nlocal n=0\nwhile n<2 do\n  n=n+1\nend\ndebug.sethook()\nreturn table.concat(lines,',')";
+    let debug = DebugCapability::deny_all()
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::EventHook);
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(debug),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("line hook: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"4,5,6,5,6,5,8");
+}
+
+#[test]
+fn p13_h_step1_line_hook_multiline_condition_matches_db_trace() {
+    let source = b"local lines={}\nlocal function h(event,line) assert(event=='line'); lines[#lines+1]=line end\nlocal function test(s)\n  debug.sethook(h,'l'); load(s)(); debug.sethook()\n  return table.concat(lines,',')\nend\nreturn test([[if\ntype(1)\nthen\n  a=1\nelse\n  a=2\nend\n]])";
+    let debug = DebugCapability::deny_all().allow(DebugPermission::EventHook);
+    let services = HostServices::deny_all().and_debug(debug).and_load(
+        LoadCapability::deny_all()
+            .and_compiler(MeteredTestCompiler)
+            .with_limits(LoadLimits {
+                max_work_units: 100_000_000,
+                max_temporary_bytes: 16 * 1024 * 1024,
+                max_module_allocation_bytes: 16 * 1024 * 1024,
+                ..LoadLimits::default()
+            }),
+    );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("多行條件 hook: {outcome:?}")
+    };
+    let expected: &[u8] = if profile().2 == LuaProfile::Lua54 {
+        b"2,3,4,7"
+    } else {
+        b"2,4,7"
+    };
+    assert_eq!(bytes(&vm, values[0]), expected);
+}
+
+#[test]
+fn p13_h_step1_line_hook_function_definition_end_matches_db_trace() {
+    let source = b"local lines={}\nlocal function h(event,line) assert(event=='line'); lines[#lines+1]=line end\nlocal function test(s)\n  debug.sethook(h,'l'); load(s)(); debug.sethook()\n  return table.concat(lines,',')\nend\nreturn test([[local function foo()\nend\nfoo()\nA = 1\nA = 2\nA = 3\n]])";
+    let services = HostServices::deny_all()
+        .and_debug(DebugCapability::deny_all().allow(DebugPermission::EventHook))
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("函式定義 hook: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"2,3,2,4,5,6");
+}
+
+#[test]
+fn p13_h_step1_line_hook_repeat_entry_matches_db_trace() {
+    let source = b"local lines={}\nlocal function h(event,line) assert(event=='line'); lines[#lines+1]=line end\nlocal function test(s)\n  debug.sethook(h,'l'); load(s)(); debug.sethook()\n  return table.concat(lines,',')\nend\nreturn test([[a=1\nrepeat\n  a=a+1\nuntil a==3\n]])";
+    let services = HostServices::deny_all()
+        .and_debug(DebugCapability::deny_all().allow(DebugPermission::EventHook))
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("repeat hook: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"1,3,4,3,4");
+}
+
+#[test]
+fn p13_h_step1_line_hook_while_break_matches_db_trace() {
+    let source = b"local lines={}\nlocal function h(event,line) assert(event=='line'); lines[#lines+1]=line end\nlocal function test(s)\n  debug.sethook(h,'l'); load(s)(); debug.sethook()\n  return table.concat(lines,',')\nend\nreturn test([[while type(1) do\n  if type(1)\n  then break\n  end\nend\na=1]])";
+    let services = HostServices::deny_all()
+        .and_debug(DebugCapability::deny_all().allow(DebugPermission::EventHook))
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("while/break hook: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"1,2,3,6");
+}
+
+#[test]
+fn p13_h_step1_line_hook_numeric_for_matches_db_trace() {
+    let source = b"local lines={}\nlocal function h(event,line) assert(event=='line'); lines[#lines+1]=line end\nlocal function test(s)\n  debug.sethook(h,'l'); load(s)(); debug.sethook()\n  return table.concat(lines,',')\nend\nreturn test([[for i=1,3 do\n  a=i\nend\n]])";
+    let services = HostServices::deny_all()
+        .and_debug(DebugCapability::deny_all().allow(DebugPermission::EventHook))
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("numeric for hook: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"1,2,1,2,1,2,1,3");
+}
+
+#[test]
+fn p13_h_step1_line_hook_single_line_for_has_one_event_per_iteration() {
+    let source = b"local lines={}\nlocal function h(event,line) assert(event=='line'); lines[#lines+1]=line end\nlocal function test(s)\n  debug.sethook(h,'l'); load(s)(); debug.sethook()\n  return table.concat(lines,',')\nend\nreturn test([[for i=1,4 do a=1 end]])";
+    let services = HostServices::deny_all()
+        .and_debug(DebugCapability::deny_all().allow(DebugPermission::EventHook))
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("single-line for hook: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"1,1,1,1");
+}
+
+#[test]
+fn p13_h_step1_line_hook_multiline_binary_gap_matches_db_trace() {
+    let source = b"local lines={}\nlocal function h(event,line) assert(event=='line'); lines[#lines+1]=line end\nlocal function test(s)\n  debug.sethook(h,'l'); load(s)(); debug.sethook()\n  return table.concat(lines,',')\nend\nreturn test([[     local b = {10}\n     a = b[1] \n + \n b[1]\n     b = 4\n  ]])";
+    let services = HostServices::deny_all()
+        .and_debug(DebugCapability::deny_all().allow(DebugPermission::EventHook))
+        .and_load(
+            LoadCapability::deny_all()
+                .and_compiler(MeteredTestCompiler)
+                .with_limits(LoadLimits {
+                    max_work_units: 100_000_000,
+                    max_temporary_bytes: 16 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        );
+    let (vm, outcome) = run_with_h_debug(source, services, 1_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("binary gap hook: {outcome:?}")
+    };
+    assert_eq!(bytes(&vm, values[0]), b"1,3,4,3,4,5");
+}
 
 impl HostOutput for TestOutput {
     fn write(&mut self, bytes: &[u8]) -> Result<(), HostOutputError> {
@@ -10522,4 +13322,1788 @@ fn p13_math_utf8_mixed_boundary_regression() {
     assert_eq!(values[5], Value::Integer(1));
     assert_eq!(values[6], Value::Boolean(false));
     assert_eq!(run.trace.ledger_after.reserved, 0);
+}
+
+#[test]
+fn p13_h_step2_local_inspection_does_not_grant_mutation() {
+    let source = br#"local function f(a) return a end
+local name = debug.getlocal(f, 1)
+local ok, err = pcall(debug.setlocal, 1, 1, 9)
+return name, ok, err"#;
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::LocalInspection)),
+        100_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("local 權限分離失敗: {outcome:?}");
+    };
+    assert_eq!(bytes(&vm, values[0]), b"a");
+    assert_eq!(values[1], Value::Boolean(false));
+    assert_eq!(bytes(&vm, values[2]), b"E_HOST_POLICY_DEBUG");
+}
+
+#[test]
+fn p13_h_step2_function_parameter_names_and_thread_selector() {
+    let source = br#"local function f(a, b, ...) local x end
+local co = coroutine.create(f)
+assert(debug.getlocal(f, 1) == 'a')
+assert(debug.getlocal(f, 2) == 'b')
+assert(debug.getlocal(f, 3) == nil)
+assert(debug.getlocal(co, f, 1) == 'a')
+assert(debug.getlocal(co, f, 2) == 'b')
+assert(debug.getlocal(co, f, 3) == nil)
+assert(debug.getlocal(print, 1) == nil)
+assert(not pcall(debug.getlocal, {}, f, 1))
+return true"#;
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::LocalInspection)),
+        100_000,
+        false,
+    );
+    assert_eq!(outcome, RunOutcome::Returned(vec![Value::Boolean(true)]));
+}
+
+#[test]
+fn p13_h_p15_function_parameter_names_survive_full_dump_load() {
+    let source = br#"local function foo(a, b, ...) local d, e end
+local function one(expected, ...)
+  assert(select('#', ...) == 1)
+  assert((...) == expected)
+end
+local function check(f, first, second)
+  local co = coroutine.create(f)
+  one(first, debug.getlocal(f, 1))
+  one(second, debug.getlocal(f, 2))
+  one(nil, debug.getlocal(f, 3))
+  one(first, debug.getlocal(co, f, 1))
+  one(second, debug.getlocal(co, f, 2))
+  one(nil, debug.getlocal(co, f, 3))
+end
+check(foo, 'a', 'b')
+check(assert(load(string.dump(foo, false))), 'a', 'b')
+check(assert(load(string.dump(foo, true))), nil, nil)
+one(nil, debug.getlocal(print, 1))
+return true"#;
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all()
+            .and_load(LoadCapability::deny_all().with_official_bytecode(true))
+            .and_dump(DumpCapability::deny_all().with_official_bytecode(true))
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::LocalInspection)),
+        1_000_000,
+        false,
+    );
+    assert_eq!(outcome, RunOutcome::Returned(vec![Value::Boolean(true)]));
+}
+
+fn p15_vararg_debug_services() -> HostServices {
+    HostServices::deny_all()
+        .and_load(
+            LoadCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(LoadLimits {
+                    max_work_units: 5_000_000,
+                    max_temporary_bytes: 8 * 1024 * 1024,
+                    max_module_allocation_bytes: 16 * 1024 * 1024,
+                    ..LoadLimits::default()
+                }),
+        )
+        .and_dump(
+            DumpCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(DumpLimits {
+                    max_work_units: 5_000_000,
+                    max_temporary_bytes: 8 * 1024 * 1024,
+                    max_encoded_bytes: 2 * 1024 * 1024,
+                }),
+        )
+        .and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation),
+        )
+}
+
+#[test]
+fn p13_h_p15_official_vararg_debug_local_matches_fixed_and_extra_arguments() {
+    let source = br#"local function foo(a, ...)
+  local t = table.pack(...)
+  local first_name, first_value = debug.getlocal(1, -1)
+  local all_match = true
+  for i = 1, t.n do
+    local name, value = debug.getlocal(1, -i)
+    if name ~= '(vararg)' or value ~= t[i] then all_match = false end
+  end
+  local beyond_name = debug.getlocal(1, -(t.n + 1))
+  local beyond_set = debug.setlocal(1, -(t.n + 1), 30)
+  local first_set, last_set
+  if t.n > 0 then
+    (function(x)
+      first_set = debug.setlocal(2, -1, x)
+      last_set = debug.setlocal(2, -t.n, x)
+    end)(430)
+  end
+  local after_first = (...)
+  local after_first_name, after_first_value = debug.getlocal(1, -1)
+  local after_last_name, after_last_value
+  if t.n > 0 then
+    after_last_name, after_last_value = debug.getlocal(1, -t.n)
+  end
+  return table.concat({tostring(t.n), type(a), tostring(first_name),
+    tostring(first_value), tostring(all_match), tostring(beyond_name),
+    tostring(beyond_set), tostring(first_set), tostring(last_set),
+    tostring(after_first), tostring(after_first_name),
+    tostring(after_first_value), tostring(after_last_name),
+    tostring(after_last_value)}, '|')
+end
+local results = {}
+for _, mode in ipairs({'direct', 'full', 'strip'}) do
+  local f = mode == 'direct' and foo or assert(load(string.dump(foo, mode == 'strip')))
+  results[#results + 1] = f()
+  results[#results + 1] = f(print)
+  results[#results + 1] = f(200)
+  results[#results + 1] = f(200, 3, 4)
+  results[#results + 1] = f(200, nil, 4)
+  local a = {}
+  for i = 1, 1000 do a[i] = i end
+  results[#results + 1] = f(table.unpack(a))
+end
+return table.unpack(results)"#;
+    let (vm, outcome) = run_with_h_debug(source, p15_vararg_debug_services(), 10_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("vararg debug local 未正常返回: {outcome:?}");
+    };
+    let no_extra = "0|nil|nil|nil|true|nil|nil|nil|nil|nil|nil|nil|nil|nil";
+    let fixed_only = "0|function|nil|nil|true|nil|nil|nil|nil|nil|nil|nil|nil|nil";
+    let fixed_number = "0|number|nil|nil|true|nil|nil|nil|nil|nil|nil|nil|nil|nil";
+    let two_extra =
+        "2|number|(vararg)|3|true|nil|nil|(vararg)|(vararg)|430|(vararg)|430|(vararg)|430";
+    let nil_extra =
+        "2|number|(vararg)|nil|true|nil|nil|(vararg)|(vararg)|430|(vararg)|430|(vararg)|430";
+    let many_extra =
+        "999|number|(vararg)|2|true|nil|nil|(vararg)|(vararg)|430|(vararg)|430|(vararg)|430";
+    let expected = [
+        no_extra,
+        fixed_only,
+        fixed_number,
+        two_extra,
+        nil_extra,
+        many_extra,
+    ];
+    let cases = [
+        "foo()",
+        "foo(print)",
+        "foo(200)",
+        "foo(200,3,4)",
+        "foo(200,nil,4)",
+        "foo(unpack(1000))",
+    ];
+    assert_eq!(values.len(), expected.len() * 3);
+    for (mode_index, mode) in ["direct", "full", "strip"].iter().enumerate() {
+        for (case_index, case) in cases.iter().enumerate() {
+            let actual =
+                String::from_utf8(bytes(&vm, values[mode_index * cases.len() + case_index]))
+                    .unwrap();
+            assert_eq!(actual, expected[case_index], "{mode}: {case}");
+        }
+    }
+}
+
+#[test]
+fn p13_h_p15_official_rawless_varargs_keep_nil_argument_slot() {
+    let source = br#"local function f(a, ...)
+  local n1, v1 = debug.getlocal(1, -1)
+  local n2, v2 = debug.getlocal(1, -2)
+  local n3 = debug.getlocal(1, -3)
+  local s = debug.setlocal(1, -1, 42)
+  local n4, v4 = debug.getlocal(1, -1)
+  return table.concat({tostring(n1), tostring(v1), tostring(n2),
+    tostring(v2), tostring(n3), tostring(s), tostring(n4), tostring(v4)}, '|')
+end
+local full = assert(load(string.dump(f, false)))
+local strip = assert(load(string.dump(f, true)))
+return f(7, nil, 11), full(7, nil, 11), strip(7, nil, 11)"#;
+    let (vm, outcome) = run_with_h_debug(source, p15_vararg_debug_services(), 10_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("rawless varargs 未正常返回: {outcome:?}");
+    };
+    assert_eq!(values.len(), 3);
+    for (mode, value) in ["direct", "full", "strip"].iter().zip(values) {
+        let actual = String::from_utf8(bytes(&vm, value)).unwrap();
+        assert_eq!(
+            actual, "(vararg)|nil|(vararg)|11|nil|(vararg)|(vararg)|42",
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn p13_h_p15_lua55_named_vararg_table_hides_negative_debug_locals() {
+    let (_, _, runtime_profile) = profile();
+    if runtime_profile == LuaProfile::Lua54 {
+        return;
+    }
+    let source = br#"local function f(a, ...t)
+  local before_name, before_value = debug.getlocal(1, -1)
+  local count = select('#', ...)
+  local before_table = t[1]
+  t[1] = 99
+  local after_name, after_value = debug.getlocal(1, -1)
+  local set_name = debug.setlocal(1, -1, 77)
+  local final_name, final_value = debug.getlocal(1, -1)
+  return count, before_name, before_value, before_table, after_name,
+    after_value, set_name, final_name, final_value, t[1], (...)
+end
+for _, mode in ipairs({'direct', 'full', 'strip'}) do
+  local g = mode == 'direct' and f or assert(load(string.dump(f, mode == 'strip')))
+  local r = table.pack(g(10, 20, 30))
+  assert(r.n == 11)
+  assert(r[1] == 2 and r[2] == nil and r[3] == nil and r[4] == 20)
+  assert(r[5] == nil and r[6] == nil and r[7] == nil and r[8] == nil and r[9] == nil)
+  assert(r[10] == 99 and r[11] == 99)
+end
+return true"#;
+    let (_, outcome) = run_with_h_debug(source, p15_vararg_debug_services(), 10_000_000, false);
+    assert_eq!(outcome, RunOutcome::Returned(vec![Value::Boolean(true)]));
+}
+
+#[test]
+fn p13_h_p15_official_suspended_vararg_debug_write_updates_resume() {
+    let source = br#"local function f(a, ...)
+  coroutine.yield()
+  local n, v = debug.getlocal(1, -1)
+  return (...), n, v
+end
+local results = {}
+for _, mode in ipairs({'direct', 'full', 'strip'}) do
+  local g = mode == 'direct' and f or assert(load(string.dump(f, mode == 'strip')))
+  local co = coroutine.create(g)
+  local started = coroutine.resume(co, 10, 20, 30)
+  local name, value = debug.getlocal(co, 1, -1)
+  local set_name = debug.setlocal(co, 1, -1, 99)
+  local resumed, first, inner_name, inner_value = coroutine.resume(co)
+  results[#results + 1] = table.concat({tostring(started), tostring(name),
+    tostring(value), tostring(set_name), tostring(resumed), tostring(first),
+    tostring(inner_name), tostring(inner_value)}, '|')
+end
+return table.unpack(results)"#;
+    let (vm, outcome) = run_with_h_debug(source, p15_vararg_debug_services(), 10_000_000, false);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("parked vararg debug 未正常返回: {outcome:?}");
+    };
+    assert_eq!(values.len(), 3);
+    for (mode, value) in ["direct", "full", "strip"].iter().zip(values) {
+        let actual = String::from_utf8(bytes(&vm, value)).unwrap();
+        assert_eq!(
+            actual, "true|(vararg)|20|(vararg)|true|99|(vararg)|99",
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn p13_h_p15_official_vararg_object_write_survives_gc_active_and_parked() {
+    let source = br#"local function active(a, ...)
+  local function patch()
+    local t = {tag = 73}
+    local name = debug.setlocal(2, -1, t)
+    t = nil
+    collectgarbage()
+    return name
+  end
+  local name = patch()
+  collectgarbage()
+  return name, type((...)), (...).tag
+end
+local function parked(a, ...)
+  coroutine.yield()
+  collectgarbage()
+  return type((...)), (...).tag
+end
+local results = {}
+for _, mode in ipairs({'direct', 'full', 'strip'}) do
+  local f = mode == 'direct' and active or assert(load(string.dump(active, mode == 'strip')))
+  local name, kind, value = f(1, 2)
+  local g = mode == 'direct' and parked or assert(load(string.dump(parked, mode == 'strip')))
+  local co = coroutine.create(g)
+  local started = coroutine.resume(co, 1, 2)
+  local object = {tag = 83}
+  local set_name = debug.setlocal(co, 1, -1, object)
+  object = nil
+  collectgarbage()
+  local resumed, parked_kind, parked_value = coroutine.resume(co)
+  results[#results + 1] = table.concat({tostring(name), tostring(kind),
+    tostring(value), tostring(started), tostring(set_name), tostring(resumed),
+    tostring(parked_kind), tostring(parked_value)}, '|')
+end
+return table.unpack(results)"#;
+    let (mut vm, outcome) = run_with_h_debug(source, p15_vararg_debug_services(), 10_000_000, true);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("vararg object GC 未正常返回: {outcome:?}");
+    };
+    assert_eq!(values.len(), 3);
+    for (mode, value) in ["direct", "full", "strip"].iter().zip(values) {
+        let actual = String::from_utf8(bytes(&vm, value)).unwrap();
+        assert_eq!(
+            actual, "(vararg)|table|73|true|(vararg)|true|table|83",
+            "{mode}"
+        );
+    }
+    assert_eq!(vm.roots().count(RootKind::Stack), 0);
+    assert_eq!(vm.roots().count(RootKind::Temporary), 0);
+    vm.collect().unwrap();
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_h_p15_official_hook_call_getlocal_reads_active_guest_local() {
+    let mut actual = Vec::new();
+    for mode in ["direct", "full", "strip"] {
+        let source = format!(
+            "local mode = '{mode}'\n{}",
+            r#"local function f(a)
+  local observed = 0
+  local function hook(event, line)
+    collectgarbage()
+    local installed, mask, count = debug.gethook()
+    assert(type(installed) == 'function' and mask == 'crl' and count == 0)
+    if event == 'call' then
+      local info = debug.getinfo(2, 'f')
+      if info.func == debug.getlocal then observed = observed + 1 end
+    end
+  end
+  debug.sethook(hook, 'crl')
+  local name, value = debug.getlocal(1, 1)
+  debug.sethook()
+  return name, value, observed
+end
+if mode ~= 'direct' then f = assert(load(string.dump(f, mode == 'strip'))) end
+local ok, name, value, observed = pcall(f, 17)
+debug.sethook()
+return ok, name, value, observed"#
+        );
+        let debug = DebugCapability::deny_all()
+            .allow(DebugPermission::Info)
+            .allow(DebugPermission::StackInspection)
+            .allow(DebugPermission::LocalInspection)
+            .allow(DebugPermission::LocalMutation)
+            .allow(DebugPermission::Upvalues)
+            .allow(DebugPermission::UpvalueMutation)
+            .allow(DebugPermission::UpvalueIdentity)
+            .allow(DebugPermission::RegistryRead)
+            .allow(DebugPermission::UserValueRead)
+            .allow(DebugPermission::UserValueWrite)
+            .allow(DebugPermission::Traceback)
+            .allow(DebugPermission::CountHook)
+            .allow(DebugPermission::EventHook)
+            .allow(DebugPermission::MetatableRead)
+            .allow(DebugPermission::TableMetatableWrite);
+        let (vm, outcome) = run_with_h_debug(
+            source.as_bytes(),
+            p15_vararg_debug_services().and_debug(debug),
+            10_000_000,
+            false,
+        );
+        let RunOutcome::Returned(values) = outcome else {
+            panic!("{mode}: hook/getlocal 未返回: {outcome:?}");
+        };
+        assert_eq!(values.len(), 4, "{mode}: {values:?}");
+        let render = |value| match value {
+            Value::Nil => "nil".to_owned(),
+            Value::Boolean(boolean) => boolean.to_string(),
+            Value::Integer(integer) => integer.to_string(),
+            Value::Object(_) => String::from_utf8(bytes(&vm, value)).unwrap(),
+            _ => format!("{value:?}"),
+        };
+        actual.push(format!(
+            "{mode}|{}|{}|{}|{}",
+            render(values[0]),
+            render(values[1]),
+            render(values[2]),
+            render(values[3]),
+        ));
+    }
+    assert_eq!(
+        actual,
+        [
+            "direct|true|a|17|1",
+            "full|true|a|17|1",
+            "strip|true|(temporary)|17|1",
+        ]
+    );
+}
+
+fn p15_official_positive_local_results(source: &str, collect: bool) -> Vec<Vec<String>> {
+    let mut results = Vec::new();
+    for mode in ["direct", "full", "strip"] {
+        let source = format!("local mode = '{mode}'\n{source}");
+        let debug = DebugCapability::deny_all()
+            .allow(DebugPermission::Info)
+            .allow(DebugPermission::StackInspection)
+            .allow(DebugPermission::LocalInspection)
+            .allow(DebugPermission::LocalMutation)
+            .allow(DebugPermission::Upvalues)
+            .allow(DebugPermission::UpvalueMutation)
+            .allow(DebugPermission::UpvalueIdentity)
+            .allow(DebugPermission::RegistryRead)
+            .allow(DebugPermission::UserValueRead)
+            .allow(DebugPermission::UserValueWrite)
+            .allow(DebugPermission::Traceback)
+            .allow(DebugPermission::CountHook)
+            .allow(DebugPermission::EventHook)
+            .allow(DebugPermission::MetatableRead)
+            .allow(DebugPermission::TableMetatableWrite);
+        let (vm, outcome) = run_with_h_debug(
+            source.as_bytes(),
+            p15_vararg_debug_services().and_debug(debug),
+            10_000_000,
+            collect,
+        );
+        let RunOutcome::Returned(values) = outcome else {
+            panic!("{mode}: official positive local 未返回: {outcome:?}");
+        };
+        assert_eq!(vm.roots().count(RootKind::Stack), 0, "{mode}");
+        assert_eq!(vm.roots().count(RootKind::Temporary), 0, "{mode}");
+        results.push(
+            values
+                .into_iter()
+                .map(|value| match value {
+                    Value::Nil => "nil".to_owned(),
+                    Value::Boolean(boolean) => boolean.to_string(),
+                    Value::Integer(integer) => integer.to_string(),
+                    Value::Object(_) => String::from_utf8(bytes(&vm, value)).unwrap(),
+                    _ => format!("{value:?}"),
+                })
+                .collect(),
+        );
+    }
+    results
+}
+
+#[test]
+fn p13_h_p15_official_caller_pending_temporary_precedes_callee() {
+    let source = r#"local observed
+local function render(value)
+  if type(value) == 'number' then return tostring(value) end
+  return type(value)
+end
+function f()
+  local n1, v1 = debug.getlocal(2, 1)
+  local n2, v2 = debug.getlocal(2, 2)
+  local n3, v3 = debug.getlocal(2, 3)
+  local n4, v4 = debug.getlocal(2, 4)
+  local changed = debug.setlocal(2, 3, 10)
+  local after_name, after_value = debug.getlocal(2, 3)
+  observed = {n1, render(v1), n2, render(v2), n3, render(v3),
+    n4 or 'nil', render(v4), changed, after_name, render(after_value)}
+  return 20
+end
+function g(a, b) return (a+1)+f() end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+local result = g(0, 0)
+return result, table.unpack(observed)"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [
+            [
+                "30",
+                "a",
+                "0",
+                "b",
+                "0",
+                "(temporary)",
+                "1",
+                "nil",
+                "nil",
+                "(temporary)",
+                "(temporary)",
+                "10"
+            ],
+            [
+                "30",
+                "a",
+                "0",
+                "b",
+                "0",
+                "(temporary)",
+                "1",
+                "nil",
+                "nil",
+                "(temporary)",
+                "(temporary)",
+                "10"
+            ],
+            [
+                "30",
+                "(temporary)",
+                "0",
+                "(temporary)",
+                "0",
+                "(temporary)",
+                "1",
+                "nil",
+                "nil",
+                "(temporary)",
+                "(temporary)",
+                "10"
+            ],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_multiple_pending_temporaries_keep_order_and_mutation() {
+    let source = r#"local observed
+function f()
+  local n3, v3 = debug.getlocal(2, 3)
+  local n4, v4 = debug.getlocal(2, 4)
+  local n5, v5 = debug.getlocal(2, 5)
+  local s3 = debug.setlocal(2, 3, 10)
+  local s4 = debug.setlocal(2, 4, 20)
+  observed = {n3, tostring(v3), n4, tostring(v4), n5 or 'nil',
+    v5 == nil and 'nil' or type(v5), s3, s4}
+  return 30
+end
+function g(a, b) return (a+1)+((b+2)+f()) end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+local result = g(0, 0)
+return result, table.unpack(observed)"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [
+            [
+                "60",
+                "(temporary)",
+                "1",
+                "(temporary)",
+                "2",
+                "nil",
+                "nil",
+                "(temporary)",
+                "(temporary)"
+            ],
+            [
+                "60",
+                "(temporary)",
+                "1",
+                "(temporary)",
+                "2",
+                "nil",
+                "nil",
+                "(temporary)",
+                "(temporary)"
+            ],
+            [
+                "60",
+                "(temporary)",
+                "1",
+                "(temporary)",
+                "2",
+                "nil",
+                "nil",
+                "(temporary)",
+                "(temporary)"
+            ],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_nested_call_preserves_outer_callee_and_fixed_arguments() {
+    let source = r#"local observed
+function probe()
+  local n1, v1 = debug.getlocal(2, 1)
+  local n2, v2 = debug.getlocal(2, 2)
+  local n3, v3 = debug.getlocal(2, 3)
+  local changed = debug.setlocal(2, 2, 17)
+  observed = {n1, type(v1), n2, tostring(v2), n3, tostring(v3), changed}
+  return 5
+end
+function outer(a, b, c) return a+b+c end
+function g() return outer(11, 22, probe()+0) end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+return g(), table.unpack(observed)"#;
+    let expected = [
+        "44",
+        "(temporary)",
+        "function",
+        "(temporary)",
+        "11",
+        "(temporary)",
+        "22",
+        "(temporary)",
+    ];
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [expected.to_vec(), expected.to_vec(), expected.to_vec()]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_nested_method_receiver_mutation_survives_gc() {
+    let source = r#"local observed
+obj = {value=7}
+replacement = {value=31}
+function probe()
+  local n1, v1 = debug.getlocal(2, 1)
+  local n2, v2 = debug.getlocal(2, 2)
+  local n3, v3 = debug.getlocal(2, 3)
+  local changed = debug.setlocal(2, 2, replacement)
+  collectgarbage('collect')
+  observed = {n1, type(v1), n2, tostring(v2==obj), n3, tostring(v3), changed}
+  return 5
+end
+function obj:m(a, b) return self.value+a+b end
+function g() return obj:m(11, probe()+0) end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+return g(), table.unpack(observed)"#;
+    let expected = [
+        "47",
+        "(temporary)",
+        "function",
+        "(temporary)",
+        "true",
+        "(temporary)",
+        "11",
+        "(temporary)",
+    ];
+    assert_eq!(
+        p15_official_positive_local_results(source, true),
+        [expected.to_vec(), expected.to_vec(), expected.to_vec()]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_nested_call_after_statement_cleanup_keeps_result_local() {
+    let source = r#"function getoutput() return 'abc' end
+function sink() end
+function g()
+  sink()
+  local release = string.match(getoutput(), 'a')
+  collectgarbage('collect')
+  return release
+end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+return g()"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, true),
+        [["a"], ["a"], ["a"]]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_open_call_chains_preserve_prefix_results() {
+    for (source, expected) in [
+        (
+            "function inner() return 19 end; function entry() local func=load(string.dump(inner)); return func() end",
+            "19",
+        ),
+        (
+            "a=7; function g() return 2,3 end; function f(a,b,c,d) return a*1000+b*100+c*10+(d or 0) end; function entry() return f(a,g()) end",
+            "7230",
+        ),
+        (
+            "function g() return 2,3 end; function h() return 4,5 end; function f(a,b,c,d) return a*1000+b*100+c*10+(d or 0) end; function entry() return f(g(),h()) end",
+            "2450",
+        ),
+        (
+            "function g() return 2,3 end; function h() return 4,5 end; function f(a,b,c,d) return a*1000+b*100+c*10+(d or 0) end; function entry() return f(11,g(),h()) end",
+            "11245",
+        ),
+    ] {
+        let script = format!(
+            "{source}; if mode ~= 'direct' then entry = assert(load(string.dump(entry, mode == 'strip'))) end; return entry()"
+        );
+        let expected = vec![expected.to_owned()];
+        assert_eq!(
+            p15_official_positive_local_results(&script, false),
+            [expected.clone(), expected.clone(), expected],
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn p13_h_p15_official_open_call_reloads_global_environment_after_chain() {
+    let (_, language, runtime_profile) = profile();
+    let source = b"function f() return 1 end; assert(f()); return print";
+    let module = compile_debug(source, b"@open-chain-env-root.lua", language);
+    for mode in ["direct", "full", "strip"] {
+        let chunk = if mode == "direct" {
+            Vec::new()
+        } else {
+            rivetlua_core::bytecode::official_export::emit_official_chunk(
+                &module,
+                rivetlua_core::ProtoId(0),
+                runtime_profile,
+                mode == "strip",
+                &OfficialChunkLimits::default(),
+                &mut rivetlua_core::OfficialWorkBudget::new(u64::MAX),
+            )
+            .unwrap_or_else(|error| panic!("{mode}: {error:?}"))
+        };
+        let (mut vm, environment, root) = official_load_vm(
+            runtime_profile,
+            &chunk,
+            LoadLimits {
+                max_work_units: 64 * 1024 * 1024,
+                max_temporary_bytes: 8 * 1024 * 1024,
+                max_module_allocation_bytes: 8 * 1024 * 1024,
+                ..LoadLimits::default()
+            },
+        );
+        let target = if mode == "direct" {
+            module.clone()
+        } else {
+            compile(b"local f=assert(load(chunk,nil,'b')); return f()", language)
+        };
+        let mut execution = vm
+            .load_with_environment(target, Value::Object(environment))
+            .unwrap();
+        let outcome = execution.run().unwrap();
+        drop(execution);
+        let RunOutcome::Returned(values) = outcome else {
+            panic!("{mode}: {outcome:?}");
+        };
+        let print_key = vm.allocate_byte_string(b"print").unwrap();
+        let print = vm.raw_get(environment, Value::Object(print_key)).unwrap();
+        assert_eq!(values, vec![print], "{mode}");
+        vm.remove_root(root).unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0, "{mode}");
+    }
+}
+
+#[test]
+fn p13_h_p15_official_open_call_tracks_global_table_writes() {
+    let (_, language, runtime_profile) = profile();
+    for (case, source, expected) in [
+        (
+            "global-write-read",
+            b"function f() return 1 end; assert(f()); marker=73; return marker".as_slice(),
+            Value::Integer(73),
+        ),
+        (
+            "same-table-identity",
+            b"local original=_ENV; function f() return 1 end; assert(f()); marker=74; return original.marker".as_slice(),
+            Value::Integer(74),
+        ),
+    ] {
+        let module = compile_debug(source, b"@open-chain-env-write.lua", language);
+        for mode in ["direct", "full", "strip"] {
+            let chunk = if mode == "direct" {
+                Vec::new()
+            } else {
+                rivetlua_core::bytecode::official_export::emit_official_chunk(
+                    &module,
+                    rivetlua_core::ProtoId(0),
+                    runtime_profile,
+                    mode == "strip",
+                    &OfficialChunkLimits::default(),
+                    &mut rivetlua_core::OfficialWorkBudget::new(u64::MAX),
+                )
+                .unwrap_or_else(|error| panic!("{case} {mode}: {error:?}"))
+            };
+            let (mut vm, environment, root) = official_load_vm(
+                runtime_profile,
+                &chunk,
+                LoadLimits {
+                    max_work_units: 64 * 1024 * 1024,
+                    max_temporary_bytes: 8 * 1024 * 1024,
+                    max_module_allocation_bytes: 8 * 1024 * 1024,
+                    ..LoadLimits::default()
+                },
+            );
+            let target = if mode == "direct" {
+                module.clone()
+            } else {
+                compile(b"local f=assert(load(chunk,nil,'b')); return f()", language)
+            };
+            let mut execution = vm
+                .load_with_environment(target, Value::Object(environment))
+                .unwrap();
+            let outcome = execution.run().unwrap();
+            drop(execution);
+            assert_eq!(outcome, RunOutcome::Returned(vec![expected]), "{case} {mode}");
+            vm.remove_root(root).unwrap();
+            assert_eq!(vm.ledger_snapshot().reserved, 0, "{case} {mode}");
+        }
+    }
+}
+
+#[test]
+fn p13_h_p15_official_nested_environment_cache() {
+    for (source, expected) in [(
+        r#"function f() return 1 end
+function entry()
+  local function outer()
+    return function() assert(f()); return type(print) end
+  end
+  return outer()()
+end"#,
+        vec!["function"],
+    )] {
+        let script = format!(
+            "{source}\nif mode ~= 'direct' then entry = assert(load(string.dump(entry, mode == 'strip'))) end\nreturn entry()"
+        );
+        let expected = expected.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            p15_official_positive_local_results(&script, true),
+            [expected.clone(), expected.clone(), expected],
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn p13_h_p15_official_consecutive_calls_share_pending_value() {
+    let source = r#"local observed = {}
+function f()
+  local n3, v3 = debug.getlocal(2, 3)
+  local n4 = debug.getlocal(2, 4)
+  observed[1], observed[2], observed[3] = n3, tostring(v3), n4 or 'nil'
+  return 2
+end
+function h()
+  local n3, v3 = debug.getlocal(2, 3)
+  local n4, v4 = debug.getlocal(2, 4)
+  local n5 = debug.getlocal(2, 5)
+  local s3 = debug.setlocal(2, 3, 10)
+  local s4 = debug.setlocal(2, 4, 20)
+  observed[4], observed[5], observed[6] = n3, tostring(v3), n4
+  observed[7], observed[8], observed[9] = tostring(v4), n5 or 'nil', s3
+  observed[10] = s4
+  return 0
+end
+function g(a, b) return (a+1)+(f()+h()) end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+local result = g(0, 0)
+return result, table.unpack(observed)"#;
+    let expected = [
+        "30",
+        "(temporary)",
+        "1",
+        "nil",
+        "(temporary)",
+        "1",
+        "(temporary)",
+        "2",
+        "nil",
+        "(temporary)",
+        "(temporary)",
+    ];
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [expected.to_vec(), expected.to_vec(), expected.to_vec()]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_pending_frontier_tracks_local_scopes() {
+    let source = r#"local count, observed = 0, {}
+function probe()
+  count = count + 1
+  local target = count == 1 and 5 or 4
+  local local_name, local_value = debug.getlocal(2, target - 1)
+  local pending_name, pending_value = debug.getlocal(2, target)
+  local beyond = debug.getlocal(2, target + 1)
+  local changed = debug.setlocal(2, target, count * 10)
+  observed[#observed + 1] = local_name
+  observed[#observed + 1] = tostring(local_value)
+  observed[#observed + 1] = pending_name
+  observed[#observed + 1] = tostring(pending_value)
+  observed[#observed + 1] = beyond or 'nil'
+  observed[#observed + 1] = changed
+  return 0
+end
+function g(a, b)
+  local total = 0
+  do local x = 5; total = total + (a+1) + probe() end
+  total = total + (a+1) + probe()
+  return total
+end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+local result = g(0, 0)
+return result, table.unpack(observed)"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [
+            [
+                "20",
+                "x",
+                "5",
+                "(temporary)",
+                "1",
+                "nil",
+                "(temporary)",
+                "total",
+                "10",
+                "(temporary)",
+                "11",
+                "nil",
+                "(temporary)"
+            ],
+            [
+                "20",
+                "x",
+                "5",
+                "(temporary)",
+                "1",
+                "nil",
+                "(temporary)",
+                "total",
+                "10",
+                "(temporary)",
+                "11",
+                "nil",
+                "(temporary)"
+            ],
+            [
+                "20",
+                "(temporary)",
+                "5",
+                "(temporary)",
+                "1",
+                "nil",
+                "(temporary)",
+                "(temporary)",
+                "10",
+                "(temporary)",
+                "11",
+                "nil",
+                "(temporary)"
+            ],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_call_without_pending_hides_callee() {
+    let source = r#"local observed
+function f()
+  local n1, v1 = debug.getlocal(2, 1)
+  local n2, v2 = debug.getlocal(2, 2)
+  local n3, v3 = debug.getlocal(2, 3)
+  observed = {n1, tostring(v1), n2, tostring(v2), n3 or 'nil',
+    v3 == nil and 'nil' or type(v3)}
+  return 20
+end
+function g(a) local x=a+1; f(); return x end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+local result = g(0)
+return result, table.unpack(observed)"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [
+            ["1", "a", "0", "x", "1", "nil", "nil"],
+            ["1", "a", "0", "x", "1", "nil", "nil"],
+            ["1", "(temporary)", "0", "(temporary)", "1", "nil", "nil"],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_dump_excludes_uninitialized_local_from_callee_slots() {
+    let source = r#"local observed
+function probe()
+  local n1, v1 = debug.getlocal(2, 1)
+  local n2, v2 = debug.getlocal(2, 2)
+  local s1 = debug.setlocal(2, 1, 10)
+  observed = {n1 or 'nil', v1 == nil and 'nil' or type(v1),
+    n2 or 'nil', v2 == nil and 'nil' or type(v2), s1 or 'nil'}
+  return 20
+end
+function g() local A=probe(); return A end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+local result = g()
+return result, table.unpack(observed)"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [
+            ["20", "(temporary)", "nil", "nil", "nil", "(temporary)"],
+            ["20", "nil", "nil", "nil", "nil", "nil"],
+            ["20", "nil", "nil", "nil", "nil", "nil"],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_open_last_argument_chain_keeps_existing_layout() {
+    let source = r#"function values() return 2, 3 end
+function sum(x, y) return x + y end
+function g(a) return (a+1)+sum(values()) end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+return g(0)"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [["6"], ["6"], ["6"]]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_positive_local_active_get_set_and_bounds() {
+    let source = r#"local function f(a, b)
+  local x = 10
+  local n1, v1 = debug.getlocal(1, 1)
+  local n2, v2 = debug.getlocal(1, 2)
+  local n3, v3 = debug.getlocal(1, 3)
+  local miss = debug.getlocal(1, 100)
+  local miss_set = debug.setlocal(1, 100, 99)
+  local s1 = debug.setlocal(1, 1, 31)
+  local s3 = debug.setlocal(1, 3, 41)
+  return n1, v1, n2, v2, n3, v3, miss, miss_set, s1, s3, a, x
+end
+if mode ~= 'direct' then f = assert(load(string.dump(f, mode == 'strip'))) end
+return f(7, nil)"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [
+            [
+                "a", "7", "b", "nil", "x", "10", "nil", "nil", "a", "x", "31", "41"
+            ],
+            [
+                "a", "7", "b", "nil", "x", "10", "nil", "nil", "a", "x", "31", "41"
+            ],
+            [
+                "(temporary)",
+                "7",
+                "(temporary)",
+                "nil",
+                "(temporary)",
+                "10",
+                "nil",
+                "nil",
+                "(temporary)",
+                "(temporary)",
+                "31",
+                "41"
+            ],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_positive_local_scope_end_hides_old_name() {
+    let source = r#"local function f(a)
+  do
+    local x = 4
+    local name, value = debug.getlocal(1, 2)
+    SCOPE_INSIDE = name
+    SCOPE_VALUE = value
+  end
+  local after_name, after_value = debug.getlocal(1, 2)
+  return SCOPE_INSIDE, SCOPE_VALUE, after_name, after_value
+end
+if mode ~= 'direct' then f = assert(load(string.dump(f, mode == 'strip'))) end
+return f(7)"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [
+            ["x", "4", "(temporary)", "nil"],
+            ["x", "4", "nil", "nil"],
+            ["(temporary)", "4", "nil", "nil"],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_positive_local_level2_mutates_caller_slots() {
+    let source = r#"function change()
+  local n4, v4 = debug.getlocal(2, 4)
+  local n5, v5 = debug.getlocal(2, 5)
+  local s4 = debug.setlocal(2, 4, 'pera')
+  local s5 = debug.setlocal(2, 5, 'manga')
+  return n4, v4, n5, v5, s4, s5
+end
+local function g()
+  local p, q, r = 1, 2, 3
+  local AAAA, B = 'xuxu', 'abacate'
+  local n4, v4, n5, v5, s4, s5 = change()
+  return n4, v4, n5, v5, s4, s5, AAAA, B
+end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+return g()"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [
+            ["AAAA", "xuxu", "B", "abacate", "AAAA", "B", "pera", "manga"],
+            ["AAAA", "xuxu", "B", "abacate", "AAAA", "B", "pera", "manga"],
+            [
+                "(temporary)",
+                "xuxu",
+                "(temporary)",
+                "abacate",
+                "(temporary)",
+                "(temporary)",
+                "pera",
+                "manga"
+            ],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_anonymous_vararg_keeps_db359_level2_indices() {
+    let (_, _, runtime_profile) = profile();
+    let (first, second) = if runtime_profile == LuaProfile::Lua55 {
+        (4, 5)
+    } else {
+        (3, 4)
+    };
+    let source = r#"function probe()
+  local n4, v4 = debug.getlocal(2, @FIRST@)
+  local n5, v5 = debug.getlocal(2, @SECOND@)
+  local s4 = debug.setlocal(2, @FIRST@, 'pera')
+  local s5 = debug.setlocal(2, @SECOND@, 'manga')
+  return n4, v4, n5, v5, s4, s5
+end
+local function g(...)
+  local arg = {...}
+  do local a, b, c; a = 40 end
+  local feijao
+  local AAAA, B = 'xuxu', 'abacate'
+  local n4, v4, n5, v5, s4, s5 = probe()
+  return n4, v4, n5, v5, s4, s5, AAAA, B
+end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+return g(99)"#
+        .replace("@FIRST@", &first.to_string())
+        .replace("@SECOND@", &second.to_string());
+    assert_eq!(
+        p15_official_positive_local_results(&source, false),
+        [
+            ["AAAA", "xuxu", "B", "abacate", "AAAA", "B", "pera", "manga"],
+            ["AAAA", "xuxu", "B", "abacate", "AAAA", "B", "pera", "manga"],
+            [
+                "(temporary)",
+                "xuxu",
+                "(temporary)",
+                "abacate",
+                "(temporary)",
+                "(temporary)",
+                "pera",
+                "manga"
+            ],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_parked_anonymous_vararg_slot_keeps_later_local_and_gc() {
+    let (_, _, runtime_profile) = profile();
+    let source = r#"local function g(...)
+  local AAAA, B = 'xuxu', 'abacate'
+  coroutine.yield()
+  return AAAA, B, (...)
+end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+local co = coroutine.create(g)
+local started = coroutine.resume(co, 'extra')
+local before_name, before_value = debug.getlocal(co, 1, 1)
+local nil_name = debug.setlocal(co, 1, 1, nil)
+local replacement = {tag = 9}
+local object_name = debug.setlocal(co, 1, 1, replacement)
+replacement = nil
+collectgarbage()
+local after_name, after_value = debug.getlocal(co, 1, 1)
+local resumed, first, second, extra = coroutine.resume(co)
+return started, before_name, type(before_value), nil_name, object_name,
+       after_name, after_value.tag, resumed, type(first),
+       type(first) == 'table' and first.tag or first, second, extra"#;
+    let actual = p15_official_positive_local_results(source, true);
+    if runtime_profile == LuaProfile::Lua55 {
+        assert_eq!(
+            actual,
+            [
+                [
+                    "true",
+                    "(vararg table)",
+                    "nil",
+                    "(vararg table)",
+                    "(vararg table)",
+                    "(vararg table)",
+                    "9",
+                    "true",
+                    "string",
+                    "xuxu",
+                    "abacate",
+                    "extra"
+                ],
+                [
+                    "true",
+                    "(vararg table)",
+                    "nil",
+                    "(vararg table)",
+                    "(vararg table)",
+                    "(vararg table)",
+                    "9",
+                    "true",
+                    "string",
+                    "xuxu",
+                    "abacate",
+                    "extra"
+                ],
+                [
+                    "true",
+                    "(temporary)",
+                    "nil",
+                    "(temporary)",
+                    "(temporary)",
+                    "(temporary)",
+                    "9",
+                    "true",
+                    "string",
+                    "xuxu",
+                    "abacate",
+                    "extra"
+                ],
+            ]
+        );
+    } else {
+        assert_eq!(
+            actual,
+            [
+                [
+                    "true", "AAAA", "string", "AAAA", "AAAA", "AAAA", "9", "true", "table", "9",
+                    "abacate", "extra"
+                ],
+                [
+                    "true", "AAAA", "string", "AAAA", "AAAA", "AAAA", "9", "true", "table", "9",
+                    "abacate", "extra"
+                ],
+                [
+                    "true",
+                    "(temporary)",
+                    "string",
+                    "(temporary)",
+                    "(temporary)",
+                    "(temporary)",
+                    "9",
+                    "true",
+                    "table",
+                    "9",
+                    "abacate",
+                    "extra"
+                ],
+            ]
+        );
+    }
+}
+
+#[test]
+fn p13_h_p15_official_positive_local_parked_nil_object_and_gc() {
+    let source = r#"local function f(a)
+  local x = {tag = 5}
+  coroutine.yield()
+  return a, x.tag
+end
+if mode ~= 'direct' then f = assert(load(string.dump(f, mode == 'strip'))) end
+local co = coroutine.create(f)
+local started = coroutine.resume(co, 17)
+local n1, v1 = debug.getlocal(co, 1, 1)
+local n2, v2 = debug.getlocal(co, 1, 2)
+local missing = debug.getlocal(co, 1, 100)
+local s1 = debug.setlocal(co, 1, 1, nil)
+local object = {tag = 9}
+local s2 = debug.setlocal(co, 1, 2, object)
+object = nil
+collectgarbage()
+local resumed, arg, tag = coroutine.resume(co)
+return started, n1, v1, n2, type(v2), v2 and v2.tag,
+       missing, s1, s2, resumed, arg, tag"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, true),
+        [
+            [
+                "true", "a", "17", "x", "table", "5", "nil", "a", "x", "true", "nil", "9"
+            ],
+            [
+                "true", "a", "17", "x", "table", "5", "nil", "a", "x", "true", "nil", "9"
+            ],
+            [
+                "true",
+                "(temporary)",
+                "17",
+                "(temporary)",
+                "table",
+                "5",
+                "nil",
+                "(temporary)",
+                "(temporary)",
+                "true",
+                "nil",
+                "9"
+            ],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_p15_official_positive_local_hook_prologue_and_return_pc() {
+    let source = r#"local function target(a)
+  local x = 9
+  return a + x
+end
+if mode ~= 'direct' then target = assert(load(string.dump(target, mode == 'strip'))) end
+local call_record, return_record
+local function hook(event)
+  local info = debug.getinfo(2, 'f')
+  if info and info.func == target then
+    local self_name, self_value = debug.getlocal(1, 1)
+    local arg_name, arg_value = debug.getlocal(2, 1)
+    local local_name, local_value = debug.getlocal(2, 2)
+    local record = {self_name, self_value, arg_name, arg_value, local_name, local_value}
+    if event == 'call' then call_record = record end
+    if event == 'return' then return_record = record end
+  end
+end
+debug.sethook(hook, 'cr')
+local result = target(3)
+debug.sethook()
+return result, call_record[1], call_record[2], call_record[3], call_record[4],
+       call_record[5], return_record[1], return_record[3], return_record[5],
+       return_record[6]"#;
+    assert_eq!(
+        p15_official_positive_local_results(source, false),
+        [
+            [
+                "12",
+                "event",
+                "call",
+                "a",
+                "3",
+                "(temporary)",
+                "event",
+                "a",
+                "x",
+                "9"
+            ],
+            [
+                "12",
+                "event",
+                "call",
+                "a",
+                "3",
+                "(temporary)",
+                "event",
+                "a",
+                "x",
+                "9"
+            ],
+            [
+                "12",
+                "event",
+                "call",
+                "(temporary)",
+                "3",
+                "(temporary)",
+                "event",
+                "(temporary)",
+                "(temporary)",
+                "9"
+            ],
+        ]
+    );
+}
+
+#[test]
+fn p13_h_step2_active_caller_local_read_write_and_invalid_levels() {
+    let source = br#"assert(not pcall(debug.getlocal, 20, 1))
+assert(not pcall(debug.setlocal, -1, 1, 10))
+local function outer(a)
+  local x = 7
+  local function probe()
+    local n, v = debug.getlocal(2, 1)
+    local m, w = debug.getlocal(2, 2)
+    assert(n == 'a' and v == 3 and m == 'x' and w == 7)
+    assert(debug.setlocal(2, 1, 5) == 'a')
+    assert(debug.setlocal(2, 2, 11) == 'x')
+    assert(debug.getlocal(2, 99) == nil)
+  end
+  probe()
+  return a, x
+end
+return outer(3)"#;
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation),
+        ),
+        300_000,
+        false,
+    );
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![Value::Integer(5), Value::Integer(11)])
+    );
+}
+
+#[test]
+fn p13_h_step2_negative_varargs_write_keeps_object_reachable() {
+    let source = br#"local function f(a, ...)
+  local n, v = debug.getlocal(1, -1)
+  assert(n == '(vararg)' and v == 8)
+  assert(debug.getlocal(1, -3) == nil)
+  assert(debug.setlocal(1, -3, 30) == nil)
+  local function patch()
+    local t = {}
+    assert(debug.setlocal(2, -1, t) == '(vararg)')
+  end
+  patch()
+  collectgarbage()
+  return type((...)) == 'table', select(2, ...)
+end
+return f(0, 8, 9)"#;
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation),
+        ),
+        300_000,
+        true,
+    );
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![Value::Boolean(true), Value::Integer(9)])
+    );
+}
+
+#[test]
+fn p13_h_step2_tail_setlocal_mutates_caller_and_cleans_roots() {
+    let source = br#"local function outer()
+  local x = {}
+  local function patch()
+    return debug.setlocal(2, 1, 19)
+  end
+  local name = patch()
+  collectgarbage()
+  return x, name
+end
+return outer()"#;
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation),
+        ),
+        300_000,
+        true,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("tail setlocal 失敗: {outcome:?}");
+    };
+    assert_eq!(values[0], Value::Integer(19));
+    assert_eq!(bytes(&vm, values[1]), b"x");
+    assert_eq!(vm.roots().count(RootKind::Stack), 0);
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
+}
+
+#[test]
+fn p13_h_step2_suspended_coroutine_local_and_vararg_mutation_survive_gc() {
+    let (_, _, runtime_profile) = profile();
+    let local_index = match runtime_profile {
+        LuaProfile::Lua55 => 3,
+        LuaProfile::Lua54 => 2,
+    };
+    let source = format!(
+        r#"local co = coroutine.create(function(a, ...)
+  local x = a
+  coroutine.yield()
+  return x, ...
+end)
+assert(coroutine.resume(co, 7, 8))
+local n, v = debug.getlocal(co, 1, {local_index})
+assert(n == 'x' and v == 7)
+local m, w = debug.getlocal(co, 1, -1)
+assert(m == '(vararg)' and w == 8)
+local t = {{}}
+assert(debug.setlocal(co, 1, {local_index}, t) == 'x')
+assert(debug.setlocal(co, 1, -1, 77) == '(vararg)')
+t = nil
+collectgarbage()
+local ok, x, y = coroutine.resume(co)
+return ok, type(x), y"#
+    );
+    let (vm, outcome) = run_with_h_debug(
+        source.as_bytes(),
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation),
+        ),
+        500_000,
+        true,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("suspended coroutine local 失敗: {outcome:?}");
+    };
+    assert_eq!(values[0], Value::Boolean(true));
+    assert_eq!(bytes(&vm, values[1]), b"table");
+    assert_eq!(values[2], Value::Integer(77));
+}
+
+#[test]
+fn p13_h_step2_suspended_caller_local_updates_open_upvalue() {
+    let source = br#"local co = coroutine.create(function()
+  local x = 7
+  local observe = function() return x end
+  local function pause() coroutine.yield(observe) end
+  pause()
+  return x, observe()
+end)
+local ok, observe = coroutine.resume(co)
+assert(ok and observe() == 7)
+local name, before = debug.getlocal(co, 2, 1)
+assert(name == 'x' and before == 7)
+local t = {}
+assert(debug.setlocal(co, 2, 1, t) == 'x')
+t = nil
+collectgarbage()
+assert(type(observe()) == 'table')
+local resumed, a, b = coroutine.resume(co)
+return resumed, type(a), type(b)"#;
+    let (vm, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation),
+        ),
+        500_000,
+        true,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("suspended caller/open upvalue 失敗: {outcome:?}");
+    };
+    assert_eq!(values.len(), 3);
+    assert_eq!(values[0], Value::Boolean(true));
+    assert_eq!(bytes(&vm, values[1]), b"table");
+    assert_eq!(bytes(&vm, values[2]), b"table");
+}
+
+#[test]
+fn p13_h_step2_coroutine_local_rejects_unavailable_frame_states() {
+    let source = br#"local fresh = coroutine.create(function() end)
+local fresh_read = pcall(debug.getlocal, fresh, 1, 1)
+local fresh_write = pcall(debug.setlocal, fresh, 1, 1, 2)
+local outer
+local inner
+inner = coroutine.create(function()
+  local normal_read = pcall(debug.getlocal, outer, 1, 1)
+  local normal_write = pcall(debug.setlocal, outer, 1, 1, 2)
+  local running_read = pcall(debug.getlocal, inner, 1, 1)
+  local running_write = pcall(debug.setlocal, inner, 1, 1, 2)
+  return normal_read, normal_write, running_read, running_write
+end)
+outer = coroutine.create(function() return coroutine.resume(inner) end)
+local ok, resumed, normal_read, normal_write, running_read, running_write = coroutine.resume(outer)
+local dead_read = pcall(debug.getlocal, inner, 1, 1)
+local dead_write = pcall(debug.setlocal, inner, 1, 1, 2)
+return ok, resumed, fresh_read, fresh_write, normal_read, normal_write,
+       running_read, running_write, dead_read, dead_write"#;
+    let (_, outcome) = run_with_h_debug(
+        source,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation),
+        ),
+        500_000,
+        false,
+    );
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("coroutine state 邊界失敗: {outcome:?}");
+    };
+    assert_eq!(values.len(), 10);
+    assert_eq!(values[0], Value::Boolean(true));
+    assert_eq!(values[1], Value::Boolean(true));
+    assert!(
+        values[2..]
+            .iter()
+            .all(|value| *value == Value::Boolean(false))
+    );
+}
+
+#[test]
+fn p13_h_step2_registry_is_vm_local_rooted_and_has_weak_hook_keys() {
+    let source = br#"local r = debug.getregistry()
+assert(r == debug.getregistry())
+assert(getmetatable(r._HOOKKEY).__mode == 'k')
+do
+  local key = {}
+  r._HOOKKEY[key] = {}
+end
+collectgarbage()
+assert(next(r._HOOKKEY) == nil)
+r.user = 17
+collectgarbage()
+return r, r.user"#;
+    let services = || {
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::RegistryRead))
+    };
+    let (mut first, first_outcome) = run_with_h_debug(source, services(), 300_000, true);
+    let (_second, second_outcome) = run_with_h_debug(source, services(), 300_000, true);
+    let RunOutcome::Returned(first_values) = first_outcome else {
+        panic!("第一個 VM registry 失敗: {first_outcome:?}");
+    };
+    let RunOutcome::Returned(second_values) = second_outcome else {
+        panic!("第二個 VM registry 失敗: {second_outcome:?}");
+    };
+    assert_eq!(first_values[1], Value::Integer(17));
+    assert_eq!(second_values[1], Value::Integer(17));
+    assert_ne!(first_values[0], second_values[0]);
+    first.collect().unwrap();
+    let Value::Object(registry) = first_values[0] else {
+        panic!("registry 必須是 table");
+    };
+    assert_eq!(first.object_kind(registry), Ok(ObjectKind::Table));
+}
+
+#[test]
+fn p13_h_step2_official_no_slot_file_uservalue_snippet() {
+    let (_, _, runtime_profile) = profile();
+    let (raw, start): (&[u8], usize) = match runtime_profile {
+        LuaProfile::Lua55 => (
+            include_bytes!("../../../vendor/lua55/lua-5.5.1-tests/db.lua"),
+            432,
+        ),
+        LuaProfile::Lua54 => (
+            include_bytes!("../../../vendor/lua54/lua-5.4.9-tests/db.lua"),
+            427,
+        ),
+    };
+    let source: Vec<u8> = raw
+        .split_inclusive(|byte| *byte == b'\n')
+        .skip(start - 1)
+        .take(6)
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(source.iter().filter(|byte| **byte == b'\n').count(), 6);
+    let state = Rc::new(RefCell::new(GHostState::default()));
+    let (_, outcome) = run_with_h_debug(
+        &source,
+        g_services(state).and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::UserValueRead)
+                .allow(DebugPermission::UserValueWrite),
+        ),
+        100_000,
+        false,
+    );
+    assert_eq!(outcome, RunOutcome::Returned(Vec::new()));
+}
+
+#[test]
+fn p13_h_step2_no_slot_file_uservalue_returns_one_nil() {
+    let source = br#"local a = debug.getuservalue(io.stdin, 10)
+local b = debug.setuservalue(io.stdin, 10)
+return a == nil, b == nil,
+       select('#', debug.getuservalue(io.stdin, 10)),
+       select('#', debug.setuservalue(io.stdin, 10))"#;
+    let state = Rc::new(RefCell::new(GHostState::default()));
+    let (_, outcome) = run_with_h_debug(
+        source,
+        g_services(state).and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::UserValueRead)
+                .allow(DebugPermission::UserValueWrite),
+        ),
+        100_000,
+        false,
+    );
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Integer(1),
+            Value::Integer(1),
+        ])
+    );
+}
+
+#[test]
+fn p13_h_step2_uservalue_permissions_are_separate() {
+    let source = b"local a=pcall(debug.getuservalue,io.stdin,1); local b=pcall(debug.setuservalue,io.stdin,2); return a,b";
+    for (permission, expected) in [
+        (DebugPermission::UserValueRead, [true, false]),
+        (DebugPermission::UserValueWrite, [false, true]),
+    ] {
+        let state = Rc::new(RefCell::new(GHostState::default()));
+        let (_, outcome) = run_with_h_debug(
+            source,
+            g_services(state).and_debug(DebugCapability::deny_all().allow(permission)),
+            100_000,
+            false,
+        );
+        assert_eq!(
+            outcome,
+            RunOutcome::Returned(vec![
+                Value::Boolean(expected[0]),
+                Value::Boolean(expected[1]),
+            ])
+        );
+    }
+}
+
+#[test]
+fn p13_h_step2_uservalue_nonuserdata_and_invalid_index_boundary() {
+    let source = br#"local count = select('#', debug.getuservalue({}, 2))
+local value = debug.getuservalue({}, 2)
+local a = pcall(debug.setuservalue, {}, 3)
+local b = pcall(debug.getuservalue, io.stdin, 'invalid')
+local c = pcall(debug.setuservalue, io.stdin, 3, 'invalid')
+return count, value == nil, a, b, c"#;
+    let state = Rc::new(RefCell::new(GHostState::default()));
+    let (_, outcome) = run_with_h_debug(
+        source,
+        g_services(state).and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::UserValueRead)
+                .allow(DebugPermission::UserValueWrite),
+        ),
+        100_000,
+        false,
+    );
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(vec![
+            Value::Integer(1),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(false),
+            Value::Boolean(false),
+        ])
+    );
+}
+
+#[test]
+fn p13_h_step2_getlocal_zero_reads_c_temporaries() {
+    let raw = include_bytes!("../../../vendor/lua55/lua-5.5.1-tests/db.lua");
+    let source: Vec<u8> = raw
+        .split_inclusive(|byte| *byte == b'\n')
+        .skip(407)
+        .take(6)
+        .flatten()
+        .copied()
+        .collect();
+    let (_, outcome) = run_with_h_debug(
+        &source,
+        HostServices::deny_all()
+            .and_debug(DebugCapability::deny_all().allow(DebugPermission::LocalInspection)),
+        100_000,
+        false,
+    );
+    assert_eq!(outcome, RunOutcome::Returned(Vec::new()));
 }

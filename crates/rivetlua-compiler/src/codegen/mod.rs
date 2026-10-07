@@ -3,8 +3,8 @@
 pub mod official;
 
 use crate::ir::{
-    IrClosePath, IrConstant, IrInstruction, IrModule, IrNativeDebug, IrNativeListWrite,
-    IrNativeLocal, IrPrototype, IrUpvalue,
+    IrClosePath, IrConstant, IrInstruction, IrModule, IrNativeDebug, IrNativeInitializerTemporary,
+    IrNativeListWrite, IrNativeLocal, IrNativeTemporary, IrPrototype, IrUpvalue,
 };
 use crate::{
     BinaryOp, BindingId, BindingKind, ClosePath, ExitKind, FunctionId, LanguageProfile, Literal,
@@ -337,6 +337,7 @@ struct Builder<'a> {
     binding_registers: Vec<(BindingId, Register)>,
     constants: Vec<IrConstant>,
     instructions: Vec<IrInstruction>,
+    call_statement_cleanups: Vec<(usize, Register)>,
     close_paths: Vec<IrClosePath>,
     label_frames: Vec<LabelFrame>,
     pending_gotos: Vec<PendingGoto>,
@@ -345,6 +346,11 @@ struct Builder<'a> {
     debug_active: Vec<usize>,
     debug_scopes: Vec<usize>,
     debug_max_active: u16,
+    pending_expression_values: Vec<Register>,
+    debug_temporaries: Vec<IrNativeTemporary>,
+    debug_initializer_temporaries: Vec<IrNativeInitializerTemporary>,
+    debug_non_counted_pcs: Vec<InstructionOffset>,
+    suppress_debug_temporaries: bool,
     native_list_writes: Vec<IrNativeListWrite>,
 }
 
@@ -390,8 +396,104 @@ pub(crate) fn lower_scratch_unit_bytes() -> usize {
         + core::mem::size_of::<LoopFrame>()
         + core::mem::size_of::<PreparedAssignmentTarget>()
         + core::mem::size_of::<IrNativeLocal>()
+        + core::mem::size_of::<IrNativeTemporary>()
+        + core::mem::size_of::<IrNativeInitializerTemporary>()
         + core::mem::size_of::<IrNativeListWrite>()
         + core::mem::size_of::<(BindingId, Register)>()
+}
+
+fn initializer_successors(instructions: &[IrInstruction], pc: usize) -> [Option<usize>; 3] {
+    let next = (pc + 1 < instructions.len()).then_some(pc + 1);
+    match instructions[pc].instruction {
+        Instruction::Jump { target } => [Some(target.0 as usize), None, None],
+        Instruction::JumpIfFalse { target, .. }
+        | Instruction::NumericForPrepare { exit: target, .. } => {
+            [Some(target.0 as usize), next, None]
+        }
+        Instruction::NumericForNext { target, exit, .. } => {
+            [Some(target.0 as usize), Some(exit.0 as usize), None]
+        }
+        Instruction::Return { .. } | Instruction::TailCall { .. } => [None; 3],
+        _ => [next, None, None],
+    }
+}
+
+fn initializer_reachable_pcs(
+    instructions: &[IrInstruction],
+    span: Span,
+) -> Result<Vec<bool>, IrError> {
+    let mut reachable = Vec::new();
+    reachable
+        .try_reserve_exact(instructions.len())
+        .map_err(|_| limit(span, "native debug initializer CFG 配置失敗"))?;
+    reachable.resize(instructions.len(), false);
+    if instructions.is_empty() {
+        return Ok(reachable);
+    }
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(instructions.len())
+        .map_err(|_| limit(span, "native debug initializer CFG worklist 配置失敗"))?;
+    reachable[0] = true;
+    pending.push(0);
+    while let Some(pc) = pending.pop() {
+        for successor in initializer_successors(instructions, pc)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(visited) = reachable.get_mut(successor) {
+                if !*visited {
+                    *visited = true;
+                    pending.push(successor);
+                }
+            }
+        }
+    }
+    Ok(reachable)
+}
+
+fn initializer_interval_safe(
+    instructions: &[IrInstruction],
+    reachable: &[bool],
+    interval: &IrNativeInitializerTemporary,
+) -> bool {
+    let start = interval.start_pc as usize;
+    let end = interval.end_pc as usize;
+    if start >= end || end >= instructions.len() || !reachable[start] {
+        return false;
+    }
+    for (pc, entry) in instructions.iter().enumerate() {
+        if start <= pc
+            && pc < end
+            && matches!(
+                entry.instruction,
+                Instruction::Jump { .. }
+                    | Instruction::JumpIfFalse { .. }
+                    | Instruction::NumericForPrepare { .. }
+                    | Instruction::NumericForNext { .. }
+                    | Instruction::Return { .. }
+                    | Instruction::TailCall { .. }
+            )
+        {
+            return false;
+        }
+        for successor in initializer_successors(instructions, pc)
+            .into_iter()
+            .flatten()
+        {
+            if start <= pc && pc < end {
+                if successor != pc + 1 {
+                    return false;
+                }
+            } else if start <= successor && successor < end && (successor != start || pc >= end) {
+                return false;
+            } else if pc >= end && successor <= start && successor < pc {
+                // 從初始化後回到較早區塊時，不能再假定 future slot 保持 frame 初始 Nil。
+                return false;
+            }
+        }
+    }
+    true
 }
 
 impl<'a> Builder<'a> {
@@ -503,6 +605,7 @@ impl<'a> Builder<'a> {
             binding_registers,
             constants: Vec::new(),
             instructions: Vec::new(),
+            call_statement_cleanups: Vec::new(),
             close_paths: Vec::new(),
             label_frames: Vec::new(),
             pending_gotos: Vec::new(),
@@ -511,6 +614,11 @@ impl<'a> Builder<'a> {
             debug_active,
             debug_scopes: Vec::new(),
             debug_max_active: 0,
+            pending_expression_values: Vec::new(),
+            debug_temporaries: Vec::new(),
+            debug_initializer_temporaries: Vec::new(),
+            debug_non_counted_pcs: Vec::new(),
+            suppress_debug_temporaries: false,
             native_list_writes: Vec::new(),
         };
         if let Some(body) = function_body {
@@ -601,6 +709,7 @@ impl<'a> Builder<'a> {
                     | Instruction::Jump { .. }
             )
         ) {
+            let close_start = self.instructions.len();
             if !body.error_close_path.bindings.is_empty() {
                 // 函式 root 的隱含返回沿用 resolver 已確認的退出 binding 清單。
                 let path = ClosePath {
@@ -612,13 +721,49 @@ impl<'a> Builder<'a> {
                     exited_bindings: body.error_close_path.exited_bindings.clone(),
                 };
                 self.emit_close(&path)?;
+            } else if !body.error_close_path.exited_bindings.is_empty() {
+                self.emit_upvalue_close(&body.error_close_path)?;
             }
+            if self.instructions.len() > close_start {
+                let close_start_pc = u32::try_from(close_start)
+                    .map_err(|_| limit(self.span, "native debug close 起始 PC 溢位"))?;
+                let close_end_pc = u32::try_from(self.instructions.len())
+                    .map_err(|_| limit(self.span, "native debug close 結束 PC 溢位"))?;
+                for local in &mut self.debug_locals {
+                    if local.end_pc != close_start_pc
+                        || !body
+                            .error_close_path
+                            .exited_bindings
+                            .contains(&local.binding)
+                    {
+                        continue;
+                    }
+                    // 同一 root scope 的 local 一起結束，維持 slot 的 LIFO 順序。
+                    local.end_pc = close_end_pc;
+                }
+            }
+            let return_span = if self.function_body.is_none() {
+                let final_span = body
+                    .statements
+                    .last()
+                    .map(resolved_statement_span)
+                    .unwrap_or(body.span);
+                Span {
+                    start_byte: final_span.end_byte.saturating_sub(1),
+                    end_byte: final_span.end_byte,
+                }
+            } else {
+                Span {
+                    start_byte: self.function.span.end_byte.saturating_sub(1),
+                    end_byte: self.function.span.end_byte,
+                }
+            };
             self.emit(
                 Instruction::Return {
                     base: Register(0),
                     result_mode: ResultMode::Fixed(0),
                 },
-                self.span,
+                return_span,
                 None,
             )?;
         }
@@ -643,9 +788,29 @@ impl<'a> Builder<'a> {
                 _ => {}
             }
         }
+        let reachable = initializer_reachable_pcs(&self.instructions, self.span)?;
+        self.debug_initializer_temporaries
+            .retain(|entry| initializer_interval_safe(&self.instructions, &reachable, entry));
         let register_count = self.next_register.max(1);
         if register_count > self.limits.max_registers {
             return Err(limit(self.span, "register 數超過 IR 限制"));
+        }
+        for &(pc, start) in &self.call_statement_cleanups {
+            let count = register_count
+                .checked_sub(start.0)
+                .filter(|count| *count != 0)
+                .ok_or_else(|| invalid(self.span, "call statement cleanup 範圍無效"))?;
+            let entry = self
+                .instructions
+                .get_mut(pc)
+                .ok_or_else(|| invalid(self.span, "call statement cleanup PC 無效"))?;
+            match &mut entry.instruction {
+                Instruction::LoadNil {
+                    start: current_start,
+                    count: current_count,
+                } if *current_start == start => *current_count = count,
+                _ => return Err(invalid(entry.span, "call statement cleanup 指令無效")),
+            }
         }
         let upvalues = self
             .function
@@ -706,6 +871,9 @@ impl<'a> Builder<'a> {
             close_paths: self.close_paths,
             native_debug: Some(IrNativeDebug {
                 locals: self.debug_locals,
+                temporaries: self.debug_temporaries,
+                initializer_temporaries: self.debug_initializer_temporaries,
+                non_counted_pcs: self.debug_non_counted_pcs,
                 max_active_locals: self.debug_max_active,
             }),
             native_list_write_upvalue: None,
@@ -878,12 +1046,108 @@ impl<'a> Builder<'a> {
         if self.instructions.len() >= self.limits.max_instructions {
             return Err(limit(span, "instruction 數超過 IR 限制"));
         }
+        if matches!(instruction, Instruction::Call { .. }) && !self.suppress_debug_temporaries {
+            let pc = self.current_offset(span)?;
+            for (index, &register) in self.pending_expression_values.iter().enumerate() {
+                if self.debug_temporaries.len() >= self.limits.max_instructions {
+                    return Err(limit(span, "native debug temporary 數超過 IR 限制"));
+                }
+                self.debug_temporaries
+                    .try_reserve(1)
+                    .map_err(|_| limit(span, "native debug temporary 配置失敗"))?;
+                let ordinal = u16::try_from(index.saturating_add(1))
+                    .map_err(|_| limit(span, "native debug temporary ordinal 溢位"))?;
+                self.debug_temporaries.push(IrNativeTemporary {
+                    call_pc: pc,
+                    ordinal,
+                    register,
+                });
+            }
+        }
         self.instructions.push(IrInstruction {
             instruction,
             span,
             close_path,
         });
         Ok(())
+    }
+
+    /// 一個 Lua 參考 opcode 已有其他 RVLU 指令作為計數錨點時，記錄其展開指令。
+    fn emit_non_counted(
+        &mut self,
+        instruction: Instruction,
+        span: Span,
+    ) -> Result<InstructionOffset, IrError> {
+        let offset = self.current_offset(span)?;
+        if self.debug_non_counted_pcs.len() >= self.limits.max_instructions {
+            return Err(limit(span, "native debug non-counted PC 數超過 IR 限制"));
+        }
+        self.debug_non_counted_pcs
+            .try_reserve(1)
+            .map_err(|_| limit(span, "native debug non-counted PC 配置失敗"))?;
+        self.emit(instruction, span, None)?;
+        self.debug_non_counted_pcs.push(offset);
+        Ok(offset)
+    }
+
+    fn mark_last_non_counted(&mut self, span: Span) -> Result<(), IrError> {
+        let index = self
+            .instructions
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| invalid(span, "native debug non-counted PC 不存在"))?;
+        if self.debug_non_counted_pcs.len() >= self.limits.max_instructions {
+            return Err(limit(span, "native debug non-counted PC 數超過 IR 限制"));
+        }
+        self.debug_non_counted_pcs
+            .try_reserve(1)
+            .map_err(|_| limit(span, "native debug non-counted PC 配置失敗"))?;
+        let offset = InstructionOffset(
+            u32::try_from(index).map_err(|_| limit(span, "native debug non-counted PC 溢位"))?,
+        );
+        if self
+            .debug_non_counted_pcs
+            .last()
+            .is_some_and(|previous| previous.0 >= offset.0)
+        {
+            return Err(invalid(span, "native debug non-counted PC 次序無效"));
+        }
+        self.debug_non_counted_pcs.push(offset);
+        Ok(())
+    }
+
+    fn with_pending_expression<T>(
+        &mut self,
+        register: Register,
+        span: Span,
+        lower: impl FnOnce(&mut Self) -> Result<T, IrError>,
+    ) -> Result<T, IrError> {
+        let pushed = self.push_pending_expression(register, span)?;
+        let result = lower(self);
+        if pushed {
+            self.pending_expression_values.pop();
+        }
+        result
+    }
+
+    fn push_pending_expression(&mut self, register: Register, span: Span) -> Result<bool, IrError> {
+        if register.0 < self.initial_top.0
+            || register == self.global_environment
+            || self
+                .debug_active
+                .iter()
+                .any(|&index| self.debug_locals[index].register == register)
+        {
+            return Ok(false);
+        }
+        if self.pending_expression_values.len() >= usize::from(self.limits.max_registers) {
+            return Err(limit(span, "native debug pending expression 深度超限"));
+        }
+        self.pending_expression_values
+            .try_reserve(1)
+            .map_err(|_| limit(span, "native debug pending expression 配置失敗"))?;
+        self.pending_expression_values.push(register);
+        Ok(true)
     }
 
     fn current_offset(&self, span: Span) -> Result<InstructionOffset, IrError> {
@@ -947,17 +1211,14 @@ impl<'a> Builder<'a> {
 
     /// 固定 opcode 集沒有 Nop 或 Label；使用未被讀取的暫存器寫入作為 CFG join/label 的真實邊界。
     fn emit_cfg_anchor(&mut self, span: Span) -> Result<InstructionOffset, IrError> {
-        let offset = self.current_offset(span)?;
         let dest = self.allocate(span)?;
-        self.emit(
+        self.emit_non_counted(
             Instruction::LoadNil {
                 start: dest,
                 count: 1,
             },
             span,
-            None,
-        )?;
-        Ok(offset)
+        )
     }
 
     fn enter_label_frame(&mut self, block: &ResolvedBlock) -> Result<(), IrError> {
@@ -1073,6 +1334,7 @@ impl<'a> Builder<'a> {
             })
             .ok_or_else(|| invalid(span, "P04 goto 目標 label 不在 lexical scope"))?;
         self.emit_close(close_path)?;
+        self.emit_exited_binding_cleanup(close_path)?;
         let jump = self.emit_jump_placeholder(span)?;
         if let Some(offset) = known {
             self.patch_jump(jump, offset)?;
@@ -1096,6 +1358,7 @@ impl<'a> Builder<'a> {
             return Err(invalid(span, "P04 break 不在 loop 中"));
         }
         self.emit_close(close_path)?;
+        self.emit_exited_binding_cleanup(close_path)?;
         let jump = self.emit_jump_placeholder(span)?;
         self.loops
             .last_mut()
@@ -1128,11 +1391,32 @@ impl<'a> Builder<'a> {
     fn lower_block(&mut self, block: &ResolvedBlock) -> Result<(), IrError> {
         self.lower_block_statements(block)?;
         self.emit_close(&block.normal_close_path)?;
+        self.emit_exited_binding_cleanup(&block.normal_close_path)?;
         self.end_debug_scope(block.span)
     }
 
     fn emit_close(&mut self, path: &ClosePath) -> Result<(), IrError> {
         self.emit_upvalue_close(path)?;
+        self.emit_tbc_close(path)
+    }
+
+    fn emit_exited_binding_cleanup(&mut self, path: &ClosePath) -> Result<(), IrError> {
+        // Upvalue 必須先取得 closed 值，<close> callback 也必須先看見原 binding。
+        for binding in &path.exited_bindings {
+            let register = self.binding_register(*binding, path.span)?;
+            self.emit(
+                Instruction::LoadNil {
+                    start: register,
+                    count: 1,
+                },
+                path.span,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_tbc_close(&mut self, path: &ClosePath) -> Result<(), IrError> {
         if path.bindings.is_empty() {
             return Ok(());
         }
@@ -1183,23 +1467,32 @@ impl<'a> Builder<'a> {
 
     fn emit_upvalue_close(&mut self, path: &ClosePath) -> Result<(), IrError> {
         for binding in &path.exited_bindings {
-            let captured = self.functions.iter().any(|child| {
-                child.parent == Some(self.function.id)
-                    && child.upvalues.iter().any(|source| {
-                        matches!(source, UpvalueSource::ParentLocal(local) if local == binding)
-                    })
-            });
-            if captured {
-                let register = self.binding_register(*binding, path.span)?;
-                self.emit(
-                    Instruction::Close {
-                        base: register,
-                        count: 0,
-                    },
-                    path.span,
-                    None,
-                )?;
-            }
+            self.emit_captured_binding_close(*binding, path.span)?;
+        }
+        Ok(())
+    }
+
+    fn emit_captured_binding_close(
+        &mut self,
+        binding: BindingId,
+        span: Span,
+    ) -> Result<(), IrError> {
+        let captured = self.functions.iter().any(|child| {
+            child.parent == Some(self.function.id)
+                && child.upvalues.iter().any(|source| {
+                    matches!(source, UpvalueSource::ParentLocal(local) if *local == binding)
+                })
+        });
+        if captured {
+            let register = self.binding_register(binding, span)?;
+            self.emit(
+                Instruction::Close {
+                    base: register,
+                    count: 0,
+                },
+                span,
+                None,
+            )?;
         }
         Ok(())
     }
@@ -1219,7 +1512,41 @@ impl<'a> Builder<'a> {
                 span,
                 ..
             } => {
+                let rhs_start = self.instructions.len();
+                let debug_span = match values.as_slice() {
+                    [ResolvedExpr::Function { body, .. }] => Span {
+                        start_byte: body.span.end_byte.saturating_sub(1),
+                        end_byte: body.span.end_byte,
+                    },
+                    _ => *span,
+                };
+                let temporary_start = self.next_register;
                 let base = self.lower_fixed_values(values, bindings.len(), *span)?;
+                let single_closure_expansion = bindings.len() == 1
+                    && matches!(values.as_slice(), [ResolvedExpr::Function { .. }])
+                    && self
+                        .function
+                        .bindings
+                        .iter()
+                        .find(|candidate| candidate.id == bindings[0])
+                        .is_some_and(|binding| binding.close_marker.is_none())
+                    && matches!(
+                        self.instructions.get(rhs_start..),
+                        Some([
+                            IrInstruction {
+                                instruction: Instruction::Closure { .. },
+                                ..
+                            },
+                            IrInstruction {
+                                instruction: Instruction::Move { .. },
+                                ..
+                            }
+                        ])
+                    );
+                if single_closure_expansion {
+                    self.instructions[rhs_start + 1].span = debug_span;
+                    self.mark_last_non_counted(*span)?;
+                }
                 let initialized_start = self.instructions.len();
                 for (index, binding) in bindings.iter().enumerate() {
                     let dest = self.binding_register(*binding, *span)?;
@@ -1238,7 +1565,24 @@ impl<'a> Builder<'a> {
                                 self.label_frames.last().expect("local scope 已建立").scope,
                             )
                         });
-                    self.emit(Instruction::Move { dest, src }, *span, close_path)?;
+                    self.emit(Instruction::Move { dest, src }, debug_span, close_path)?;
+                    if single_closure_expansion {
+                        self.mark_last_non_counted(*span)?;
+                    }
+                }
+                let temporary_count = self.next_register - temporary_start;
+                if temporary_count != 0 {
+                    self.emit(
+                        Instruction::LoadNil {
+                            start: Register(temporary_start),
+                            count: temporary_count,
+                        },
+                        debug_span,
+                        None,
+                    )?;
+                    if single_closure_expansion {
+                        self.mark_last_non_counted(*span)?;
+                    }
                 }
                 let start_pc = self.instructions.len();
                 for (index, binding) in bindings.iter().enumerate() {
@@ -1249,6 +1593,33 @@ impl<'a> Builder<'a> {
                         *span,
                     )?;
                 }
+                if rhs_start < start_pc {
+                    let first = self.debug_locals.len() - bindings.len();
+                    for local in &self.debug_locals[first..] {
+                        if self.debug_initializer_temporaries.len() >= self.limits.max_instructions
+                        {
+                            return Err(limit(
+                                *span,
+                                "native debug initializer temporary 數超過 IR 限制",
+                            ));
+                        }
+                        self.debug_initializer_temporaries
+                            .try_reserve(1)
+                            .map_err(|_| {
+                                limit(*span, "native debug initializer temporary 配置失敗")
+                            })?;
+                        self.debug_initializer_temporaries
+                            .push(IrNativeInitializerTemporary {
+                                binding: local.binding,
+                                register: local.register,
+                                slot: local.slot,
+                                start_pc: u32::try_from(rhs_start).map_err(|_| {
+                                    limit(*span, "native debug initializer 起始 PC 溢位")
+                                })?,
+                                end_pc: local.start_pc,
+                            });
+                    }
+                }
                 Ok(())
             }
             ResolvedStmt::Assignment {
@@ -1256,16 +1627,68 @@ impl<'a> Builder<'a> {
                 values,
                 span,
             } => {
+                let binary_gap = match (targets.as_slice(), values.as_slice()) {
+                    ([ResolvedExpr::Name { .. }], [ResolvedExpr::Binary { left, right, .. }])
+                        if matches!(
+                            left.as_ref(),
+                            ResolvedExpr::Index { base, index, .. }
+                                if matches!(base.as_ref(), ResolvedExpr::Name { resolution: ResolvedName::Local(_), .. })
+                                    && matches!(index.as_ref(), ResolvedExpr::Literal { .. })
+                        ) =>
+                    {
+                        let gap = Span {
+                            start_byte: expr_span(left).end_byte,
+                            end_byte: expr_span(right).start_byte,
+                        };
+                        (gap.start_byte < gap.end_byte).then_some((gap, expr_span(right)))
+                    }
+                    _ => None,
+                };
+                let temporary_start = self.next_register;
+                let target_start = self.instructions.len();
                 let destinations = targets
                     .iter()
                     .map(|target| self.prepare_assignment_target(target, *span))
                     .collect::<Result<Vec<_>, _>>()?;
+                if let Some((gap, _)) = binary_gap {
+                    for entry in &mut self.instructions[target_start..] {
+                        entry.span = gap;
+                    }
+                }
+                let values_start = self.instructions.len();
                 let base = self.lower_fixed_values(values, targets.len(), *span)?;
+                if let Some((gap, _)) = binary_gap {
+                    if let Some(binary) =
+                        self.instructions[values_start..].iter().rposition(|entry| {
+                            matches!(entry.instruction, Instruction::BinaryOp { .. })
+                        })
+                    {
+                        for entry in &mut self.instructions[values_start + binary + 1..] {
+                            if entry.span == *span {
+                                entry.span = gap;
+                            }
+                        }
+                    }
+                }
+                let store_span = binary_gap.map_or(*span, |(_, right)| Span {
+                    start_byte: right.end_byte.saturating_sub(1),
+                    end_byte: right.end_byte,
+                });
                 for (index, destination) in destinations.iter().enumerate() {
                     self.store_prepared_target(
                         destination,
                         register_offset(base, index, *span)?,
-                        *span,
+                        store_span,
+                    )?;
+                }
+                let temporary_count = self.next_register - temporary_start;
+                if temporary_count != 0 {
+                    self.emit_non_counted(
+                        Instruction::LoadNil {
+                            start: Register(temporary_start),
+                            count: temporary_count,
+                        },
+                        store_span,
                     )?;
                 }
                 Ok(())
@@ -1288,8 +1711,19 @@ impl<'a> Builder<'a> {
                 let mut false_to_join = Vec::new();
                 for (index, clause) in clauses.iter().enumerate() {
                     let condition = self.lower_expr(&clause.condition)?;
-                    let false_jump = self
-                        .emit_jump_if_false_placeholder(condition, expr_span(&clause.condition))?;
+                    let condition_span = expr_span(&clause.condition);
+                    let then_span = Span {
+                        start_byte: condition_span.end_byte,
+                        end_byte: clause.body.span.start_byte,
+                    };
+                    let false_jump = self.emit_jump_if_false_placeholder(
+                        condition,
+                        if then_span.start_byte < then_span.end_byte {
+                            then_span
+                        } else {
+                            condition_span
+                        },
+                    )?;
                     self.lower_block(&clause.body)?;
                     end_patches.push(self.emit_jump_placeholder(*span)?);
                     if index + 1 < clauses.len() {
@@ -1303,7 +1737,10 @@ impl<'a> Builder<'a> {
                         false_to_join.push(false_jump);
                     }
                 }
-                let join = self.emit_cfg_anchor(*span)?;
+                let join = self.emit_cfg_anchor(Span {
+                    start_byte: span.end_byte.saturating_sub(1),
+                    end_byte: span.end_byte,
+                })?;
                 for jump in end_patches.into_iter().chain(false_to_join) {
                     self.patch_jump(jump, join)?;
                 }
@@ -1333,21 +1770,59 @@ impl<'a> Builder<'a> {
                 ..
             } => {
                 // `until` condition 仍在 repeat body scope；只有判斷後才離開該 scope。
-                let loop_start = self.emit_cfg_anchor(*span)?;
+                let loop_start = self.emit_cfg_anchor(body.span)?;
                 self.push_loop();
                 self.lower_block_statements(body)?;
+                let condition_temporary_start = self.next_register;
                 let condition_register = self.lower_expr(condition)?;
-                self.emit_close(&body.normal_close_path)?;
-                self.end_debug_scope(body.span)?;
+                let condition_temporary_end = self.next_register;
+                let condition_value = self.allocate(*span)?;
                 self.emit(
-                    Instruction::JumpIfFalse {
-                        condition: condition_register,
-                        target: loop_start,
+                    Instruction::Move {
+                        dest: condition_value,
+                        src: condition_register,
                     },
                     expr_span(condition),
                     None,
                 )?;
-                let exit = self.emit_cfg_anchor(*span)?;
+                let condition_temporary_count = condition_temporary_end - condition_temporary_start;
+                if condition_temporary_count != 0 {
+                    self.emit(
+                        Instruction::LoadNil {
+                            start: Register(condition_temporary_start),
+                            count: condition_temporary_count,
+                        },
+                        expr_span(condition),
+                        None,
+                    )?;
+                }
+                self.emit_close(&body.normal_close_path)?;
+                self.emit_exited_binding_cleanup(&body.normal_close_path)?;
+                self.end_debug_scope(body.span)?;
+                let false_jump =
+                    self.emit_jump_if_false_placeholder(condition_value, expr_span(condition))?;
+                self.emit(
+                    Instruction::LoadNil {
+                        start: condition_value,
+                        count: 1,
+                    },
+                    expr_span(condition),
+                    None,
+                )?;
+                let exit_jump = self.emit_jump_placeholder(*span)?;
+                let false_cleanup = self.current_offset(*span)?;
+                self.patch_jump(false_jump, false_cleanup)?;
+                self.emit(
+                    Instruction::LoadNil {
+                        start: condition_value,
+                        count: 1,
+                    },
+                    expr_span(condition),
+                    None,
+                )?;
+                self.emit(Instruction::Jump { target: loop_start }, *span, None)?;
+                let exit = self.emit_cfg_anchor(expr_span(condition))?;
+                self.patch_jump(exit_jump, exit)?;
                 self.finish_loop(exit, *span)
             }
             ResolvedStmt::NumericFor {
@@ -1362,26 +1837,49 @@ impl<'a> Builder<'a> {
                 // 所有 numeric conversion、零 step、整數不溢位終止與 float 前進均由
                 // 專用 NumericForPrepare/NumericForNext 表達，而非一般比較/加法序列。
                 let visible = self.binding_register(name.binding, *span)?;
+                let initial_start = self.instructions.len();
                 let initial_value = self.lower_expr(initial)?;
                 let control = self.allocate(*span)?;
-                self.emit(
-                    Instruction::Move {
-                        dest: control,
-                        src: initial_value,
-                    },
-                    *span,
-                    None,
-                )?;
+                if self.instructions.len() > initial_start {
+                    self.emit_non_counted(
+                        Instruction::Move {
+                            dest: control,
+                            src: initial_value,
+                        },
+                        *span,
+                    )?;
+                } else {
+                    self.emit(
+                        Instruction::Move {
+                            dest: control,
+                            src: initial_value,
+                        },
+                        *span,
+                        None,
+                    )?;
+                }
+                let limit_start = self.instructions.len();
                 let end_value = self.lower_expr(end)?;
                 let limit_register = self.allocate(*span)?;
-                self.emit(
-                    Instruction::Move {
-                        dest: limit_register,
-                        src: end_value,
-                    },
-                    *span,
-                    None,
-                )?;
+                if self.instructions.len() > limit_start {
+                    self.emit_non_counted(
+                        Instruction::Move {
+                            dest: limit_register,
+                            src: end_value,
+                        },
+                        *span,
+                    )?;
+                } else {
+                    self.emit(
+                        Instruction::Move {
+                            dest: limit_register,
+                            src: end_value,
+                        },
+                        *span,
+                        None,
+                    )?;
+                }
+                let step_start = self.instructions.len();
                 let step_value = match step {
                     Some(step) => self.lower_expr(step)?,
                     None => {
@@ -1402,14 +1900,24 @@ impl<'a> Builder<'a> {
                     }
                 };
                 let step_register = self.allocate(*span)?;
-                self.emit(
-                    Instruction::Move {
-                        dest: step_register,
-                        src: step_value,
-                    },
-                    *span,
-                    None,
-                )?;
+                if self.instructions.len() > step_start {
+                    self.emit_non_counted(
+                        Instruction::Move {
+                            dest: step_register,
+                            src: step_value,
+                        },
+                        *span,
+                    )?;
+                } else {
+                    self.emit(
+                        Instruction::Move {
+                            dest: step_register,
+                            src: step_value,
+                        },
+                        *span,
+                        None,
+                    )?;
+                }
                 let prepare = self.instructions.len();
                 self.emit(
                     Instruction::NumericForPrepare {
@@ -1446,6 +1954,13 @@ impl<'a> Builder<'a> {
                 self.patch_numeric_for_exit(prepare, exit)?;
                 self.patch_numeric_for_exit(next, exit)?;
                 self.finish_loop(exit, *span)?;
+                self.emit_non_counted(
+                    Instruction::LoadNil {
+                        start: visible,
+                        count: 1,
+                    },
+                    *span,
+                )?;
                 self.end_debug_scope(*span)
             }
             ResolvedStmt::GenericFor {
@@ -1462,7 +1977,9 @@ impl<'a> Builder<'a> {
                 if values.is_empty() {
                     return Err(invalid(*span, "P04 generic for 缺少 iterator"));
                 }
+                let initial_temporary_start = self.next_register;
                 let initial_base = self.lower_fixed_values(values, 4, *span)?;
+                let initial_temporary_end = self.next_register;
                 let iterator_source = initial_base;
                 let iterator = self.allocate(*span)?;
                 self.emit(
@@ -1508,6 +2025,17 @@ impl<'a> Builder<'a> {
                     *span,
                     None,
                 )?;
+                let initial_temporary_count = initial_temporary_end - initial_temporary_start;
+                if initial_temporary_count != 0 {
+                    self.emit(
+                        Instruction::LoadNil {
+                            start: Register(initial_temporary_start),
+                            count: initial_temporary_count,
+                        },
+                        *span,
+                        None,
+                    )?;
+                }
 
                 let loop_start = self.current_offset(*span)?;
                 let call_base = self.allocate(*span)?;
@@ -1609,13 +2137,40 @@ impl<'a> Builder<'a> {
                 }
                 self.push_loop();
                 self.lower_block(body)?;
+                // 每輪的可見 name 在回邊前結束；hidden 第四值只在整個
+                // generic-for 離開時關閉，不能隨迭代重複關閉。
+                for name in names.iter().rev() {
+                    self.emit_captured_binding_close(name.binding, *span)?;
+                }
+                for name in names.iter().rev() {
+                    let register = self.binding_register(name.binding, name.span)?;
+                    self.emit(
+                        Instruction::LoadNil {
+                            start: register,
+                            count: 1,
+                        },
+                        name.span,
+                        None,
+                    )?;
+                }
                 self.emit(Instruction::Jump { target: loop_start }, *span, None)?;
+                self.end_debug_scope(*span)?;
                 let normal_exit = self.emit_cfg_anchor(*span)?;
                 self.patch_jump(exit_jump, normal_exit)?;
-                self.emit_close(close_path)?;
+                self.emit_tbc_close(close_path)?;
+                // 可見 name 已在每次回邊前清除；nil 分支尚未建立新一輪 name。
+                // hidden closing binding 則須等 callback 完成後才釋放。
+                self.emit(
+                    Instruction::LoadNil {
+                        start: closing_register,
+                        count: 1,
+                    },
+                    *span,
+                    None,
+                )?;
                 let break_exit = self.emit_cfg_anchor(*span)?;
                 self.finish_loop(break_exit, *span)?;
-                self.end_debug_scope(*span)
+                Ok(())
             }
             ResolvedStmt::Function {
                 name, body, span, ..
@@ -1624,10 +2179,26 @@ impl<'a> Builder<'a> {
                 self.store_target(name, closure, *span)
             }
             ResolvedStmt::LocalFunction { name, body, span } => {
+                let debug_span = Span {
+                    start_byte: body.span.end_byte.saturating_sub(1),
+                    end_byte: body.span.end_byte,
+                };
+                let temporary_start = self.next_register;
                 let closure = self.lower_function(body)?;
                 let dest = self.binding_register(name.binding, *span)?;
                 let initialized_pc = self.instructions.len();
-                self.emit(Instruction::Move { dest, src: closure }, *span, None)?;
+                self.emit(Instruction::Move { dest, src: closure }, debug_span, None)?;
+                let temporary_count = self.next_register - temporary_start;
+                if temporary_count != 0 {
+                    self.emit(
+                        Instruction::LoadNil {
+                            start: Register(temporary_start),
+                            count: temporary_count,
+                        },
+                        debug_span,
+                        None,
+                    )?;
+                }
                 self.activate_debug_binding(
                     name.binding,
                     initialized_pc,
@@ -1644,6 +2215,10 @@ impl<'a> Builder<'a> {
         declaration: &ResolvedGlobalDeclaration,
         span: Span,
     ) -> Result<(), IrError> {
+        if matches!(declaration, ResolvedGlobalDeclaration::Names { values, .. } if values.is_empty())
+        {
+            return Ok(());
+        }
         let table = self.global_table_register(span)?;
         match declaration {
             ResolvedGlobalDeclaration::Names { names, values, .. } => {
@@ -1789,6 +2364,8 @@ impl<'a> Builder<'a> {
         }
         let (base, result_mode) = self.lower_return_values(values, span)?;
         self.emit_close(close_path)?;
+        // Return hook 在執行 Return 前觀察 frame；退出的 local 須保留原值到 frame 回收。
+        // <close> 的 Return 仍緊鄰 Close group，供 VM 暫停／恢復路徑辨認。
         self.emit(Instruction::Return { base, result_mode }, span, None)
     }
 
@@ -1908,6 +2485,7 @@ impl<'a> Builder<'a> {
         expression: &ResolvedExpr,
         span: Span,
     ) -> Result<(), IrError> {
+        let temporary_start = self.next_register;
         let (base, arg_count) = self.prepare_open_call(expression, span)?;
         self.emit(
             Instruction::Call {
@@ -1917,7 +2495,27 @@ impl<'a> Builder<'a> {
             },
             span,
             None,
-        )
+        )?;
+        let count = self
+            .next_register
+            .checked_sub(temporary_start)
+            .filter(|count| *count != 0)
+            .ok_or_else(|| invalid(span, "call statement 沒有私有暫存器"))?;
+        self.call_statement_cleanups
+            .try_reserve(1)
+            .map_err(|_| limit(span, "call statement cleanup patch 配置失敗"))?;
+        let cleanup_pc = self.instructions.len();
+        self.emit(
+            Instruction::LoadNil {
+                start: Register(temporary_start),
+                count,
+            },
+            span,
+            None,
+        )?;
+        self.call_statement_cleanups
+            .push((cleanup_pc, Register(temporary_start)));
+        Ok(())
     }
 
     fn prepare_open_call(
@@ -1964,58 +2562,79 @@ impl<'a> Builder<'a> {
         fixed_base: Option<Register>,
         span: Span,
     ) -> Result<(Register, u16), IrError> {
-        let last_open = arguments
-            .last()
-            .filter(|last| self.is_open_expression(last));
-        let fixed_count = arguments.len() - usize::from(last_open.is_some());
-        let mut values = Vec::with_capacity(leading.len().saturating_add(fixed_count));
-        values.extend_from_slice(leading);
-        for argument in &arguments[..fixed_count] {
-            values.push(self.lower_expr(argument)?);
-        }
-        let Some(last) = last_open else {
-            return match fixed_base {
-                Some(base) => Ok((base, self.move_call_inputs_at(base, callee, &values, span)?)),
-                None => self.prepare_call_registers(callee, &values, span),
-            };
-        };
-        let slots = values
-            .len()
-            .checked_add(2)
-            .ok_or_else(|| limit(span, "動態 call 引數 register 數超過 IR 限制"))?;
-        let base = match fixed_base {
-            Some(base) => {
-                let end = usize::from(base.0)
-                    .checked_add(slots)
-                    .ok_or_else(|| limit(span, "動態 call 引數 register 數超過 IR 限制"))?;
-                while usize::from(self.next_register) < end {
-                    self.allocate(span)?;
-                }
-                base
+        let pending_start = self.pending_expression_values.len();
+        let result = (|| {
+            let last_open = arguments
+                .last()
+                .filter(|last| self.is_open_expression(last));
+            let fixed_count = arguments.len() - usize::from(last_open.is_some());
+            self.push_pending_expression(callee, span)?;
+            for &value in leading {
+                self.push_pending_expression(value, span)?;
             }
-            None => self.reserve_registers(slots, span)?,
-        };
-        self.emit(
-            Instruction::Move {
-                dest: base,
-                src: callee,
-            },
-            span,
-            None,
-        )?;
-        for (index, source) in values.iter().enumerate() {
+            let mut values = Vec::with_capacity(leading.len().saturating_add(fixed_count));
+            values.extend_from_slice(leading);
+            for argument in &arguments[..fixed_count] {
+                let value = self.lower_expr(argument)?;
+                values.push(value);
+                self.push_pending_expression(value, span)?;
+            }
+            let Some(last) = last_open else {
+                return match fixed_base {
+                    Some(base) => {
+                        Ok((base, self.move_call_inputs_at(base, callee, &values, span)?))
+                    }
+                    None => self.prepare_call_registers(callee, &values, span),
+                };
+            };
+            let slots = values
+                .len()
+                .checked_add(2)
+                .ok_or_else(|| limit(span, "動態 call 引數 register 數超過 IR 限制"))?;
+            let base = match fixed_base {
+                Some(base) => {
+                    let end = usize::from(base.0)
+                        .checked_add(slots)
+                        .ok_or_else(|| limit(span, "動態 call 引數 register 數超過 IR 限制"))?;
+                    while usize::from(self.next_register) < end {
+                        self.allocate(span)?;
+                    }
+                    base
+                }
+                None => self.reserve_registers(slots, span)?,
+            };
             self.emit(
                 Instruction::Move {
-                    dest: register_offset(base, index + 1, span)?,
-                    src: *source,
+                    dest: base,
+                    src: callee,
                 },
                 span,
                 None,
             )?;
-        }
-        let producer_base = register_offset(base, values.len() + 1, span)?;
-        self.lower_open_expression_at(last, producer_base, ResultMode::All, span)?;
-        Ok((base, u16::MAX))
+            for (index, source) in values.iter().enumerate() {
+                self.emit(
+                    Instruction::Move {
+                        dest: register_offset(base, index + 1, span)?,
+                        src: *source,
+                    },
+                    span,
+                    None,
+                )?;
+            }
+            // 最後的 open producer 開始前，外層固定前綴已搬到 call-base。
+            // 此時記錄實體拷貝，包含原本被 active-local 規則排除的值；
+            // 原 local register 不會與拷貝重複記為 temporary。
+            self.pending_expression_values.truncate(pending_start);
+            for offset in 0..=values.len() {
+                let copy = register_offset(base, offset, span)?;
+                self.push_pending_expression(copy, span)?;
+            }
+            let producer_base = register_offset(base, values.len() + 1, span)?;
+            self.lower_open_expression_at(last, producer_base, ResultMode::All, span)?;
+            Ok((base, u16::MAX))
+        })();
+        self.pending_expression_values.truncate(pending_start);
+        result
     }
 
     fn prepare_call_registers(
@@ -2214,7 +2833,43 @@ impl<'a> Builder<'a> {
                 right,
                 span,
             } => {
+                let order_comparison = matches!(
+                    op,
+                    BinaryOp::Less
+                        | BinaryOp::LessEqual
+                        | BinaryOp::Greater
+                        | BinaryOp::GreaterEqual
+                );
+                let left_immediate = order_comparison
+                    && !matches!(right.as_ref(), ResolvedExpr::Literal { .. })
+                    && reference_order_immediate(left);
+                let right_immediate = order_comparison
+                    && !matches!(left.as_ref(), ResolvedExpr::Literal { .. })
+                    && reference_order_immediate(right);
+                let operator_span = Span {
+                    start_byte: expr_span(left).end_byte,
+                    end_byte: expr_span(right).start_byte,
+                };
+                let left_start = self.instructions.len();
+                let left_expr = left.as_ref();
                 let left = self.lower_expr(left)?;
+                if left_immediate {
+                    // Lua 的 GTI/GEI/LTI/LEI 將短整數放在 operand。
+                    self.mark_last_non_counted(*span)?;
+                }
+                if !matches!(op, BinaryOp::And | BinaryOp::Or)
+                    && operator_span.start_byte < operator_span.end_byte
+                    && matches!(
+                        left_expr,
+                        ResolvedExpr::Index { base, index, .. }
+                            if matches!(base.as_ref(), ResolvedExpr::Name { resolution: ResolvedName::Local(_), .. })
+                                && matches!(index.as_ref(), ResolvedExpr::Literal { .. })
+                    )
+                {
+                    for entry in &mut self.instructions[left_start..] {
+                        entry.span = operator_span;
+                    }
+                }
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     let dest = self.allocate(*span)?;
                     self.emit(Instruction::Move { dest, src: left }, *span, None)?;
@@ -2239,7 +2894,11 @@ impl<'a> Builder<'a> {
                     self.patch_jump(keep_left, self.current_offset(*span)?)?;
                     return Ok(dest);
                 }
-                let right = self.lower_expr(right)?;
+                let right =
+                    self.with_pending_expression(left, *span, |builder| builder.lower_expr(right))?;
+                if right_immediate {
+                    self.mark_last_non_counted(*span)?;
+                }
                 let dest = self.allocate(*span)?;
                 self.emit(
                     Instruction::BinaryOp {
@@ -2248,7 +2907,11 @@ impl<'a> Builder<'a> {
                         left,
                         right,
                     },
-                    *span,
+                    if operator_span.start_byte < operator_span.end_byte {
+                        operator_span
+                    } else {
+                        *span
+                    },
                     None,
                 )?;
                 Ok(dest)
@@ -2256,7 +2919,8 @@ impl<'a> Builder<'a> {
             ResolvedExpr::Paren { expression, .. } => self.lower_expr(expression),
             ResolvedExpr::Index { base, index, span } => {
                 let table = self.lower_expr(base)?;
-                let key = self.lower_expr(index)?;
+                let key = self
+                    .with_pending_expression(table, *span, |builder| builder.lower_expr(index))?;
                 let dest = self.allocate(*span)?;
                 self.emit(Instruction::GetTable { dest, table, key }, *span, None)?;
                 Ok(dest)
@@ -2264,6 +2928,8 @@ impl<'a> Builder<'a> {
             ResolvedExpr::Field { base, name, span } => {
                 let table = self.lower_expr(base)?;
                 let key = self.name_constant(name, *span)?;
+                // Lua GETFIELD 把固定欄名放在 operand；RVLU 的 key register 是展開。
+                self.mark_last_non_counted(*span)?;
                 let dest = self.allocate(*span)?;
                 self.emit(Instruction::GetTable { dest, table, key }, *span, None)?;
                 Ok(dest)
@@ -2399,7 +3065,9 @@ impl<'a> Builder<'a> {
             u32::try_from(self.instructions.len())
                 .map_err(|_| limit(span, "native RawListWrite PC 超出限制"))?,
         );
-        self.emit(
+        let previous_suppression = self.suppress_debug_temporaries;
+        self.suppress_debug_temporaries = true;
+        let helper_call = self.emit(
             Instruction::Call {
                 base,
                 arg_count: u16::MAX,
@@ -2407,7 +3075,9 @@ impl<'a> Builder<'a> {
             },
             span,
             None,
-        )?;
+        );
+        self.suppress_debug_temporaries = previous_suppression;
+        helper_call?;
         self.emit(
             Instruction::LoadNil {
                 start: base,
@@ -2429,7 +3099,14 @@ impl<'a> Builder<'a> {
     fn lower_function(&mut self, body: &ResolvedFunctionBody) -> Result<Register, IrError> {
         let dest = self.allocate(body.span)?;
         let proto = proto_for(self.prototypes, body.function, body.span)?;
-        self.emit(Instruction::Closure { dest, proto }, body.span, None)?;
+        self.emit(
+            Instruction::Closure { dest, proto },
+            Span {
+                start_byte: body.span.end_byte.saturating_sub(1),
+                end_byte: body.span.end_byte,
+            },
+            None,
+        )?;
         Ok(dest)
     }
 
@@ -2444,13 +3121,20 @@ impl<'a> Builder<'a> {
             ResolvedName::Upvalue(upvalue) => self.load_upvalue(*upvalue, span),
             ResolvedName::EnvField { env, .. } => {
                 let key = self.name_constant(name, span)?;
+                self.mark_last_non_counted(span)?;
+                let env_start = self.instructions.len();
                 let table = self.binding_value(*env, span)?;
+                if self.instructions.len() > env_start {
+                    // Lua GETTABUP 直接讀環境 upvalue；GetTable 保留唯一計數錨點。
+                    self.mark_last_non_counted(span)?;
+                }
                 let dest = self.allocate(span)?;
                 self.emit(Instruction::GetTable { dest, table, key }, span, None)?;
                 Ok(dest)
             }
             ResolvedName::Global(_) => {
                 let key = self.name_constant(name, span)?;
+                self.mark_last_non_counted(span)?;
                 let table = self.global_table_register(span)?;
                 let dest = self.allocate(span)?;
                 self.emit(Instruction::GetTable { dest, table, key }, span, None)?;
@@ -2696,6 +3380,21 @@ fn register_offset(base: Register, offset: usize, span: Span) -> Result<Register
     })?))
 }
 
+fn reference_order_immediate(expression: &ResolvedExpr) -> bool {
+    // Lua 5.4/5.5 的 sC 為 8 位偏移整數，可表達 -127..=128。
+    match expression {
+        ResolvedExpr::Literal {
+            literal: Literal::Integer(Number::Integer(value)),
+            ..
+        } => (-127..=128).contains(value),
+        ResolvedExpr::Literal {
+            literal: Literal::Float(Number::Float(value)),
+            ..
+        } => value.is_finite() && value.fract() == 0.0 && (-127.0..=128.0).contains(value),
+        _ => false,
+    }
+}
+
 fn proto_for(
     prototypes: &[(FunctionId, ProtoId)],
     function: FunctionId,
@@ -2728,6 +3427,27 @@ fn expr_span(expression: &ResolvedExpr) -> Span {
         | ResolvedExpr::MethodCall { span, .. }
         | ResolvedExpr::Function { span, .. }
         | ResolvedExpr::TableConstructor { span, .. } => *span,
+    }
+}
+fn resolved_statement_span(statement: &ResolvedStmt) -> Span {
+    match statement {
+        ResolvedStmt::Empty { span }
+        | ResolvedStmt::Return { span, .. }
+        | ResolvedStmt::Assignment { span, .. }
+        | ResolvedStmt::Call { span, .. }
+        | ResolvedStmt::Local { span, .. }
+        | ResolvedStmt::Global { span, .. }
+        | ResolvedStmt::Break { span, .. }
+        | ResolvedStmt::Goto { span, .. }
+        | ResolvedStmt::Label { span, .. }
+        | ResolvedStmt::Do { span, .. }
+        | ResolvedStmt::If { span, .. }
+        | ResolvedStmt::While { span, .. }
+        | ResolvedStmt::Repeat { span, .. }
+        | ResolvedStmt::NumericFor { span, .. }
+        | ResolvedStmt::GenericFor { span, .. }
+        | ResolvedStmt::Function { span, .. }
+        | ResolvedStmt::LocalFunction { span, .. } => *span,
     }
 }
 fn limit(span: Span, message: &str) -> IrError {
@@ -2774,6 +3494,135 @@ fn map_binary(op: BinaryOp) -> BinaryOperation {
 mod tests {
     use super::*;
     use crate::{CompileLimits, lex, parse, resolve};
+
+    #[test]
+    fn pending_call_prefix_is_cleared_after_input_allocation_error() {
+        let compile_limits = CompileLimits::default();
+        let tokens = lex(b"", LanguageProfile::Lua55, &compile_limits).unwrap();
+        let ast = parse(&tokens, LanguageProfile::Lua55, &compile_limits).unwrap();
+        let resolved = resolve(&ast, &tokens, LanguageProfile::Lua55, &compile_limits).unwrap();
+        let function = &resolved.functions[0];
+        let mappings = vec![(FunctionId(0), ProtoId(0))];
+        let limits = IrLimits {
+            max_registers: 2,
+            ..IrLimits::default()
+        };
+        let mut builder = Builder::new(
+            function,
+            ProtoId(0),
+            None,
+            resolved.span,
+            &limits,
+            &mappings,
+            &resolved.functions,
+            None,
+        )
+        .unwrap();
+        assert!(
+            builder
+                .lower_call_inputs(Register(2), &[], &[], None, resolved.span)
+                .is_err()
+        );
+        assert!(builder.pending_expression_values.is_empty());
+    }
+
+    #[test]
+    fn lower_private_vec_growth_and_close_clones_fit_declared_envelope() {
+        fn push_envelope<T>(mut make: impl FnMut(u32) -> T) {
+            let mut values = Vec::<T>::new();
+            for index in 0..64 {
+                let old = values.capacity();
+                values.push(make(index));
+                let count = index as usize + 1;
+                // 每類 Vec 的 old＋new buffer 至多 4 倍實際元素數；
+                // lower_scratch_unit_bytes 為這些類別各留一份元素大小。
+                assert!(old + values.capacity() <= 4 * count);
+            }
+        }
+
+        let span = Span {
+            start_byte: 0,
+            end_byte: 0,
+        };
+        push_envelope(|index| LabelFrame {
+            scope: ScopeId(index),
+            labels: Vec::new(),
+        });
+        push_envelope(|index| LabelEntry {
+            name: format!("n{index}").into_bytes(),
+            offset: None,
+        });
+        push_envelope(|index| PendingGoto {
+            instruction: index as usize,
+            scope: ScopeId(0),
+            name: format!("n{index}").into_bytes(),
+            span,
+        });
+        push_envelope(|_| LoopFrame::default());
+        push_envelope(|index| PreparedAssignmentTarget::Register(Register(index as u16)));
+        push_envelope(|index| IrNativeLocal {
+            binding: BindingId {
+                function: FunctionId(0),
+                ordinal: index,
+            },
+            register: Register(index as u16),
+            slot: index as u16,
+            initialized_pc: 0,
+            start_pc: 0,
+            end_pc: 1,
+        });
+        push_envelope(|index| IrNativeListWrite {
+            call_pc: InstructionOffset(index),
+            function_register: Register(index as u16),
+        });
+        push_envelope(|index| {
+            (
+                BindingId {
+                    function: FunctionId(0),
+                    ordinal: index,
+                },
+                Register(index as u16),
+            )
+        });
+
+        let limits = CompileLimits::default();
+        let source = b"local f; do local a <close> = f(); local b <close> = f(); local c <close> = f(); local d <close> = f() end; return {1,f()}";
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            let chunk = lex(source, profile, &limits).unwrap();
+            let ast = parse(&chunk, profile, &limits).unwrap();
+            let resolved = resolve(&ast, &chunk, profile, &limits).unwrap();
+            let ir = lower(&resolved, &IrLimits::default()).unwrap();
+            let root = ir.prototype_for(FunctionId(0)).unwrap();
+            let path = root
+                .close_paths
+                .iter()
+                .find(|path| path.bindings.len() == 4)
+                .unwrap();
+            assert_eq!(path.registers.len(), 4);
+            assert_eq!(
+                root.instructions
+                    .iter()
+                    .filter(|instruction| instruction.close_path.as_ref() == Some(path))
+                    .count(),
+                4,
+            );
+            for (len, capacity) in [
+                (root.instructions.len(), root.instructions.capacity()),
+                (root.constants.len(), root.constants.capacity()),
+                (root.close_paths.len(), root.close_paths.capacity()),
+                (
+                    root.binding_registers.len(),
+                    root.binding_registers.capacity(),
+                ),
+                (
+                    root.native_list_writes.len(),
+                    root.native_list_writes.capacity(),
+                ),
+            ] {
+                assert!(capacity <= (2 * len).max(4));
+            }
+        }
+    }
 
     #[test]
     fn ir_rejects_open_result_without_immediate_return_consumer() {
@@ -3251,6 +4100,87 @@ pub(crate) fn emit_with_native_debug_candidate(
             * core::mem::size_of::<rivetlua_core::NativePrototypeDebug>(),
         limits.max_artifact_bytes,
     )?;
+    let temporary_count = module.prototypes.iter().try_fold(0usize, |sum, proto| {
+        sum.checked_add(
+            proto
+                .native_debug
+                .as_ref()
+                .map_or(0, |debug| debug.temporaries.len()),
+        )
+        .ok_or_else(|| native_debug_limit("native debug temporary 數溢位"))
+    })?;
+    native_debug_add(
+        &mut allocated,
+        temporary_count
+            .checked_mul(core::mem::size_of::<rivetlua_core::NativeTemporary>())
+            .ok_or_else(|| native_debug_limit("native debug temporary 大小溢位"))?,
+        limits.max_artifact_bytes,
+    )?;
+    let mut temporaries = Vec::new();
+    temporaries
+        .try_reserve_exact(temporary_count)
+        .map_err(|_| native_debug_limit("native debug temporary 配置失敗"))?;
+    native_debug_add(
+        &mut allocated,
+        (temporaries.capacity() - temporary_count)
+            * core::mem::size_of::<rivetlua_core::NativeTemporary>(),
+        limits.max_artifact_bytes,
+    )?;
+    let initializer_count = module.prototypes.iter().try_fold(0usize, |sum, proto| {
+        sum.checked_add(
+            proto
+                .native_debug
+                .as_ref()
+                .map_or(0, |debug| debug.initializer_temporaries.len()),
+        )
+        .ok_or_else(|| native_debug_limit("native debug initializer 數溢位"))
+    })?;
+    native_debug_add(
+        &mut allocated,
+        initializer_count
+            .checked_mul(core::mem::size_of::<
+                rivetlua_core::bytecode::native_debug::NativeInitializerTemporary,
+            >())
+            .ok_or_else(|| native_debug_limit("native debug initializer 大小溢位"))?,
+        limits.max_artifact_bytes,
+    )?;
+    let mut initializer_temporaries = Vec::new();
+    initializer_temporaries
+        .try_reserve_exact(initializer_count)
+        .map_err(|_| native_debug_limit("native debug initializer 配置失敗"))?;
+    native_debug_add(
+        &mut allocated,
+        (initializer_temporaries.capacity() - initializer_count)
+            * core::mem::size_of::<rivetlua_core::bytecode::native_debug::NativeInitializerTemporary>(
+            ),
+        limits.max_artifact_bytes,
+    )?;
+    let non_counted_count = module.prototypes.iter().try_fold(0usize, |sum, proto| {
+        sum.checked_add(
+            proto
+                .native_debug
+                .as_ref()
+                .map_or(0, |debug| debug.non_counted_pcs.len()),
+        )
+        .ok_or_else(|| native_debug_limit("native debug CFG anchor 數溢位"))
+    })?;
+    native_debug_add(
+        &mut allocated,
+        non_counted_count
+            .checked_mul(core::mem::size_of::<(ProtoId, InstructionOffset)>())
+            .ok_or_else(|| native_debug_limit("native debug CFG anchor 大小溢位"))?,
+        limits.max_artifact_bytes,
+    )?;
+    let mut non_counted_pcs = Vec::new();
+    non_counted_pcs
+        .try_reserve_exact(non_counted_count)
+        .map_err(|_| native_debug_limit("native debug CFG anchor 配置失敗"))?;
+    native_debug_add(
+        &mut allocated,
+        (non_counted_pcs.capacity() - non_counted_count)
+            * core::mem::size_of::<(ProtoId, InstructionOffset)>(),
+        limits.max_artifact_bytes,
+    )?;
     for proto in &module.prototypes {
         native_debug_charge(&mut work, resolved.functions.len())?;
         let function = resolved
@@ -3261,6 +4191,41 @@ pub(crate) fn emit_with_native_debug_candidate(
         let Some(debug) = proto.native_debug.as_ref() else {
             return Err(native_debug_verify("native debug IR metadata 缺失"));
         };
+        native_debug_charge(&mut work, debug.temporaries.len())?;
+        native_debug_charge(&mut work, debug.initializer_temporaries.len())?;
+        native_debug_charge(&mut work, debug.non_counted_pcs.len())?;
+        non_counted_pcs.extend(
+            debug
+                .non_counted_pcs
+                .iter()
+                .copied()
+                .map(|pc| (proto.id, pc)),
+        );
+        temporaries.extend(
+            debug
+                .temporaries
+                .iter()
+                .map(|entry| rivetlua_core::NativeTemporary {
+                    prototype: proto.id,
+                    call_pc: entry.call_pc,
+                    ordinal: entry.ordinal,
+                    register: entry.register,
+                }),
+        );
+        for initializer in &debug.initializer_temporaries {
+            initializer_temporaries.push(
+                rivetlua_core::bytecode::native_debug::NativeInitializerTemporary {
+                    prototype: proto.id,
+                    binding: bytecode_binding(initializer.binding),
+                    register: initializer.register,
+                    slot: u8::try_from(initializer.slot).map_err(|_| {
+                        native_debug_limit("native debug initializer slot 超出範圍")
+                    })?,
+                    start_pc: initializer.start_pc,
+                    end_pc: initializer.end_pc,
+                },
+            );
+        }
         native_debug_charge(
             &mut work,
             proto
@@ -3296,7 +4261,24 @@ pub(crate) fn emit_with_native_debug_candidate(
             limits.max_artifact_bytes,
         )?;
         for entry in &proto.instructions {
-            lines.push(line_at(entry.span.start_byte)?);
+            let range = source
+                .get(entry.span.start_byte..entry.span.end_byte)
+                .ok_or_else(|| native_debug_verify("native debug span 超出來源"))?;
+            let offset = if range.first().is_some_and(u8::is_ascii_whitespace)
+                && (resolved.profile == LanguageProfile::Lua54
+                    || !matches!(entry.instruction, Instruction::JumpIfFalse { .. }))
+            {
+                native_debug_charge(&mut work, range.len())?;
+                range
+                    .iter()
+                    .position(|byte| !byte.is_ascii_whitespace())
+                    .map_or(entry.span.start_byte, |offset| {
+                        entry.span.start_byte + offset
+                    })
+            } else {
+                entry.span.start_byte
+            };
+            lines.push(line_at(offset)?);
         }
         allocated = allocated
             .checked_add(
@@ -3343,11 +4325,30 @@ pub(crate) fn emit_with_native_debug_candidate(
                 name,
             });
         }
+        native_debug_charge(&mut work, proto.instructions.len().saturating_add(1))?;
+        let virtual_environment = resolved.profile == LanguageProfile::Lua55
+            && matches!(
+                proto.frame.environment_source,
+                EnvironmentSource::RootExternal | EnvironmentSource::ParentFrame { .. }
+            )
+            && proto.instructions.iter().any(|entry| {
+                matches!(
+                    entry.instruction,
+                    Instruction::GetTable { table, .. } | Instruction::SetTable { table, .. }
+                        if table == proto.global_environment
+                )
+            });
+        let upvalue_name_count = proto
+            .upvalues
+            .len()
+            .checked_add(usize::from(virtual_environment))
+            .ok_or_else(|| native_debug_limit("native debug upvalue 名稱數溢位"))?;
+        if upvalue_name_count > limits.max_upvalues_per_prototype {
+            return Err(native_debug_limit("native debug upvalue 名稱數超限"));
+        }
         allocated = allocated
             .checked_add(
-                proto
-                    .upvalues
-                    .len()
+                upvalue_name_count
                     .checked_mul(core::mem::size_of::<Option<Vec<u8>>>())
                     .ok_or_else(|| native_debug_limit("native debug upvalue 名稱大小溢位"))?,
             )
@@ -3355,15 +4356,23 @@ pub(crate) fn emit_with_native_debug_candidate(
             .ok_or_else(|| native_debug_limit("native debug upvalue 名稱配置超限"))?;
         let mut upvalue_names = Vec::new();
         upvalue_names
-            .try_reserve_exact(proto.upvalues.len())
+            .try_reserve_exact(upvalue_name_count)
             .map_err(|_| native_debug_limit("native debug upvalue 名稱配置失敗"))?;
         native_debug_add(
             &mut allocated,
-            (upvalue_names.capacity() - proto.upvalues.len())
+            (upvalue_names.capacity() - upvalue_name_count)
                 * core::mem::size_of::<Option<Vec<u8>>>(),
             limits.max_artifact_bytes,
         )?;
         for index in 0..proto.upvalues.len() {
+            if virtual_environment && index == function.upvalues.len() {
+                upvalue_names.push(Some(native_debug_clone(
+                    b"_ENV",
+                    &mut allocated,
+                    limits.max_artifact_bytes,
+                    &mut work,
+                )?));
+            }
             let name = if index < function.upvalues.len() {
                 native_debug_name(function, index, &resolved.functions, 0, &mut work)?
             } else {
@@ -3376,10 +4385,26 @@ pub(crate) fn emit_with_native_debug_candidate(
                 .transpose()?,
             );
         }
+        if virtual_environment && function.upvalues.len() == proto.upvalues.len() {
+            upvalue_names.push(Some(native_debug_clone(
+                b"_ENV",
+                &mut allocated,
+                limits.max_artifact_bytes,
+                &mut work,
+            )?));
+        }
         prototypes.push(rivetlua_core::NativePrototypeDebug {
             prototype: proto.id,
-            line_defined: line_at(proto.span.start_byte)?,
-            last_line_defined: line_at(proto.span.end_byte.saturating_sub(1))?,
+            line_defined: if function.parent.is_none() {
+                0
+            } else {
+                line_at(function.span.start_byte)?
+            },
+            last_line_defined: if function.parent.is_none() {
+                0
+            } else {
+                line_at(function.span.end_byte.saturating_sub(1))?
+            },
             lines,
             locals,
             upvalue_names,
@@ -3393,6 +4418,9 @@ pub(crate) fn emit_with_native_debug_candidate(
         rivetlua_core::NativeDebugCandidate {
             source_name,
             prototypes,
+            temporaries,
+            initializer_temporaries,
+            non_counted_pcs,
         },
         limits,
         &mut work,

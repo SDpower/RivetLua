@@ -484,7 +484,24 @@ fn sdk_case_008() {
             b"local function nested() return 42 end; return nested()",
         );
         let mut sibling = multi.clone();
+        let rvlu_start = 40;
+        let first_record_start = 76;
         let first_record_len = u32::from_le_bytes(sibling[72..76].try_into().unwrap());
+        let multi_rvlu_len = u64::from_le_bytes(multi[16..24].try_into().unwrap()) as usize;
+        let section_len = u32::from_le_bytes(multi[64..68].try_into().unwrap()) as usize;
+        let prototype_count = u32::from_le_bytes(multi[68..72].try_into().unwrap());
+        assert_eq!(prototype_count, 2);
+        let section_end = 68 + section_len;
+        assert_eq!(section_end, rvlu_start + multi_rvlu_len);
+        let second_record_len_at = first_record_start + first_record_len as usize;
+        let second_record_at = second_record_len_at + 4;
+        assert!(second_record_at < section_end);
+        let second_record_len = u32::from_le_bytes(
+            multi[second_record_len_at..second_record_at]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(second_record_at + second_record_len, section_end);
         sibling[72..76].copy_from_slice(&(first_record_len + 4).to_le_bytes());
         refresh_crc(&mut sibling);
         let sibling_budget = budget();
@@ -494,7 +511,21 @@ fn sdk_case_008() {
             sibling_error.payload_kind,
             Some(rivetlua::TransportErrorKind::InvalidFormat)
         );
-        assert_eq!(sibling_error.offset, 200);
+        assert_eq!(
+            sibling_error.offset,
+            second_record_len_at - first_record_start
+        );
+        let core_sibling = rivetlua_core::decode_module(
+            &sibling[rvlu_start..rvlu_start + multi_rvlu_len],
+            profile,
+            &rivetlua_core::VerifyLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            core_sibling.message,
+            "RVLU prototype record 尾端 bytes 無效"
+        );
+        assert_eq!(core_sibling.offset, second_record_len_at - rvlu_start);
         assert_eq!(sibling_budget.allocation_snapshot().reserved, 0);
         let baseline = budget();
         engine.load_module(&good, &baseline).unwrap();

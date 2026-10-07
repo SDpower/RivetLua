@@ -97,10 +97,10 @@ fn official_p13_preflight_bounds_both_profiles() {
         assert!(work.consumed() <= stats.subsequent_work);
         let total_work = (bytes.len() as u64) * 2 + 1 + stats.subsequent_work;
         if bytes.len() < 200 {
-            assert!(total_work < 100_000);
+            assert!(total_work < 10_000);
         } else {
-            assert!(total_work > 100_000);
-            assert!(total_work < 200_000);
+            assert!(total_work > 50_000);
+            assert!(total_work < 100_000);
         }
     }
 }

@@ -14,7 +14,8 @@ pub use bytecode::input::{
 };
 
 pub use bytecode::native_debug::{
-    NativeDebug, NativeDebugCandidate, NativeLocal, NativePrototypeDebug, verify_native_debug,
+    NativeDebug, NativeDebugCandidate, NativeLocal, NativePrototypeDebug, NativeTemporary,
+    verify_native_debug,
 };
 pub use bytecode::official::{
     OfficialAbsLine, OfficialChunk, OfficialChunkError, OfficialChunkErrorKind,

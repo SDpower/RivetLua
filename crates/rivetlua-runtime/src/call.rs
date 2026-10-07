@@ -73,6 +73,10 @@ pub(crate) struct CallFrame {
     pub(crate) return_destination: Option<Register>,
     pub(crate) return_mode: ResultMode,
     pub(crate) tail_return: bool,
+    pub(crate) hook_entry: Option<bool>,
+    pub(crate) tail_called: bool,
+    pub(crate) call_extraargs: u8,
+    pub(crate) hook_exit_fired: bool,
     pub(crate) pending_close: Option<PendingCloseSnapshot>,
     pub(crate) caller: Option<usize>,
     pub(crate) depth: usize,
@@ -82,7 +86,11 @@ pub(crate) struct CallFrame {
     pub(crate) varargs: Vec<Value>,
     pub(crate) vararg_roots: Vec<Option<RootId>>,
     pub(crate) vararg_charge: usize,
+    pub(crate) official_raw_varargs: Option<Register>,
+    pub(crate) official_raw_vararg_count: usize,
     pub(crate) named_vararg: Option<Register>,
+    pub(crate) debug_vararg_table: Value,
+    pub(crate) debug_vararg_table_root: Option<RootId>,
     pub(crate) dynamic_top: usize,
     pub(crate) register_limit: usize,
     pub(crate) max_register_limit: usize,
@@ -99,6 +107,29 @@ pub(crate) struct OpenUpvalue {
     pub(crate) slot: usize,
     pub(crate) object: ObjectRef,
     pub(crate) root: Option<RootId>,
+}
+
+#[derive(Clone, Copy)]
+enum DebugWriteSlot {
+    Register(usize),
+    Vararg(usize),
+    VarargTable,
+}
+
+#[must_use]
+pub(crate) struct DebugWrite {
+    slot: DebugWriteSlot,
+    previous_value: Value,
+    previous_root: Option<RootId>,
+}
+
+impl DebugWrite {
+    pub(crate) fn commit(self, vm: &mut Vm) -> Result<(), RuntimeError> {
+        if let Some(root) = self.previous_root {
+            vm.remove_root(root)?;
+        }
+        Ok(())
+    }
 }
 
 impl CallFrame {
@@ -126,6 +157,10 @@ impl CallFrame {
             return_destination: None,
             return_mode: ResultMode::Fixed(0),
             tail_return: false,
+            hook_entry: None,
+            tail_called: false,
+            call_extraargs: 0,
+            hook_exit_fired: false,
             pending_close: None,
             caller: None,
             depth: 0,
@@ -135,7 +170,11 @@ impl CallFrame {
             varargs: Vec::new(),
             vararg_roots: Vec::new(),
             vararg_charge: 0,
+            official_raw_varargs: None,
+            official_raw_vararg_count: 0,
             named_vararg: None,
+            debug_vararg_table: Value::Nil,
+            debug_vararg_table_root: None,
             dynamic_top: 1,
             register_limit: 1,
             max_register_limit: usize::from(u16::MAX),
@@ -197,6 +236,10 @@ impl CallFrame {
             return_destination: None,
             return_mode: ResultMode::Fixed(0),
             tail_return: false,
+            hook_entry: None,
+            tail_called: false,
+            call_extraargs: 0,
+            hook_exit_fired: false,
             pending_close: None,
             caller: None,
             depth: 0,
@@ -206,7 +249,11 @@ impl CallFrame {
             varargs: Vec::new(),
             vararg_roots: Vec::new(),
             vararg_charge: 0,
+            official_raw_varargs: None,
+            official_raw_vararg_count: 0,
             named_vararg: prototype.named_vararg.map(|(_, register)| register),
+            debug_vararg_table: Value::Nil,
+            debug_vararg_table_root: None,
             dynamic_top,
             register_limit: limit,
             max_register_limit: usize::from(prototype.frame.register_limit),
@@ -367,6 +414,112 @@ impl CallFrame {
         Ok(())
     }
 
+    pub(crate) fn begin_debug_register_write(
+        &mut self,
+        vm: &mut Vm,
+        register: Register,
+        value: Value,
+    ) -> Result<DebugWrite, RuntimeError> {
+        let index = self.index(register)?;
+        self.begin_debug_write(vm, DebugWriteSlot::Register(index), value)
+    }
+
+    pub(crate) fn begin_debug_vararg_write(
+        &mut self,
+        vm: &mut Vm,
+        index: usize,
+        value: Value,
+    ) -> Result<DebugWrite, RuntimeError> {
+        if index >= self.varargs.len() {
+            return Err(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds));
+        }
+        self.begin_debug_write(vm, DebugWriteSlot::Vararg(index), value)
+    }
+
+    pub(crate) fn begin_debug_vararg_table_write(
+        &mut self,
+        vm: &mut Vm,
+        value: Value,
+    ) -> Result<DebugWrite, RuntimeError> {
+        self.begin_debug_write(vm, DebugWriteSlot::VarargTable, value)
+    }
+
+    fn begin_debug_write(
+        &mut self,
+        vm: &mut Vm,
+        slot: DebugWriteSlot,
+        value: Value,
+    ) -> Result<DebugWrite, RuntimeError> {
+        let new_root = if let Value::Object(object) = value {
+            Some(vm.add_root(RootKind::Stack, object)?)
+        } else {
+            None
+        };
+        let (previous_value, previous_root) = match slot {
+            DebugWriteSlot::Register(index) => (
+                core::mem::replace(&mut self.registers[index], value),
+                core::mem::replace(&mut self.roots[index], new_root),
+            ),
+            DebugWriteSlot::Vararg(index) => (
+                core::mem::replace(&mut self.varargs[index], value),
+                core::mem::replace(&mut self.vararg_roots[index], new_root),
+            ),
+            DebugWriteSlot::VarargTable => (
+                core::mem::replace(&mut self.debug_vararg_table, value),
+                core::mem::replace(&mut self.debug_vararg_table_root, new_root),
+            ),
+        };
+        Ok(DebugWrite {
+            slot,
+            previous_value,
+            previous_root,
+        })
+    }
+
+    pub(crate) fn rollback_debug_write(
+        &mut self,
+        vm: &mut Vm,
+        write: DebugWrite,
+    ) -> Result<(), RuntimeError> {
+        let current_root = match write.slot {
+            DebugWriteSlot::Register(index) => {
+                self.registers[index] = write.previous_value;
+                core::mem::replace(&mut self.roots[index], write.previous_root)
+            }
+            DebugWriteSlot::Vararg(index) => {
+                self.varargs[index] = write.previous_value;
+                core::mem::replace(&mut self.vararg_roots[index], write.previous_root)
+            }
+            DebugWriteSlot::VarargTable => {
+                self.debug_vararg_table = write.previous_value;
+                core::mem::replace(&mut self.debug_vararg_table_root, write.previous_root)
+            }
+        };
+        if let Some(root) = current_root.filter(|root| Some(*root) != write.previous_root) {
+            vm.remove_root(root)?;
+        }
+        Ok(())
+    }
+
+    /// 清除開放結果擴張的暫存值與 stack roots，保留已配置的 frame storage。
+    pub(crate) fn clear_dynamic_extension_from(
+        &mut self,
+        vm: &mut Vm,
+        start: usize,
+    ) -> Result<(), RuntimeError> {
+        if start > self.register_limit {
+            return Err(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds));
+        }
+        for index in start..self.register_limit {
+            let register = Register(
+                u16::try_from(index)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?,
+            );
+            self.write(vm, register, Value::Nil)?;
+        }
+        Ok(())
+    }
+
     /// 額外引數維持精確數量；caller 在此操作完成前持有所有來源 root。
     pub(crate) fn set_varargs(
         &mut self,
@@ -474,9 +627,15 @@ impl CallFrame {
                 }
             }
         }
-        if official.raw.is_none() && official.guest_named.is_none() && official.active.is_none() {
+        if official.raw.is_none() && official.guest_named.is_none() {
             self.set_varargs(vm, values)?;
         }
+        self.official_raw_varargs = official.raw;
+        self.official_raw_vararg_count = if official.raw.is_some() {
+            values.len()
+        } else {
+            0
+        };
         Ok(payloads)
     }
 
@@ -531,6 +690,9 @@ impl CallFrame {
                 *root = None;
             }
         }
+        if let Some(root) = self.debug_vararg_table_root.take() {
+            vm.remove_root(root)?;
+        }
         if let Some(root) = self.closure_root {
             vm.remove_root(root)?;
             self.closure_root = None;
@@ -570,6 +732,9 @@ impl CallFrame {
                     *root = Some(vm.add_root(RootKind::Stack, *object)?);
                 }
             }
+            if let Value::Object(object) = self.debug_vararg_table {
+                self.debug_vararg_table_root = Some(vm.add_root(RootKind::Stack, object)?);
+            }
             for entry in &mut self.open_upvalues {
                 entry.root = Some(vm.add_root(RootKind::Temporary, entry.object)?);
             }
@@ -600,6 +765,9 @@ impl CallFrame {
             if let Value::Object(object) = value {
                 visit(*object)?;
             }
+        }
+        if let Value::Object(object) = self.debug_vararg_table {
+            visit(object)?;
         }
         for entry in &self.open_upvalues {
             visit(entry.object)?;

@@ -469,8 +469,8 @@ struct Resolver<'a> {
     goto_count: usize,
     parent_visible: Option<HashMap<Vec<u8>, ParentBinding>>,
     root_environment_binding: Option<BindingId>,
-    inherited_global_mode: Option<bool>,
-    implicit_globals: HashMap<Vec<u8>, BindingId>,
+    inherited_global_mode: Option<GlobalMode>,
+    implicit_globals: HashMap<Vec<u8>, [Option<BindingId>; 2]>,
     completed_functions: Vec<ResolvedFunction>,
 }
 
@@ -481,8 +481,13 @@ struct ScopeFrame {
     close_bindings: Vec<BindingId>,
     labels: HashMap<Vec<u8>, LabelInfo>,
     declaration_spans: Vec<Span>,
-    // Some(true) 是只允許已宣告名稱的 explicit global scope；Some(false) 是 global *。
-    global_mode: Option<bool>,
+    global_mode: Option<GlobalMode>,
+}
+
+#[derive(Clone, Copy)]
+enum GlobalMode {
+    NamedOnly,
+    Wildcard { readonly: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -501,6 +506,16 @@ enum ParentBinding {
     Direct(BindingId),
     Ancestor(BindingId),
     Global(BindingId),
+}
+
+// 預算層需要 private resolver 容器的實際元素大小；不公開其表示或語意。
+pub(crate) fn budget_layout_sizes() -> (usize, usize, usize, usize) {
+    (
+        core::mem::size_of::<ScopeFrame>(),
+        core::mem::size_of::<LabelInfo>(),
+        core::mem::size_of::<ParentBinding>(),
+        core::mem::size_of::<BindingAccess>(),
+    )
 }
 
 impl<'a> Resolver<'a> {
@@ -795,7 +810,8 @@ impl<'a> Resolver<'a> {
                 prefix_attribute,
                 span,
             } => {
-                self.set_explicit_global_mode(false);
+                let readonly = self.global_attribute_readonly(prefix_attribute.as_ref(), *span)?;
+                self.set_wildcard_global_mode(readonly);
                 Ok(ResolvedStmt::Global {
                     declaration: ResolvedGlobalDeclaration::Star {
                         prefix_attribute: prefix_attribute.clone(),
@@ -813,16 +829,18 @@ impl<'a> Resolver<'a> {
                 self.ensure_list(names.len(), *span)?;
                 self.ensure_list(values.len(), *span)?;
                 self.ensure_binding_capacity(names.len(), *span)?;
-                self.set_explicit_global_mode(true);
+                self.set_named_global_mode();
                 let mut resolved_names = Vec::new();
                 resolved_names
                     .try_reserve(names.len())
                     .map_err(|_| self.limit(*span, "global name 配置超過編譯限制"))?;
                 for name in names {
+                    let attribute = name.attribute.as_ref().or(prefix_attribute.as_ref());
+                    self.global_attribute_readonly(attribute, name.span)?;
                     let binding = self.declare_binding(
                         name.name.clone(),
                         name.span,
-                        name.attribute.clone(),
+                        attribute.cloned(),
                         BindingKind::Global,
                         false,
                     )?;
@@ -846,7 +864,7 @@ impl<'a> Resolver<'a> {
             }
             GlobalDeclaration::Function { name, body, span } => {
                 self.ensure_binding_capacity(1, *span)?;
-                self.set_explicit_global_mode(true);
+                self.set_named_global_mode();
                 let binding =
                     self.declare_binding(name.clone(), *span, None, BindingKind::Global, false)?;
                 let body = self.resolve_function_body(body, None)?;
@@ -1056,9 +1074,22 @@ impl<'a> Resolver<'a> {
         let binding = match resolution {
             ResolvedName::Local(binding) => Some(*binding),
             ResolvedName::Upvalue(upvalue) => Some(self.upvalue_binding(*upvalue, span)?),
-            ResolvedName::EnvField { .. } | ResolvedName::Global(_) => None,
+            ResolvedName::Global(binding) => Some(*binding),
+            ResolvedName::EnvField { name, .. } if self.profile == LanguageProfile::Lua55 => {
+                self.visible_named_global(name)
+            }
+            ResolvedName::EnvField { .. } => None,
         };
         if binding.is_some_and(|binding| self.binding_readonly(binding).unwrap_or(false)) {
+            return Err(self.resolve_error(span, "不可指派 readonly binding"));
+        }
+        if matches!(resolution, ResolvedName::EnvField { .. })
+            && binding.is_none()
+            && matches!(
+                self.effective_global_mode(),
+                Some(GlobalMode::Wildcard { readonly: true })
+            )
+        {
             return Err(self.resolve_error(span, "不可指派 readonly binding"));
         }
         Ok(())
@@ -1417,8 +1448,14 @@ impl<'a> Resolver<'a> {
         &mut self,
         name: &[u8],
         span: Span,
+        readonly: bool,
     ) -> Result<BindingId, Diagnostic> {
-        if let Some(binding) = self.implicit_globals.get(name).copied() {
+        let index = usize::from(readonly);
+        if let Some(binding) = self
+            .implicit_globals
+            .get(name)
+            .and_then(|bindings| bindings[index])
+        {
             return Ok(binding);
         }
         let binding = self.allocate_binding(
@@ -1426,11 +1463,13 @@ impl<'a> Resolver<'a> {
             span,
             None,
             BindingKind::Global,
-            false,
+            readonly,
             None,
             0,
         )?;
-        self.implicit_globals.insert(name.to_vec(), binding);
+        self.implicit_globals
+            .entry(name.to_vec())
+            .or_insert([None, None])[index] = Some(binding);
         Ok(binding)
     }
 
@@ -1511,7 +1550,8 @@ impl<'a> Resolver<'a> {
         }
         match self.profile {
             LanguageProfile::Lua55 => {
-                if self.effective_global_mode() == Some(true) {
+                let mode = self.effective_global_mode();
+                if matches!(mode, Some(GlobalMode::NamedOnly)) {
                     Ok(None)
                 } else if let Some(env) = self.lexical_environment_shadow(span)? {
                     Ok(Some(ResolvedName::EnvField {
@@ -1519,9 +1559,11 @@ impl<'a> Resolver<'a> {
                         name: name.to_vec(),
                     }))
                 } else {
-                    Ok(Some(ResolvedName::Global(
-                        self.declare_implicit_global(name, span)?,
-                    )))
+                    Ok(Some(ResolvedName::Global(self.declare_implicit_global(
+                        name,
+                        span,
+                        matches!(mode, Some(GlobalMode::Wildcard { readonly: true })),
+                    )?)))
                 }
             }
             LanguageProfile::Lua54 => match self.lookup(b"_ENV", span)? {
@@ -1720,16 +1762,58 @@ impl<'a> Resolver<'a> {
             .map(|meta| meta.kind)
     }
 
-    fn effective_global_mode(&self) -> Option<bool> {
+    fn effective_global_mode(&self) -> Option<GlobalMode> {
+        let mut named = false;
+        for scope in self.scopes.iter().rev() {
+            match scope.global_mode {
+                Some(mode @ GlobalMode::Wildcard { .. }) => return Some(mode),
+                Some(GlobalMode::NamedOnly) => named = true,
+                None => {}
+            }
+        }
+        match self.inherited_global_mode {
+            Some(mode @ GlobalMode::Wildcard { .. }) => Some(mode),
+            Some(GlobalMode::NamedOnly) => Some(GlobalMode::NamedOnly),
+            None if named => Some(GlobalMode::NamedOnly),
+            None => None,
+        }
+    }
+
+    fn set_named_global_mode(&mut self) {
+        let scope = self.scopes.last_mut().expect("scope 已建立");
+        if scope.global_mode.is_none() {
+            scope.global_mode = Some(GlobalMode::NamedOnly);
+        }
+    }
+
+    fn set_wildcard_global_mode(&mut self, readonly: bool) {
+        self.scopes.last_mut().expect("scope 已建立").global_mode =
+            Some(GlobalMode::Wildcard { readonly });
+    }
+
+    fn global_attribute_readonly(
+        &self,
+        attribute: Option<&Attribute>,
+        span: Span,
+    ) -> Result<bool, Diagnostic> {
+        match attribute.map(|attribute| attribute.name.as_slice()) {
+            None => Ok(false),
+            Some(b"const") => Ok(true),
+            Some(b"close") => Err(self.resolve_error(span, "global 不可為 close binding")),
+            Some(_) => Err(self.resolve_error(span, "未知 global attribute")),
+        }
+    }
+
+    fn visible_named_global(&self, name: &[u8]) -> Option<BindingId> {
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.global_mode)
-            .or(self.inherited_global_mode)
-    }
-
-    fn set_explicit_global_mode(&mut self, restrictive: bool) {
-        self.scopes.last_mut().expect("scope 已建立").global_mode = Some(restrictive);
+            .find_map(|scope| scope.bindings.get(name).copied())
+            .filter(|binding| self.binding_kind(*binding) == Some(BindingKind::Global))
+            .or_else(|| match self.parent_visible.as_ref()?.get(name)? {
+                ParentBinding::Global(binding) => Some(*binding),
+                ParentBinding::Direct(_) | ParentBinding::Ancestor(_) => None,
+            })
     }
 
     fn current_scope(&self) -> ScopeId {
@@ -1907,8 +1991,223 @@ fn diagnostic(token: Option<&Token>, code: DiagnosticCode, message: &'static str
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedStmt, resolve};
-    use crate::{CompileLimits, DiagnosticCode, LanguageProfile, lex, parse};
+    use super::{
+        BindingAccess, BindingId, FunctionId, LabelInfo, ParentBinding, ResolvedStmt, ScopeFrame,
+        ScopeId, UpvalueId, budget_layout_sizes, resolve,
+    };
+    use crate::{CompileLimits, DiagnosticCode, LanguageProfile, Span, lex, parse};
+    use std::collections::HashMap;
+
+    #[test]
+    fn budget_layout_uses_private_resolver_element_sizes() {
+        assert_eq!(
+            budget_layout_sizes(),
+            (
+                core::mem::size_of::<ScopeFrame>(),
+                core::mem::size_of::<LabelInfo>(),
+                core::mem::size_of::<ParentBinding>(),
+                core::mem::size_of::<BindingAccess>(),
+            )
+        );
+        assert!(budget_layout_sizes().0 > 0);
+    }
+
+    fn observed_buckets(capacity: usize) -> usize {
+        if capacity == 0 {
+            return 0;
+        }
+        let buckets = if capacity < 8 {
+            capacity + 1
+        } else {
+            assert_eq!(capacity % 7, 0);
+            capacity / 7 * 8
+        };
+        assert!(buckets.is_power_of_two());
+        buckets
+    }
+
+    fn assert_map_capacity_bound(old: usize, new: usize, entries: usize, entry_size: usize) {
+        // 本工具鏈的 hashbrown 0.17.1：小表至少 4 bucket；其餘表
+        // capacity 為 7/8 bucket。這裡用實際 capacity 還原 bucket，
+        // 同時計入 grow/clone 瞬間的舊表與新表及控制 bytes。
+        let buckets = observed_buckets(old) + observed_buckets(new);
+        let observed_layout_ceiling = buckets * (entry_size + 1) + 64;
+        let admission_ceiling = 5 * entries * (entry_size + 16) + 128;
+        assert!(
+            observed_layout_ceiling <= admission_ceiling,
+            "old={old} new={new} entries={entries} buckets={buckets}"
+        );
+    }
+
+    fn assert_vec_capacity_bound(old: usize, new: usize, entries: usize) {
+        assert!(
+            old + new <= 4 * entries,
+            "old={old} new={new} entries={entries}"
+        );
+    }
+
+    #[test]
+    fn budget_private_containers_cover_growth_shadow_reserve_and_clone() {
+        let (scope_size, label_size, parent_size, access_size) = budget_layout_sizes();
+        assert_eq!(scope_size, core::mem::size_of::<ScopeFrame>());
+        let actual_entry = [
+            core::mem::size_of::<(Vec<u8>, BindingId)>(),
+            core::mem::size_of::<(Vec<u8>, LabelInfo)>(),
+            core::mem::size_of::<(Vec<u8>, ParentBinding)>(),
+            core::mem::size_of::<(Vec<u8>, [Option<BindingId>; 2])>(),
+            core::mem::size_of::<(BindingId, BindingAccess)>(),
+            core::mem::size_of::<(BindingId, UpvalueId)>(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        let admitted_entry = 16
+            + [
+                core::mem::size_of::<(Vec<u8>, BindingId)>(),
+                core::mem::size_of::<Vec<u8>>() + label_size,
+                core::mem::size_of::<Vec<u8>>() + parent_size,
+                core::mem::size_of::<Vec<u8>>() + 2 * core::mem::size_of::<Option<BindingId>>(),
+                core::mem::size_of::<BindingId>() + access_size,
+                core::mem::size_of::<(BindingId, UpvalueId)>(),
+            ]
+            .into_iter()
+            .max()
+            .unwrap();
+        assert!(actual_entry <= admitted_entry);
+
+        let mut scope = ScopeFrame {
+            id: ScopeId(0),
+            bindings: HashMap::new(),
+            local_bindings: Vec::new(),
+            close_bindings: Vec::new(),
+            labels: HashMap::new(),
+            declaration_spans: Vec::new(),
+            global_mode: None,
+        };
+        let label_capacity_before_reserve = scope.labels.capacity();
+        scope.labels.try_reserve(64).unwrap();
+        assert_map_capacity_bound(
+            label_capacity_before_reserve,
+            scope.labels.capacity(),
+            64,
+            core::mem::size_of::<(Vec<u8>, LabelInfo)>(),
+        );
+        let spans_before_reserve = scope.declaration_spans.capacity();
+        scope.declaration_spans.try_reserve(64).unwrap();
+        assert_vec_capacity_bound(spans_before_reserve, scope.declaration_spans.capacity(), 64);
+
+        let mut pending = Vec::<(BindingId, UpvalueId)>::new();
+        let mut parent_visible = HashMap::<Vec<u8>, ParentBinding>::new();
+        let mut parent_metadata = HashMap::<BindingId, BindingAccess>::new();
+        let mut implicit = HashMap::<Vec<u8>, [Option<BindingId>; 2]>::new();
+        let mut upvalue_ids = HashMap::<BindingId, UpvalueId>::new();
+        for index in 0..64 {
+            let binding = BindingId {
+                function: FunctionId(0),
+                ordinal: index,
+            };
+            let span = Span {
+                start_byte: index as usize,
+                end_byte: index as usize + 1,
+            };
+            let key = format!("n{index}").into_bytes();
+            let old_scope = scope.bindings.capacity();
+            scope.bindings.insert(key.clone(), binding);
+            assert_map_capacity_bound(
+                old_scope,
+                scope.bindings.capacity(),
+                index as usize + 1,
+                core::mem::size_of::<(Vec<u8>, BindingId)>(),
+            );
+            let old_labels = scope.labels.capacity();
+            scope.labels.insert(
+                key.clone(),
+                LabelInfo {
+                    scope: scope.id,
+                    span,
+                },
+            );
+            assert_map_capacity_bound(
+                old_labels,
+                scope.labels.capacity(),
+                64,
+                core::mem::size_of::<(Vec<u8>, LabelInfo)>(),
+            );
+            for values in [&mut scope.local_bindings, &mut scope.close_bindings] {
+                let old = values.capacity();
+                values.push(binding);
+                assert_vec_capacity_bound(old, values.capacity(), index as usize + 1);
+            }
+            let old = scope.declaration_spans.capacity();
+            scope.declaration_spans.push(span);
+            assert_vec_capacity_bound(old, scope.declaration_spans.capacity(), 64);
+            let old = pending.capacity();
+            pending.push((binding, UpvalueId(index)));
+            assert_vec_capacity_bound(old, pending.capacity(), index as usize + 1);
+
+            let old = parent_visible.capacity();
+            parent_visible.insert(key.clone(), ParentBinding::Direct(binding));
+            assert_map_capacity_bound(
+                old,
+                parent_visible.capacity(),
+                index as usize + 1,
+                core::mem::size_of::<(Vec<u8>, ParentBinding)>(),
+            );
+            let old = parent_metadata.capacity();
+            parent_metadata.insert(binding, BindingAccess { readonly: false });
+            assert_map_capacity_bound(
+                old,
+                parent_metadata.capacity(),
+                index as usize + 1,
+                core::mem::size_of::<(BindingId, BindingAccess)>(),
+            );
+            let old = implicit.capacity();
+            implicit.insert(key, [Some(binding), None]);
+            assert_map_capacity_bound(
+                old,
+                implicit.capacity(),
+                index as usize + 1,
+                core::mem::size_of::<(Vec<u8>, [Option<BindingId>; 2])>(),
+            );
+            let old = upvalue_ids.capacity();
+            upvalue_ids.insert(binding, UpvalueId(index));
+            assert_map_capacity_bound(
+                old,
+                upvalue_ids.capacity(),
+                index as usize + 1,
+                core::mem::size_of::<(BindingId, UpvalueId)>(),
+            );
+        }
+        let old = scope.bindings.capacity();
+        for index in 0..64 {
+            scope.bindings.insert(
+                b"n0".to_vec(),
+                BindingId {
+                    function: FunctionId(0),
+                    ordinal: index,
+                },
+            );
+        }
+        assert_eq!(scope.bindings.len(), 64);
+        assert_eq!(scope.bindings.capacity(), old);
+
+        let visible_clone = parent_visible.clone();
+        let access_clone = parent_metadata.clone();
+        assert_eq!(visible_clone.capacity(), parent_visible.capacity());
+        assert_eq!(access_clone.capacity(), parent_metadata.capacity());
+        assert_map_capacity_bound(
+            parent_visible.capacity(),
+            visible_clone.capacity(),
+            128,
+            core::mem::size_of::<(Vec<u8>, ParentBinding)>(),
+        );
+        assert_map_capacity_bound(
+            parent_metadata.capacity(),
+            access_clone.capacity(),
+            128,
+            core::mem::size_of::<(BindingId, BindingAccess)>(),
+        );
+    }
 
     #[test]
     fn rejects_unimplemented_statement_instead_of_empty_success() {

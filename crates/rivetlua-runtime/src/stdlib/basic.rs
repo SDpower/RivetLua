@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BasicBuiltin {
     Assert,
+    CollectGarbage,
     Select,
     Type,
     ToString,
@@ -510,6 +511,116 @@ pub(crate) fn execute(
             }
             result(vm, args)
         }
+        BasicBuiltin::CollectGarbage => {
+            let operation = match args.first().copied().unwrap_or(Value::Nil) {
+                Value::Nil => Some(4),
+                Value::Object(option) if vm.object_kind(option)? == ObjectKind::ByteString => vm
+                    .with_byte_string(option, |string| match string.as_bytes() {
+                        b"count" => Some(0),
+                        b"isrunning" => Some(1),
+                        b"stop" => Some(2),
+                        b"restart" => Some(3),
+                        b"collect" => Some(4),
+                        b"incremental" => Some(5),
+                        b"generational" => Some(6),
+                        b"step" => Some(7),
+                        b"param" if vm.language_profile() == rivetlua_core::LuaProfile::Lua55 => {
+                            Some(8)
+                        }
+                        _ => None,
+                    })?,
+                _ => return Err(argument()),
+            };
+            match operation {
+                Some(0) => {
+                    let bytes = vm.ledger_snapshot().lua_heap_bytes;
+                    result(vm, &[Value::Float(bytes as f64 / 1024.0)])
+                }
+                Some(1..=8) if vm.finalizer_running() => result(vm, &[Value::Nil]),
+                Some(1) => result(vm, &[Value::Boolean(vm.automatic_gc_running())]),
+                Some(2) => {
+                    let output = result(vm, &[Value::Integer(0)])?;
+                    vm.stop_automatic_gc();
+                    Ok(output)
+                }
+                Some(3) => {
+                    let output = result(vm, &[Value::Integer(0)])?;
+                    vm.restart_automatic_gc();
+                    Ok(output)
+                }
+                Some(4) => {
+                    let output = result(vm, &[Value::Integer(0)])?;
+                    vm.collect()?;
+                    Ok(output)
+                }
+                Some(5 | 6) => {
+                    let requested = if operation == Some(5) {
+                        GcMode::Incremental
+                    } else {
+                        GcMode::Generational
+                    };
+                    let previous = vm.gc_mode();
+                    let (mut values, ticket) = result(vm, &[Value::Nil])?;
+                    let name = match previous {
+                        GcMode::Incremental => b"incremental".as_slice(),
+                        GcMode::Generational => b"generational".as_slice(),
+                    };
+                    let string = vm.allocate_byte_string(name)?;
+                    let root = vm.add_root(RootKind::Temporary, string)?;
+                    let switched = (|| {
+                        if requested != previous {
+                            while vm.gc_trace().phase != GcPhase::Pause {
+                                vm.incremental_step(1024)?;
+                            }
+                            vm.set_gc_mode(requested)?;
+                        }
+                        Ok::<(), VmError>(())
+                    })();
+                    let removed = vm.remove_root(root);
+                    switched?;
+                    removed?;
+                    values[0] = Value::Object(string);
+                    Ok((values, ticket))
+                }
+                Some(7) => {
+                    let size = match args.get(1).copied().unwrap_or(Value::Nil) {
+                        Value::Nil => 0,
+                        value => lua_integer(number(vm, value, None)?).ok_or_else(argument)?,
+                    };
+                    let (mut values, ticket) = result(vm, &[Value::Boolean(false)])?;
+                    values[0] = Value::Boolean(vm.explicit_gc_step(size)?);
+                    Ok((values, ticket))
+                }
+                Some(8) => {
+                    let Value::Object(name_object) = arg(args, 1)? else {
+                        return Err(argument());
+                    };
+                    if vm.object_kind(name_object)? != ObjectKind::ByteString {
+                        return Err(argument());
+                    }
+                    let parameter = vm
+                        .with_byte_string(name_object, |string| match string.as_bytes() {
+                            b"pause" => Some(GcParameter::Pause),
+                            b"stepmul" => Some(GcParameter::StepMultiplier),
+                            _ => None,
+                        })?
+                        .ok_or_else(argument)?;
+                    let previous = vm.gc_param(parameter);
+                    let new_value = match args.get(2).copied().unwrap_or(Value::Nil) {
+                        Value::Nil => None,
+                        value => Some(lua_integer(number(vm, value, None)?).ok_or_else(argument)?),
+                    };
+                    let previous =
+                        i64::try_from(previous).map_err(|_| VmError::ArithmeticOverflow)?;
+                    let output = result(vm, &[Value::Integer(previous)])?;
+                    if let Some(value) = new_value.filter(|value| *value >= 0) {
+                        vm.set_gc_param(parameter, value);
+                    }
+                    Ok(output)
+                }
+                _ => Err(argument()),
+            }
+        }
         BasicBuiltin::Select => {
             let index = arg(args, 0)?;
             if let Value::Object(object) = index {
@@ -673,13 +784,115 @@ use rivetlua_core::{ObjectRef, Value};
 
 use crate::alloc::{AllocationLedger, FailPoint, Reservation, reserve_vec};
 use crate::errors::explicit_error;
+use crate::gc::GcParameter;
 use crate::host::HostServiceError;
 use crate::vm::{RuntimeError, RuntimeErrorKind};
-use crate::{ObjectKind, Vm, VmError};
+use crate::{GcMode, GcPhase, ObjectKind, RootKind, Vm, VmError};
 
 #[cfg(test)]
 mod p13_a_tests {
     use super::*;
+    use crate::HostHandle;
+    use rivetlua_core::{LuaProfile, Value};
+
+    #[test]
+    fn collectgarbage_count_reads_only_lua_heap_and_retries_after_result_failure() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let option = vm.allocate_byte_string(b"count").unwrap();
+            let _option_root = HostHandle::<Value>::new(&mut vm, option).unwrap();
+            let host = vm.allocation_ledger().reserve(4096).unwrap();
+            host.commit().unwrap();
+            vm.observe_shared_rss(32 * 1024 * 1024);
+            let before = vm.ledger_snapshot();
+            assert_eq!(before.shared_rss_observation, Some(32 * 1024 * 1024));
+            let gc_before = vm.gc_trace();
+            let (values, reservation) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(option)],
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                values,
+                [Value::Float(before.lua_heap_bytes as f64 / 1024.0)]
+            );
+            drop(reservation);
+            assert_eq!(vm.ledger_snapshot().lua_heap_bytes, before.lua_heap_bytes);
+            assert_eq!(vm.gc_trace(), gc_before);
+            assert_eq!(
+                vm.ledger_snapshot().host_allocation_bytes,
+                before.host_allocation_bytes
+            );
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+
+            vm.inject_failure_once(FailPoint::ReturnReserve);
+            assert!(matches!(
+                execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(option)],
+                    0
+                ),
+                Err(RuntimeError {
+                    kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                        FailPoint::ReturnReserve
+                    )),
+                    ..
+                })
+            ));
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            let (values, reservation) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(option)],
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                values,
+                [Value::Float(before.lua_heap_bytes as f64 / 1024.0)]
+            );
+            drop(reservation);
+
+            let before_fault = vm.ledger_snapshot();
+            let roots = vm.roots().total_count();
+            let ordinal = vm.allocation_trace().next_ordinal;
+            vm.inject_allocation_failure_at(ordinal);
+            assert!(
+                execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(option)],
+                    0,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                vm.allocation_trace().last_failure.unwrap().attempt.ordinal,
+                ordinal
+            );
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot(), before_fault);
+            let (values, reservation) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(option)],
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                values,
+                [Value::Float(before.lua_heap_bytes as f64 / 1024.0)]
+            );
+            drop(reservation);
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot(), before_fault);
+            vm.allocation_ledger().refund(4096).unwrap();
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
 
     #[test]
     fn p13_a_print_buffer_failure_rolls_back_host_ledger_and_retries() {
@@ -701,5 +914,594 @@ mod p13_a_tests {
         drop(buffer);
         assert_eq!(vm.ledger_snapshot().host_allocation_bytes, baseline);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+}
+
+#[cfg(test)]
+mod gc_running_tests {
+    use super::*;
+    use crate::HostHandle;
+    use crate::{GcCycleKind, GcMode, GcPhase};
+    use rivetlua_core::LuaProfile;
+
+    #[test]
+    fn mode_controls_start_generational_and_retry_after_precommit_failures() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            assert_eq!(vm.gc_mode(), GcMode::Generational);
+            vm.stop_automatic_gc();
+            let incremental = vm.allocate_byte_string(b"incremental").unwrap();
+            let generational = vm.allocate_byte_string(b"generational").unwrap();
+            let _incremental_root = HostHandle::<Value>::new(&mut vm, incremental).unwrap();
+            let _generational_root = HostHandle::<Value>::new(&mut vm, generational).unwrap();
+            let roots = vm.roots().total_count();
+            let trace = vm.gc_trace();
+            let ledger = vm.ledger_snapshot();
+
+            vm.inject_failure_once(FailPoint::ReturnReserve);
+            assert!(matches!(
+                execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(incremental)],
+                    0
+                ),
+                Err(RuntimeError {
+                    kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                        FailPoint::ReturnReserve
+                    )),
+                    ..
+                })
+            ));
+            assert_eq!(vm.gc_trace(), trace);
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot(), ledger);
+            assert!(!vm.automatic_gc_running());
+
+            vm.inject_failure_once(FailPoint::StringBytesReserve);
+            assert!(matches!(
+                execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(incremental)],
+                    0
+                ),
+                Err(RuntimeError {
+                    kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                        FailPoint::StringBytesReserve
+                    )),
+                    ..
+                })
+            ));
+            assert_eq!(vm.gc_trace(), trace);
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot(), ledger);
+            assert!(!vm.automatic_gc_running());
+
+            let (values, ticket) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(incremental)],
+                0,
+            )
+            .unwrap();
+            let [Value::Object(old)] = values.as_slice() else {
+                panic!("前模式應以單一 ByteString 回傳")
+            };
+            assert!(
+                vm.with_byte_string(*old, |bytes| bytes.as_bytes() == b"generational")
+                    .unwrap()
+            );
+            drop(ticket);
+            assert_eq!(vm.gc_mode(), GcMode::Incremental);
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+
+            let (values, ticket) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(generational)],
+                0,
+            )
+            .unwrap();
+            let [Value::Object(old)] = values.as_slice() else {
+                panic!("前模式應以單一 ByteString 回傳")
+            };
+            assert!(
+                vm.with_byte_string(*old, |bytes| bytes.as_bytes() == b"incremental")
+                    .unwrap()
+            );
+            drop(ticket);
+            assert_eq!(vm.gc_mode(), GcMode::Generational);
+            assert!(!vm.automatic_gc_running());
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn mode_same_active_cycle_stays_put_and_switch_finishes_cycle() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let generational = vm.allocate_byte_string(b"generational").unwrap();
+            let incremental = vm.allocate_byte_string(b"incremental").unwrap();
+            let _generational_root = HostHandle::<Value>::new(&mut vm, generational).unwrap();
+            let _incremental_root = HostHandle::<Value>::new(&mut vm, incremental).unwrap();
+            vm.incremental_step(1).unwrap();
+            let active = vm.gc_trace();
+            assert_ne!(active.phase, GcPhase::Pause);
+            let (values, ticket) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(generational)],
+                0,
+            )
+            .unwrap();
+            let [Value::Object(old)] = values.as_slice() else {
+                panic!("相同模式應回傳 ByteString")
+            };
+            assert!(
+                vm.with_byte_string(*old, |bytes| bytes.as_bytes() == b"generational")
+                    .unwrap()
+            );
+            drop(ticket);
+            assert_eq!(vm.gc_trace().phase, active.phase);
+            assert_eq!(vm.gc_trace().transition_count, active.transition_count);
+            assert_eq!(vm.gc_mode(), GcMode::Generational);
+
+            let (values, ticket) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(incremental)],
+                0,
+            )
+            .unwrap();
+            let [Value::Object(old)] = values.as_slice() else {
+                panic!("切換模式應回傳 ByteString")
+            };
+            assert!(
+                vm.with_byte_string(*old, |bytes| bytes.as_bytes() == b"generational")
+                    .unwrap()
+            );
+            drop(ticket);
+            let completed = vm.gc_trace();
+            assert_eq!(completed.phase, GcPhase::Pause);
+            assert!(completed.transition_count > active.transition_count);
+            assert_eq!(completed.remembered_len, 0);
+            assert_eq!(vm.gc_mode(), GcMode::Incremental);
+            assert!(!vm.automatic_gc_running());
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn mode_root_reserve_failure_leaves_no_root_or_return_ticket_and_retries() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let incremental = vm.allocate_byte_string(b"incremental").unwrap();
+            let _option_root = HostHandle::<Value>::new(&mut vm, incremental).unwrap();
+            let roots = vm.roots().total_count();
+            vm.inject_failure_once(FailPoint::RootReserve);
+            assert!(matches!(
+                execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(incremental)],
+                    0
+                ),
+                Err(RuntimeError {
+                    kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::RootReserve)),
+                    ..
+                })
+            ));
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            assert_eq!(vm.gc_mode(), GcMode::Generational);
+            assert!(!vm.automatic_gc_running());
+            let (values, ticket) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(incremental)],
+                0,
+            )
+            .unwrap();
+            let [Value::Object(old)] = values.as_slice() else {
+                panic!("失敗後重試應回傳 ByteString")
+            };
+            assert!(
+                vm.with_byte_string(*old, |bytes| bytes.as_bytes() == b"generational")
+                    .unwrap()
+            );
+            drop(ticket);
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.gc_mode(), GcMode::Incremental);
+            vm.collect().unwrap();
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn mode_finalizer_returns_nil_without_state_changes() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let incremental = vm.allocate_byte_string(b"incremental").unwrap();
+            let generational = vm.allocate_byte_string(b"generational").unwrap();
+            let _incremental_root = HostHandle::<Value>::new(&mut vm, incremental).unwrap();
+            let _generational_root = HostHandle::<Value>::new(&mut vm, generational).unwrap();
+            let target = vm.allocate_table().unwrap();
+            let metatable = vm.allocate_table().unwrap();
+            let key = vm.allocate_byte_string(b"__gc").unwrap();
+            vm.raw_set(metatable, Value::Object(key), Value::Integer(1))
+                .unwrap();
+            vm.set_metatable(target, Some(metatable)).unwrap();
+            vm.set_execution_running(true);
+            vm.incremental_step(1).unwrap();
+            for _ in 0..8192 {
+                if vm.gc_trace().phase == GcPhase::Pause {
+                    break;
+                }
+                vm.incremental_step(1).unwrap();
+            }
+            assert_eq!(vm.gc_trace().phase, GcPhase::Pause);
+            let (queued, _) = vm.pending_finalizer().unwrap().unwrap();
+            assert_eq!(queued, target);
+            vm.start_finalizer(queued).unwrap();
+            let trace = vm.gc_trace();
+            let roots = vm.roots().total_count();
+            let ledger = vm.ledger_snapshot();
+            for option in [incremental, generational] {
+                let (values, ticket) = execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(option)],
+                    0,
+                )
+                .unwrap();
+                assert_eq!(values, [Value::Nil]);
+                drop(ticket);
+                assert_eq!(vm.gc_trace(), trace);
+                assert_eq!(vm.roots().total_count(), roots);
+                assert_eq!(vm.ledger_snapshot(), ledger);
+                assert_eq!(vm.gc_mode(), GcMode::Generational);
+                assert!(!vm.automatic_gc_running());
+            }
+            vm.finish_finalizer(queued).unwrap();
+            vm.set_execution_running(false);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn explicit_collect_reserves_result_before_gc_and_retries_after_mark_failure() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let collect = vm.allocate_byte_string(b"collect").unwrap();
+            let _option_root = HostHandle::<Value>::new(&mut vm, collect).unwrap();
+            let retained = vm.allocate_byte_string(b"rooted").unwrap();
+            let _retained_root = HostHandle::<Value>::new(&mut vm, retained).unwrap();
+
+            for args in [
+                Vec::new(),
+                vec![Value::Nil],
+                vec![Value::Object(collect), Value::Integer(99)],
+            ] {
+                let victim = vm.allocate_byte_string(b"unreachable").unwrap();
+                let trace = vm.gc_trace();
+                let roots = vm.roots().total_count();
+                let ledger = vm.ledger_snapshot();
+                vm.inject_failure_once(FailPoint::ReturnReserve);
+                assert!(matches!(
+                    execute(&mut vm, BasicBuiltin::CollectGarbage, &args, 0),
+                    Err(RuntimeError {
+                        kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                            FailPoint::ReturnReserve
+                        )),
+                        ..
+                    })
+                ));
+                assert_eq!(vm.gc_trace(), trace);
+                assert_eq!(vm.roots().total_count(), roots);
+                assert_eq!(vm.ledger_snapshot(), ledger);
+                assert!(!vm.automatic_gc_running());
+                assert_eq!(vm.object_kind(victim), Ok(ObjectKind::ByteString));
+
+                vm.inject_failure_once(FailPoint::MarkReserve);
+                assert!(matches!(
+                    execute(&mut vm, BasicBuiltin::CollectGarbage, &args, 0),
+                    Err(RuntimeError {
+                        kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                            FailPoint::MarkReserve
+                        )),
+                        ..
+                    })
+                ));
+                assert_eq!(vm.gc_trace(), trace);
+                assert_eq!(vm.roots().total_count(), roots);
+                assert_eq!(vm.ledger_snapshot(), ledger);
+                assert!(!vm.automatic_gc_running());
+                assert_eq!(vm.object_kind(victim), Ok(ObjectKind::ByteString));
+
+                let (values, ticket) =
+                    execute(&mut vm, BasicBuiltin::CollectGarbage, &args, 0).unwrap();
+                assert_eq!(values, [Value::Integer(0)]);
+                drop(ticket);
+                assert_eq!(vm.object_kind(victim), Err(VmError::StaleObject));
+                assert_eq!(vm.object_kind(retained), Ok(ObjectKind::ByteString));
+                assert!(!vm.automatic_gc_running());
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_collect_finishes_active_cycle_then_runs_major_while_stopped() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            vm.set_gc_mode(GcMode::Generational).unwrap();
+            vm.set_gc_major_threshold(usize::MAX).unwrap();
+            let victim = vm.allocate_byte_string(b"unreachable").unwrap();
+            vm.incremental_step(1).unwrap();
+            let active = vm.gc_trace();
+            assert_ne!(active.phase, GcPhase::Pause);
+            assert_eq!(active.cycle, GcCycleKind::Minor);
+            let (values, ticket) = execute(&mut vm, BasicBuiltin::CollectGarbage, &[], 0).unwrap();
+            assert_eq!(values, [Value::Integer(0)]);
+            drop(ticket);
+            let completed = vm.gc_trace();
+            assert_eq!(completed.phase, GcPhase::Pause);
+            assert_eq!(completed.cycle, GcCycleKind::Major);
+            assert!(completed.transition_count > active.transition_count);
+            assert_eq!(vm.object_kind(victim), Err(VmError::StaleObject));
+            assert!(!vm.automatic_gc_running());
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn explicit_collect_in_running_finalizer_returns_nil_without_gc_changes() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let option = vm.allocate_byte_string(b"collect").unwrap();
+            let _option_root = HostHandle::<Value>::new(&mut vm, option).unwrap();
+            let target = vm.allocate_table().unwrap();
+            let metatable = vm.allocate_table().unwrap();
+            let key = vm.allocate_byte_string(b"__gc").unwrap();
+            vm.raw_set(metatable, Value::Object(key), Value::Integer(1))
+                .unwrap();
+            vm.set_metatable(target, Some(metatable)).unwrap();
+            vm.set_execution_running(true);
+            vm.incremental_step(1).unwrap();
+            for _ in 0..8192 {
+                if vm.gc_trace().phase == GcPhase::Pause {
+                    break;
+                }
+                vm.incremental_step(1).unwrap();
+            }
+            assert_eq!(vm.gc_trace().phase, GcPhase::Pause);
+            let (queued, _) = vm.pending_finalizer().unwrap().unwrap();
+            assert_eq!(queued, target);
+            vm.start_finalizer(queued).unwrap();
+            let trace = vm.gc_trace();
+            let roots = vm.roots().total_count();
+            let ledger = vm.ledger_snapshot();
+            for args in [Vec::new(), vec![Value::Nil], vec![Value::Object(option)]] {
+                let (values, ticket) =
+                    execute(&mut vm, BasicBuiltin::CollectGarbage, &args, 0).unwrap();
+                assert_eq!(values, [Value::Nil]);
+                drop(ticket);
+                assert_eq!(vm.gc_trace(), trace);
+                assert_eq!(vm.roots().total_count(), roots);
+                assert_eq!(vm.ledger_snapshot(), ledger);
+                assert!(!vm.automatic_gc_running());
+            }
+            vm.finish_finalizer(queued).unwrap();
+            vm.set_execution_running(false);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn controls_commit_only_after_return_reserve_and_actual_ordinal() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let stop = vm.allocate_byte_string(b"stop").unwrap();
+            let restart = vm.allocate_byte_string(b"restart").unwrap();
+            let query = vm.allocate_byte_string(b"isrunning").unwrap();
+            let _stop_root = HostHandle::<Value>::new(&mut vm, stop).unwrap();
+            let _restart_root = HostHandle::<Value>::new(&mut vm, restart).unwrap();
+            let _query_root = HostHandle::<Value>::new(&mut vm, query).unwrap();
+
+            let roots = vm.roots().total_count();
+            let gc_before = vm.gc_trace();
+            let ledger_before = vm.ledger_snapshot();
+            vm.inject_failure_once(FailPoint::ReturnReserve);
+            assert!(matches!(
+                execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(stop)],
+                    0
+                ),
+                Err(RuntimeError {
+                    kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                        FailPoint::ReturnReserve
+                    )),
+                    ..
+                })
+            ));
+            assert!(vm.automatic_gc_running());
+            assert_eq!(vm.gc_trace(), gc_before);
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot(), ledger_before);
+            let (values, ticket) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(stop)],
+                0,
+            )
+            .unwrap();
+            assert_eq!(values, [Value::Integer(0)]);
+            drop(ticket);
+            assert!(!vm.automatic_gc_running());
+
+            vm.allocate_byte_string(b"debt while stopped").unwrap();
+            let gc_stopped = vm.gc_trace();
+            assert!(gc_stopped.debt_bytes > 0);
+            let ledger_stopped = vm.ledger_snapshot();
+            let ordinal = vm.allocation_trace().next_ordinal;
+            vm.inject_allocation_failure_at(ordinal);
+            assert!(
+                execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(restart)],
+                    0
+                )
+                .is_err()
+            );
+            let failure = vm.allocation_trace().last_failure.unwrap();
+            assert_eq!(failure.attempt.ordinal, ordinal);
+            assert_eq!(failure.attempt.point, Some(FailPoint::ReturnReserve));
+            assert!(!vm.automatic_gc_running());
+            assert_eq!(vm.gc_trace(), gc_stopped);
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot(), ledger_stopped);
+            let (values, ticket) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(restart)],
+                0,
+            )
+            .unwrap();
+            assert_eq!(values, [Value::Integer(0)]);
+            drop(ticket);
+            assert!(vm.automatic_gc_running());
+            assert_eq!(vm.gc_trace().debt_bytes, 0);
+
+            let gc_running = vm.gc_trace();
+            let ledger_running = vm.ledger_snapshot();
+            vm.inject_failure_once(FailPoint::ReturnReserve);
+            assert!(matches!(
+                execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(query)],
+                    0
+                ),
+                Err(RuntimeError {
+                    kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                        FailPoint::ReturnReserve
+                    )),
+                    ..
+                })
+            ));
+            assert!(vm.automatic_gc_running());
+            assert_eq!(vm.gc_trace(), gc_running);
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot(), ledger_running);
+            let (values, ticket) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(query)],
+                0,
+            )
+            .unwrap();
+            assert_eq!(values, [Value::Boolean(true)]);
+            drop(ticket);
+            assert_eq!(vm.gc_trace(), gc_running);
+            assert_eq!(vm.ledger_snapshot(), ledger_running);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn param_and_step_commit_only_after_return_reserve() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let step = vm.allocate_byte_string(b"step").unwrap();
+            let _step_root = HostHandle::<Value>::new(&mut vm, step).unwrap();
+            let trace = vm.gc_trace();
+            let roots = vm.roots().total_count();
+            let ledger = vm.ledger_snapshot();
+            vm.inject_failure_once(FailPoint::ReturnReserve);
+            assert!(matches!(
+                execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(step), Value::Integer(0)],
+                    0,
+                ),
+                Err(RuntimeError {
+                    kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                        FailPoint::ReturnReserve
+                    )),
+                    ..
+                })
+            ));
+            assert_eq!(vm.gc_trace(), trace);
+            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.ledger_snapshot(), ledger);
+            assert!(!vm.automatic_gc_running());
+            let (values, ticket) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(step), Value::Integer(0)],
+                0,
+            )
+            .unwrap();
+            assert!(matches!(values.as_slice(), [Value::Boolean(_)]));
+            drop(ticket);
+            assert!(!vm.automatic_gc_running());
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+
+            if profile == LuaProfile::Lua55 {
+                let param = vm.allocate_byte_string(b"param").unwrap();
+                let pause = vm.allocate_byte_string(b"pause").unwrap();
+                let _param_root = HostHandle::<Value>::new(&mut vm, param).unwrap();
+                let _pause_root = HostHandle::<Value>::new(&mut vm, pause).unwrap();
+                let trace = vm.gc_trace();
+                let roots = vm.roots().total_count();
+                let ledger = vm.ledger_snapshot();
+                vm.inject_failure_once(FailPoint::ReturnReserve);
+                assert!(matches!(
+                    execute(
+                        &mut vm,
+                        BasicBuiltin::CollectGarbage,
+                        &[
+                            Value::Object(param),
+                            Value::Object(pause),
+                            Value::Integer(500),
+                        ],
+                        0,
+                    ),
+                    Err(RuntimeError {
+                        kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                            FailPoint::ReturnReserve
+                        )),
+                        ..
+                    })
+                ));
+                assert_eq!(vm.gc_trace(), trace);
+                assert_eq!(vm.roots().total_count(), roots);
+                assert_eq!(vm.ledger_snapshot(), ledger);
+                let (values, ticket) = execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(param), Value::Object(pause)],
+                    0,
+                )
+                .unwrap();
+                assert_eq!(values, [Value::Integer(250)]);
+                drop(ticket);
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+            }
+        }
     }
 }

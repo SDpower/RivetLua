@@ -211,14 +211,62 @@ pub struct LexedChunk {
     pub tokens: Vec<Token>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NumericCharge {
+    DecimalFast(usize),
+    DecimalConservative(usize),
+    HexPowi,
+}
+
+pub(crate) trait NumericBudget {
+    type Error;
+
+    fn before_conversion(&mut self, charge: NumericCharge) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug)]
+pub(crate) enum ScanError<E> {
+    Diagnostic(Diagnostic),
+    Budget(E),
+}
+
+impl<E> From<Diagnostic> for ScanError<E> {
+    fn from(value: Diagnostic) -> Self {
+        Self::Diagnostic(value)
+    }
+}
+
+struct UnmeteredNumeric;
+
+impl NumericBudget for UnmeteredNumeric {
+    type Error = core::convert::Infallible;
+
+    fn before_conversion(&mut self, _: NumericCharge) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 /// 將原始 bytes 掃描成詞法資料。此入口不會先將輸入轉為 UTF-8。
 pub fn lex(
     input: &[u8],
     profile: LanguageProfile,
     limits: &CompileLimits,
 ) -> Result<LexedChunk, Diagnostic> {
+    match lex_with_numeric_budget(input, profile, limits, &mut UnmeteredNumeric) {
+        Ok(chunk) => Ok(chunk),
+        Err(ScanError::Diagnostic(diagnostic)) => Err(diagnostic),
+        Err(ScanError::Budget(never)) => match never {},
+    }
+}
+
+pub(crate) fn lex_with_numeric_budget<B: NumericBudget>(
+    input: &[u8],
+    profile: LanguageProfile,
+    limits: &CompileLimits,
+    budget: &mut B,
+) -> Result<LexedChunk, ScanError<B::Error>> {
     if input.len() > limits.max_source_bytes {
-        return Err(Diagnostic {
+        return Err(ScanError::Diagnostic(Diagnostic {
             code: DiagnosticCode::CompileLimit,
             span: Span {
                 start_byte: 0,
@@ -227,10 +275,10 @@ pub fn lex(
             start: SourcePosition { line: 1, column: 1 },
             end: SourcePosition { line: 1, column: 1 },
             message: "來源超過編譯限制",
-        });
+        }));
     }
     let mut cursor = Cursor::new(input, profile);
-    scanner::scan(&mut cursor, limits)
+    scanner::scan(&mut cursor, limits, budget)
 }
 
 pub(in crate::lexer) fn push_token(

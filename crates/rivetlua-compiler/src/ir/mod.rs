@@ -49,7 +49,28 @@ pub struct IrNativeLocal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrNativeDebug {
     pub locals: Vec<IrNativeLocal>,
+    pub temporaries: Vec<IrNativeTemporary>,
+    pub initializer_temporaries: Vec<IrNativeInitializerTemporary>,
+    pub non_counted_pcs: Vec<InstructionOffset>,
     pub max_active_locals: u16,
+}
+
+/// 在 child Call 暫停時仍由父表達式持有的語意結果；不屬於 wire。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IrNativeTemporary {
+    pub call_pc: InstructionOffset,
+    pub ordinal: u16,
+    pub register: Register,
+}
+
+/// local 初始化期間已保留但尚未取得名稱的 guest slot；不屬於 wire。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IrNativeInitializerTemporary {
+    pub binding: BindingId,
+    pub register: Register,
+    pub slot: u16,
+    pub start_pc: u32,
+    pub end_pc: u32,
 }
 
 /// 已編譯的 native RawListWrite 呼叫宣告；P05 仍須對 bytecode 重新驗證。

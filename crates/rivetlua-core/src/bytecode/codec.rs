@@ -1388,8 +1388,22 @@ fn verify_control_and_dataflow(
             let Some(producer) = open else {
                 return Err(verify(0, "RVLU 動態 call 引數缺少 open producer"));
             };
-            let immediate = index.checked_sub(1).and_then(|previous| {
+            let outer_base = match instruction {
+                Instruction::Call { base, .. } | Instruction::TailCall { base, .. } => *base,
+                _ => return Err(verify(0, "RVLU 動態 call consumer 類型無效")),
+            };
+            let mut previous = index
+                .checked_sub(1)
+                .ok_or_else(|| verify(0, "RVLU 動態 call 缺少 open producer"))?;
+            let source = loop {
                 match &prototype.instructions[previous].instruction {
+                    Instruction::Move { dest, src }
+                        if dest.0 < outer_base.0 && src.0 < producer.0 =>
+                    {
+                        previous = previous
+                            .checked_sub(1)
+                            .ok_or_else(|| verify(0, "RVLU 動態 call 缺少 open producer"))?;
+                    }
                     Instruction::Call {
                         base,
                         result_mode: ResultMode::All,
@@ -1398,18 +1412,19 @@ fn verify_control_and_dataflow(
                     | Instruction::Vararg {
                         base,
                         result_mode: ResultMode::All,
-                    } => Some(*base),
-                    _ => None,
+                    } => break Some(*base),
+                    _ => break None,
                 }
-            });
-            let outer_base = match instruction {
-                Instruction::Call { base, .. } | Instruction::TailCall { base, .. } => *base,
-                _ => return Err(verify(0, "RVLU 動態 call consumer 類型無效")),
             };
-            if immediate != Some(producer) || producer.0 <= outer_base.0 {
+            if source != Some(producer) || producer.0 <= outer_base.0 {
                 return Err(verify(0, "RVLU 動態 call 引數 producer 順序或 base 無效"));
             }
         }
+        let top_preserving_move = matches!(
+            (open, instruction),
+            (Some(producer), Instruction::Move { dest, src })
+                if dest.0 < producer.0 && src.0 < producer.0
+        );
         if open.is_some()
             && !matches!(
                 instruction,
@@ -1420,6 +1435,7 @@ fn verify_control_and_dataflow(
                     }
             )
             && !dynamic_consumer
+            && !top_preserving_move
         {
             return Err(verify(0, "RVLU open result 未立即流向 Return(All)"));
         }
@@ -3061,6 +3077,108 @@ mod tests {
             },
         );
         assert!(verify_module(interrupted, LuaProfile::Lua55, &limits).is_err());
+    }
+
+    #[test]
+    fn p09_3_open_call_allows_only_linear_moves_below_dynamic_consumers() {
+        let limits = VerifyLimits::default();
+        let mut valid = sample();
+        let prototype = &mut valid.prototypes[0];
+        prototype.register_count = 4;
+        prototype.frame.register_limit = 4;
+        prototype.frame.initial_top = Register(4);
+        prototype.frame.dynamic_top = Register(4);
+        prototype.instructions = [
+            Instruction::Call {
+                base: Register(3),
+                arg_count: 0,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Move {
+                dest: Register(0),
+                src: Register(0),
+            },
+            Instruction::Call {
+                base: Register(2),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Move {
+                dest: Register(0),
+                src: Register(0),
+            },
+            Instruction::Call {
+                base: Register(1),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::Fixed(1),
+            },
+            Instruction::Return {
+                base: Register(1),
+                result_mode: ResultMode::Fixed(1),
+            },
+        ]
+        .into_iter()
+        .map(|instruction| BytecodeInstruction {
+            instruction,
+            span: prototype.span,
+            close_path: None,
+        })
+        .collect();
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut candidate = valid.clone();
+            candidate.profile = profile;
+            verify_module(candidate, profile, &limits)
+                .expect("低於 open tail 的線性 MOVE 須保留動態 top");
+        }
+
+        for (index, instruction) in [
+            (
+                1,
+                Instruction::Move {
+                    dest: Register(3),
+                    src: Register(0),
+                },
+            ),
+            (
+                1,
+                Instruction::Move {
+                    dest: Register(2),
+                    src: Register(0),
+                },
+            ),
+            (
+                1,
+                Instruction::Move {
+                    dest: Register(0),
+                    src: Register(3),
+                },
+            ),
+            (
+                1,
+                Instruction::LoadNil {
+                    start: Register(0),
+                    count: 1,
+                },
+            ),
+        ] {
+            let mut malformed = valid.clone();
+            malformed.prototypes[0].instructions[index].instruction = instruction;
+            assert!(verify_module(malformed, LuaProfile::Lua55, &limits).is_err());
+        }
+        let mut branch_entry = valid;
+        let span = branch_entry.prototypes[0].span;
+        branch_entry.prototypes[0].instructions.insert(
+            0,
+            BytecodeInstruction {
+                instruction: Instruction::JumpIfFalse {
+                    condition: Register(0),
+                    target: InstructionOffset(2),
+                },
+                span,
+                close_path: None,
+            },
+        );
+        assert!(verify_module(branch_entry, LuaProfile::Lua55, &limits).is_err());
     }
 
     #[test]

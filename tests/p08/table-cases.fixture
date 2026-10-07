@@ -7,7 +7,7 @@ case|TAB-004|raw-api|raw_set(Nil,1)|NilTableKey|nil write key is rejected withou
 case|TAB-005|raw-api|raw_set(Float(NaN),1)|NaNTableKey|NaN write key is rejected without mutation
 case|TAB-006|compiler-vm|local t={x=1}; t.x=nil; return t.x|Returned(Nil)|nil value removes the field
 case|TAB-007|compiler-vm|local t={}; t[1]=7; t[3]=9; return #t|valid_border|hole table result satisfies border predicate
-case|TAB-008|runtime-contract|forced_gc_vm_stack_and_table_fields|stack_2_live_then_removed_5_table_1|key and value tracing with collection
+case|TAB-008|runtime-contract|forced_gc_vm_stack_and_table_fields|stack_objects_reclaimed_then_removed_5_table_1|key and value tracing with collection
 case|TAB-009|runtime-contract|rehash_failpoint,quota,overflow,init,string_reserve|fields_and_ledger_unchanged|failed growth preserves fields and accounting
 case|TAB-010|runtime-internal|internal_raw_traversal|five_fields_each_once|two insertion orders produce the same field set
 case|TAB-011|raw-api|raw_get(Nil)|Nil|nil read key is absent without mutation

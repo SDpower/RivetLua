@@ -37,6 +37,13 @@ pub(crate) enum BasicPending {
     },
     DebugHook {
         original: Value,
+        dynamic_top: usize,
+        resume_instruction: bool,
+        local_current_pc: bool,
+        target: Option<ObjectRef>,
+        target_root: Option<RootId>,
+        transfer: Option<DebugTransfer>,
+        builtin_return: Option<DebugBuiltinReturn>,
     },
     OsCalendarTime {
         state: CalendarTimeState,
@@ -120,8 +127,19 @@ impl BasicPending {
         if let Self::HostCallback { state, .. } = self {
             state.clear_roots(vm)?;
         }
-        if matches!(self, Self::DebugHook { .. }) {
+        if let Self::DebugHook {
+            target_root,
+            builtin_return,
+            ..
+        } = self
+        {
             vm.set_debug_hook_running(false);
+            if let Some(root) = target_root.take() {
+                vm.remove_root(root)?;
+            }
+            if let Some(result) = builtin_return {
+                result.values.clear_roots(vm)?;
+            }
         }
         if let Self::OsCalendarTime { state, .. } = self {
             state.clear_roots(vm)?;
@@ -158,6 +176,22 @@ impl BasicPending {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DebugTransfer {
+    pub(crate) first: usize,
+    pub(crate) count: usize,
+    pub(crate) register: Option<Register>,
+    pub(crate) builtin: bool,
+}
+
+pub(crate) struct DebugBuiltinReturn {
+    pub(crate) values: PrintArguments,
+    pub(crate) destination: Register,
+    pub(crate) mode: ResultMode,
+    pub(crate) tail_return: bool,
+    pub(crate) next: usize,
 }
 
 pub(crate) struct HostCallbackPending {
@@ -412,6 +446,13 @@ impl PendingOp {
         if let Some(BasicPending::HostCallback { state, .. }) = self.basic.as_mut() {
             state.restore_roots(vm)?;
         }
+        if let Some(BasicPending::DebugHook {
+            builtin_return: Some(result),
+            ..
+        }) = self.basic.as_mut()
+        {
+            result.values.restore_roots(vm)?;
+        }
         if let Some(BasicPending::Print { arguments, .. }) = self.basic.as_mut() {
             arguments.restore_roots(vm)?;
         }
@@ -462,6 +503,13 @@ impl PendingOp {
         }
         if let Some(BasicPending::HostCallback { state, .. }) = self.basic.as_ref() {
             state.trace_children(&mut visit)?;
+        }
+        if let Some(BasicPending::DebugHook {
+            builtin_return: Some(result),
+            ..
+        }) = self.basic.as_ref()
+        {
+            result.values.trace_children(&mut visit)?;
         }
         if let Some(BasicPending::Print { arguments, .. }) = self.basic.as_ref() {
             arguments.trace_children(&mut visit)?;
@@ -542,6 +590,19 @@ impl PendingStack {
         self.entries
             .iter()
             .any(|pending| matches!(pending.basic, Some(BasicPending::DebugHook { .. })))
+    }
+
+    pub(crate) fn current_local_hook_caller_depth(&self) -> Option<usize> {
+        self.entries.iter().rev().find_map(|pending| {
+            matches!(
+                pending.basic,
+                Some(BasicPending::DebugHook {
+                    local_current_pc: true,
+                    ..
+                })
+            )
+            .then_some(pending.caller_depth)
+        })
     }
 
     pub(crate) fn outermost_sort_trace(&self) -> Option<TableSortTrace> {

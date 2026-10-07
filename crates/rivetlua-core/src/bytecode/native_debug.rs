@@ -1,13 +1,17 @@
 //! P05 驗證的一般 RVLU 來源除錯資料；不屬於 RVLU_V2 wire。
 
 use core::mem::size_of;
+use core::ops::Range;
 
 use super::codec::{
     BytecodeBindingId, BytecodeClosePath, BytecodeError, BytecodeErrorCode, BytecodeInstruction,
     BytecodePrototype, VerifyLimits,
 };
 use super::official_translation::OfficialWorkBudget;
-use super::{Instruction, ProtoId, Register, ResultMode, VerifiedModule};
+use super::{
+    EnvironmentSource, Instruction, InstructionOffset, LuaProfile, ProtoId, Register, ResultMode,
+    UpvalueId, VerifiedModule,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeLocal {
@@ -35,15 +39,56 @@ pub struct NativePrototypeDebug {
 pub struct NativeDebugCandidate {
     pub source_name: Vec<u8>,
     pub prototypes: Vec<NativePrototypeDebug>,
+    pub temporaries: Vec<NativeTemporary>,
+    pub initializer_temporaries: Vec<NativeInitializerTemporary>,
+    pub non_counted_pcs: Vec<(ProtoId, InstructionOffset)>,
+}
+
+/// 編譯器在一般來源的 Call 暫停點宣告的父表達式 pending value。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeTemporary {
+    pub prototype: ProtoId,
+    pub call_pc: InstructionOffset,
+    pub ordinal: u16,
+    pub register: Register,
+}
+
+/// Native-only：local 初始化期間尚未具名的 guest slot；transport 不保存此資料。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeInitializerTemporary {
+    pub prototype: ProtoId,
+    pub binding: BytecodeBindingId,
+    pub register: Register,
+    pub slot: u8,
+    pub start_pc: u32,
+    pub end_pc: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDebug {
     source_name: Vec<u8>,
     prototypes: Vec<NativePrototypeDebug>,
+    semantic_upvalues: Vec<NativeSemanticUpvalueMap>,
     storage: Vec<Vec<NativeStorageInterval>>,
     close_groups: Vec<Vec<NativeCloseGroup>>,
+    temporaries: Vec<NativeTemporary>,
+    temporary_ranges: Vec<Range<usize>>,
+    initializer_temporaries: Vec<NativeInitializerTemporary>,
+    initializer_ranges: Vec<Range<usize>>,
+    non_counted_pcs: Vec<(ProtoId, InstructionOffset)>,
     allocated_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSemanticUpvalue {
+    Closure(UpvalueId),
+    Environment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeSemanticUpvalueMap {
+    physical_guest_count: u16,
+    environment: bool,
 }
 
 /// P05 證明可作為單一官方 OP_CLOSE 的連續 RVLU 退出序列。
@@ -96,11 +141,81 @@ impl NativeDebug {
             .and_then(|index| self.storage.get(index).map(Vec::as_slice))
     }
 
+    pub fn semantic_upvalue_count(&self, id: ProtoId) -> Option<usize> {
+        self.prototypes
+            .iter()
+            .position(|entry| entry.prototype == id)
+            .and_then(|index| self.semantic_upvalues.get(index))
+            .map(|entry| usize::from(entry.physical_guest_count) + usize::from(entry.environment))
+    }
+
+    pub fn semantic_upvalue(&self, id: ProtoId, index: usize) -> Option<NativeSemanticUpvalue> {
+        let map = self
+            .prototypes
+            .iter()
+            .position(|entry| entry.prototype == id)
+            .and_then(|index| self.semantic_upvalues.get(index))?;
+        if index < usize::from(map.physical_guest_count) {
+            Some(NativeSemanticUpvalue::Closure(UpvalueId(index as u16)))
+        } else if map.environment && index == usize::from(map.physical_guest_count) {
+            Some(NativeSemanticUpvalue::Environment)
+        } else {
+            None
+        }
+    }
+
+    pub fn semantic_upvalue_name(&self, id: ProtoId, index: usize) -> Option<Option<&[u8]>> {
+        self.semantic_upvalue(id, index)?;
+        self.prototype(id)
+            .and_then(|entry| entry.upvalue_names.get(index))
+            .map(|name| name.as_deref())
+    }
+
     pub fn close_groups_for(&self, id: ProtoId) -> Option<&[NativeCloseGroup]> {
         self.prototypes
             .iter()
             .position(|entry| entry.prototype == id)
             .and_then(|index| self.close_groups.get(index).map(Vec::as_slice))
+    }
+
+    pub fn temporaries_for(&self, id: ProtoId) -> Option<&[NativeTemporary]> {
+        let index = self
+            .prototypes
+            .iter()
+            .position(|entry| entry.prototype == id)?;
+        self.temporary_ranges
+            .get(index)
+            .and_then(|range| self.temporaries.get(range.clone()))
+    }
+
+    pub fn temporaries_at(
+        &self,
+        id: ProtoId,
+        call_pc: InstructionOffset,
+    ) -> Option<&[NativeTemporary]> {
+        let entries = self.temporaries_for(id)?;
+        let start = entries.partition_point(|entry| entry.call_pc.0 < call_pc.0);
+        let end = entries.partition_point(|entry| entry.call_pc.0 <= call_pc.0);
+        Some(&entries[start..end])
+    }
+
+    pub fn initializer_temporaries_for(
+        &self,
+        id: ProtoId,
+    ) -> Option<&[NativeInitializerTemporary]> {
+        let index = self
+            .prototypes
+            .iter()
+            .position(|entry| entry.prototype == id)?;
+        self.initializer_ranges
+            .get(index)
+            .and_then(|range| self.initializer_temporaries.get(range.clone()))
+    }
+
+    pub fn is_non_counted_pc(&self, id: ProtoId, pc: InstructionOffset) -> bool {
+        self.non_counted_pcs
+            .binary_search_by_key(&(id.0, pc.0), |(prototype, offset)| (prototype.0, offset.0))
+            .is_ok()
     }
 }
 
@@ -268,6 +383,373 @@ fn prototype_register_access(
             .named_vararg
             .is_some_and(|(_, named)| named == register);
     (read || named_read, write, possible_write, close)
+}
+
+fn temporary_successors(
+    proto: &BytecodePrototype,
+    pc: usize,
+) -> Result<[Option<usize>; 3], BytecodeError> {
+    let count = proto.instructions.len();
+    let next = pc.checked_add(1).filter(|next| *next < count);
+    let mut successors = [None; 3];
+    match &proto.instructions[pc].instruction {
+        Instruction::Jump { target } => successors[0] = Some(target.0 as usize),
+        Instruction::JumpIfFalse { target, .. }
+        | Instruction::NumericForPrepare { exit: target, .. } => {
+            successors[0] = Some(target.0 as usize);
+            successors[1] = next;
+        }
+        Instruction::NumericForNext { target, exit, .. } => {
+            successors[0] = Some(target.0 as usize);
+            successors[1] = Some(exit.0 as usize);
+        }
+        Instruction::Return { .. } | Instruction::TailCall { .. } => {}
+        _ => successors[0] = next,
+    }
+    if successors
+        .iter()
+        .flatten()
+        .any(|successor| *successor >= count)
+    {
+        return Err(invalid(
+            "native debug temporary CFG successor 超出 prototype",
+        ));
+    }
+    Ok(successors)
+}
+
+fn temporary_semantic_read(instruction: &Instruction, register: Register) -> bool {
+    matches!(instruction,
+        Instruction::BinaryOp { left, right, .. } if *left == register || *right == register
+    ) || matches!(instruction,
+        Instruction::GetTable { table, key, .. } if *table == register || *key == register
+    ) || matches!(instruction,
+        Instruction::Call { base, arg_count, .. } | Instruction::TailCall { base, arg_count, .. }
+            if in_range(register, *base, arg_count.saturating_add(1))
+    )
+}
+
+fn verify_initializer_interval(
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    local: &NativeLocal,
+    interval: &NativeInitializerTemporary,
+    work: &mut OfficialWorkBudget,
+    max_temporary_bytes: usize,
+) -> Result<(), BytecodeError> {
+    let count = proto.instructions.len();
+    let start = interval.start_pc as usize;
+    let end = interval.end_pc as usize;
+    if !proto.frame.registers_start_as_nil
+        || interval.register.0 == 0
+        || interval.register == proto.global_environment
+        || interval.register.0 >= proto.frame.initial_top.0
+        || interval.register.0 >= proto.register_count
+        || start >= end
+        || end >= count
+        || local.binding != interval.binding
+        || local.register != interval.register
+        || local.slot != interval.slot
+        || local.start_pc != interval.end_pc
+        || local.initialized_pc < interval.start_pc
+        || local.initialized_pc >= interval.end_pc
+        || local.end_pc < interval.end_pc
+    {
+        return Err(invalid("native debug initializer slot/binding/PC 無效"));
+    }
+    let scratch = count
+        .checked_mul(size_of::<u8>() + size_of::<usize>())
+        .ok_or_else(|| limit("native debug initializer CFG 暫存大小溢位"))?;
+    if scratch > max_temporary_bytes {
+        return Err(limit("native debug initializer CFG 暫存配置額度超限"));
+    }
+    charge(
+        work,
+        count
+            .checked_mul(16)
+            .ok_or_else(|| limit("native debug initializer CFG work 溢位"))?,
+    )?;
+    let mut seen = Vec::new();
+    seen.try_reserve_exact(count)
+        .map_err(|_| limit("native debug initializer CFG 配置失敗"))?;
+    seen.resize(count, 0u8);
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(count)
+        .map_err(|_| limit("native debug initializer CFG worklist 配置失敗"))?;
+    if seen
+        .capacity()
+        .checked_add(
+            pending
+                .capacity()
+                .checked_mul(size_of::<usize>())
+                .ok_or_else(|| limit("native debug initializer CFG capacity 溢位"))?,
+        )
+        .is_none_or(|bytes| bytes > max_temporary_bytes)
+    {
+        return Err(limit("native debug initializer CFG capacity 超限"));
+    }
+    seen[0] = 1;
+    pending.push(0);
+    while let Some(pc) = pending.pop() {
+        for successor in temporary_successors(proto, pc)?.into_iter().flatten() {
+            if seen[successor] == 0 {
+                seen[successor] = 1;
+                pending.push(successor);
+            }
+        }
+    }
+    if seen[start] == 0 {
+        return Err(invalid("native debug initializer CFG 起點不可達"));
+    }
+    for (pc, entry) in proto.instructions.iter().enumerate() {
+        let instruction = &entry.instruction;
+        let (read, write, possible_write, close) =
+            prototype_register_access(proto, instruction, interval.register);
+        let early_capture = pc < end && capture_at(module, instruction, interval.binding, work)?;
+        if (pc < start && (read || write || possible_write || close))
+            || (start <= pc
+                && pc < end
+                && (read
+                    || possible_write
+                    || close
+                    || early_capture
+                    || (write != (pc == local.initialized_pc as usize))))
+            || (pc < start && early_capture)
+        {
+            return Err(invalid("native debug initializer register 寫入契約無效"));
+        }
+        if start <= pc
+            && pc < end
+            && matches!(
+                instruction,
+                Instruction::Jump { .. }
+                    | Instruction::JumpIfFalse { .. }
+                    | Instruction::NumericForPrepare { .. }
+                    | Instruction::NumericForNext { .. }
+                    | Instruction::Return { .. }
+                    | Instruction::TailCall { .. }
+            )
+        {
+            return Err(invalid("native debug initializer 區間含控制轉移"));
+        }
+        for successor in temporary_successors(proto, pc)?.into_iter().flatten() {
+            if start <= pc && pc < end {
+                if successor != pc + 1 {
+                    return Err(invalid("native debug initializer 提前離開區間"));
+                }
+            } else if start <= successor && successor < end && (successor != start || pc >= end) {
+                return Err(invalid("native debug initializer CFG 跳入或重入區間"));
+            } else if pc >= end && successor <= start && successor < pc {
+                return Err(invalid("native debug initializer CFG 可能重入 future slot"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_temporary_initialized(
+    proto: &BytecodePrototype,
+    call_pc: usize,
+    register: Register,
+    work: &mut OfficialWorkBudget,
+    max_temporary_bytes: usize,
+) -> Result<(), BytecodeError> {
+    let count = proto.instructions.len();
+    let states = count
+        .checked_mul(2)
+        .ok_or_else(|| limit("native debug temporary CFG state 溢位"))?;
+    let needed = count
+        .checked_add(
+            states
+                .checked_mul(size_of::<(usize, bool)>())
+                .ok_or_else(|| limit("native debug temporary CFG 大小溢位"))?,
+        )
+        .ok_or_else(|| limit("native debug temporary CFG 大小溢位"))?;
+    if needed > max_temporary_bytes {
+        return Err(limit("native debug temporary CFG 暫存額度超限"));
+    }
+    let mut seen = Vec::new();
+    seen.try_reserve_exact(count)
+        .map_err(|_| limit("native debug temporary CFG 配置失敗"))?;
+    seen.resize(count, 0u8);
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(states)
+        .map_err(|_| limit("native debug temporary CFG 配置失敗"))?;
+    if seen
+        .capacity()
+        .checked_add(
+            pending
+                .capacity()
+                .checked_mul(size_of::<(usize, bool)>())
+                .ok_or_else(|| limit("native debug temporary CFG capacity 溢位"))?,
+        )
+        .is_none_or(|actual| actual > max_temporary_bytes)
+    {
+        return Err(limit("native debug temporary CFG capacity 超限"));
+    }
+    if count == 0 {
+        return Err(invalid("native debug temporary Call 不可達"));
+    }
+    pending.push((0usize, false));
+    seen[0] = 1;
+    let mut reached = false;
+    while let Some((pc, initialized)) = pending.pop() {
+        charge(work, 1)?;
+        if pc == call_pc {
+            if !initialized {
+                return Err(invalid(
+                    "native debug temporary 在 Call 前未經所有路徑初始化",
+                ));
+            }
+            reached = true;
+            continue;
+        }
+        let (read, write, possible_write, _) =
+            prototype_register_access(proto, &proto.instructions[pc].instruction, register);
+        let initialized = if write && (!read || initialized) {
+            true
+        } else {
+            initialized && !possible_write
+        };
+        for successor in temporary_successors(proto, pc)?.into_iter().flatten() {
+            let bit = if initialized { 2 } else { 1 };
+            if seen[successor] & bit == 0 {
+                seen[successor] |= bit;
+                pending.push((successor, initialized));
+            }
+        }
+    }
+    if !reached {
+        return Err(invalid("native debug temporary Call 不可達"));
+    }
+    Ok(())
+}
+
+fn verify_temporary_consumed(
+    proto: &BytecodePrototype,
+    call_pc: usize,
+    register: Register,
+    work: &mut OfficialWorkBudget,
+    max_temporary_bytes: usize,
+) -> Result<(), BytecodeError> {
+    let first = call_pc
+        .checked_add(1)
+        .filter(|pc| *pc < proto.instructions.len())
+        .ok_or_else(|| invalid("native debug temporary Call 後缺少語意使用"))?;
+    verify_temporary_consumed_from(proto, first, register, false, work, max_temporary_bytes)
+}
+
+fn verify_temporary_consumed_from(
+    proto: &BytecodePrototype,
+    first: usize,
+    register: Register,
+    moved_to_call: bool,
+    work: &mut OfficialWorkBudget,
+    max_temporary_bytes: usize,
+) -> Result<(), BytecodeError> {
+    let count = proto.instructions.len();
+    let stack_slots = count
+        .checked_mul(4)
+        .ok_or_else(|| limit("native debug temporary CFG stack 溢位"))?;
+    let needed = count
+        .checked_add(
+            stack_slots
+                .checked_mul(size_of::<(usize, bool)>())
+                .ok_or_else(|| limit("native debug temporary CFG 大小溢位"))?,
+        )
+        .ok_or_else(|| limit("native debug temporary CFG 大小溢位"))?;
+    if needed > max_temporary_bytes {
+        return Err(limit("native debug temporary CFG 暫存額度超限"));
+    }
+    let mut colors = Vec::new();
+    colors
+        .try_reserve_exact(count)
+        .map_err(|_| limit("native debug temporary CFG 配置失敗"))?;
+    colors.resize(count, 0u8);
+    let mut pending = Vec::new();
+    pending
+        .try_reserve_exact(stack_slots)
+        .map_err(|_| limit("native debug temporary CFG 配置失敗"))?;
+    if colors
+        .capacity()
+        .checked_add(
+            pending
+                .capacity()
+                .checked_mul(size_of::<(usize, bool)>())
+                .ok_or_else(|| limit("native debug temporary CFG capacity 溢位"))?,
+        )
+        .is_none_or(|actual| actual > max_temporary_bytes)
+    {
+        return Err(limit("native debug temporary CFG capacity 超限"));
+    }
+    pending.push((first, false));
+    while let Some((pc, leaving)) = pending.pop() {
+        charge(work, 1)?;
+        if leaving {
+            colors[pc] = 2;
+            continue;
+        }
+        match colors[pc] {
+            2 => continue,
+            1 => return Err(invalid("native debug temporary 在語意使用前形成 CFG 循環")),
+            _ => {}
+        }
+        let instruction = &proto.instructions[pc].instruction;
+        let (read, write, possible_write, _) =
+            prototype_register_access(proto, instruction, register);
+        if read {
+            if let Instruction::Move { dest, src } = instruction {
+                if !moved_to_call && *src == register && *dest != register {
+                    let allocated = colors
+                        .capacity()
+                        .checked_add(
+                            pending
+                                .capacity()
+                                .checked_mul(size_of::<(usize, bool)>())
+                                .ok_or_else(|| limit("native debug temporary CFG capacity 溢位"))?,
+                        )
+                        .ok_or_else(|| limit("native debug temporary CFG capacity 溢位"))?;
+                    let remaining = max_temporary_bytes
+                        .checked_sub(allocated)
+                        .ok_or_else(|| limit("native debug temporary CFG capacity 超限"))?;
+                    let next = pc
+                        .checked_add(1)
+                        .filter(|next| *next < count)
+                        .ok_or_else(|| invalid("native debug temporary Move 後缺少外層 Call"))?;
+                    verify_temporary_consumed_from(proto, next, *dest, true, work, remaining)?;
+                    colors[pc] = 2;
+                    continue;
+                }
+            }
+            let semantic_read = if moved_to_call {
+                matches!(instruction,
+                    Instruction::Call { base, arg_count, .. } | Instruction::TailCall { base, arg_count, .. }
+                        if in_range(register, *base, arg_count.saturating_add(1)))
+            } else {
+                temporary_semantic_read(instruction, register)
+            };
+            if !semantic_read {
+                return Err(invalid("native debug temporary 首次讀取不是父運算"));
+            }
+            colors[pc] = 2;
+            continue;
+        }
+        if write || possible_write {
+            return Err(invalid("native debug temporary 在語意使用前被覆寫"));
+        }
+        let successors = temporary_successors(proto, pc)?;
+        if successors.iter().all(Option::is_none) {
+            return Err(invalid("native debug temporary 在語意使用前退出"));
+        }
+        colors[pc] = 1;
+        pending.push((pc, true));
+        for successor in successors.into_iter().flatten() {
+            pending.push((successor, false));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn capture_at(
@@ -969,6 +1451,36 @@ fn preflight_native_debug_bytes(
     )?;
     add_bytes(
         &mut bytes,
+        candidate.temporaries.capacity(),
+        size_of::<NativeTemporary>(),
+        limits.max_artifact_bytes,
+    )?;
+    add_bytes(
+        &mut bytes,
+        candidate.initializer_temporaries.capacity(),
+        size_of::<NativeInitializerTemporary>(),
+        limits.max_artifact_bytes,
+    )?;
+    add_bytes(
+        &mut bytes,
+        candidate.non_counted_pcs.capacity(),
+        size_of::<(ProtoId, InstructionOffset)>(),
+        limits.max_artifact_bytes,
+    )?;
+    add_bytes(
+        &mut bytes,
+        candidate.prototypes.len(),
+        size_of::<Range<usize>>(),
+        limits.max_artifact_bytes,
+    )?;
+    add_bytes(
+        &mut bytes,
+        candidate.prototypes.len(),
+        size_of::<Range<usize>>(),
+        limits.max_artifact_bytes,
+    )?;
+    add_bytes(
+        &mut bytes,
         candidate.prototypes.len(),
         size_of::<Vec<NativeStorageInterval>>(),
         limits.max_artifact_bytes,
@@ -979,12 +1491,21 @@ fn preflight_native_debug_bytes(
         size_of::<Vec<NativeCloseGroup>>(),
         limits.max_artifact_bytes,
     )?;
+    add_bytes(
+        &mut bytes,
+        candidate.prototypes.len(),
+        size_of::<NativeSemanticUpvalueMap>(),
+        limits.max_artifact_bytes,
+    )?;
     charge(
         work,
         candidate
             .source_name
             .len()
             .checked_add(candidate.prototypes.len())
+            .and_then(|sum| sum.checked_add(candidate.temporaries.len()))
+            .and_then(|sum| sum.checked_add(candidate.initializer_temporaries.len()))
+            .and_then(|sum| sum.checked_add(candidate.non_counted_pcs.len()))
             .ok_or_else(|| limit("native debug preflight work 溢位"))?,
     )?;
     for (entry, proto) in candidate.prototypes.iter().zip(&module.module().prototypes) {
@@ -1053,6 +1574,65 @@ fn preflight_native_debug_bytes(
     Ok(bytes)
 }
 
+fn verify_semantic_upvalues(
+    module: &VerifiedModule,
+    entry: &NativePrototypeDebug,
+    proto: &super::codec::BytecodePrototype,
+    limits: &VerifyLimits,
+    work: &mut OfficialWorkBudget,
+) -> Result<NativeSemanticUpvalueMap, BytecodeError> {
+    charge(work, proto.instructions.len().saturating_add(1))?;
+    let uses_global_environment = proto.instructions.iter().any(|entry| {
+        matches!(
+            entry.instruction,
+            Instruction::GetTable { table, .. } | Instruction::SetTable { table, .. }
+                if table == proto.global_environment
+        )
+    });
+    let environment = module.profile() == LuaProfile::Lua55
+        && uses_global_environment
+        && matches!(
+            proto.frame.environment_source,
+            EnvironmentSource::RootExternal | EnvironmentSource::ParentFrame { .. }
+        );
+    let physical_guest_count = module
+        .official_execution()
+        .filter(|plan| plan.is_native_builtin())
+        .and_then(|plan| plan.upvalue_map(proto.id))
+        .map_or(proto.upvalues.len(), |map| usize::from(map.guest_count));
+    let semantic_count = physical_guest_count
+        .checked_add(usize::from(environment))
+        .ok_or_else(|| limit("native debug 語意 upvalue 數溢位"))?;
+    let expected_names = proto
+        .upvalues
+        .len()
+        .checked_add(usize::from(environment))
+        .ok_or_else(|| limit("native debug upvalue 名稱數溢位"))?;
+    if semantic_count > limits.max_upvalues_per_prototype
+        || expected_names > limits.max_upvalues_per_prototype
+    {
+        return Err(limit("native debug 語意 upvalue 超過限制"));
+    }
+    if entry.upvalue_names.len() != expected_names
+        || environment
+            && entry
+                .upvalue_names
+                .get(physical_guest_count)
+                .and_then(Option::as_deref)
+                != Some(b"_ENV")
+        || entry.upvalue_names[semantic_count..]
+            .iter()
+            .any(Option::is_some)
+    {
+        return Err(invalid("native debug 語意/hidden upvalue 對應無效"));
+    }
+    Ok(NativeSemanticUpvalueMap {
+        physical_guest_count: u16::try_from(physical_guest_count)
+            .map_err(|_| limit("native debug guest upvalue 數溢位"))?,
+        environment,
+    })
+}
+
 /// 驗證候選資料的身分、範圍、活躍槽與資源額度；成功後才保留於 VerifiedModule。
 pub fn verify_native_debug(
     module: &VerifiedModule,
@@ -1074,6 +1654,37 @@ pub fn verify_native_debug(
         return Err(invalid("native debug prototype 數不符"));
     }
     let mut bytes = preflight_native_debug_bytes(module, &candidate, limits, work)?;
+    let mut prior_non_counted = None;
+    for &(prototype, offset) in &candidate.non_counted_pcs {
+        charge(work, module.module().prototypes.len().saturating_add(1))?;
+        let key = (prototype.0, offset.0);
+        if prior_non_counted.is_some_and(|prior| key <= prior) {
+            return Err(invalid("native debug non-counted PC 順序或重複無效"));
+        }
+        let Some(proto) = module
+            .module()
+            .prototypes
+            .iter()
+            .find(|entry| entry.id == prototype)
+        else {
+            return Err(invalid("native debug non-counted prototype 不存在"));
+        };
+        if !matches!(
+            proto
+                .instructions
+                .get(offset.0 as usize)
+                .map(|entry| &entry.instruction),
+            Some(
+                Instruction::LoadNil { .. }
+                    | Instruction::Move { .. }
+                    | Instruction::LoadConst { .. }
+                    | Instruction::GetUpvalue { .. }
+            )
+        ) {
+            return Err(invalid("native debug non-counted PC 指令無效"));
+        }
+        prior_non_counted = Some(key);
+    }
     let mut storage = Vec::new();
     storage
         .try_reserve_exact(candidate.prototypes.len())
@@ -1082,30 +1693,40 @@ pub fn verify_native_debug(
     close_groups
         .try_reserve_exact(candidate.prototypes.len())
         .map_err(|_| limit("native debug close group 清單配置失敗"))?;
+    let mut semantic_upvalues = Vec::new();
+    semantic_upvalues
+        .try_reserve_exact(candidate.prototypes.len())
+        .map_err(|_| limit("native debug 語意 upvalue 清單配置失敗"))?;
+    let mut temporary_ranges = Vec::new();
+    temporary_ranges
+        .try_reserve_exact(candidate.prototypes.len())
+        .map_err(|_| limit("native debug temporary range 配置失敗"))?;
+    let mut temporary_cursor = 0usize;
+    let mut initializer_ranges = Vec::new();
+    initializer_ranges
+        .try_reserve_exact(candidate.prototypes.len())
+        .map_err(|_| limit("native debug initializer range 配置失敗"))?;
+    let mut initializer_cursor = 0usize;
     for (entry, proto) in candidate.prototypes.iter().zip(&module.module().prototypes) {
+        let root = proto.parent.is_none();
+        let valid_definition_range = if root {
+            entry.line_defined == 0 && entry.last_line_defined == 0
+        } else {
+            entry.line_defined > 0 && entry.line_defined <= entry.last_line_defined
+        };
         if entry.prototype != proto.id
             || entry.lines.len() != proto.instructions.len()
-            || entry.upvalue_names.len() != proto.upvalues.len()
-            || entry.line_defined > entry.last_line_defined
+            || !valid_definition_range
         {
             return Err(invalid("native debug prototype/line/upvalue 對應無效"));
         }
-        if let Some(map) = module
-            .official_execution()
-            .filter(|plan| plan.is_native_builtin())
-            .and_then(|plan| plan.upvalue_map(proto.id))
-        {
-            if entry.upvalue_names[usize::from(map.guest_count)..]
-                .iter()
-                .any(Option::is_some)
-            {
-                return Err(invalid("native debug 不可命名 hidden helper upvalue"));
-            }
-        }
+        semantic_upvalues.push(verify_semantic_upvalues(
+            module, entry, proto, limits, work,
+        )?);
         if entry
             .lines
             .iter()
-            .any(|line| *line == 0 || *line > entry.last_line_defined.max(1))
+            .any(|line| *line == 0 || (!root && *line > entry.last_line_defined))
         {
             return Err(invalid("native debug 行號無效"));
         }
@@ -1120,6 +1741,185 @@ pub fn verify_native_debug(
             work,
             limits.max_artifact_bytes.saturating_sub(bytes),
         )?;
+        let start = temporary_cursor;
+        while candidate
+            .temporaries
+            .get(temporary_cursor)
+            .is_some_and(|temporary| temporary.prototype == proto.id)
+        {
+            temporary_cursor += 1;
+        }
+        let mut prior_pc = None;
+        let mut prior_register = None;
+        for (index, temporary) in candidate.temporaries[start..temporary_cursor]
+            .iter()
+            .enumerate()
+        {
+            charge(
+                work,
+                proto
+                    .instructions
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|cost| cost.checked_add(entry.locals.len()))
+                    .and_then(|cost| {
+                        cost.checked_add(
+                            module
+                                .official_execution()
+                                .map_or(0, |plan| plan.calls().len()),
+                        )
+                    })
+                    .ok_or_else(|| limit("native debug temporary 檢查 work 溢位"))?,
+            )?;
+            let pc = temporary.call_pc.0 as usize;
+            let expected_ordinal = if prior_pc == Some(pc) {
+                prior_register
+                    .map(|(_, ordinal): (Register, u16)| ordinal.checked_add(1))
+                    .flatten()
+                    .ok_or_else(|| invalid("native debug temporary ordinal 溢位"))?
+            } else {
+                1
+            };
+            let mut duplicate_register = false;
+            if prior_pc == Some(pc) {
+                for prior in candidate.temporaries[start..start + index]
+                    .iter()
+                    .rev()
+                    .take_while(|prior| prior.call_pc == temporary.call_pc)
+                {
+                    charge(work, 1)?;
+                    duplicate_register |= prior.register == temporary.register;
+                }
+            }
+            if temporary.ordinal != expected_ordinal
+                || pc >= proto.instructions.len()
+                || prior_pc.is_some_and(|prior| pc < prior)
+                || duplicate_register
+                || temporary.register.0 >= proto.register_count
+                || temporary.register.0 < proto.frame.initial_top.0
+                || temporary.register == proto.global_environment
+                || entry.locals.iter().any(|local| {
+                    local.register == temporary.register
+                        && local.start_pc as usize <= pc
+                        && pc < local.end_pc as usize
+                })
+                || module
+                    .official_execution()
+                    .filter(|plan| plan.is_native_builtin())
+                    .is_some_and(|plan| {
+                        plan.calls().iter().any(|call| {
+                            call.prototype == proto.id && call.call_pc == temporary.call_pc
+                        })
+                    })
+            {
+                return Err(invalid(
+                    "native debug temporary PC/ordinal/register/alias 無效",
+                ));
+            }
+            let instruction = &proto.instructions[pc].instruction;
+            if !matches!(instruction, Instruction::Call { .. }) {
+                return Err(invalid("native debug temporary 只能映射 Call"));
+            }
+            let (input, output, possible_output, _) =
+                prototype_register_access(proto, instruction, temporary.register);
+            if input || output || possible_output {
+                return Err(invalid("native debug temporary 與 Call input/output 重疊"));
+            }
+            let scratch = limits.max_artifact_bytes.saturating_sub(bytes);
+            verify_temporary_initialized(proto, pc, temporary.register, work, scratch)?;
+            verify_temporary_consumed(proto, pc, temporary.register, work, scratch)?;
+            prior_pc = Some(pc);
+            prior_register = Some((temporary.register, temporary.ordinal));
+        }
+        temporary_ranges.push(start..temporary_cursor);
+        let initializer_start = initializer_cursor;
+        while candidate
+            .initializer_temporaries
+            .get(initializer_cursor)
+            .is_some_and(|temporary| temporary.prototype == proto.id)
+        {
+            initializer_cursor += 1;
+        }
+        let mut previous_initializer: Option<(u32, u32, u8)> = None;
+        for initializer in &candidate.initializer_temporaries[initializer_start..initializer_cursor]
+        {
+            charge(work, entry.locals.len().saturating_add(1))?;
+            let local = entry
+                .locals
+                .iter()
+                .find(|local| local.binding == initializer.binding)
+                .ok_or_else(|| invalid("native debug initializer binding 不存在"))?;
+            let expected_slot = match previous_initializer {
+                Some((start, end, slot)) if start == initializer.start_pc => {
+                    if end != initializer.end_pc {
+                        return Err(invalid("native debug initializer 同組區間不一致"));
+                    }
+                    slot.checked_add(1)
+                        .ok_or_else(|| invalid("native debug initializer slot 溢位"))?
+                }
+                Some((_, end, _)) if initializer.start_pc < end => {
+                    return Err(invalid("native debug initializer 區間重疊或順序無效"));
+                }
+                _ => {
+                    let active = entry
+                        .locals
+                        .iter()
+                        .filter(|local| {
+                            local.start_pc <= initializer.start_pc
+                                && initializer.start_pc < local.end_pc
+                        })
+                        .count();
+                    u8::try_from(active)
+                        .map_err(|_| invalid("native debug initializer active slot 溢位"))?
+                }
+            };
+            if initializer.slot != expected_slot
+                || local_storage
+                    .iter()
+                    .find(|storage| storage.binding == initializer.binding)
+                    .is_none_or(|storage| {
+                        storage.register != initializer.register
+                            || storage.slot != initializer.slot
+                            || storage.start_pc > local.initialized_pc
+                            || storage.end_pc < local.end_pc
+                    })
+            {
+                return Err(invalid("native debug initializer slot/storage 契約無效"));
+            }
+            verify_initializer_interval(
+                module,
+                proto,
+                local,
+                initializer,
+                work,
+                limits.max_artifact_bytes.saturating_sub(bytes),
+            )?;
+            previous_initializer =
+                Some((initializer.start_pc, initializer.end_pc, initializer.slot));
+        }
+        let entries = &candidate.initializer_temporaries[initializer_start..initializer_cursor];
+        let mut group_start = 0;
+        while group_start < entries.len() {
+            let first = entries[group_start];
+            let group_end = entries[group_start..]
+                .partition_point(|entry| entry.start_pc == first.start_pc)
+                + group_start;
+            charge(work, entry.locals.len())?;
+            let expected = entry
+                .locals
+                .iter()
+                .filter(|local| {
+                    local.start_pc == first.end_pc
+                        && first.start_pc <= local.initialized_pc
+                        && local.initialized_pc < first.end_pc
+                })
+                .count();
+            if group_end - group_start != expected {
+                return Err(invalid("native debug initializer future slot 不連續"));
+            }
+            group_start = group_end;
+        }
+        initializer_ranges.push(initializer_start..initializer_cursor);
         add_bytes(
             &mut bytes,
             local_storage.capacity().saturating_sub(entry.locals.len()),
@@ -1148,6 +1948,12 @@ pub fn verify_native_debug(
         )?;
         close_groups.push(groups);
     }
+    if temporary_cursor != candidate.temporaries.len() {
+        return Err(invalid("native debug temporary prototype 順序無效"));
+    }
+    if initializer_cursor != candidate.initializer_temporaries.len() {
+        return Err(invalid("native debug initializer prototype 順序無效"));
+    }
     add_bytes(
         &mut bytes,
         storage
@@ -1164,11 +1970,41 @@ pub fn verify_native_debug(
         size_of::<Vec<NativeCloseGroup>>(),
         limits.max_artifact_bytes,
     )?;
+    add_bytes(
+        &mut bytes,
+        semantic_upvalues
+            .capacity()
+            .saturating_sub(candidate.prototypes.len()),
+        size_of::<NativeSemanticUpvalueMap>(),
+        limits.max_artifact_bytes,
+    )?;
+    add_bytes(
+        &mut bytes,
+        temporary_ranges
+            .capacity()
+            .saturating_sub(candidate.prototypes.len()),
+        size_of::<Range<usize>>(),
+        limits.max_artifact_bytes,
+    )?;
+    add_bytes(
+        &mut bytes,
+        initializer_ranges
+            .capacity()
+            .saturating_sub(candidate.prototypes.len()),
+        size_of::<Range<usize>>(),
+        limits.max_artifact_bytes,
+    )?;
     Ok(NativeDebug {
         source_name: candidate.source_name,
         prototypes: candidate.prototypes,
+        semantic_upvalues,
         storage,
         close_groups,
+        temporaries: candidate.temporaries,
+        temporary_ranges,
+        initializer_temporaries: candidate.initializer_temporaries,
+        initializer_ranges,
+        non_counted_pcs: candidate.non_counted_pcs,
         allocated_bytes: bytes,
     })
 }
@@ -1265,8 +2101,8 @@ mod tests {
             source_name: b"@forged.lua".to_vec(),
             prototypes: vec![NativePrototypeDebug {
                 prototype: ProtoId(0),
-                line_defined: 1,
-                last_line_defined: 1,
+                line_defined: 0,
+                last_line_defined: 0,
                 lines: vec![1; 5],
                 upvalue_names: vec![],
                 max_active_locals: 1,
@@ -1291,6 +2127,9 @@ mod tests {
                     },
                 ],
             }],
+            temporaries: Vec::new(),
+            initializer_temporaries: Vec::new(),
+            non_counted_pcs: Vec::new(),
         };
         (
             verify_module(module, LuaProfile::Lua55, &VerifyLimits::default()).unwrap(),
@@ -1317,6 +2156,1001 @@ mod tests {
             verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap(),
             candidate,
         )
+    }
+
+    fn initializer_fixture() -> (VerifiedModule, NativeDebugCandidate) {
+        let (verified, mut candidate) = valid_fixture();
+        candidate
+            .initializer_temporaries
+            .push(NativeInitializerTemporary {
+                prototype: ProtoId(0),
+                binding: binding(2),
+                register: Register(3),
+                slot: 0,
+                start_pc: 2,
+                end_pc: 3,
+            });
+        (verified, candidate)
+    }
+
+    fn two_initializer_fixture() -> (VerifiedModule, NativeDebugCandidate) {
+        let (verified, mut candidate) = initializer_fixture();
+        let mut raw = verified.module().clone();
+        let proto = &mut raw.prototypes[0];
+        proto.register_count = 5;
+        proto.frame.register_limit = 5;
+        proto.frame.initial_top = Register(5);
+        proto.frame.dynamic_top = Register(5);
+        proto.binding_registers.push((binding(3), Register(4)));
+        proto.instructions.insert(
+            3,
+            BytecodeInstruction {
+                instruction: Instruction::LoadConst {
+                    dest: Register(4),
+                    constant: ConstId(1),
+                },
+                span: BytecodeSpan {
+                    start_byte: 0,
+                    end_byte: 1,
+                },
+                close_path: None,
+            },
+        );
+        candidate.prototypes[0].lines.push(1);
+        candidate.prototypes[0].max_active_locals = 2;
+        candidate.prototypes[0].locals[1].start_pc = 4;
+        candidate.prototypes[0].locals[1].end_pc = 6;
+        candidate.prototypes[0].locals.push(NativeLocal {
+            binding: binding(3),
+            register: Register(4),
+            slot: 1,
+            initialized_pc: 3,
+            start_pc: 4,
+            end_pc: 6,
+            name: b"c".to_vec(),
+        });
+        candidate.initializer_temporaries[0].end_pc = 4;
+        candidate
+            .initializer_temporaries
+            .push(NativeInitializerTemporary {
+                prototype: ProtoId(0),
+                binding: binding(3),
+                register: Register(4),
+                slot: 1,
+                start_pc: 2,
+                end_pc: 4,
+            });
+        (
+            verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap(),
+            candidate,
+        )
+    }
+
+    #[test]
+    fn initializer_interval_maps_only_future_local_slot() {
+        let (verified, candidate) = initializer_fixture();
+        let debug = check(candidate, &verified).unwrap();
+        let entries = debug.initializer_temporaries_for(ProtoId(0)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].binding, binding(2));
+        assert_eq!((entries[0].start_pc, entries[0].end_pc), (2, 3));
+        assert!(debug.initializer_temporaries_for(ProtoId(99)).is_none());
+    }
+
+    #[test]
+    fn initializer_interval_rejects_forged_identity_slot_lifetime_and_order() {
+        let (verified, candidate) = initializer_fixture();
+        let mut cases = Vec::new();
+        for change in [
+            NativeInitializerTemporary {
+                prototype: ProtoId(99),
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                binding: binding(99),
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                register: Register(0),
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                register: Register(1),
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                register: Register(2),
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                register: Register(99),
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                slot: 1,
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                start_pc: 3,
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                start_pc: 4,
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                end_pc: 2,
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                end_pc: 4,
+                ..candidate.initializer_temporaries[0]
+            },
+            NativeInitializerTemporary {
+                end_pc: 99,
+                ..candidate.initializer_temporaries[0]
+            },
+        ] {
+            let mut forged = candidate.clone();
+            forged.initializer_temporaries[0] = change;
+            cases.push(forged);
+        }
+        let mut duplicate = candidate.clone();
+        duplicate
+            .initializer_temporaries
+            .push(candidate.initializer_temporaries[0]);
+        cases.push(duplicate);
+        for forged in cases {
+            assert_eq!(
+                check(forged, &verified).unwrap_err().code,
+                BytecodeErrorCode::Verify
+            );
+        }
+    }
+
+    #[test]
+    fn initializer_interval_rejects_missing_second_future_slot() {
+        let (verified, candidate) = two_initializer_fixture();
+        assert_eq!(
+            check(candidate.clone(), &verified)
+                .unwrap()
+                .initializer_temporaries_for(ProtoId(0))
+                .unwrap()
+                .len(),
+            2
+        );
+        let mut missing = candidate;
+        missing.initializer_temporaries.pop();
+        let error = check(missing, &verified).unwrap_err();
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
+        assert!(error.message.contains("不連續"));
+    }
+
+    #[test]
+    fn initializer_interval_rejects_cfg_reentry_after_local_activation() {
+        let (verified, candidate) = initializer_fixture();
+        let mut raw = verified.module().clone();
+        raw.prototypes[0].instructions[3].instruction = Instruction::Jump {
+            target: InstructionOffset(2),
+        };
+        let reentering = verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        let error = check(candidate, &reentering).unwrap_err();
+        assert_eq!(error.code, BytecodeErrorCode::Verify);
+        assert!(error.message.contains("initializer"), "{error:?}");
+    }
+
+    #[test]
+    fn initializer_interval_charges_exact_artifact_and_work_limits() {
+        let (verified, candidate) = initializer_fixture();
+        let limits = VerifyLimits::default();
+        let mut ample = OfficialWorkBudget::new(u64::MAX);
+        let debug = verify_native_debug(&verified, candidate.clone(), &limits, &mut ample).unwrap();
+        let spent = u64::MAX - ample.remaining();
+        let mut exact = OfficialWorkBudget::new(spent);
+        assert!(verify_native_debug(&verified, candidate.clone(), &limits, &mut exact).is_ok());
+        let mut short = OfficialWorkBudget::new(spent - 1);
+        assert_eq!(
+            verify_native_debug(&verified, candidate.clone(), &limits, &mut short)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::CompileLimit
+        );
+        let mut lower = debug.allocated_bytes().saturating_sub(1);
+        let mut upper = limits.max_artifact_bytes;
+        while lower + 1 < upper {
+            let middle = lower + (upper - lower) / 2;
+            let bounded = VerifyLimits {
+                max_artifact_bytes: middle,
+                ..limits
+            };
+            let mut work = OfficialWorkBudget::new(u64::MAX);
+            if verify_native_debug(&verified, candidate.clone(), &bounded, &mut work).is_ok() {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        let bounded = VerifyLimits {
+            max_artifact_bytes: upper,
+            ..limits
+        };
+        let mut ample = OfficialWorkBudget::new(u64::MAX);
+        assert!(verify_native_debug(&verified, candidate.clone(), &bounded, &mut ample).is_ok());
+        let bounded = VerifyLimits {
+            max_artifact_bytes: upper - 1,
+            ..limits
+        };
+        let mut ample = OfficialWorkBudget::new(u64::MAX);
+        assert_eq!(
+            verify_native_debug(&verified, candidate, &bounded, &mut ample)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::CompileLimit
+        );
+    }
+
+    fn temporary_fixture() -> (VerifiedModule, NativeDebugCandidate) {
+        let span = BytecodeSpan {
+            start_byte: 0,
+            end_byte: 1,
+        };
+        let instructions = vec![
+            Instruction::LoadConst {
+                dest: Register(4),
+                constant: ConstId(0),
+            },
+            Instruction::Move {
+                dest: Register(6),
+                src: Register(1),
+            },
+            Instruction::Call {
+                base: Register(6),
+                arg_count: 0,
+                result_mode: ResultMode::Fixed(1),
+            },
+            Instruction::BinaryOp {
+                dest: Register(7),
+                op: super::super::BinaryOperation::Add,
+                left: Register(4),
+                right: Register(6),
+            },
+            Instruction::Return {
+                base: Register(7),
+                result_mode: ResultMode::Fixed(1),
+            },
+        ];
+        let module = BytecodeModule {
+            format_version: RVLU_V2,
+            profile: LuaProfile::Lua55,
+            numeric_config: RVLU_NUMERIC_I64_F64,
+            span,
+            function_prototypes: vec![(0, ProtoId(0))],
+            prototypes: vec![BytecodePrototype {
+                id: ProtoId(0),
+                function: 0,
+                parent: None,
+                span,
+                register_count: 8,
+                parameter_count: 0,
+                is_variadic: false,
+                named_vararg: None,
+                frame: FrameLayout {
+                    register_limit: 8,
+                    initial_top: Register(2),
+                    dynamic_top: Register(2),
+                    return_base: Register(0),
+                    environment: Register(1),
+                    environment_source: EnvironmentSource::RootExternal,
+                    registers_start_as_nil: true,
+                },
+                global_environment: Register(1),
+                global_environment_binding: binding(0),
+                binding_registers: vec![(binding(0), Register(1))],
+                constants: vec![BytecodeConstant::Integer(1)],
+                upvalues: vec![],
+                instructions: instructions
+                    .into_iter()
+                    .map(|instruction| BytecodeInstruction {
+                        instruction,
+                        span,
+                        close_path: None,
+                    })
+                    .collect(),
+                close_paths: vec![],
+            }],
+        };
+        let candidate = NativeDebugCandidate {
+            source_name: b"@temporary.lua".to_vec(),
+            prototypes: vec![NativePrototypeDebug {
+                prototype: ProtoId(0),
+                line_defined: 0,
+                last_line_defined: 0,
+                lines: vec![1; 5],
+                locals: vec![],
+                upvalue_names: vec![],
+                max_active_locals: 0,
+            }],
+            temporaries: vec![NativeTemporary {
+                prototype: ProtoId(0),
+                call_pc: InstructionOffset(2),
+                ordinal: 1,
+                register: Register(4),
+            }],
+            initializer_temporaries: Vec::new(),
+            non_counted_pcs: Vec::new(),
+        };
+        (
+            verify_module(module, LuaProfile::Lua55, &VerifyLimits::default()).unwrap(),
+            candidate,
+        )
+    }
+
+    #[test]
+    fn temporary_map_accepts_only_call_pending_value_with_parent_binary_read() {
+        let (verified, candidate) = temporary_fixture();
+        let debug = check(candidate, &verified).unwrap();
+        let expected = [NativeTemporary {
+            prototype: ProtoId(0),
+            call_pc: InstructionOffset(2),
+            ordinal: 1,
+            register: Register(4),
+        }];
+        assert_eq!(
+            debug.temporaries_at(ProtoId(0), InstructionOffset(2)),
+            Some(expected.as_slice())
+        );
+        assert_eq!(
+            debug.temporaries_at(ProtoId(0), InstructionOffset(1)),
+            Some([].as_slice())
+        );
+    }
+
+    fn temporary_move_to_call_fixture() -> (VerifiedModule, NativeDebugCandidate) {
+        let (verified, mut candidate) = temporary_fixture();
+        let mut raw = verified.module().clone();
+        let proto = &mut raw.prototypes[0];
+        proto.instructions[3].instruction = Instruction::Move {
+            dest: Register(7),
+            src: Register(4),
+        };
+        let last = proto.instructions.pop().unwrap();
+        proto.instructions.push(BytecodeInstruction {
+            instruction: Instruction::Call {
+                base: Register(7),
+                arg_count: 0,
+                result_mode: ResultMode::Fixed(1),
+            },
+            span: last.span,
+            close_path: None,
+        });
+        proto.instructions.push(last);
+        candidate.prototypes[0].lines.push(1);
+        (
+            verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap(),
+            candidate,
+        )
+    }
+
+    #[test]
+    fn temporary_map_accepts_outer_call_prefix_after_move_or_direct_read() {
+        let (verified, candidate) = temporary_move_to_call_fixture();
+        assert!(check(candidate, &verified).is_ok());
+
+        let (verified, candidate) = temporary_fixture();
+        let mut raw = verified.module().clone();
+        raw.prototypes[0].instructions[3].instruction = Instruction::Call {
+            base: Register(4),
+            arg_count: 0,
+            result_mode: ResultMode::Fixed(1),
+        };
+        raw.prototypes[0].instructions[4].instruction = Instruction::Return {
+            base: Register(4),
+            result_mode: ResultMode::Fixed(1),
+        };
+        let verified = verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        assert!(check(candidate, &verified).is_ok());
+    }
+
+    #[test]
+    fn temporary_map_accepts_reverse_register_order_with_unique_ordinals() {
+        let (verified, mut candidate) = temporary_fixture();
+        let mut raw = verified.module().clone();
+        let proto = &mut raw.prototypes[0];
+        let span = proto.instructions[0].span;
+        proto.instructions.insert(
+            1,
+            BytecodeInstruction {
+                instruction: Instruction::LoadConst {
+                    dest: Register(3),
+                    constant: ConstId(0),
+                },
+                span,
+                close_path: None,
+            },
+        );
+        proto.instructions[4].instruction = Instruction::BinaryOp {
+            dest: Register(7),
+            op: super::super::BinaryOperation::Add,
+            left: Register(4),
+            right: Register(3),
+        };
+        candidate.prototypes[0].lines.push(1);
+        candidate.temporaries[0].call_pc = InstructionOffset(3);
+        candidate.temporaries.push(NativeTemporary {
+            prototype: ProtoId(0),
+            call_pc: InstructionOffset(3),
+            ordinal: 2,
+            register: Register(3),
+        });
+        let verified = verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        assert!(check(candidate.clone(), &verified).is_ok());
+
+        candidate.temporaries[1].register = Register(4);
+        assert_eq!(
+            check(candidate, &verified).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+    }
+
+    #[test]
+    fn temporary_map_rejects_overwritten_or_unrelated_move_consumer() {
+        let (verified, candidate) = temporary_move_to_call_fixture();
+        let mut raw = verified.module().clone();
+        raw.prototypes[0].instructions[4].instruction = Instruction::LoadConst {
+            dest: Register(7),
+            constant: ConstId(0),
+        };
+        let overwritten = verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        assert_eq!(
+            check(candidate.clone(), &overwritten).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut raw = verified.module().clone();
+        raw.prototypes[0].instructions[4].instruction = Instruction::Move {
+            dest: Register(6),
+            src: Register(7),
+        };
+        let unrelated = verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        assert_eq!(
+            check(candidate.clone(), &unrelated).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut alias = candidate;
+        alias.temporaries[0].register = Register(6);
+        assert_eq!(
+            check(alias, &verified).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+    }
+
+    fn non_counted_fixture() -> (VerifiedModule, NativeDebugCandidate) {
+        let (verified, mut candidate) = temporary_fixture();
+        let mut raw = verified.module().clone();
+        let span = BytecodeSpan {
+            start_byte: 0,
+            end_byte: 1,
+        };
+        for pc in [4, 4] {
+            raw.prototypes[0].instructions.insert(
+                pc,
+                BytecodeInstruction {
+                    instruction: Instruction::LoadNil {
+                        start: Register(0),
+                        count: 1,
+                    },
+                    span,
+                    close_path: None,
+                },
+            );
+            candidate.prototypes[0].lines.push(1);
+        }
+        candidate.non_counted_pcs = vec![
+            (ProtoId(0), InstructionOffset(4)),
+            (ProtoId(0), InstructionOffset(5)),
+        ];
+        (
+            verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap(),
+            candidate,
+        )
+    }
+
+    #[test]
+    fn non_counted_pc_accepts_sorted_anchor_and_rejects_malformed_candidates() {
+        let (verified, candidate) = non_counted_fixture();
+        let debug = check(candidate.clone(), &verified).unwrap();
+        assert!(debug.is_non_counted_pc(ProtoId(0), InstructionOffset(4)));
+        assert!(debug.is_non_counted_pc(ProtoId(0), InstructionOffset(5)));
+        assert!(!debug.is_non_counted_pc(ProtoId(0), InstructionOffset(3)));
+        let mut cases = Vec::new();
+        let mut duplicate = candidate.clone();
+        duplicate.non_counted_pcs[1].1 = InstructionOffset(4);
+        cases.push(duplicate);
+        let mut unordered = candidate.clone();
+        unordered.non_counted_pcs.reverse();
+        cases.push(unordered);
+        let mut unknown = candidate.clone();
+        unknown.non_counted_pcs[1].0 = ProtoId(99);
+        cases.push(unknown);
+        let mut out_of_bounds = candidate.clone();
+        out_of_bounds.non_counted_pcs[1].1 = InstructionOffset(999);
+        cases.push(out_of_bounds);
+        let mut real_opcode = candidate;
+        real_opcode.non_counted_pcs[0].1 = InstructionOffset(3);
+        cases.push(real_opcode);
+        for forged in cases {
+            assert_eq!(
+                check(forged, &verified).unwrap_err().code,
+                BytecodeErrorCode::Verify
+            );
+        }
+    }
+
+    #[test]
+    fn non_counted_pc_accepts_bounded_expansion_opcode_classes() {
+        let (verified, mut candidate) = non_counted_fixture();
+        candidate.non_counted_pcs = vec![
+            (ProtoId(0), InstructionOffset(0)), // LoadConst 輔助值
+            (ProtoId(0), InstructionOffset(1)), // Move 位置調整
+            (ProtoId(0), InstructionOffset(4)), // LoadNil 清理
+            (ProtoId(0), InstructionOffset(5)), // LoadNil CFG 錨點
+        ];
+        let debug = check(candidate.clone(), &verified).unwrap();
+        for (_, pc) in &candidate.non_counted_pcs {
+            assert!(debug.is_non_counted_pc(ProtoId(0), *pc));
+        }
+        let limits = VerifyLimits::default();
+        let mut ample = OfficialWorkBudget::new(u64::MAX);
+        verify_native_debug(&verified, candidate.clone(), &limits, &mut ample).unwrap();
+        let spent = u64::MAX - ample.remaining();
+        let mut exact = OfficialWorkBudget::new(spent);
+        assert!(verify_native_debug(&verified, candidate.clone(), &limits, &mut exact).is_ok());
+        let mut short = OfficialWorkBudget::new(spent - 1);
+        assert_eq!(
+            verify_native_debug(&verified, candidate, &limits, &mut short)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::CompileLimit
+        );
+    }
+
+    #[test]
+    fn non_counted_pc_charges_exact_artifact_and_work_limits() {
+        let (verified, candidate) = non_counted_fixture();
+        let limits = VerifyLimits::default();
+        let mut ample = OfficialWorkBudget::new(u64::MAX);
+        let debug = verify_native_debug(&verified, candidate.clone(), &limits, &mut ample).unwrap();
+        let spent = u64::MAX - ample.remaining();
+        let mut exact_work = OfficialWorkBudget::new(spent);
+        assert!(
+            verify_native_debug(&verified, candidate.clone(), &limits, &mut exact_work).is_ok()
+        );
+        let mut short_work = OfficialWorkBudget::new(spent - 1);
+        assert_eq!(
+            verify_native_debug(&verified, candidate.clone(), &limits, &mut short_work)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::CompileLimit,
+        );
+        let mut exact_limits = limits;
+        let mut lower = 0usize;
+        let mut upper = limits.max_artifact_bytes;
+        while lower + 1 < upper {
+            let middle = lower + (upper - lower) / 2;
+            exact_limits.max_artifact_bytes = middle;
+            let mut work = OfficialWorkBudget::new(u64::MAX);
+            if verify_native_debug(&verified, candidate.clone(), &exact_limits, &mut work).is_ok() {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        assert!(upper >= debug.allocated_bytes());
+        exact_limits.max_artifact_bytes = upper;
+        let mut work = OfficialWorkBudget::new(u64::MAX);
+        assert!(
+            verify_native_debug(&verified, candidate.clone(), &exact_limits, &mut work).is_ok()
+        );
+        exact_limits.max_artifact_bytes -= 1;
+        let mut work = OfficialWorkBudget::new(u64::MAX);
+        assert_eq!(
+            verify_native_debug(&verified, candidate, &exact_limits, &mut work)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::CompileLimit,
+        );
+    }
+
+    #[test]
+    fn temporary_map_rejects_pc_ordinal_register_and_call_alias_forgeries() {
+        let (verified, candidate) = temporary_fixture();
+        let mut cases = Vec::new();
+        let mut non_call = candidate.clone();
+        non_call.temporaries[0].call_pc = InstructionOffset(1);
+        cases.push(non_call);
+        let mut zero = candidate.clone();
+        zero.temporaries[0].ordinal = 0;
+        cases.push(zero);
+        let mut gap = candidate.clone();
+        gap.temporaries[0].ordinal = 2;
+        cases.push(gap);
+        let mut duplicate = candidate.clone();
+        duplicate.temporaries.push(duplicate.temporaries[0]);
+        cases.push(duplicate);
+        let mut bounds = candidate.clone();
+        bounds.temporaries[0].register = Register(8);
+        cases.push(bounds);
+        let mut environment = candidate.clone();
+        environment.temporaries[0].register = Register(1);
+        cases.push(environment);
+        let mut call_slot = candidate.clone();
+        call_slot.temporaries[0].register = Register(6);
+        cases.push(call_slot);
+        let mut prototype = candidate;
+        prototype.temporaries[0].prototype = ProtoId(1);
+        cases.push(prototype);
+        for case in cases {
+            assert_eq!(
+                check(case, &verified).unwrap_err().code,
+                BytecodeErrorCode::Verify
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_map_rejects_uninitialized_dead_overwritten_and_settable_key() {
+        let (verified, candidate) = temporary_fixture();
+        let mut uninitialized = candidate.clone();
+        uninitialized.temporaries[0].register = Register(5);
+        let mut raw = verified.module().clone();
+        raw.prototypes[0].instructions[3].instruction = Instruction::BinaryOp {
+            dest: Register(7),
+            op: super::super::BinaryOperation::Add,
+            left: Register(5),
+            right: Register(6),
+        };
+        let uninitialized_module =
+            verify_module(raw.clone(), LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        assert_eq!(
+            check(uninitialized, &uninitialized_module)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::Verify
+        );
+        assert_eq!(
+            check(candidate.clone(), &uninitialized_module)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::Verify
+        );
+
+        raw.prototypes[0].instructions[3].instruction = Instruction::LoadNil {
+            start: Register(4),
+            count: 1,
+        };
+        raw.prototypes[0].instructions.insert(
+            4,
+            BytecodeInstruction {
+                instruction: Instruction::BinaryOp {
+                    dest: Register(7),
+                    op: super::super::BinaryOperation::Add,
+                    left: Register(4),
+                    right: Register(6),
+                },
+                span: BytecodeSpan {
+                    start_byte: 0,
+                    end_byte: 1,
+                },
+                close_path: None,
+            },
+        );
+        let overwritten_module =
+            verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        let mut overwritten = candidate.clone();
+        overwritten.prototypes[0].lines.push(1);
+        assert_eq!(
+            check(overwritten, &overwritten_module).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut raw = verified.module().clone();
+        raw.prototypes[0].instructions[3].instruction = Instruction::SetTable {
+            table: Register(6),
+            key: Register(4),
+            value: Register(6),
+        };
+        raw.prototypes[0].instructions[4].instruction = Instruction::Return {
+            base: Register(6),
+            result_mode: ResultMode::Fixed(1),
+        };
+        let settable_module =
+            verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        assert_eq!(
+            check(candidate, &settable_module).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+    }
+
+    #[test]
+    fn temporary_map_checks_artifact_and_work_exactly() {
+        let (verified, candidate) = temporary_fixture();
+        let limits = VerifyLimits::default();
+        let mut generous = OfficialWorkBudget::new(u64::MAX);
+        let debug =
+            verify_native_debug(&verified, candidate.clone(), &limits, &mut generous).unwrap();
+        let spent = generous.consumed();
+        assert!(spent > 0);
+        let mut exact = OfficialWorkBudget::new(spent);
+        verify_native_debug(&verified, candidate.clone(), &limits, &mut exact).unwrap();
+        assert_eq!(exact.remaining(), 0);
+        let mut short = OfficialWorkBudget::new(spent - 1);
+        assert_eq!(
+            verify_native_debug(&verified, candidate.clone(), &limits, &mut short)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::CompileLimit
+        );
+        let mut exact_limits = limits;
+        let mut lower = 0usize;
+        let mut upper = limits.max_artifact_bytes;
+        while lower + 1 < upper {
+            let middle = lower + (upper - lower) / 2;
+            exact_limits.max_artifact_bytes = middle;
+            let mut work = OfficialWorkBudget::new(u64::MAX);
+            if verify_native_debug(&verified, candidate.clone(), &exact_limits, &mut work).is_ok() {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        assert!(upper >= debug.allocated_bytes());
+        exact_limits.max_artifact_bytes = upper;
+        let mut work = OfficialWorkBudget::new(u64::MAX);
+        assert!(
+            verify_native_debug(&verified, candidate.clone(), &exact_limits, &mut work).is_ok()
+        );
+        exact_limits.max_artifact_bytes -= 1;
+        let mut work = OfficialWorkBudget::new(u64::MAX);
+        assert_eq!(
+            verify_native_debug(&verified, candidate, &exact_limits, &mut work)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::CompileLimit
+        );
+    }
+
+    #[test]
+    fn temporary_map_requires_initialization_and_consumer_on_every_cfg_path() {
+        let (verified, candidate) = temporary_fixture();
+        let span = BytecodeSpan {
+            start_byte: 0,
+            end_byte: 1,
+        };
+        let mut before = verified.module().clone();
+        before.prototypes[0].instructions.insert(
+            0,
+            BytecodeInstruction {
+                instruction: Instruction::JumpIfFalse {
+                    condition: Register(1),
+                    target: InstructionOffset(2),
+                },
+                span,
+                close_path: None,
+            },
+        );
+        let before = verify_module(before, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        let mut before_candidate = candidate.clone();
+        before_candidate.prototypes[0].lines.push(1);
+        before_candidate.temporaries[0].call_pc = InstructionOffset(3);
+        assert_eq!(
+            check(before_candidate, &before).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut after = verified.module().clone();
+        after.prototypes[0].instructions.insert(
+            3,
+            BytecodeInstruction {
+                instruction: Instruction::JumpIfFalse {
+                    condition: Register(1),
+                    target: InstructionOffset(5),
+                },
+                span,
+                close_path: None,
+            },
+        );
+        let after = verify_module(after, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        let mut after_candidate = candidate;
+        after_candidate.prototypes[0].lines.push(1);
+        assert_eq!(
+            check(after_candidate, &after).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+    }
+
+    fn semantic_environment_fixture() -> (VerifiedModule, NativeDebugCandidate) {
+        let (verified, mut candidate) = valid_fixture();
+        let mut raw = verified.module().clone();
+        raw.prototypes[0].instructions[3].instruction = Instruction::GetTable {
+            dest: Register(0),
+            table: Register(1),
+            key: Register(3),
+        };
+        candidate.prototypes[0]
+            .upvalue_names
+            .push(Some(b"_ENV".to_vec()));
+        (
+            verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap(),
+            candidate,
+        )
+    }
+
+    #[test]
+    fn native_semantic_environment_maps_root_without_physical_upvalue() {
+        let (verified, candidate) = semantic_environment_fixture();
+        let debug = check(candidate, &verified).unwrap();
+        assert_eq!(debug.semantic_upvalue_count(ProtoId(0)), Some(1));
+        assert_eq!(
+            debug.semantic_upvalue(ProtoId(0), 0),
+            Some(NativeSemanticUpvalue::Environment)
+        );
+        assert_eq!(debug.semantic_upvalue(ProtoId(0), 1), None);
+        assert_eq!(
+            debug.semantic_upvalue_name(ProtoId(0), 0),
+            Some(Some(b"_ENV".as_slice()))
+        );
+        assert_eq!(verified.module().prototypes[0].upvalues.len(), 0);
+        assert!(debug.allocated_bytes() > 0);
+    }
+
+    #[test]
+    fn native_semantic_environment_rejects_forged_source_duplicate_and_bounds() {
+        let (verified, candidate) = semantic_environment_fixture();
+        let mut missing = candidate.clone();
+        missing.prototypes[0].upvalue_names.clear();
+        assert_eq!(
+            check(missing, &verified).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut duplicate = candidate.clone();
+        duplicate.prototypes[0]
+            .upvalue_names
+            .push(Some(b"_ENV".to_vec()));
+        assert_eq!(
+            check(duplicate, &verified).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+
+        let mut wrong_name = candidate.clone();
+        wrong_name.prototypes[0].upvalue_names[0] = Some(b"other".to_vec());
+        assert_eq!(
+            check(wrong_name, &verified).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+
+        let (without_use, mut forged) = valid_fixture();
+        forged.prototypes[0]
+            .upvalue_names
+            .push(Some(b"_ENV".to_vec()));
+        assert_eq!(
+            check(forged, &without_use).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+    }
+
+    #[test]
+    fn native_semantic_environment_accounts_for_exact_artifact_budget() {
+        let (verified, candidate) = semantic_environment_fixture();
+        let debug = check(candidate.clone(), &verified).unwrap();
+        let mut limits = VerifyLimits::default();
+        let mut lower = 0;
+        let mut upper = limits.max_artifact_bytes;
+        while lower + 1 < upper {
+            let middle = lower + (upper - lower) / 2;
+            limits.max_artifact_bytes = middle;
+            let mut work = OfficialWorkBudget::for_limits(&limits).unwrap();
+            if verify_native_debug(&verified, candidate.clone(), &limits, &mut work).is_ok() {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        assert!(upper >= debug.allocated_bytes());
+        limits.max_artifact_bytes = upper;
+        let mut work = OfficialWorkBudget::for_limits(&limits).unwrap();
+        assert!(verify_native_debug(&verified, candidate.clone(), &limits, &mut work).is_ok());
+        limits.max_artifact_bytes = upper - 1;
+        let mut work = OfficialWorkBudget::for_limits(&limits).unwrap();
+        assert_eq!(
+            verify_native_debug(&verified, candidate, &limits, &mut work)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::CompileLimit
+        );
+    }
+
+    #[test]
+    fn native_semantic_environment_charges_work_exactly() {
+        let (verified, candidate) = semantic_environment_fixture();
+        let limits = VerifyLimits::default();
+        let mut generous = OfficialWorkBudget::new(u64::MAX);
+        verify_native_debug(&verified, candidate.clone(), &limits, &mut generous).unwrap();
+        let spent = generous.consumed();
+        assert!(spent > 0);
+        let mut exact = OfficialWorkBudget::new(spent);
+        verify_native_debug(&verified, candidate.clone(), &limits, &mut exact).unwrap();
+        assert_eq!(exact.remaining(), 0);
+        let mut short = OfficialWorkBudget::new(spent - 1);
+        assert_eq!(
+            verify_native_debug(&verified, candidate, &limits, &mut short)
+                .unwrap_err()
+                .code,
+            BytecodeErrorCode::CompileLimit
+        );
+        assert!(short.exhausted());
+    }
+
+    #[test]
+    fn root_definition_range_is_zero_with_positive_instruction_lines() {
+        let (verified, mut candidate) = valid_fixture();
+        candidate.prototypes[0].line_defined = 0;
+        candidate.prototypes[0].last_line_defined = 0;
+        candidate.prototypes[0].lines[0] = 2;
+        assert!(candidate.prototypes[0].lines.iter().all(|line| *line > 0));
+        check(candidate, &verified).unwrap();
+    }
+
+    #[test]
+    fn root_nonzero_or_half_zero_definition_range_is_rejected() {
+        let (verified, candidate) = valid_fixture();
+        for (first, last) in [(1, 1), (0, 1), (1, 0)] {
+            let mut forged = candidate.clone();
+            forged.prototypes[0].line_defined = first;
+            forged.prototypes[0].last_line_defined = last;
+            assert_eq!(
+                check(forged, &verified).unwrap_err().code,
+                BytecodeErrorCode::Verify
+            );
+        }
+    }
+
+    #[test]
+    fn child_definition_range_and_instruction_upper_bound_remain_strict() {
+        let (verified, mut candidate) = captured_fixture();
+        let mut raw = verified.module().clone();
+        raw.prototypes[0].instructions.insert(
+            2,
+            BytecodeInstruction {
+                instruction: Instruction::Close {
+                    base: Register(2),
+                    count: 0,
+                },
+                span: raw.span,
+                close_path: None,
+            },
+        );
+        candidate.prototypes[0].lines.push(1);
+        candidate.prototypes[0].locals[0].end_pc = 3;
+        candidate.prototypes[0].locals[1].initialized_pc = 3;
+        candidate.prototypes[0].locals[1].start_pc = 4;
+        candidate.prototypes[0].locals[1].end_pc = 6;
+        let verified = verify_module(raw, LuaProfile::Lua55, &VerifyLimits::default()).unwrap();
+        check(candidate.clone(), &verified).unwrap();
+        candidate.prototypes[1].line_defined = 0;
+        candidate.prototypes[1].last_line_defined = 0;
+        assert_eq!(
+            check(candidate.clone(), &verified).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
+        candidate.prototypes[1].line_defined = 1;
+        candidate.prototypes[1].last_line_defined = 1;
+        candidate.prototypes[1].lines[0] = 2;
+        assert_eq!(
+            check(candidate, &verified).unwrap_err().code,
+            BytecodeErrorCode::Verify
+        );
     }
 
     fn named_vararg_fixture() -> (VerifiedModule, NativeDebugCandidate) {

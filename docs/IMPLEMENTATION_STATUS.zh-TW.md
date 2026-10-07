@@ -2,7 +2,7 @@
 
 [English](IMPLEMENTATION_STATUS.md) | 繁體中文 | [한국어](IMPLEMENTATION_STATUS.ko.md) | [日本語](IMPLEMENTATION_STATUS.ja.md)
 
-更新日期：2026-10-04。本頁列出專案中已實作與待實作的功能。勾選代表所述範圍已通過測試；未勾選代表尚未實作。規格文件或測試資料存在，不代表對應的執行功能已完成。
+更新日期：2026-10-08。本頁列出專案中已實作與待實作的功能。勾選代表所述範圍已通過測試；未勾選代表尚未實作。規格文件或測試資料存在，不代表對應的執行功能已完成。
 
 ## 已實作並驗收
 
@@ -32,7 +32,7 @@
 
 ## 待實作
 
-- [ ] 完成公開 Rust SDK、模組序列化與命令列工具的 P14 fresh gates 與三平台 CI 驗收（實作及局部測試已完成）。
+- [ ] 完成 P15 官方 Lua Basic 相容性驗收；目前只完成官方測試執行與報告基礎設施，兩個 profile 的 Basic 相容性皆為 `FAIL`。
 - [ ] 通過官方 Lua Basic 測試套件相容性驗收。
 - [ ] 實作正式 C API／ABI 與原生模組支援。
 - [ ] 通過官方 Lua Complete 測試套件相容性驗收。
@@ -43,6 +43,12 @@
 - [ ] 建立沙箱、私人程序與防資料外洩機制。
 - [ ] 加入 fuzzing、故障注入與效能驗證。
 - [ ] 完成套件發布、第三方採用與 1.0 發布驗收。
+
+## P15 官方測試基礎設施狀態（2026-10-08）
+
+P14 已於提交 `048c0d942a2fc1a343b6c2d00c4eca88882eac60` 完成階段驗收。P15 採核准的 `scope=oracle-infrastructure`：固定 Lua 5.5.1／5.4.9 官方來源與測試包、雙 profile manifest、隔離測試樹、來源與 binary 雜湊、嚴格 child 啟動參數、原始 log、可解析報告，以及以前置 P00～P14 報告與雙 profile 觀察為條件的 P15 gate。P15 gate 通過只表示基礎設施及觀察有效，不表示官方 Basic 語意相容。
+
+正式 Basic 觀察中，`lua55-i64f64` 與 `lua54-i64f64` 的 runner 皆為 `PASS`，但官方 child 皆以非零狀態結束，`final OK !!!` 未出現；兩份報告的 `basic_compatibility_status` 皆為 `FAIL`。因此 BASIC-001／BASIC-002 與完整 Lua 相容性仍未驗收。完整 `_U` skip trace／coverage 與 production arithmetic injection 亦未納入本階段；後續須完成相容性修復與重新驗證。本節的基礎設施與 Basic 狀態以 P15 isolated stage 的 fresh 報告為最終證據；早期 P14 前置紀錄僅代表各自記載的程式狀態。
 
 ## 重新執行驗證
 

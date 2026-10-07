@@ -53,6 +53,67 @@ fn rich_native(profile: LuaProfile) -> rivetlua_core::VerifiedModule {
 }
 
 #[test]
+fn native_initializer_temporary_is_ephemeral_across_transport() {
+    let source = b"local A=function() return 7 end; return A()";
+    let limits = TransportLimits::default();
+    for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+        let language = match profile {
+            LuaProfile::Lua54 => LanguageProfile::Lua54,
+            LuaProfile::Lua55 => LanguageProfile::Lua55,
+        };
+        let tokens = lex(source, language, &CompileLimits::default()).unwrap();
+        let ast = parse(&tokens, language, &CompileLimits::default()).unwrap();
+        let resolved = resolve(&ast, &tokens, language, &CompileLimits::default()).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let original = emit_with_native_debug(
+            &ir,
+            &resolved,
+            source,
+            b"@transport-initializer.lua",
+            &limits.verify,
+        )
+        .unwrap();
+        let original_debug = original.verified().native_debug().unwrap();
+        assert_eq!(
+            original_debug
+                .initializer_temporaries_for(ir.prototypes[0].id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut work = OfficialWorkBudget::for_limits(&limits.verify).unwrap();
+        let encoded = encode_transport_module(original.verified(), &limits, &mut work).unwrap();
+        let reloaded = decode_transport_module(
+            encoded.rvlu(),
+            encoded.sidecar(),
+            profile,
+            &limits,
+            &mut work,
+        )
+        .unwrap();
+        // RVAS/RVLU 只保存既有可執行語意；native initializer mapping 不進 wire。
+        assert!(
+            reloaded
+                .native_debug()
+                .unwrap()
+                .initializer_temporaries_for(ir.prototypes[0].id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reloaded.module(), original.verified().module());
+        for module in [original.verified().clone(), reloaded] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            assert_eq!(
+                vm.load(module).unwrap().run().unwrap(),
+                RunOutcome::Returned(vec![Value::Integer(7)])
+            );
+            assert_eq!(vm.roots().total_count(), 0);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+}
+
+#[test]
 fn native_raw_list_write_kind3_roundtrips_with_optional_debug_both_profiles() {
     let source =
         b"local function values() return 7,8,9 end; local t={values()}; return t[1],t[2],t[3]";
@@ -143,6 +204,9 @@ fn native_helper_debug_cannot_name_hidden_upvalue_or_private_scratch() {
         let make_candidate = || NativeDebugCandidate {
             source_name: debug.source_name().to_vec(),
             prototypes: debug.prototypes().to_vec(),
+            temporaries: Vec::new(),
+            initializer_temporaries: Vec::new(),
+            non_counted_pcs: Vec::new(),
         };
         let mut forged = make_candidate();
         let hidden = forged.prototypes[proto_index]
@@ -650,6 +714,9 @@ fn native_debug_transport_revalidates_nested_locals_names_and_forged_slots_both_
         let mut candidate = NativeDebugCandidate {
             source_name: original.source_name().to_vec(),
             prototypes: original.prototypes().to_vec(),
+            temporaries: Vec::new(),
+            initializer_temporaries: Vec::new(),
+            non_counted_pcs: Vec::new(),
         };
         let named = candidate
             .prototypes

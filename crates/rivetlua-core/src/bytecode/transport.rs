@@ -816,6 +816,10 @@ fn read_native_body(
     Ok(NativeDebugCandidate {
         source_name,
         prototypes,
+        temporaries: Vec::new(),
+        // Native-only initializer 區間與 Call temporary 一樣不進 transport wire。
+        initializer_temporaries: Vec::new(),
+        non_counted_pcs: Vec::new(),
     })
 }
 

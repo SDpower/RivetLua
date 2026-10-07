@@ -1,11 +1,44 @@
 use rivetlua_compiler::{
     CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
 };
-use rivetlua_core::{Value, VerifyLimits};
+use rivetlua_core::{LuaProfile, Value, VerifyLimits};
 use rivetlua_runtime::{
     ActiveRootKind, AllocationDomain, AllocationFailureKind, FailPoint, GcAge, GcColor,
     GcCycleKind, GcMode, GcPhase, HostHandle, RootKind, RunOutcome, Vm, VmError,
 };
+
+#[test]
+fn p12_host_weak_kv_self_pair_drops_unrooted_key_and_value() {
+    for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+        let mut vm = Vm::new_with_profile(profile).unwrap();
+        let weak = vm.allocate_table().unwrap();
+        let _weak_root = HostHandle::<Value>::new(&mut vm, weak).unwrap();
+        let metatable = vm.allocate_table().unwrap();
+        let mode_key = vm.allocate_byte_string(b"__mode").unwrap();
+        let mode_value = vm.allocate_byte_string(b"kv").unwrap();
+        vm.raw_set(
+            metatable,
+            Value::Object(mode_key),
+            Value::Object(mode_value),
+        )
+        .unwrap();
+        vm.set_metatable(weak, Some(metatable)).unwrap();
+        let pair = vm.allocate_table().unwrap();
+        vm.raw_set(weak, Value::Object(pair), Value::Object(pair))
+            .unwrap();
+        assert_eq!(
+            vm.raw_get(weak, Value::Object(pair)),
+            Ok(Value::Object(pair))
+        );
+        vm.collect().unwrap();
+        assert_eq!(
+            vm.object_kind(pair),
+            Err(VmError::StaleObject),
+            "{profile:?}"
+        );
+        assert_eq!(vm.with_table(weak, |table| table.is_empty()), Ok(true));
+    }
+}
 
 #[test]
 fn p12_6_ledger_reports_separate_lua_and_host_bytes() {
@@ -459,7 +492,7 @@ fn p12_6_string_constant_staging_is_host_and_payload_is_lua() {
             continue;
         };
         if failure.attempt.point == Some(FailPoint::StringBytesReserve) {
-            if p12_6_is_vm_mod_site(failure.attempt.site.file) {
+            if p12_6_site_file_is(failure.attempt.site.file, "heap.rs") {
                 assert_eq!(failure.attempt.domain, AllocationDomain::Host);
                 staging += 1;
             } else if p12_6_site_file_is(failure.attempt.site.file, "string.rs") {

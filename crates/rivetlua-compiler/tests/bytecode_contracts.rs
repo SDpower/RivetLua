@@ -200,6 +200,65 @@ fn public_ir_preserves_lua55_global_structure_as_typed_table_operations() {
 }
 
 #[test]
+fn public_ir_lua55_global_declaration_without_initializer_preserves_existing_value() {
+    let ir = lower(
+        &resolved(
+            b"global collectgarbage; return collectgarbage",
+            LanguageProfile::Lua55,
+        ),
+        &IrLimits::default(),
+    )
+    .unwrap();
+    let root = ir.prototype_for(FunctionId(0)).unwrap();
+    assert!(
+        !root
+            .instructions
+            .iter()
+            .any(|entry| matches!(entry.instruction, Instruction::SetTable { .. })),
+        "沒有 initializer 的 global 宣告不得覆寫既有 _ENV 值"
+    );
+    assert!(root.instructions.iter().any(|entry| matches!(
+        entry.instruction,
+        Instruction::GetTable { table, .. } if table == root.global_environment
+    )));
+
+    let store_values = |source: &[u8]| {
+        let ir = lower(
+            &resolved(source, LanguageProfile::Lua55),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        root.instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, entry)| match entry.instruction {
+                Instruction::SetTable { value, .. } => {
+                    let definition = root.instructions[..pc].iter().rev().find_map(|entry| {
+                        match entry.instruction {
+                            Instruction::LoadConst { dest, .. } if dest == value => {
+                                Some("constant")
+                            }
+                            Instruction::LoadNil { start, count }
+                                if start.0 <= value.0
+                                    && value.0 < start.0.saturating_add(count) =>
+                            {
+                                Some("nil")
+                            }
+                            _ => None,
+                        }
+                    });
+                    Some(definition.expect("global store 的來源必須在此前定義"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(store_values(b"global a,b=1"), ["constant", "nil"]);
+    assert_eq!(store_values(b"global a=nil"), ["nil"]);
+}
+
+#[test]
 fn public_ir_is_deterministic_and_stops_before_limits() {
     let resolved_binary = resolved(b"return 1+2", LanguageProfile::Lua55);
     assert_eq!(
@@ -467,9 +526,32 @@ fn public_ir_preserves_repeat_numeric_and_generic_for_lowering_semantics() {
             })
             .expect("repeat backedge branch");
         assert!(condition < close && close < branch);
+        let Instruction::JumpIfFalse {
+            condition: condition_value,
+            target: false_cleanup,
+        } = repeat_root.instructions[branch].instruction
+        else {
+            unreachable!()
+        };
+        let false_cleanup = false_cleanup.0 as usize;
+        let clears_condition = |instruction: &Instruction| {
+            matches!(instruction, Instruction::LoadNil { start, count }
+                if u32::from(start.0) <= u32::from(condition_value.0)
+                    && u32::from(condition_value.0) < u32::from(start.0) + u32::from(*count))
+        };
+        assert!(clears_condition(
+            &repeat_root.instructions[branch + 1].instruction
+        ));
+        assert!(clears_condition(
+            &repeat_root.instructions[false_cleanup].instruction
+        ));
         assert!(matches!(
-            repeat_root.instructions[branch].instruction,
-            Instruction::JumpIfFalse { target, .. } if (target.0 as usize) < branch
+            repeat_root.instructions[false_cleanup + 1].instruction,
+            Instruction::Jump { target } if (target.0 as usize) < branch
+        ));
+        assert!(matches!(
+            repeat_root.instructions[branch + 2].instruction,
+            Instruction::Jump { target } if (target.0 as usize) > false_cleanup + 1
         ));
 
         let numeric = lower(
@@ -820,10 +902,22 @@ fn public_ir_generic_for_break_skips_normal_closing_path() {
         let normal_close = normal_closes[0];
         assert!(break_close < normal_close);
 
-        let break_target = match root.instructions[break_close + 1].instruction {
-            Instruction::Jump { target } => target.0 as usize,
-            _ => panic!("Break ClosePath 後必須跳出 generic-for"),
-        };
+        let (break_jump, break_target) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .skip(break_close + 1)
+            .find_map(|(pc, entry)| match entry.instruction {
+                Instruction::Jump { target } => Some((pc, target.0 as usize)),
+                _ => None,
+            })
+            .expect("Break ClosePath 與 cleanup 後必須跳出 generic-for");
+        assert!(
+            root.instructions[break_close + 1..break_jump]
+                .iter()
+                .all(|entry| matches!(entry.instruction, Instruction::LoadNil { .. })),
+            "break 關閉 hidden binding 後只能清除離開的 register"
+        );
         let nil_target = root
             .instructions
             .iter()
@@ -1019,6 +1113,386 @@ fn public_ir_snapshots_table_assignment_targets_before_rhs_and_commit() {
         assert!(key_snapshot_index < call_index && call_index < set_index);
         rivetlua_compiler::emit(&call_ir, &rivetlua_compiler::VerifyLimits::default())
             .expect("snapshot assignment RVLU_V2 必須通過 verifier");
+    }
+}
+
+#[test]
+fn public_ir_releases_anonymous_assignment_temporaries_after_last_store() {
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        let ir = lower(
+            &resolved(b"local a={}; a[{}]=1; return a", profile),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let table_allocations = root
+            .instructions
+            .iter()
+            .filter_map(|entry| match entry.instruction {
+                Instruction::NewTable { dest } => Some(dest),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(table_allocations.len(), 2);
+        let temporary_start = table_allocations[1];
+        let (store_pc, table, key, value) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(pc, entry)| match entry.instruction {
+                Instruction::SetTable { table, key, value } => Some((pc, table, key, value)),
+                _ => None,
+            })
+            .expect("anonymous assignment 必須有 SetTable");
+        let next = &root.instructions[store_pc + 1];
+        let Instruction::LoadNil { start, count } = next.instruction else {
+            panic!("最後 SetTable 後必須立即清除 statement 暫存器");
+        };
+        assert_eq!(start, temporary_start);
+        let end = u32::from(start.0) + u32::from(count);
+        for register in [table, key, value] {
+            assert!(u32::from(register.0) < end);
+            assert!(register.0 >= start.0);
+        }
+        assert_eq!(next.span, root.instructions[store_pc].span);
+        rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default())
+            .expect("新增 cleanup 後 RVLU_V2 仍須可驗證");
+        let limit = IrLimits {
+            max_instructions: store_pc + 1,
+            ..IrLimits::default()
+        };
+        let error = lower(&resolved(b"local a={}; a[{}]=1; return a", profile), &limit)
+            .expect_err("cleanup 亦須支付一筆 IR instruction 額度");
+        assert_eq!(error.span, next.span);
+        assert!(error.message.contains("instruction 數超過 IR 限制"));
+    }
+}
+
+#[test]
+fn public_ir_clears_local_initializer_source_after_binding_move() {
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        let ir = lower(
+            &resolved(b"do local t={} end; return 1", profile),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let (alloc_pc, temporary) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(pc, entry)| match entry.instruction {
+                Instruction::NewTable { dest } => Some((pc, dest)),
+                _ => None,
+            })
+            .unwrap();
+        let binding = root
+            .binding_registers
+            .iter()
+            .map(|(_, register)| *register)
+            .find(|register| *register != root.global_environment)
+            .unwrap();
+        let (move_pc, base) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(pc, entry)| match entry.instruction {
+                Instruction::Move { dest, src } if dest == binding => Some((pc, src)),
+                _ => None,
+            })
+            .unwrap();
+        let cleanup = &root.instructions[move_pc + 1].instruction;
+        assert!(
+            matches!(cleanup, Instruction::LoadNil { start, count }
+                if *start == base && start.0 <= temporary.0 && temporary.0 < start.0 + count),
+            "{profile:?}: NewTable pc={alloc_pc} R{}, binding Move pc={move_pc} R{}←R{}, next={cleanup:?}",
+            temporary.0,
+            binding.0,
+            base.0,
+        );
+    }
+}
+
+fn assert_statement_call_private_interval(source: &[u8], kind: &str) {
+    let mut missing = Vec::new();
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        let ir = lower(&resolved(source, profile), &IrLimits::default()).unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let live = root
+            .binding_registers
+            .iter()
+            .find_map(|(_, register)| (*register != root.global_environment).then_some(*register))
+            .unwrap();
+        let (call_pc, base, arg_count) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(pc, entry)| match entry.instruction {
+                Instruction::Call {
+                    base,
+                    arg_count,
+                    result_mode: ResultMode::Fixed(0),
+                } => Some((pc, base, arg_count)),
+                _ => None,
+            })
+            .expect("call statement 必須產生 Fixed(0) Call");
+        let (prior_pc, prior_end) = root.instructions[..call_pc]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(pc, entry)| match entry.instruction {
+                Instruction::LoadNil { start, count } => Some((pc, start.0 + count)),
+                _ => None,
+            })
+            .expect("前一個 local initializer 必須清除暫存器");
+        let (return_base, return_pc) = root.instructions[call_pc + 1..]
+            .iter()
+            .enumerate()
+            .find_map(|(offset, entry)| match entry.instruction {
+                Instruction::Return {
+                    base,
+                    result_mode: ResultMode::Fixed(1),
+                } => Some((base, call_pc + 1 + offset)),
+                _ => None,
+            })
+            .expect("外層 live binding 必須可回傳");
+        assert!(live.0 < prior_end && prior_end < return_base.0);
+        assert!(
+            root.instructions[call_pc + 1..return_pc]
+                .iter()
+                .any(|entry| {
+                    matches!(entry.instruction, Instruction::Move { dest, src }
+                if dest == return_base && src == live)
+                })
+        );
+
+        let mut get_table = Vec::new();
+        let mut new_table = Vec::new();
+        let mut nested_calls = Vec::new();
+        for entry in &root.instructions[prior_pc + 1..=call_pc] {
+            let register = match entry.instruction {
+                Instruction::GetTable { dest, .. } => {
+                    get_table.push(dest);
+                    Some(dest)
+                }
+                Instruction::NewTable { dest } => {
+                    new_table.push(dest);
+                    Some(dest)
+                }
+                Instruction::Move { dest, .. } => Some(dest),
+                Instruction::Call {
+                    base, result_mode, ..
+                } => {
+                    if result_mode != ResultMode::Fixed(0) {
+                        nested_calls.push((base, result_mode));
+                    }
+                    Some(base)
+                }
+                _ => None,
+            };
+            if let Some(register) = register {
+                assert!(
+                    prior_end <= register.0 && register.0 < return_base.0,
+                    "{profile:?} {kind}: R{} 不在 statement-private interval R{prior_end}..R{}",
+                    register.0,
+                    return_base.0
+                );
+            }
+        }
+        assert!(
+            !get_table.is_empty(),
+            "{profile:?} {kind}: 缺少 private callee"
+        );
+        assert!(
+            !new_table.is_empty(),
+            "{profile:?} {kind}: 缺少 private argument"
+        );
+        assert!(base.0 >= prior_end && base.0 < return_base.0);
+        match kind {
+            "normal" => assert_eq!(arg_count, 2),
+            "method" => {
+                assert_eq!(arg_count, 3);
+                assert!(
+                    nested_calls
+                        .iter()
+                        .any(|(_, mode)| *mode == ResultMode::Fixed(1))
+                );
+            }
+            "open" => {
+                assert_eq!(arg_count, u16::MAX);
+                assert!(
+                    nested_calls
+                        .iter()
+                        .any(|(_, mode)| *mode == ResultMode::All)
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        let expected_count = root.register_count - prior_end;
+        let next = root
+            .instructions
+            .get(call_pc + 1)
+            .map(|entry| &entry.instruction);
+        if !matches!(next, Some(Instruction::LoadNil { start, count })
+            if start.0 == prior_end && *count == expected_count)
+        {
+            missing.push(format!(
+                "{profile:?} {kind}: Call pc={call_pc} 後為 {next:?}，預期 LoadNil R{prior_end} count={expected_count}"
+            ));
+        }
+        rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default())
+            .expect("call statement RVLU_V2 必須通過 verifier");
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+#[test]
+fn public_ir_clears_normal_call_statement_private_interval() {
+    assert_statement_call_private_interval(b"local live={}; sink(live,{}); return live", "normal");
+}
+
+#[test]
+fn public_ir_clears_method_call_statement_private_interval() {
+    assert_statement_call_private_interval(
+        b"local live={}; make():m(live,{}); return live",
+        "method",
+    );
+}
+
+#[test]
+fn public_ir_clears_open_last_call_statement_private_interval() {
+    assert_statement_call_private_interval(
+        b"local live={}; sink(live,{},produce()); return live",
+        "open",
+    );
+}
+
+#[test]
+fn public_ir_call_statement_tail_cleanup_preserves_backedge_bindings() {
+    let source = b"local keep={v=7}; local sum=0; local calls=0; \
+        local function touch() calls=calls+1 end; \
+        for i=1,2 do touch(); local later={v=i}; \
+          sum=sum+later.v+keep.v end; \
+        return sum,calls,keep.v";
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        let ir = lower(&resolved(source, profile), &IrLimits::default()).unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let (call_pc, base) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(pc, entry)| match entry.instruction {
+                Instruction::Call {
+                    base,
+                    arg_count: 0,
+                    result_mode: ResultMode::Fixed(0),
+                } => Some((pc, base)),
+                _ => None,
+            })
+            .expect("loop 內 touch() 必須產生 call statement");
+        let Instruction::LoadNil { start, count } = root.instructions[call_pc + 1].instruction
+        else {
+            panic!("{profile:?}: call 後缺少靜態暫存清理");
+        };
+        assert!(start.0 <= base.0 && base.0 < start.0 + count);
+        assert_eq!(start.0 + count, root.register_count);
+        assert!(
+            root.binding_registers
+                .iter()
+                .all(|(_, binding)| binding.0 < start.0),
+            "{profile:?}: 目前及後宣告 binding 不可位於 cleanup 範圍"
+        );
+        rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default()).unwrap();
+    }
+}
+
+#[test]
+fn public_ir_clears_exited_block_binding_before_following_return() {
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        let ir = lower(
+            &resolved(b"do local t={} end; return 1", profile),
+            &IrLimits::default(),
+        )
+        .unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let binding = root
+            .binding_registers
+            .iter()
+            .map(|(_, register)| *register)
+            .find(|register| *register != root.global_environment)
+            .unwrap();
+        let (move_pc, _base) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(pc, entry)| match entry.instruction {
+                Instruction::Move { dest, src } if dest == binding => Some((pc, src)),
+                _ => None,
+            })
+            .unwrap();
+        let return_pc = root
+            .instructions
+            .iter()
+            .enumerate()
+            .skip(move_pc + 1)
+            .find_map(|(pc, entry)| {
+                matches!(entry.instruction, Instruction::Return { .. }).then_some(pc)
+            })
+            .unwrap();
+        assert!(
+            root.instructions[move_pc + 1..return_pc].iter().any(
+                |entry| matches!(entry.instruction,
+                    Instruction::LoadNil { start, count }
+                    if start.0 <= binding.0 && binding.0 < start.0 + count)
+            ),
+            "{profile:?}: Move pc={move_pc} binding R{}, Return pc={return_pc}; exit 未清 binding",
+            binding.0,
+        );
+    }
+}
+
+#[test]
+fn public_ir_clears_local_function_closure_source_after_binding_move() {
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        let source = b"local function f() return 7 end; return f";
+        let ir = lower(&resolved(source, profile), &IrLimits::default()).unwrap();
+        let root = ir.prototype_for(FunctionId(0)).unwrap();
+        let closure = root
+            .instructions
+            .iter()
+            .find_map(|entry| match entry.instruction {
+                Instruction::Closure { dest, .. } => Some(dest),
+                _ => None,
+            })
+            .unwrap();
+        let (move_pc, binding) = root
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(pc, entry)| match entry.instruction {
+                Instruction::Move { dest, src } if src == closure => Some((pc, dest)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            root.binding_registers
+                .iter()
+                .any(|(_, register)| *register == binding)
+        );
+        assert!(matches!(
+            root.instructions[move_pc + 1].instruction,
+            Instruction::LoadNil { start, count: 1 } if start == closure
+        ));
+        rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default()).unwrap();
+        let limit = IrLimits {
+            max_instructions: move_pc + 1,
+            ..IrLimits::default()
+        };
+        let error = lower(&resolved(source, profile), &limit)
+            .expect_err("closure 暫存清除必須支付 IR instruction 額度");
+        assert!(error.message.contains("instruction 數超過 IR 限制"));
     }
 }
 
@@ -1573,10 +2047,17 @@ fn public_codegen_finishes_reachable_fallthrough_with_empty_return() {
         )
         .unwrap();
         let root = ir.prototype_for(FunctionId(0)).unwrap();
-        assert!(matches!(
-            root.instructions[root.instructions.len() - 2].instruction,
-            Instruction::Close { .. }
-        ));
+        let return_pc = root.instructions.len() - 1;
+        let close_pc = (0..return_pc)
+            .rev()
+            .find(|&pc| matches!(root.instructions[pc].instruction, Instruction::Close { .. }))
+            .expect("落尾前須關閉 <close> binding");
+        assert!(
+            root.instructions[close_pc + 1..return_pc]
+                .iter()
+                .all(|entry| matches!(entry.instruction, Instruction::LoadNil { .. })),
+            "<close> callback 後只能清除已離開的 binding"
+        );
         assert!(matches!(
             root.instructions.last().map(|entry| &entry.instruction),
             Some(Instruction::Return {

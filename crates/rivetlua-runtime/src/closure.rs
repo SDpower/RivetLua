@@ -12,6 +12,7 @@ pub struct Closure {
     prototype: ProtoId,
     upvalues: Vec<ObjectRef>,
     environment: Option<Value>,
+    environment_cell: Option<ObjectRef>,
     ledger: AllocationLedger,
     charge: usize,
 }
@@ -41,6 +42,7 @@ impl Closure {
             prototype,
             upvalues,
             environment,
+            environment_cell: None,
             ledger: ledger.clone(),
             charge,
         })
@@ -58,8 +60,27 @@ impl Closure {
         self.upvalues.get(index).copied()
     }
 
+    pub(crate) fn replace_upvalue(&mut self, index: usize, value: ObjectRef) -> Option<ObjectRef> {
+        self.upvalues
+            .get_mut(index)
+            .map(|slot| core::mem::replace(slot, value))
+    }
+
     pub(crate) fn environment(&self) -> Option<Value> {
         self.environment
+    }
+
+    pub(crate) fn environment_cell(&self) -> Option<ObjectRef> {
+        self.environment_cell
+    }
+
+    pub(crate) fn has_environment(&self) -> bool {
+        self.environment.is_some() || self.environment_cell.is_some()
+    }
+
+    pub(crate) fn set_environment_cell(&mut self, cell: ObjectRef) {
+        self.environment = None;
+        self.environment_cell = Some(cell);
     }
 
     pub(crate) fn trace_children(
@@ -69,6 +90,9 @@ impl Closure {
         visit(self.module)?;
         if let Some(Value::Object(environment)) = self.environment {
             visit(environment)?;
+        }
+        if let Some(cell) = self.environment_cell {
+            visit(cell)?;
         }
         for &upvalue in &self.upvalues {
             visit(upvalue)?;

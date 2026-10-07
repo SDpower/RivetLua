@@ -410,12 +410,18 @@ impl<'a> Scan<'a> {
         let mut tbc = 0_u128;
         let mut close_exits = 0_u128;
         let mut fixed_list_values = 0_u128;
+        let mut concat_values = 0_u128;
         let mut maximum_list = 3_u128;
         let mut numeric = 0_u128;
         let mut internal_calls = 0_u128;
         for word in code_bytes.chunks_exact(4) {
             let word = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
             match (word & 0x7f) as u8 {
+                53 => add(
+                    &mut concat_values,
+                    u128::from((word >> 16) & 0xff),
+                    self.offset,
+                )?,
                 55 | 75 => tbc += 1,
                 54 | 69..=72 => close_exits += 1,
                 74 => numeric += 1,
@@ -439,9 +445,12 @@ impl<'a> Scan<'a> {
         let stack = max_stack as u128;
         let expanded = sum(
             &[
-                n.checked_mul(16)
+                // 固定 lowering 的最大值是 TFORCALL 的 7 條；SETLIST
+                // 的逐值複製、CONCAT 的逐值合併及 close 路徑另外計入。
+                n.checked_mul(7)
                     .ok_or_else(|| budget_overflow(self.offset))?,
                 fixed_list_values,
+                concat_values,
                 close_exits
                     .checked_mul(
                         stack
@@ -503,8 +512,9 @@ impl<'a> Scan<'a> {
         )?;
         add(
             &mut self.stats.source_cfg_work,
-            n.checked_mul(n)
-                .and_then(|units| units.checked_mul(tbc + 2))
+            // close flow 每個 PC 入 worklist 至多一次，出邊至多兩條；
+            // 每次狀態比較與關閉至多走訪 TBC 深度。
+            n.checked_mul(tbc + 2)
                 .ok_or_else(|| budget_overflow(self.offset))?,
             self.offset,
         )?;
@@ -883,8 +893,9 @@ pub fn preflight_official_chunk(
         offset,
     )?;
     let decoded = sum(&[mul(decoded, 2, offset)?, 512], offset)?;
-    // E_p=參數 prologue+每 op 最多 16 條基本 lowering+SETLIST 固定值
-    // 複製+關閉時 captured≤stack 與 active≤TBC+8 條 prologue。
+    // E_p=參數 prologue+每 op 最多 7 條固定 lowering（TFORCALL）
+    // +CONCAT 逐值合併+SETLIST 固定值複製+關閉時 captured≤stack
+    // 與 active≤TBC+8 條 prologue。各項按 source prototype 分別計入。
     let expanded = s.expanded_instructions;
     let close_cells = s.close_cells;
     let constants_upper = sum(&[c, mul(i, 4, offset)?, mul(p, 16, offset)?], offset)?;
@@ -1057,4 +1068,205 @@ pub fn preflight_official_chunk(
         constants: bounded(c, offset)?,
         expanded_instructions: bounded(expanded, offset)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytecode::official::{
+        OfficialChunk, OfficialDebug, OfficialPrototype, decode_official_chunk,
+        encode_official_chunk,
+    };
+    use crate::bytecode::official_translation::{
+        OfficialWorkBudget, translate_official_chunk_with_work,
+    };
+    use crate::verified_module_allocation_bytes;
+
+    #[test]
+    fn official_preflight_bounds_small_decode_translation_and_rejects_hostile_counts() {
+        for (profile, bytes) in [
+            (
+                LuaProfile::Lua54,
+                include_bytes!("../../tests/official_chunk_fixtures/lua54-debug.luac").as_slice(),
+            ),
+            (
+                LuaProfile::Lua55,
+                include_bytes!("../../tests/official_chunk_fixtures/lua55-debug.luac").as_slice(),
+            ),
+        ] {
+            let limits = OfficialChunkLimits::default();
+            let verify = VerifyLimits::default();
+            let stats = preflight_official_chunk(bytes, profile, &limits, &verify).unwrap();
+            let mut decode_limits = limits;
+            decode_limits.max_allocated_bytes = stats.decoded_bytes;
+            let decoded = decode_official_chunk(bytes, profile, &decode_limits).unwrap();
+            let mut work = OfficialWorkBudget::new(stats.subsequent_work);
+            let translated =
+                translate_official_chunk_with_work(&decoded, &verify, &mut work).unwrap();
+            assert!(work.consumed() <= stats.subsequent_work);
+            assert!(
+                verified_module_allocation_bytes(translated.verified()).unwrap()
+                    <= stats.retained_bytes
+            );
+
+            let mut count_limited = limits;
+            count_limited.max_instructions = 1;
+            assert_eq!(
+                preflight_official_chunk(bytes, profile, &count_limited, &verify)
+                    .unwrap_err()
+                    .kind,
+                OfficialChunkErrorKind::LimitExceeded
+            );
+            let mut string_limited = limits;
+            string_limited.max_string_bytes = 0;
+            assert_eq!(
+                preflight_official_chunk(bytes, profile, &string_limited, &verify)
+                    .unwrap_err()
+                    .kind,
+                OfficialChunkErrorKind::LimitExceeded
+            );
+            let mut scan = Scan {
+                input: bytes,
+                offset: 0,
+                profile,
+                limits: &limits,
+                verify: &verify,
+                stats: Stats::default(),
+            };
+            scan.header().unwrap();
+            scan.byte().unwrap();
+            if profile == LuaProfile::Lua54 {
+                scan.string().unwrap();
+            }
+            scan.int().unwrap();
+            scan.int().unwrap();
+            scan.byte().unwrap();
+            scan.byte().unwrap();
+            scan.byte().unwrap();
+            let mut overflowing = bytes[..scan.offset].to_vec();
+            overflowing
+                .extend_from_slice(&[if profile == LuaProfile::Lua54 { 0 } else { 128 }; 10]);
+            assert_eq!(
+                preflight_official_chunk(&overflowing, profile, &limits, &verify)
+                    .unwrap_err()
+                    .kind,
+                OfficialChunkErrorKind::Overflow
+            );
+        }
+    }
+
+    #[test]
+    fn official_preflight_counts_long_concat_expansion_in_both_profiles() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let source = OfficialChunk {
+                profile,
+                root_upvalues: 0,
+                main: OfficialPrototype {
+                    source: None,
+                    line_defined: 0,
+                    last_line_defined: 0,
+                    num_params: 0,
+                    flags: 0,
+                    max_stack_size: 255,
+                    code: vec![53 | (255 << 16), 71],
+                    constants: vec![],
+                    upvalues: vec![],
+                    children: vec![],
+                    debug: OfficialDebug::default(),
+                },
+            };
+            let limits = OfficialChunkLimits::default();
+            let verify = VerifyLimits::default();
+            let bytes = encode_official_chunk(&source, false, &limits).unwrap();
+            let stats = preflight_official_chunk(&bytes, profile, &limits, &verify).unwrap();
+            let mut decode_limits = limits;
+            decode_limits.max_allocated_bytes = stats.decoded_bytes;
+            let decoded = decode_official_chunk(&bytes, profile, &decode_limits).unwrap();
+            let mut work = OfficialWorkBudget::new(stats.subsequent_work);
+            let translated =
+                translate_official_chunk_with_work(&decoded, &verify, &mut work).unwrap();
+            assert!(
+                translated.verified().module().prototypes[0]
+                    .instructions
+                    .len()
+                    >= 256
+            );
+            assert!(work.consumed() <= stats.subsequent_work);
+            assert!(
+                verified_module_allocation_bytes(translated.verified()).unwrap()
+                    <= stats.retained_bytes
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "需明示固定的 P15 db.lua 官方 chunk 路徑"]
+    fn p15_db_preflight_formula_diagnostic() {
+        let path = std::env::var_os("RIVETLUA_P15_DB_CHUNK").expect("官方 chunk 路徑");
+        let bytes = std::fs::read(path).unwrap();
+        let limits = OfficialChunkLimits::default();
+        let verify = VerifyLimits::default();
+        let mut scan = Scan {
+            input: &bytes,
+            offset: 0,
+            profile: LuaProfile::Lua55,
+            limits: &limits,
+            verify: &verify,
+            stats: Stats::default(),
+        };
+        scan.header().unwrap();
+        let roots = scan.byte().unwrap();
+        assert_eq!(scan.prototype(1, None).unwrap(), roots as usize);
+        assert_eq!(scan.offset, bytes.len());
+        let stats = &scan.stats;
+        let result = preflight_official_chunk(&bytes, LuaProfile::Lua55, &limits, &verify).unwrap();
+        eprintln!(
+            "p15 db stats instruction_squares={} expanded={} stack_slots={} register_slots={} binding_capacity={} binding_squares={} close_cells={} source_metered_work={} source_cfg_work={} plan_metered_work={} source_work_bytes={} numeric_cfg_bytes={} numeric_dominator_work={} internal_calls={} call_inputs={} result={result:?}",
+            stats.instruction_squares,
+            stats.expanded_instructions,
+            stats.stack_slots,
+            stats.register_slots,
+            stats.binding_capacity,
+            stats.binding_squares,
+            stats.close_cells,
+            stats.source_metered_work,
+            stats.source_cfg_work,
+            stats.plan_metered_work,
+            stats.source_work_bytes,
+            stats.numeric_cfg_bytes,
+            stats.numeric_dominator_work,
+            stats.internal_calls,
+            stats.call_inputs,
+        );
+        eprintln!(
+            "p15 db sizes instruction={} constant={} upvalue={} prototype={} binding={} close={} plan_call={} pc_map={} rvlu_pc={} source_prototype={} source_constant={} source_upvalue={} source_local={}",
+            size_of::<BytecodeInstruction>(),
+            size_of::<BytecodeConstant>(),
+            size_of::<BytecodeUpvalue>(),
+            size_of::<BytecodePrototype>(),
+            size_of::<(BytecodeBindingId, Register)>(),
+            size_of::<BytecodeClosePath>(),
+            size_of::<OfficialPlanCall>(),
+            size_of::<OfficialPcMap>(),
+            size_of::<OfficialRvluPc>(),
+            size_of::<super::super::official::OfficialPrototype>(),
+            size_of::<super::super::official::OfficialConstant>(),
+            size_of::<super::super::official::OfficialUpvalue>(),
+            size_of::<super::super::official::OfficialLocal>(),
+        );
+        let prescan = bytes.len() * 2 + 1;
+        assert!(result.subsequent_work + prescan as u64 <= 2 * 1024 * 1024 * 1024);
+        assert!(result.temporary_bytes <= 256 * 1024 * 1024);
+        assert!(result.retained_bytes <= 64 * 1024 * 1024);
+        let mut decode_limits = limits;
+        decode_limits.max_allocated_bytes = result.decoded_bytes;
+        let decoded = decode_official_chunk(&bytes, LuaProfile::Lua55, &decode_limits).unwrap();
+        let mut work = OfficialWorkBudget::new(result.subsequent_work);
+        let translated = translate_official_chunk_with_work(&decoded, &verify, &mut work).unwrap();
+        assert!(work.consumed() <= result.subsequent_work);
+        assert!(
+            verified_module_allocation_bytes(translated.verified()).unwrap()
+                <= result.retained_bytes
+        );
+    }
 }

@@ -164,14 +164,17 @@ fn native_debugged(profile: LuaProfile) -> rivetlua_core::VerifiedModule {
             .iter()
             .map(|prototype| NativePrototypeDebug {
                 prototype: prototype.id,
-                line_defined: 1,
-                last_line_defined: 1,
+                line_defined: 0,
+                last_line_defined: 0,
                 lines: vec![1; prototype.instructions.len()],
                 locals: Vec::new(),
                 upvalue_names: vec![None; prototype.upvalues.len()],
                 max_active_locals: 0,
             })
             .collect(),
+        temporaries: Vec::new(),
+        initializer_temporaries: Vec::new(),
+        non_counted_pcs: Vec::new(),
     };
     let mut work = OfficialWorkBudget::for_limits(&VerifyLimits::default()).unwrap();
     encode_module(module, profile, &VerifyLimits::default())

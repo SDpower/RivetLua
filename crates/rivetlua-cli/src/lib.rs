@@ -5,16 +5,22 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rivetlua::{
-    AbortReason, CompileBudget, ContainerLimits, Engine, HostLoadError, HostLoadErrorKind,
-    HostModuleBytes, HostModuleRepository, HostOutput, HostOutputError, HostServices,
+    AbortReason, CompileBudget, ContainerLimits, DebugCapability, DebugPermission, DumpCapability,
+    DumpLimits, Engine, HostDeadline, HostEntropy, HostEntropyError, HostLoadError,
+    HostLoadErrorKind, HostModuleBytes, HostModuleRepository, HostOs, HostOsOperation, HostOsValue,
+    HostOutput, HostOutputError, HostResourceError, HostResourceErrorKind, HostServices,
     HostSourceReader, InputFormat, LoadBudget, LoadCapability, LoadFormat, LoadLimits, LuaProfile,
-    Module, RunOutcome, SdkError, TransportBudget, Value, Vm,
+    Module, ResourceBudget, ResourceCapability, RunOutcome, SdkError, TransportBudget, Value, Vm,
 };
 
 const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_READER_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HOST_LOAD_TEMPORARY_BYTES: usize = 256 * 1024 * 1024;
+const MAX_HOST_LOAD_WORK_UNITS: usize = 2 * 1024 * 1024 * 1024;
+const CLI_EXECUTION_FUEL: u64 = 8_000_000_000;
 const READ_CHUNK_BYTES: usize = 1024;
 const DEFAULT_LUA_PATH: &[u8] = b"./?.lua;./?/init.lua";
 const DEFAULT_LUA_CPATH: &[u8] = b"";
@@ -68,6 +74,16 @@ struct Options {
     stdin_as_file_after_double_dash: bool,
 }
 
+#[cfg(feature = "default-lua54")]
+const fn default_profile() -> LuaProfile {
+    LuaProfile::Lua54
+}
+
+#[cfg(not(feature = "default-lua54"))]
+const fn default_profile() -> LuaProfile {
+    LuaProfile::Lua55
+}
+
 fn os_bytes(value: &OsStr) -> Vec<u8> {
     #[cfg(unix)]
     {
@@ -93,7 +109,7 @@ fn os_from_bytes(value: &[u8]) -> OsString {
 }
 
 fn parse_options(args: &[OsString]) -> CliResult<Options> {
-    let mut profile = LuaProfile::Lua55;
+    let mut profile = default_profile();
     let mut ignore_environment = false;
     let mut show_version = false;
     let mut interactive = false;
@@ -213,6 +229,166 @@ impl HostOutput for StdoutOutput {
             .write_all(bytes)
             .map_err(|_| HostOutputError::WriteFailed)
     }
+}
+
+struct OsEntropy;
+
+impl HostEntropy for OsEntropy {
+    fn seed(&mut self) -> Result<u64, HostEntropyError> {
+        #[cfg(unix)]
+        {
+            let mut source =
+                File::open("/dev/urandom").map_err(|_| HostEntropyError::ReadFailed)?;
+            read_entropy_seed(&mut source)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(HostEntropyError::ReadFailed)
+        }
+    }
+}
+
+#[cfg(any(unix, test))]
+fn read_entropy_seed(source: &mut impl Read) -> Result<u64, HostEntropyError> {
+    let mut bytes = [0_u8; 8];
+    source
+        .read_exact(&mut bytes)
+        .map_err(|_| HostEntropyError::ReadFailed)?;
+    Ok(u64::from_ne_bytes(bytes))
+}
+
+struct CliOs;
+
+impl HostOs for CliOs {
+    fn authorize(
+        &mut self,
+        operation: HostOsOperation<'_>,
+        budget: &mut ResourceBudget<'_>,
+    ) -> Result<(), HostResourceError> {
+        budget.spend_work(1)?;
+        match operation {
+            HostOsOperation::Clock
+            | HostOsOperation::Time(None)
+            | HostOsOperation::Locale(_, _) => Ok(()),
+            _ => Err(HostResourceError::new(
+                HostResourceErrorKind::PolicyDenied,
+                Vec::new(),
+            )),
+        }
+    }
+
+    fn authorize_path(
+        &mut self,
+        _path: &[u8],
+        budget: &mut ResourceBudget<'_>,
+    ) -> Result<(), HostResourceError> {
+        budget.spend_work(1)?;
+        Err(HostResourceError::new(
+            HostResourceErrorKind::PolicyDenied,
+            Vec::new(),
+        ))
+    }
+
+    fn perform(
+        &mut self,
+        operation: HostOsOperation<'_>,
+        budget: &mut ResourceBudget<'_>,
+    ) -> Result<HostOsValue, HostResourceError> {
+        budget.spend_work(1)?;
+        match operation {
+            HostOsOperation::Clock => {
+                #[cfg(any(unix, windows))]
+                {
+                    let process_time = cpu_time::ProcessTime::try_now().map_err(|_| {
+                        HostResourceError::new(HostResourceErrorKind::IoFailure, Vec::new())
+                    })?;
+                    let seconds = process_time.as_duration().as_secs_f64();
+                    if !seconds.is_finite() || seconds < 0.0 {
+                        return Err(HostResourceError::new(
+                            HostResourceErrorKind::IoFailure,
+                            Vec::new(),
+                        ));
+                    }
+                    Ok(HostOsValue::Number(seconds))
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    Err(HostResourceError::new(
+                        HostResourceErrorKind::Unsupported,
+                        Vec::new(),
+                    ))
+                }
+            }
+            HostOsOperation::Time(None) => Ok(HostOsValue::Time {
+                epoch: unix_epoch_seconds(SystemTime::now())?,
+                normalized: None,
+            }),
+            HostOsOperation::Locale(None, _) | HostOsOperation::Locale(Some(b"C"), _) => {
+                budget.claim_temporary(1)?;
+                Ok(HostOsValue::Bytes(b"C".to_vec()))
+            }
+            HostOsOperation::Locale(Some(_), _) => Ok(HostOsValue::Nil),
+            _ => Err(HostResourceError::new(
+                HostResourceErrorKind::PolicyDenied,
+                Vec::new(),
+            )),
+        }
+    }
+}
+
+fn unix_epoch_seconds(time: SystemTime) -> Result<i64, HostResourceError> {
+    let range_error =
+        || HostResourceError::new(HostResourceErrorKind::PlatformDifference, Vec::new());
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).map_err(|_| range_error()),
+        Err(error) => {
+            let duration = error.duration();
+            let magnitude = if duration.subsec_nanos() == 0 {
+                duration.as_secs()
+            } else {
+                duration.as_secs().checked_add(1).ok_or_else(range_error)?
+            };
+            let min_magnitude = 1_u64 << 63;
+            if magnitude > min_magnitude {
+                Err(range_error())
+            } else if magnitude == min_magnitude {
+                Ok(i64::MIN)
+            } else {
+                Ok(-i64::try_from(magnitude).map_err(|_| range_error())?)
+            }
+        }
+    }
+}
+
+struct CliResourceDeadline {
+    expires_at: Option<Instant>,
+}
+
+impl CliResourceDeadline {
+    fn from_now() -> Self {
+        Self {
+            expires_at: Instant::now().checked_add(Duration::from_secs(3600)),
+        }
+    }
+}
+
+impl HostDeadline for CliResourceDeadline {
+    fn check(&mut self, budget: &mut ResourceBudget<'_>) -> Result<(), HostResourceError> {
+        budget.spend_work(1)?;
+        match self.expires_at {
+            Some(expires_at) if Instant::now() < expires_at => Ok(()),
+            _ => Err(HostResourceError::new(
+                HostResourceErrorKind::Deadline,
+                Vec::new(),
+            )),
+        }
+    }
+}
+
+fn cli_resource_capability(deadline: CliResourceDeadline) -> ResourceCapability {
+    ResourceCapability::deny_all()
+        .and_os(CliOs)
+        .and_deadline(deadline)
 }
 
 struct FsSourceReader;
@@ -413,11 +589,38 @@ fn load_limits() -> LoadLimits {
         max_source_bytes: MAX_READER_BYTES,
         max_encoded_bytes: 64 * 1024 * 1024,
         max_module_allocation_bytes: 64 * 1024 * 1024,
-        max_temporary_bytes: MAX_READER_BYTES + MAX_CANDIDATE_BYTES * 3,
-        max_work_units: 16 * 1024 * 1024,
+        max_temporary_bytes: MAX_HOST_LOAD_TEMPORARY_BYTES,
+        max_work_units: MAX_HOST_LOAD_WORK_UNITS,
         max_reader_chunks: 512,
         max_path_candidates: 512,
     }
+}
+
+fn dump_limits() -> DumpLimits {
+    DumpLimits {
+        max_work_units: 512 * 1024 * 1024,
+        max_temporary_bytes: 4 * 1024 * 1024,
+        max_encoded_bytes: 1024 * 1024,
+    }
+}
+
+fn debug_capability() -> DebugCapability {
+    DebugCapability::deny_all()
+        .allow(DebugPermission::Info)
+        .allow(DebugPermission::StackInspection)
+        .allow(DebugPermission::LocalInspection)
+        .allow(DebugPermission::LocalMutation)
+        .allow(DebugPermission::Upvalues)
+        .allow(DebugPermission::UpvalueMutation)
+        .allow(DebugPermission::UpvalueIdentity)
+        .allow(DebugPermission::RegistryRead)
+        .allow(DebugPermission::UserValueRead)
+        .allow(DebugPermission::UserValueWrite)
+        .allow(DebugPermission::Traceback)
+        .allow(DebugPermission::CountHook)
+        .allow(DebugPermission::EventHook)
+        .allow(DebugPermission::MetatableRead)
+        .allow(DebugPermission::TableMetatableWrite)
 }
 
 fn host_services(engine: &Engine) -> HostServices {
@@ -428,7 +631,15 @@ fn host_services(engine: &Engine) -> HostServices {
         .with_bytecode(true)
         .with_official_bytecode(true)
         .with_limits(load_limits());
-    HostServices::with_output(StdoutOutput).and_load(load)
+    let dump = DumpCapability::deny_all()
+        .with_official_bytecode(true)
+        .with_limits(dump_limits());
+    HostServices::with_output(StdoutOutput)
+        .and_load(load)
+        .and_entropy(OsEntropy)
+        .and_resource(cli_resource_capability(CliResourceDeadline::from_now()))
+        .and_dump(dump)
+        .and_debug(debug_capability())
 }
 
 fn version_line(profile: LuaProfile) -> &'static [u8] {
@@ -668,6 +879,15 @@ fn input_module(engine: &Engine, mut bytes: Vec<u8>, chunk_name: &[u8]) -> CliRe
     compile_source(engine, &bytes, chunk_name)
 }
 
+fn set_cli_execution_fuel(execution: &mut rivetlua::Execution<'_>) -> CliResult<()> {
+    execution.set_fuel(CLI_EXECUTION_FUEL).map_err(|error| {
+        CliFailure::failed(format!(
+            "Execution fuel 設定失敗 {}：{:?}",
+            error.diagnostic_id, error.kind
+        ))
+    })
+}
+
 fn write_bytes(writer: &mut dyn Write, bytes: &[u8]) -> CliResult<()> {
     writer
         .write_all(bytes)
@@ -686,6 +906,7 @@ fn run_module(
         let mut execution = vm
             .load_module_with_args(module, args)
             .map_err(sdk_failure)?;
+        set_cli_execution_fuel(&mut execution)?;
         execution.run()
     };
     let outcome = outcome.map_err(|error| {
@@ -738,6 +959,7 @@ fn print_interactive_values(
     let print = vm.root(print).map_err(sdk_failure)?;
     let outcome = {
         let mut execution = vm.call(&print, values).map_err(sdk_failure)?;
+        set_cli_execution_fuel(&mut execution)?;
         execution.run()
     };
     let outcome = outcome.map_err(|error| {
@@ -872,6 +1094,7 @@ fn run_require_action(vm: &mut Vm, argument: &[u8], errors: &mut dyn Write) -> C
         let mut execution = vm
             .call(&require, &[module_arg.value(vm).map_err(sdk_failure)?])
             .map_err(sdk_failure)?;
+        set_cli_execution_fuel(&mut execution)?;
         execution.run()
     };
     let outcome = outcome.map_err(|error| {
@@ -1130,10 +1353,74 @@ pub fn rivetluac_main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod cli_unit_tests {
-    use super::atomic_write;
+    #[cfg(not(unix))]
+    use super::OsEntropy;
+    use super::{
+        CLI_EXECUTION_FUEL, CliResourceDeadline, atomic_write, cli_resource_capability,
+        debug_capability, dump_limits, load_limits, read_entropy_seed, unix_epoch_seconds,
+    };
+    use rivetlua::{
+        DebugCapability, DebugPermission, Engine, HostEntropyError, HostResourceErrorKind,
+        HostServices, LuaProfile, ResourceCapability, ResourceLimits, RunOutcome, RuntimeErrorKind,
+        Value,
+    };
+    use std::io::{self, Cursor, Read};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn cli_dump_policy_uses_finite_work_temporary_and_encoded_limits() {
+        assert_eq!(
+            dump_limits(),
+            rivetlua::DumpLimits {
+                max_work_units: 512 * 1024 * 1024,
+                max_temporary_bytes: 4 * 1024 * 1024,
+                max_encoded_bytes: 1024 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn cli_load_policy_matches_finite_gc_work_temporary_and_fuel_caps() {
+        assert_eq!(
+            load_limits(),
+            rivetlua::LoadLimits {
+                max_source_bytes: 4 * 1024 * 1024,
+                max_encoded_bytes: 64 * 1024 * 1024,
+                max_module_allocation_bytes: 64 * 1024 * 1024,
+                max_temporary_bytes: 256 * 1024 * 1024,
+                max_work_units: 2 * 1024 * 1024 * 1024,
+                max_reader_chunks: 512,
+                max_path_candidates: 512,
+            }
+        );
+        assert_eq!(CLI_EXECUTION_FUEL, 8_000_000_000);
+    }
+
+    #[test]
+    fn cli_debug_policy_matches_official_suite_capabilities() {
+        assert_eq!(
+            debug_capability(),
+            DebugCapability::deny_all()
+                .allow(DebugPermission::Info)
+                .allow(DebugPermission::StackInspection)
+                .allow(DebugPermission::LocalInspection)
+                .allow(DebugPermission::LocalMutation)
+                .allow(DebugPermission::Upvalues)
+                .allow(DebugPermission::UpvalueMutation)
+                .allow(DebugPermission::UpvalueIdentity)
+                .allow(DebugPermission::RegistryRead)
+                .allow(DebugPermission::UserValueRead)
+                .allow(DebugPermission::UserValueWrite)
+                .allow(DebugPermission::Traceback)
+                .allow(DebugPermission::CountHook)
+                .allow(DebugPermission::EventHook)
+                .allow(DebugPermission::MetatableRead)
+                .allow(DebugPermission::TableMetatableWrite)
+        );
+    }
 
     #[test]
     fn cli_atomic_output_failure_preserves_destination_and_cleans_temporary_file() {
@@ -1158,6 +1445,209 @@ mod cli_unit_tests {
 
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn cli_entropy_reader_consumes_exactly_one_native_endian_seed() {
+        let bytes = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut source = Cursor::new(bytes);
+        assert_eq!(
+            read_entropy_seed(&mut source),
+            Ok(u64::from_ne_bytes(bytes[..8].try_into().unwrap()))
+        );
+        assert_eq!(source.position(), 8);
+    }
+
+    struct InterruptedOnceReader {
+        source: Cursor<[u8; 8]>,
+        interrupted: bool,
+    }
+
+    impl Read for InterruptedOnceReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            self.source.read(buffer)
+        }
+    }
+
+    #[test]
+    fn cli_entropy_reader_retries_interrupted_reads() {
+        let bytes = [8, 7, 6, 5, 4, 3, 2, 1];
+        let mut source = InterruptedOnceReader {
+            source: Cursor::new(bytes),
+            interrupted: false,
+        };
+        assert_eq!(
+            read_entropy_seed(&mut source),
+            Ok(u64::from_ne_bytes(bytes))
+        );
+        assert!(source.interrupted);
+        assert_eq!(source.source.position(), 8);
+    }
+
+    #[test]
+    fn cli_entropy_reader_maps_short_reads_and_read_errors_to_read_failed() {
+        let mut short = Cursor::new([0_u8; 7]);
+        assert_eq!(
+            read_entropy_seed(&mut short),
+            Err(HostEntropyError::ReadFailed)
+        );
+        assert_eq!(short.position(), 7);
+
+        struct FailingReader;
+
+        impl Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            }
+        }
+
+        assert_eq!(
+            read_entropy_seed(&mut FailingReader),
+            Err(HostEntropyError::ReadFailed)
+        );
+    }
+
+    #[test]
+    fn cli_unix_epoch_seconds_floor_negative_fractions() {
+        assert_eq!(unix_epoch_seconds(UNIX_EPOCH), Ok(0));
+        assert_eq!(
+            unix_epoch_seconds(
+                UNIX_EPOCH
+                    .checked_add(Duration::new(2, 999_999_999))
+                    .unwrap()
+            ),
+            Ok(2)
+        );
+        assert_eq!(
+            unix_epoch_seconds(UNIX_EPOCH.checked_sub(Duration::from_nanos(1)).unwrap()),
+            Ok(-1)
+        );
+        assert_eq!(
+            unix_epoch_seconds(UNIX_EPOCH.checked_sub(Duration::new(1, 1)).unwrap()),
+            Ok(-2)
+        );
+    }
+
+    #[test]
+    fn cli_unix_epoch_seconds_checks_i64_bounds_when_system_time_can_represent_them() {
+        let max_seconds = i64::MAX as u64;
+        if let Some(maximum) = UNIX_EPOCH.checked_add(Duration::from_secs(max_seconds)) {
+            assert_eq!(unix_epoch_seconds(maximum), Ok(i64::MAX));
+        }
+        if let Some(maximum_fraction) = UNIX_EPOCH
+            .checked_add(Duration::from_secs(max_seconds))
+            .and_then(|time| time.checked_add(Duration::from_nanos(999_999_999)))
+        {
+            assert_eq!(unix_epoch_seconds(maximum_fraction), Ok(i64::MAX));
+        }
+        if let Some(overflow) = UNIX_EPOCH.checked_add(Duration::from_secs(max_seconds + 1)) {
+            assert_eq!(
+                unix_epoch_seconds(overflow).unwrap_err().kind,
+                HostResourceErrorKind::PlatformDifference
+            );
+        }
+
+        let min_magnitude = 1_u64 << 63;
+        if let Some(minimum) = UNIX_EPOCH.checked_sub(Duration::from_secs(min_magnitude)) {
+            assert_eq!(unix_epoch_seconds(minimum), Ok(i64::MIN));
+        }
+        if let Some(underflow) = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(min_magnitude))
+            .and_then(|time| time.checked_sub(Duration::from_nanos(1)))
+        {
+            assert_eq!(
+                unix_epoch_seconds(underflow).unwrap_err().kind,
+                HostResourceErrorKind::PlatformDifference
+            );
+        }
+    }
+
+    fn run_resource_script(source: &[u8], resource: ResourceCapability) -> RunOutcome {
+        let engine = Engine::new(LuaProfile::Lua55);
+        let module = engine.compile(source).unwrap();
+        let mut vm = engine
+            .new_vm_with_services(HostServices::deny_all().and_resource(resource))
+            .unwrap();
+        vm.load_module(&module).unwrap().run().unwrap()
+    }
+
+    #[test]
+    fn cli_resource_deadline_expires_and_unrepresentable_deadline_fails_closed() {
+        for deadline in [
+            CliResourceDeadline {
+                expires_at: Some(Instant::now()),
+            },
+            CliResourceDeadline { expires_at: None },
+        ] {
+            let outcome =
+                run_resource_script(b"return os.clock()", cli_resource_capability(deadline));
+            let RunOutcome::LuaError(error) = outcome else {
+                panic!("expired resource deadline 應拒絕 host operation: {outcome:?}");
+            };
+            assert_eq!(error.kind, RuntimeErrorKind::HostDeadline);
+        }
+    }
+
+    #[test]
+    fn cli_resource_budget_is_charged_before_authorize_deadline_and_perform() {
+        for work_units in [0, 1, 2] {
+            let limits = ResourceLimits {
+                max_work_units: work_units,
+                ..ResourceLimits::default()
+            };
+            let deadline = CliResourceDeadline::from_now();
+            assert!(deadline.expires_at.is_some());
+            let resource = cli_resource_capability(deadline).with_limits(limits);
+            let outcome = run_resource_script(b"return os.time()", resource);
+            let RunOutcome::LuaError(error) = outcome else {
+                panic!("work_units={work_units} 應在 host effect 前耗盡: {outcome:?}");
+            };
+            assert_eq!(error.kind, RuntimeErrorKind::HostResourceBudget);
+        }
+    }
+
+    #[test]
+    fn cli_locale_response_is_precharged_and_respects_the_temporary_limit() {
+        let limited = ResourceLimits {
+            max_temporary_bytes: 0,
+            ..ResourceLimits::default()
+        };
+        let outcome = run_resource_script(
+            b"return os.setlocale() == 'C'",
+            cli_resource_capability(CliResourceDeadline::from_now()).with_limits(limited),
+        );
+        let RunOutcome::LuaError(error) = outcome else {
+            panic!("zero temporary bytes 應在建立 C locale 回應前耗盡: {outcome:?}");
+        };
+        assert_eq!(error.kind, RuntimeErrorKind::HostResourceBudget);
+
+        let admitted = ResourceLimits {
+            max_temporary_bytes: 1,
+            ..ResourceLimits::default()
+        };
+        let outcome = run_resource_script(
+            b"return os.setlocale() == 'C'",
+            cli_resource_capability(CliResourceDeadline::from_now()).with_limits(admitted),
+        );
+        assert!(matches!(
+            outcome,
+            RunOutcome::Returned(values) if values == [Value::Boolean(true)]
+        ));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn cli_entropy_provider_fails_closed_on_unsupported_platforms() {
+        use rivetlua::HostEntropy;
+
+        assert_eq!(
+            HostEntropy::seed(&mut OsEntropy),
+            Err(HostEntropyError::ReadFailed)
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -1171,7 +1661,7 @@ struct CompilerOptions {
 }
 
 fn parse_compiler_options(args: &[OsString]) -> CliResult<CompilerOptions> {
-    let mut profile = LuaProfile::Lua55;
+    let mut profile = default_profile();
     let mut list = false;
     let mut syntax_only = false;
     let mut show_version = false;

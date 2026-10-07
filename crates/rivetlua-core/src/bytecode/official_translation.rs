@@ -722,7 +722,7 @@ struct ValidatedCode {
 }
 
 struct OpenListPlans {
-    preparation_at: Vec<Option<usize>>,
+    preparation_at: Vec<Option<(usize, u16)>>,
     producer_at: Vec<Option<usize>>,
 }
 
@@ -768,8 +768,11 @@ fn plan_open_lists(
             .checked_sub(1)
             .ok_or_else(|| invalid(entry.id, sink, "開放 SETLIST 無 producer"))?;
         let mut first = producer;
+        let mut table_source = op.a;
+        let mut lowest_producer = u16::MAX;
         loop {
             let current = code.ops[first];
+            lowest_producer = lowest_producer.min(current.a);
             if current.opcode == 80 && current.c == 0 {
                 break;
             }
@@ -783,15 +786,32 @@ fn plan_open_lists(
             if current.b != 0 {
                 break;
             }
-            first = first
+            let previous = first
                 .checked_sub(1)
                 .ok_or_else(|| invalid(entry.id, first, "動態 CALL 缺少 open producer"))?;
+            let between = code.ops[previous];
+            if between.opcode == 0 {
+                // MOVE 不改動 dynamic top；只允許把最終 table 值向前追溯。
+                if between.a != table_source || between.a >= current.a {
+                    return Err(invalid(
+                        entry.id,
+                        previous,
+                        "開放列表 MOVE 改寫動態呼叫區段",
+                    ));
+                }
+                table_source = between.b;
+                first = previous
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid(entry.id, previous, "MOVE 前缺少 open producer"))?;
+            } else {
+                first = previous;
+            }
         }
-        if code.ops[producer].a <= op.a {
+        if op.a >= lowest_producer || table_source >= lowest_producer {
             return Err(invalid(
                 entry.id,
                 sink,
-                "開放 SETLIST producer base 不在 table 之後",
+                "開放 SETLIST table 來源位於 open producer 區段",
             ));
         }
         for middle in first + 1..=sink {
@@ -799,7 +819,9 @@ fn plan_open_lists(
                 return Err(invalid(entry.id, middle, "開放列表中途有非線性 CFG 入口"));
             }
         }
-        if preparation_at[first].replace(sink).is_some()
+        if preparation_at[first]
+            .replace((sink, table_source))
+            .is_some()
             || producer_at[sink].replace(producer).is_some()
         {
             return Err(invalid(entry.id, sink, "開放列表區段重疊"));
@@ -2994,11 +3016,11 @@ fn translate_prototype(
         }
         mapping.push(Some(InstructionOffset(instructions.len() as u32)));
         let decoded = validated.ops[pc];
-        if let Some(sink) = open_plans.preparation_at[pc] {
+        if let Some((sink, table_source)) = open_plans.preparation_at[pc] {
             let builtin = OfficialFixedBuiltin::RawListWrite;
             let source_upvalue = hidden_upvalue(upvalue_maps, entry.id, sink, builtin)?;
             let first = list_first_index(entry, validated, sink, profile)?;
-            let table = guest(validated.ops[sink].a);
+            let table = guest(table_source);
             let first_id = append_constant(
                 &mut constants,
                 limits,

@@ -13,6 +13,326 @@ pub mod table;
 pub(crate) mod utf8;
 
 #[cfg(test)]
+mod standard_module_tests {
+    use rivetlua_core::{LuaProfile, ObjectRef, Value};
+
+    use crate::{AllocationFailureKind, ObjectKind, RootKind, Vm, VmError};
+
+    fn field(vm: &mut Vm, table: ObjectRef, name: &[u8]) -> Value {
+        let key = vm.allocate_byte_string(name).unwrap();
+        vm.raw_get(table, Value::Object(key)).unwrap()
+    }
+
+    fn table_field(vm: &mut Vm, table: ObjectRef, name: &[u8]) -> ObjectRef {
+        let Value::Object(table) = field(vm, table, name) else {
+            panic!("{name:?} 應為 table")
+        };
+        assert_eq!(vm.object_kind(table), Ok(ObjectKind::Table));
+        table
+    }
+
+    #[test]
+    fn weak_value_environment_registration_retains_modules_only_through_loaded() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let environment = vm.allocate_table().unwrap();
+            vm.add_root(RootKind::Host, environment).unwrap();
+            let metatable = vm.allocate_table().unwrap();
+            let mode_key = vm.allocate_byte_string(b"__mode").unwrap();
+            let mode = vm.allocate_byte_string(b"v").unwrap();
+            vm.raw_set(metatable, Value::Object(mode_key), Value::Object(mode))
+                .unwrap();
+            vm.set_metatable(environment, Some(metatable)).unwrap();
+            vm.collect().unwrap();
+
+            let mut modules = Vec::new();
+            for name in [b"math".as_slice(), b"string", b"debug"] {
+                let table = vm.allocate_table().unwrap();
+                let root = vm.add_root(RootKind::Host, table).unwrap();
+                let key = vm.allocate_byte_string(name).unwrap();
+                vm.raw_set(environment, Value::Object(key), Value::Object(table))
+                    .unwrap();
+                modules.push((name, table, root));
+            }
+            vm.set_collect_every_allocation(true);
+            vm.install_package_builtins(environment).unwrap();
+            for (_, _, root) in &modules {
+                vm.remove_root(*root).unwrap();
+            }
+            vm.collect().unwrap();
+
+            let package = table_field(&mut vm, environment, b"package");
+            let loaded = table_field(&mut vm, package, b"loaded");
+            for (name, table, _) in modules {
+                assert_eq!(field(&mut vm, loaded, name), Value::Object(table));
+                assert_eq!(vm.object_kind(table), Ok(ObjectKind::Table));
+            }
+            assert_eq!(vm.roots().total_count(), 3);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn registered_debug_reinstall_limit_failure_restores_both_tables_and_retries() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let environment = vm.allocate_table().unwrap();
+            vm.add_root(RootKind::Host, environment).unwrap();
+            vm.install_package_builtins(environment).unwrap();
+            vm.install_debug_builtins(environment).unwrap();
+            let package = table_field(&mut vm, environment, b"package");
+            let loaded = table_field(&mut vm, package, b"loaded");
+            let old = table_field(&mut vm, environment, b"debug");
+            let before_roots = vm.roots().total_count();
+            let before = vm.ledger_snapshot();
+            vm.set_allocation_limit(before.committed);
+            assert_eq!(
+                vm.install_debug_builtins(environment),
+                Err(VmError::AllocationFailed)
+            );
+            vm.set_allocation_limit(usize::MAX);
+            assert_eq!(field(&mut vm, environment, b"debug"), Value::Object(old));
+            assert_eq!(field(&mut vm, loaded, b"debug"), Value::Object(old));
+            assert_eq!(vm.roots().total_count(), before_roots);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            vm.install_debug_builtins(environment).unwrap();
+            let new = table_field(&mut vm, environment, b"debug");
+            assert_ne!(new, old);
+            assert_eq!(field(&mut vm, loaded, b"debug"), Value::Object(new));
+            assert_eq!(vm.roots().total_count(), before_roots);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Publisher {
+        Package,
+        IoOs,
+        Debug,
+    }
+
+    #[derive(Clone, Copy)]
+    struct FieldSnapshot {
+        table: ObjectRef,
+        key: ObjectRef,
+        value: Value,
+    }
+
+    struct PublisherFixture {
+        vm: Vm,
+        environment: ObjectRef,
+        loaded: Option<ObjectRef>,
+        preload: Option<ObjectRef>,
+        fields: Vec<FieldSnapshot>,
+    }
+
+    fn install(vm: &mut Vm, environment: ObjectRef, publisher: Publisher) -> Result<(), VmError> {
+        match publisher {
+            Publisher::Package => vm.install_package_builtins(environment),
+            Publisher::IoOs => vm.install_io_os_builtins(environment),
+            Publisher::Debug => vm.install_debug_builtins(environment),
+        }
+    }
+
+    fn snapshot_field(vm: &mut Vm, table: ObjectRef, name: &[u8]) -> FieldSnapshot {
+        let key = vm.allocate_byte_string(name).unwrap();
+        vm.add_root(RootKind::Host, key).unwrap();
+        FieldSnapshot {
+            table,
+            key,
+            value: vm.raw_get(table, Value::Object(key)).unwrap(),
+        }
+    }
+
+    fn setup_publisher(
+        publisher: Publisher,
+        registry_before: bool,
+        reinstall: bool,
+        active_gc: bool,
+    ) -> PublisherFixture {
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        let environment = vm.allocate_table().unwrap();
+        vm.add_root(RootKind::Host, environment).unwrap();
+        if registry_before {
+            vm.install_package_builtins(environment).unwrap();
+        }
+        if reinstall && !matches!(publisher, Publisher::Package) {
+            install(&mut vm, environment, publisher).unwrap();
+        }
+        let loaded = vm.package_loaded();
+        let preload = vm.package_preload();
+        let names: &[&[u8]] = match publisher {
+            Publisher::Package => &[b"package", b"require"],
+            Publisher::IoOs => &[b"io", b"os"],
+            Publisher::Debug => &[b"debug"],
+        };
+        let mut fields = Vec::new();
+        for &name in names {
+            let old = vm.allocate_table().unwrap();
+            vm.set_string_field(environment, name, Value::Object(old))
+                .unwrap();
+            fields.push(snapshot_field(&mut vm, environment, name));
+        }
+        if let Some(loaded) = loaded {
+            for &name in names {
+                if name == b"require" {
+                    continue;
+                }
+                let old = vm.allocate_table().unwrap();
+                vm.set_string_field(loaded, name, Value::Object(old))
+                    .unwrap();
+                fields.push(snapshot_field(&mut vm, loaded, name));
+            }
+            vm.set_string_field(loaded, b"custom", Value::Boolean(false))
+                .unwrap();
+            fields.push(snapshot_field(&mut vm, loaded, b"custom"));
+            let preload = preload.unwrap();
+            let old = vm.allocate_table().unwrap();
+            vm.set_string_field(preload, b"custom", Value::Object(old))
+                .unwrap();
+            fields.push(snapshot_field(&mut vm, preload, b"custom"));
+        } else if matches!(publisher, Publisher::Package) {
+            let old = vm.allocate_table().unwrap();
+            vm.set_string_field(environment, b"math", Value::Object(old))
+                .unwrap();
+            fields.push(snapshot_field(&mut vm, environment, b"math"));
+        }
+        vm.collect().unwrap();
+        vm.collect().unwrap();
+        if active_gc {
+            vm.incremental_step(1).unwrap();
+        }
+        vm.set_collect_every_allocation(active_gc);
+        PublisherFixture {
+            vm,
+            environment,
+            loaded,
+            preload,
+            fields,
+        }
+    }
+
+    #[test]
+    fn standard_publisher_ordinal_failures_restore_env_loaded_registry_and_retry() {
+        let cases = [
+            (Publisher::Package, false, false),
+            (Publisher::Package, true, true),
+            (Publisher::IoOs, false, false),
+            (Publisher::IoOs, false, true),
+            (Publisher::IoOs, true, false),
+            (Publisher::IoOs, true, true),
+            (Publisher::Debug, false, false),
+            (Publisher::Debug, false, true),
+            (Publisher::Debug, true, false),
+            (Publisher::Debug, true, true),
+        ];
+        for (publisher, registry_before, reinstall) in cases {
+            for active_gc in [false, true] {
+                let mut dry = setup_publisher(publisher, registry_before, reinstall, active_gc);
+                let start = dry.vm.allocation_trace().next_ordinal;
+                install(&mut dry.vm, dry.environment, publisher).unwrap();
+                let attempts = dry.vm.allocation_trace().next_ordinal - start;
+                assert!(
+                    attempts > 10,
+                    "{publisher:?} {registry_before} {reinstall} {active_gc}"
+                );
+
+                let mut failures = 0;
+                for offset in 0..attempts {
+                    let mut fixture =
+                        setup_publisher(publisher, registry_before, reinstall, active_gc);
+                    assert_eq!(fixture.vm.allocation_trace().next_ordinal, start);
+                    let before_roots = fixture.vm.roots().total_count();
+                    fixture.vm.inject_allocation_failure_at(start + offset);
+                    let error = install(&mut fixture.vm, fixture.environment, publisher).err();
+                    let Some(error) = error else {
+                        continue;
+                    };
+                    assert!(
+                        matches!(error, VmError::InjectedAllocation(_)),
+                        "{publisher:?} {registry_before} {reinstall} {active_gc} {offset}: {error:?}"
+                    );
+                    failures += 1;
+                    let trace = fixture.vm.allocation_trace();
+                    let failure = trace.last_failure.expect("失敗應記錄配置點");
+                    assert_eq!(failure.kind, AllocationFailureKind::Injection);
+                    assert_eq!(failure.attempt.ordinal, start + offset);
+                    assert_eq!(
+                        fixture.vm.roots().total_count(),
+                        before_roots,
+                        "{publisher:?} {registry_before} {reinstall} {active_gc} {offset}"
+                    );
+                    assert_eq!(fixture.vm.package_loaded(), fixture.loaded);
+                    assert_eq!(fixture.vm.package_preload(), fixture.preload);
+                    for field in &fixture.fields {
+                        assert_eq!(
+                            fixture
+                                .vm
+                                .raw_get(field.table, Value::Object(field.key))
+                                .unwrap(),
+                            field.value,
+                            "{publisher:?} {registry_before} {reinstall} {active_gc} {offset}"
+                        );
+                    }
+                    assert_eq!(fixture.vm.ledger_snapshot().reserved, 0);
+                    fixture.vm.collect().unwrap();
+                    fixture.vm.collect().unwrap();
+                    for field in &fixture.fields {
+                        if let Value::Object(object) = field.value {
+                            assert_eq!(fixture.vm.object_kind(object), Ok(ObjectKind::Table));
+                        }
+                    }
+                    install(&mut fixture.vm, fixture.environment, publisher).unwrap();
+                    let root_gain = usize::from(matches!(publisher, Publisher::IoOs) && !reinstall)
+                        + 2 * usize::from(
+                            matches!(publisher, Publisher::Package) && !registry_before,
+                        );
+                    assert_eq!(fixture.vm.roots().total_count(), before_roots + root_gain);
+                    assert_eq!(fixture.vm.ledger_snapshot().reserved, 0);
+                    if let Some(loaded) = fixture.vm.package_loaded() {
+                        match publisher {
+                            Publisher::Package => {
+                                let package =
+                                    table_field(&mut fixture.vm, fixture.environment, b"package");
+                                assert_eq!(
+                                    field(&mut fixture.vm, loaded, b"package"),
+                                    Value::Object(package)
+                                );
+                            }
+                            Publisher::IoOs => {
+                                for name in [b"io".as_slice(), b"os"] {
+                                    let global =
+                                        table_field(&mut fixture.vm, fixture.environment, name);
+                                    assert_eq!(
+                                        field(&mut fixture.vm, loaded, name),
+                                        Value::Object(global)
+                                    );
+                                }
+                            }
+                            Publisher::Debug => {
+                                let global =
+                                    table_field(&mut fixture.vm, fixture.environment, b"debug");
+                                assert_eq!(
+                                    field(&mut fixture.vm, loaded, b"debug"),
+                                    Value::Object(global)
+                                );
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    failures > 10,
+                    "{publisher:?} {registry_before} {reinstall} {active_gc}"
+                );
+                eprintln!(
+                    "標準庫發布 {publisher:?} registry={registry_before} reinstall={reinstall} active_gc={active_gc} 配置點={attempts} 回滾={failures}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod p13_h_tests {
     use rivetlua_core::{LuaProfile, ObjectRef, Value};
 

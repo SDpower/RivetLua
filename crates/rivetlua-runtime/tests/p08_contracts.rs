@@ -269,22 +269,33 @@ fn p08_5_gc_and_failure_cases() {
 
     let mut vm = Vm::new().unwrap();
     vm.set_collect_every_allocation(true);
-    let source = b"local s=\"\\0\\x80\"; local t={}; t[s]=s; return t[s]";
+    let source = b"local s=\"\\0\\x80\"; local t={}; t[s]=s; return t,t[s]";
     let mut execution = vm.load(compiled(source, language_profile)).unwrap();
     let RunOutcome::Returned(values) = execution.run().unwrap() else {
         panic!("強制收集下 VM table/string 須正常回傳")
     };
     drop(execution);
-    let [Value::Object(string)] = values.as_slice() else {
-        panic!("VM 須回傳 byte string object")
+    let [Value::Object(table), Value::Object(string)] = values.as_slice() else {
+        panic!("VM 須回傳 table 與 byte string object")
     };
+    assert_eq!(
+        vm.raw_get(*table, Value::Object(*string)),
+        Ok(Value::Object(*string))
+    );
     assert_eq!(
         vm.with_byte_string(*string, |value| value.as_bytes().to_vec()),
         Ok(vec![0, 0x80])
     );
     assert_eq!(vm.roots().total_count(), 0);
-    let stack_reclaimed = vm.collect().unwrap();
-    assert_eq!(stack_reclaimed, 2);
+    vm.collect().unwrap();
+    assert_eq!(
+        vm.with_table(*table, |table| table.is_empty()),
+        Err(VmError::StaleObject)
+    );
+    assert_eq!(
+        vm.with_byte_string(*string, |value| value.as_bytes().to_vec()),
+        Err(VmError::StaleObject)
+    );
     assert_eq!(vm.ledger_snapshot().reserved, 0);
 
     let mut vm = Vm::new().unwrap();
@@ -380,7 +391,7 @@ fn p08_5_gc_and_failure_cases() {
     assert_eq!(vm.roots().total_count(), 0);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
     println!(
-        "P08_CASE\tTAB-008\t{profile}\tinput=forced_gc_vm_stack_and_table_fields\texpected=stack_2_live_then_removed_5_table_1\tactual=stack_reclaimed,{stack_reclaimed};live,true;removed,{removed};table_reclaimed,{table_reclaimed};reserved,{}",
+        "P08_CASE\tTAB-008\t{profile}\tinput=forced_gc_vm_stack_and_table_fields\texpected=stack_objects_reclaimed_then_removed_5_table_1\tactual=stack_objects_reclaimed,true;live,true;removed,{removed};table_reclaimed,{table_reclaimed};reserved,{}",
         vm.ledger_snapshot().reserved
     );
 

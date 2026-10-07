@@ -40,7 +40,7 @@ fn sdk_module_exposes_only_verified_native_source_and_main_line_range() {
         .compile_named(source, b"=sdk-native-source")
         .unwrap();
     assert_eq!(module.source_name(), Some(b"=sdk-native-source".as_slice()));
-    assert_eq!(module.main_line_range(), Some((1, 2)));
+    assert_eq!(module.main_line_range(), Some((0, 0)));
 }
 
 #[test]

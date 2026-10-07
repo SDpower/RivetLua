@@ -1,6 +1,9 @@
 //! 將一般 RVLU_V2 原型降低成官方 Lua opcode。
 
-use super::codec::{BytecodeConstant, BytecodeExitKind, BytecodePrototype, BytecodeUpvalueSource};
+use super::codec::{
+    BytecodeConstant, BytecodeExitKind, BytecodeInstruction, BytecodePrototype,
+    BytecodeUpvalueSource,
+};
 use super::official::{
     OfficialAbsLine, OfficialChunk, OfficialChunkLimits, OfficialConstant, OfficialDebug,
     OfficialLocal, OfficialPrototype, OfficialUpvalue,
@@ -16,13 +19,15 @@ use super::{
 use core::mem::size_of;
 use std::borrow::Cow;
 
-use super::native_debug::NativeCloseGroup;
+use super::native_debug::{NativeCloseGroup, NativeLocal, register_access};
 use super::official_execution::OfficialPlanCall;
 
 struct Layout {
+    anonymous_vararg_slot: Option<u8>,
     tuple_base: u16,
     scratch: Vec<u16>,
     parallel_spare: Vec<u16>,
+    call_cleanup_slots: Vec<[u8; 32]>,
     max_stack: u8,
     guest_upvalue_offset: u16,
     env_upvalue: Option<u16>,
@@ -40,6 +45,50 @@ fn native_guest_upvalues(module: &VerifiedModule, proto: &BytecodePrototype) -> 
 
 const NO_PARALLEL_COPY: u16 = u16::MAX;
 const NO_SPARE_SLOT: u16 = 255;
+const ANONYMOUS_VARARG_LOCAL: &[u8] = b"(vararg table)";
+
+fn anonymous_vararg_slot(
+    proto: &BytecodePrototype,
+    profile: LuaProfile,
+) -> Result<Option<u8>, OfficialExportError> {
+    if profile != LuaProfile::Lua55 || !proto.is_variadic || proto.named_vararg.is_some() {
+        return Ok(None);
+    }
+    u8::try_from(proto.parameter_count)
+        .ok()
+        .filter(|slot| *slot < 255)
+        .map(Some)
+        .ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                0,
+                "匿名 vararg table slot 超出官方 stack",
+            )
+        })
+}
+
+fn official_storage_slot(
+    slot: u8,
+    anonymous_vararg_slot: Option<u8>,
+    id: ProtoId,
+    pc: usize,
+) -> Result<u8, OfficialExportError> {
+    if anonymous_vararg_slot.is_some_and(|boundary| slot >= boundary) {
+        slot.checked_add(1)
+            .filter(|shifted| *shifted < 255)
+            .ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    id,
+                    pc,
+                    "匿名 vararg 後續 local slot 超出官方 stack",
+                )
+            })
+    } else {
+        Ok(slot)
+    }
+}
 
 struct ParallelMoves {
     moves: [(u8, u8); 512],
@@ -626,7 +675,7 @@ fn open_chain_end(
             Some(Instruction::Close { .. }) => next += 1,
             _ => {
                 return Err(error(
-                    OfficialExportErrorKind::InvalidPrototype,
+                    OfficialExportErrorKind::Unsupported,
                     proto.id,
                     producer_pc,
                     "open scratch 鏈缺 consumer",
@@ -634,6 +683,146 @@ fn open_chain_end(
             }
         }
     }
+}
+
+/// 僅辨識相鄰的 All producer 與動態引數 consumer；Return 的開放結果
+/// 繼續使用既有佈局，Close 不可插入動態引數鏈。
+fn strict_open_call_terminal(
+    proto: &BytecodePrototype,
+    producer_pc: usize,
+    work: &mut OfficialWorkBudget,
+) -> Result<Option<usize>, OfficialExportError> {
+    if !matches!(
+        proto.instructions[producer_pc].instruction,
+        Instruction::Call {
+            result_mode: ResultMode::All,
+            ..
+        }
+    ) {
+        return Ok(None);
+    }
+    let mut next = producer_pc + 1;
+    loop {
+        work_charge(work, 1, proto.id, next)?;
+        match proto.instructions.get(next).map(|entry| &entry.instruction) {
+            Some(Instruction::Call {
+                arg_count: u16::MAX,
+                result_mode: ResultMode::All,
+                ..
+            }) => next += 1,
+            Some(
+                Instruction::Call {
+                    arg_count: u16::MAX,
+                    ..
+                }
+                | Instruction::TailCall {
+                    arg_count: u16::MAX,
+                    ..
+                },
+            ) => break,
+            Some(Instruction::Return {
+                result_mode: ResultMode::All,
+                ..
+            }) => return Ok(None),
+            Some(Instruction::Close { .. }) => {
+                if matches!(
+                    proto
+                        .instructions
+                        .get(open_chain_end(proto, producer_pc, work)?)
+                        .map(|entry| &entry.instruction),
+                    Some(
+                        Instruction::Call {
+                            arg_count: u16::MAX,
+                            ..
+                        } | Instruction::TailCall {
+                            arg_count: u16::MAX,
+                            ..
+                        }
+                    )
+                ) {
+                    return Err(error(
+                        OfficialExportErrorKind::Unsupported,
+                        proto.id,
+                        producer_pc,
+                        "open Call 鏈不可插入 Close",
+                    ));
+                }
+                return Ok(None);
+            }
+            _ => return Ok(None),
+        }
+    }
+    work_charge(work, proto.instructions.len(), proto.id, producer_pc)?;
+    for entry in &proto.instructions {
+        let targets = match &entry.instruction {
+            Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } => {
+                [Some(target.0 as usize), None]
+            }
+            Instruction::NumericForPrepare { exit, .. } => [Some(exit.0 as usize), None],
+            Instruction::NumericForNext { target, exit, .. } => {
+                [Some(target.0 as usize), Some(exit.0 as usize)]
+            }
+            _ => [None, None],
+        };
+        if targets
+            .into_iter()
+            .flatten()
+            .any(|target| producer_pc <= target && target <= next)
+        {
+            return Err(error(
+                OfficialExportErrorKind::Unsupported,
+                proto.id,
+                producer_pc,
+                "open Call 鏈不可由跳躍進入",
+            ));
+        }
+    }
+    Ok(Some(next))
+}
+
+/// `_ENV` 的實體 upvalue 是權威值；僅在相鄰的開放引數呼叫鏈沒有使用
+/// guest environment register 時，允許官方動態結果覆寫其 stack 快取。
+fn environment_cache_chain_safe(
+    proto: &BytecodePrototype,
+    producer_pc: usize,
+    candidate: Register,
+    has_physical_upvalue: bool,
+    work: &mut OfficialWorkBudget,
+) -> Result<bool, OfficialExportError> {
+    if !has_physical_upvalue || candidate != proto.global_environment {
+        return Ok(false);
+    }
+    let Some(terminal) = strict_open_call_terminal(proto, producer_pc, work)? else {
+        return Ok(false);
+    };
+    for pc in producer_pc..=terminal {
+        work_charge(work, 1, proto.id, pc)?;
+        let (read, write, possible_write, close) = register_access(
+            &proto.instructions[pc].instruction,
+            candidate,
+            proto.register_count,
+        );
+        if read || write || possible_write || close {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn environment_cache_slot_exclusive(
+    intervals: &[(u8, usize, usize)],
+    slot: u8,
+    pc: usize,
+    id: ProtoId,
+    work: &mut OfficialWorkBudget,
+) -> Result<bool, OfficialExportError> {
+    work_charge(work, intervals.len(), id, pc)?;
+    Ok(intervals
+        .iter()
+        .filter(|&&(occupied, start, end)| occupied == slot && start <= pc && pc < end)
+        .take(2)
+        .count()
+        == 1)
 }
 
 fn native_close_groups<'a>(
@@ -955,7 +1144,11 @@ fn visit_static_registers<F: FnMut(Register) -> Result<(), OfficialExportError>>
         | Instruction::GetUpvalue { dest, .. }
         | Instruction::NewTable { dest }
         | Instruction::Closure { dest, .. } => visit(*dest)?,
-        Instruction::LoadNil { start, count } => visit_range(*start, *count, visit)?,
+        Instruction::LoadNil { start, count } => {
+            if call_cleanup_range(proto, pc).is_none() {
+                visit_range(*start, *count, visit)?;
+            }
+        }
         Instruction::SetUpvalue { src, .. } => visit(*src)?,
         Instruction::GetTable { dest, table, key } => {
             visit(*table)?;
@@ -1085,6 +1278,34 @@ fn visit_static_registers<F: FnMut(Register) -> Result<(), OfficialExportError>>
         } => {}
     }
     Ok(())
+}
+
+/// statement Call 的尾端 cleanup 會涵蓋此時尚未使用的 guest register。
+/// 這些 nil 寫入是物理槽的 root 清理，不能使未來值從本 PC 起佔用獨立槽。
+fn call_cleanup_range(proto: &BytecodePrototype, pc: usize) -> Option<(usize, usize)> {
+    let Instruction::LoadNil { start, count } = proto.instructions.get(pc)?.instruction else {
+        return None;
+    };
+    let Instruction::Call {
+        base,
+        result_mode: ResultMode::Fixed(0),
+        ..
+    } = proto.instructions.get(pc.checked_sub(1)?)?.instruction
+    else {
+        return None;
+    };
+    let first = usize::from(start.0);
+    let end = first.checked_add(usize::from(count))?;
+    (first <= usize::from(base.0) && end == usize::from(proto.register_count))
+        .then_some((first, end))
+}
+
+fn cleanup_slot_set(slots: &mut [u8; 32], slot: u8) {
+    slots[usize::from(slot) / 8] |= 1 << (slot % 8);
+}
+
+fn cleanup_slot_contains(slots: &[u8; 32], slot: u8) -> bool {
+    slots[usize::from(slot) / 8] & (1 << (slot % 8)) != 0
 }
 
 fn static_register_access(
@@ -1595,11 +1816,786 @@ fn extend_capture_spans(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct TemporaryCallLayout {
+    pc: usize,
+    first_slot: u16,
+    window_start: u16,
+    window_width: u16,
+    window_end: u16,
+    call_base: u16,
+    open_chain: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingRelayPair {
+    source: Register,
+    destination: Register,
+    move_pc: usize,
+    consumer_pc: usize,
+    slot: u8,
+}
+
+fn pending_relay_reverse_revisit(
+    pair: PendingRelayPair,
+    source: Register,
+    destination: Register,
+    slot: u8,
+    call_pc: usize,
+    terminal_pc: Option<usize>,
+    source_span: (usize, usize),
+    destination_span: (usize, usize),
+    reservations: &[(u8, usize, usize)],
+) -> bool {
+    pair.source == source
+        && pair.destination == destination
+        && pair.slot == slot
+        && pair.move_pc + 1 == source_span.1
+        && pair.move_pc == destination_span.0
+        && pair.move_pc < call_pc
+        && call_pc < pair.consumer_pc
+        && terminal_pc == Some(pair.consumer_pc)
+        && reservations.iter().any(|&(reserved_slot, start, end)| {
+            reserved_slot == slot && start == pair.move_pc + 1 && end >= start
+        })
+}
+
+fn temporary_call_layouts(
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    anonymous_vararg_slot: Option<u8>,
+    work: &mut OfficialWorkBudget,
+) -> Result<Vec<TemporaryCallLayout>, OfficialExportError> {
+    let Some(debug) = module.native_debug() else {
+        return Ok(Vec::new());
+    };
+    let locals = &debug
+        .prototype(proto.id)
+        .ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::InvalidPrototype,
+                proto.id,
+                0,
+                "native temporary 缺少 prototype debug",
+            )
+        })?
+        .locals;
+    let storage = debug.storage_for(proto.id).ok_or_else(|| {
+        error(
+            OfficialExportErrorKind::InvalidPrototype,
+            proto.id,
+            0,
+            "native Call frontier 缺少 local storage",
+        )
+    })?;
+    let plan_calls = module
+        .official_execution()
+        .map_or(&[][..], |plan| plan.calls());
+    let mut calls = Vec::new();
+    let call_count = proto
+        .instructions
+        .iter()
+        .filter(|entry| {
+            matches!(entry.instruction, Instruction::Call { .. })
+                || matches!(
+                    entry.instruction,
+                    Instruction::TailCall {
+                        arg_count: u16::MAX,
+                        ..
+                    }
+                )
+        })
+        .count();
+    work_charge(work, proto.instructions.len(), proto.id, 0)?;
+    calls.try_reserve_exact(call_count).map_err(|_| {
+        error(
+            OfficialExportErrorKind::AllocationFailed,
+            proto.id,
+            0,
+            "native Call 佈局配置失敗",
+        )
+    })?;
+    for (pc, entry) in proto.instructions.iter().enumerate() {
+        let (base, arg_count) = match &entry.instruction {
+            Instruction::Call {
+                base, arg_count, ..
+            }
+            | Instruction::TailCall {
+                base, arg_count, ..
+            } => (*base, *arg_count),
+            _ => continue,
+        };
+        let chain_terminal = if matches!(
+            entry.instruction,
+            Instruction::Call {
+                result_mode: ResultMode::All,
+                ..
+            }
+        ) {
+            strict_open_call_terminal(proto, pc, work)?
+        } else {
+            None
+        };
+        let chain_terminal = if let Some(terminal) = chain_terminal {
+            work_charge(work, plan_calls.len(), proto.id, pc)?;
+            (!plan_calls
+                .iter()
+                .any(|call| call.prototype == proto.id && call.call_pc.0 as usize == terminal))
+            .then_some(terminal)
+        } else {
+            None
+        };
+        let helper_here = if arg_count == u16::MAX {
+            work_charge(work, plan_calls.len(), proto.id, pc)?;
+            plan_calls
+                .iter()
+                .any(|call| call.prototype == proto.id && call.call_pc.0 as usize == pc)
+        } else {
+            false
+        };
+        let is_terminal = arg_count == u16::MAX
+            && !helper_here
+            && pc.checked_sub(1).is_some_and(|prior| {
+                matches!(
+                    proto.instructions[prior].instruction,
+                    Instruction::Call {
+                        result_mode: ResultMode::All,
+                        ..
+                    }
+                )
+            })
+            && strict_open_call_terminal(proto, pc - 1, work)? == Some(pc);
+        let open_chain = chain_terminal.is_some() || is_terminal;
+        let fixed_call = matches!(entry.instruction, Instruction::Call {
+            arg_count,
+            result_mode: ResultMode::Fixed(_),
+            ..
+        } if arg_count != u16::MAX);
+        if !fixed_call && !open_chain {
+            continue;
+        }
+        let call_pc = InstructionOffset(u32::try_from(pc).map_err(|_| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                pc,
+                "native Call PC 超出範圍",
+            )
+        })?);
+        let pending = debug.temporaries_at(proto.id, call_pc).unwrap_or(&[]);
+        work_charge(
+            work,
+            pending
+                .len()
+                .checked_add(locals.len())
+                .and_then(|count| count.checked_add(1))
+                .ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        pc,
+                        "native Call frontier 掃描 work 溢位",
+                    )
+                })?,
+            proto.id,
+            pc,
+        )?;
+        let active = locals
+            .iter()
+            .zip(storage)
+            .filter(|(local, storage)| {
+                local.start_pc as usize <= pc
+                    && pc < local.end_pc as usize
+                    && storage.start_pc as usize <= pc
+                    && pc < storage.end_pc as usize
+            })
+            .count()
+            .checked_add(usize::from(anonymous_vararg_slot.is_some()))
+            .ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    pc,
+                    "native temporary active local 數溢位",
+                )
+            })?;
+        let first_slot = u16::try_from(active).map_err(|_| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                pc,
+                "native temporary active local 超出 stack",
+            )
+        })?;
+        let call_base = first_slot
+            .checked_add(u16::try_from(pending.len()).map_err(|_| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    pc,
+                    "native temporary 數超出 stack",
+                )
+            })?)
+            .ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    pc,
+                    "native temporary call base 溢位",
+                )
+            })?;
+        let terminal = chain_terminal.unwrap_or(pc);
+        let root = if open_chain {
+            match proto.instructions[terminal].instruction {
+                Instruction::Call { base, .. } | Instruction::TailCall { base, .. } => base,
+                _ => unreachable!("strict open Call terminal 必為 Call 或 TailCall"),
+            }
+        } else {
+            base
+        };
+        let offset = base.0.checked_sub(root.0).ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::InvalidPrototype,
+                proto.id,
+                pc,
+                "native temporary open Call root 無效",
+            )
+        })?;
+        if open_chain {
+            let terminal_pending = if matches!(
+                proto.instructions[terminal].instruction,
+                Instruction::Call { .. }
+            ) {
+                let terminal_pc = InstructionOffset(u32::try_from(terminal).map_err(|_| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        pc,
+                        "open Call terminal PC 超出範圍",
+                    )
+                })?);
+                debug
+                    .temporaries_at(proto.id, terminal_pc)
+                    .map_or(0, <[_]>::len)
+            } else {
+                0
+            };
+            if pending.len() != terminal_pending + usize::from(offset) {
+                return Err(error(
+                    OfficialExportErrorKind::Unsupported,
+                    proto.id,
+                    pc,
+                    "open Call 鏈缺少完整 pending prefix",
+                ));
+            }
+        }
+        let window_start = call_base.checked_sub(offset).ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                pc,
+                "native temporary Call window 起點溢位",
+            )
+        })?;
+        let window_width = scratch_width_at(proto, pc, work)?;
+        let window_end = window_start.checked_add(window_width).ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                pc,
+                "native temporary Call window 終點溢位",
+            )
+        })?;
+        if (!open_chain && window_start < call_base) || window_end > 255 {
+            return Err(error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                pc,
+                "native temporary Call window 與 pending slot 衝突",
+            ));
+        }
+        calls.push(TemporaryCallLayout {
+            pc,
+            first_slot,
+            window_start,
+            window_width,
+            window_end,
+            call_base,
+            open_chain,
+        });
+    }
+    Ok(calls)
+}
+
+/// 原始 register 的值經單一 Move 交給外層固定 Call 時，容許兩者共用同一官方槽。
+/// 證明只接受無分支的連續區間；其餘情形仍交由保守 live span 衝突檢查拒絕。
+fn pending_move_relay_alias(
+    instructions: &[BytecodeInstruction],
+    register_count: u16,
+    id: ProtoId,
+    call_pc: usize,
+    source: Register,
+    candidate: Register,
+    locals: &[NativeLocal],
+    work: &mut OfficialWorkBudget,
+) -> Result<Option<(usize, usize)>, OfficialExportError> {
+    let access = |pc: usize, register| {
+        register_access(&instructions[pc].instruction, register, register_count)
+    };
+    let mut definition = None;
+    for pc in (0..call_pc).rev() {
+        work_charge(work, 1, id, pc)?;
+        let (_, write, possible_write, _) = access(pc, source);
+        if possible_write {
+            return Ok(None);
+        }
+        if write {
+            definition = Some(pc);
+            break;
+        }
+    }
+    let Some(definition) = definition else {
+        return Ok(None);
+    };
+    let mut relay = None;
+    for pc in definition..instructions.len() {
+        work_charge(work, 1, id, pc)?;
+        let instruction = &instructions[pc].instruction;
+        let (source_read, source_write, source_possible, source_close) = access(pc, source);
+        if pc > definition && pc <= call_pc && (source_write || source_possible || source_close) {
+            return Ok(None);
+        }
+        if pc == call_pc && source_read {
+            return Ok(None);
+        }
+        if pc <= call_pc {
+            continue;
+        }
+        if source_write || source_possible || source_close {
+            return Ok(None);
+        }
+        if source_read {
+            if let Instruction::Move { dest, src } = instruction {
+                if *src == source && *dest != source {
+                    relay = Some((pc, *dest));
+                }
+            }
+            break;
+        }
+    }
+    let Some((relay, destination)) = relay else {
+        return Ok(None);
+    };
+    for pc in definition..relay {
+        work_charge(work, 1, id, pc)?;
+        let (dest_read, dest_write, dest_possible, dest_close) = access(pc, destination);
+        let (candidate_read, candidate_write, candidate_possible, candidate_close) =
+            access(pc, candidate);
+        if dest_read
+            || dest_write
+            || dest_possible
+            || dest_close
+            || candidate_read
+            || candidate_write
+            || candidate_possible
+            || candidate_close
+        {
+            return Ok(None);
+        }
+    }
+    let mut consumer = None;
+    for pc in relay + 1..instructions.len() {
+        work_charge(work, 1, id, pc)?;
+        let instruction = &instructions[pc].instruction;
+        let (source_read, source_write, source_possible, source_close) = access(pc, source);
+        let (dest_read, dest_write, dest_possible, dest_close) = access(pc, destination);
+        if source_read || source_write || source_possible || source_close {
+            return Ok(None);
+        }
+        if dest_possible || dest_close || (dest_write && !dest_read) {
+            return Ok(None);
+        }
+        if dest_read {
+            let fixed_consumer = matches!(instruction,
+                Instruction::Call { base, arg_count, result_mode: ResultMode::Fixed(_), .. }
+                    if *arg_count != u16::MAX && destination.0 >= base.0
+                        && destination.0 - base.0 <= *arg_count)
+                || matches!(instruction,
+                    Instruction::TailCall { base, arg_count, .. }
+                        if *arg_count != u16::MAX && destination.0 >= base.0
+                            && destination.0 - base.0 <= *arg_count);
+            let open_consumer = if let Instruction::Call {
+                base,
+                arg_count,
+                result_mode: ResultMode::All,
+            } = instruction
+            {
+                let mut next = pc + 1;
+                while matches!(
+                    instructions.get(next).map(|entry| &entry.instruction),
+                    Some(Instruction::Call {
+                        arg_count: u16::MAX,
+                        result_mode: ResultMode::All,
+                        ..
+                    })
+                ) {
+                    work_charge(work, 1, id, next)?;
+                    next += 1;
+                }
+                *arg_count != u16::MAX
+                    && candidate == destination
+                    && destination.0 >= base.0
+                    && destination.0 <= base.0.saturating_add(*arg_count)
+                    && matches!(
+                        instructions.get(next).map(|entry| &entry.instruction),
+                        Some(
+                            Instruction::Call {
+                                arg_count: u16::MAX,
+                                ..
+                            } | Instruction::TailCall {
+                                arg_count: u16::MAX,
+                                ..
+                            }
+                        )
+                    )
+            } else {
+                false
+            };
+            let dynamic_consumer = pc > 0
+                && candidate == destination
+                && matches!(instruction,
+                    Instruction::Call { base, arg_count: u16::MAX, .. }
+                        | Instruction::TailCall { base, arg_count: u16::MAX, .. }
+                        if matches!(instructions[pc - 1].instruction,
+                            Instruction::Call { base: producer_base, result_mode: ResultMode::All, .. }
+                                if destination.0 >= base.0 && destination.0 < producer_base.0));
+            if fixed_consumer || open_consumer || dynamic_consumer {
+                consumer = Some(pc);
+            }
+            break;
+        }
+    }
+    let Some(consumer) = consumer else {
+        return Ok(None);
+    };
+    let future_local = if candidate == destination {
+        false
+    } else {
+        let copy_pc = consumer + 1;
+        let Some(copy) = instructions.get(copy_pc) else {
+            return Ok(None);
+        };
+        if !matches!(instructions[consumer].instruction,
+            Instruction::Call { base, result_mode: ResultMode::Fixed(count), .. }
+                if base == destination && count > 0)
+            || !matches!(copy.instruction,
+                Instruction::Move { dest, src } if dest == candidate && src == destination)
+            || !locals.iter().any(|local| {
+                local.register == candidate
+                    && local.initialized_pc as usize == copy_pc
+                    && local.end_pc as usize > copy_pc
+            })
+        {
+            return Ok(None);
+        }
+        for pc in relay..=consumer {
+            work_charge(work, 1, id, pc)?;
+            let (read, write, possible_write, close) = access(pc, candidate);
+            if read || write || possible_write || close {
+                return Ok(None);
+            }
+        }
+        true
+    };
+    for pc in definition..consumer {
+        work_charge(work, 1, id, pc)?;
+        if matches!(
+            instructions[pc].instruction,
+            Instruction::Jump { .. }
+                | Instruction::JumpIfFalse { .. }
+                | Instruction::NumericForPrepare { .. }
+                | Instruction::NumericForNext { .. }
+                | Instruction::Return { .. }
+                | Instruction::TailCall { .. }
+        ) {
+            return Ok(None);
+        }
+    }
+    for (pc, entry) in instructions.iter().enumerate() {
+        work_charge(work, 1, id, pc)?;
+        let targets = match &entry.instruction {
+            Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } => {
+                [Some(target.0 as usize), None]
+            }
+            Instruction::NumericForPrepare { exit, .. } => [Some(exit.0 as usize), None],
+            Instruction::NumericForNext { target, exit, .. } => {
+                [Some(target.0 as usize), Some(exit.0 as usize)]
+            }
+            _ => [None, None],
+        };
+        if targets
+            .into_iter()
+            .flatten()
+            .any(|target| definition <= target && target <= consumer)
+        {
+            return Ok(None);
+        }
+    }
+    let mut cleared = false;
+    for pc in consumer + 1..instructions.len() {
+        work_charge(work, 1, id, pc)?;
+        let instruction = &instructions[pc].instruction;
+        let (source_read, source_write, source_possible, source_close) = access(pc, source);
+        let (dest_read, dest_write, dest_possible, dest_close) = access(pc, destination);
+        if source_read || source_possible || source_close || dest_possible || dest_close {
+            return Ok(None);
+        }
+        if cleared {
+            if dest_read
+                || ((source_write || dest_write)
+                    && !matches!(instruction, Instruction::LoadNil { .. }))
+            {
+                return Ok(None);
+            }
+        } else if source_write || dest_write {
+            if !matches!(instruction, Instruction::LoadNil { .. })
+                || (source_write && !dest_write)
+                || dest_read
+            {
+                return Ok(None);
+            }
+            cleared = true;
+        }
+    }
+    Ok((candidate == destination || future_local).then_some((relay, consumer)))
+}
+
+fn pending_open_result_local_alias(
+    instructions: &[BytecodeInstruction],
+    register_count: u16,
+    id: ProtoId,
+    call_pc: usize,
+    source: Register,
+    candidate: Register,
+    locals: &[NativeLocal],
+    work: &mut OfficialWorkBudget,
+) -> Result<Option<usize>, OfficialExportError> {
+    let access = |pc: usize, register| {
+        register_access(&instructions[pc].instruction, register, register_count)
+    };
+    let mut terminal = None;
+    for pc in call_pc + 1..instructions.len() {
+        work_charge(work, 1, id, pc)?;
+        if let Instruction::Call {
+            base,
+            arg_count: u16::MAX,
+            result_mode: ResultMode::Fixed(count),
+        } = instructions[pc].instruction
+        {
+            if count > 0
+                && source.0 >= base.0
+                && source.0 - base.0 < count
+                && pc > 0
+                && matches!(
+                    instructions[pc - 1].instruction,
+                    Instruction::Call {
+                        result_mode: ResultMode::All,
+                        ..
+                    }
+                )
+            {
+                terminal = Some((pc, base, count));
+                break;
+            }
+        }
+        let (_, write, possible_write, close) = access(pc, source);
+        let (candidate_read, candidate_write, candidate_possible, candidate_close) =
+            access(pc, candidate);
+        if write
+            || possible_write
+            || close
+            || candidate_read
+            || candidate_write
+            || candidate_possible
+            || candidate_close
+        {
+            return Ok(None);
+        }
+    }
+    let Some((terminal_pc, base, count)) = terminal else {
+        return Ok(None);
+    };
+    let copy_start = terminal_pc + 1;
+    let Some(copy_end) = copy_start.checked_add(usize::from(count)) else {
+        return Ok(None);
+    };
+    if copy_end > instructions.len() {
+        return Ok(None);
+    }
+    let source_index = usize::from(source.0 - base.0);
+    let mut first_slot = None;
+    for index in 0..usize::from(count) {
+        let pc = copy_start + index;
+        work_charge(work, 1, id, pc)?;
+        let Some(expected_source) = base.0.checked_add(index as u16) else {
+            return Ok(None);
+        };
+        let Instruction::Move { dest, src } = instructions[pc].instruction else {
+            return Ok(None);
+        };
+        if src.0 != expected_source || (index == source_index && dest != candidate) {
+            return Ok(None);
+        }
+        let Some(local) = locals.iter().find(|local| local.register == dest) else {
+            return Ok(None);
+        };
+        work_charge(work, locals.len(), id, pc)?;
+        if local.initialized_pc as usize != pc
+            || (local.start_pc as usize) < pc
+            || (local.end_pc as usize) <= pc
+        {
+            return Ok(None);
+        }
+        let first = *first_slot.get_or_insert(local.slot);
+        if usize::from(local.slot) != usize::from(first) + index {
+            return Ok(None);
+        }
+    }
+    work_charge(work, instructions.len(), id, terminal_pc)?;
+    for (pc, entry) in instructions.iter().enumerate() {
+        let targets = match &entry.instruction {
+            Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } => {
+                [Some(target.0 as usize), None]
+            }
+            Instruction::NumericForPrepare { exit, .. } => [Some(exit.0 as usize), None],
+            Instruction::NumericForNext { target, exit, .. } => {
+                [Some(target.0 as usize), Some(exit.0 as usize)]
+            }
+            _ => [None, None],
+        };
+        if targets
+            .into_iter()
+            .flatten()
+            .any(|target| call_pc <= target && target < copy_end)
+        {
+            return Ok(None);
+        }
+        if pc < copy_end {
+            continue;
+        }
+        let (read, write, possible_write, close) = access(pc, source);
+        let (_, candidate_write, candidate_possible, candidate_close) = access(pc, candidate);
+        if read || possible_write || close {
+            return Ok(None);
+        }
+        if write
+            && (!matches!(entry.instruction, Instruction::LoadNil { .. })
+                || candidate_write
+                || candidate_possible
+                || candidate_close)
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(copy_end))
+}
+
+/// open Call 的動態結果可覆蓋已死亡的固定值；證明只接受到下一次定義或
+/// 函式退出前無讀取、無分支的區間。
+fn dead_after_open_call(
+    proto: &BytecodePrototype,
+    call_pc: usize,
+    register: Register,
+    work: &mut OfficialWorkBudget,
+) -> Result<bool, OfficialExportError> {
+    let producer_base = match proto.instructions[call_pc].instruction {
+        Instruction::Call {
+            base,
+            result_mode: ResultMode::All,
+            ..
+        } => base,
+        _ => return Ok(false),
+    };
+    let Some(terminal) = strict_open_call_terminal(proto, call_pc, work)? else {
+        return Ok(false);
+    };
+    let mut end = proto.instructions.len();
+    for pc in call_pc + 1..proto.instructions.len() {
+        work_charge(work, 1, proto.id, pc)?;
+        let instruction = &proto.instructions[pc].instruction;
+        if pc <= terminal
+            && register.0 >= producer_base.0
+            && matches!(
+                instruction,
+                Instruction::Call {
+                    arg_count: u16::MAX,
+                    ..
+                } | Instruction::TailCall {
+                    arg_count: u16::MAX,
+                    ..
+                }
+            )
+        {
+            if matches!(instruction, Instruction::TailCall { .. }) {
+                end = pc;
+                break;
+            }
+            continue;
+        }
+        let (read, write, possible_write, close) =
+            register_access(instruction, register, proto.register_count);
+        if read || possible_write || close {
+            return Ok(false);
+        }
+        if matches!(
+            instruction,
+            Instruction::Jump { .. }
+                | Instruction::JumpIfFalse { .. }
+                | Instruction::NumericForPrepare { .. }
+                | Instruction::NumericForNext { .. }
+        ) {
+            return Ok(false);
+        }
+        if write
+            || matches!(
+                instruction,
+                Instruction::Return { .. } | Instruction::TailCall { .. }
+            )
+        {
+            end = pc;
+            break;
+        }
+    }
+    work_charge(work, proto.instructions.len(), proto.id, call_pc)?;
+    for entry in &proto.instructions {
+        let targets = match &entry.instruction {
+            Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } => {
+                [Some(target.0 as usize), None]
+            }
+            Instruction::NumericForPrepare { exit, .. } => [Some(exit.0 as usize), None],
+            Instruction::NumericForNext { target, exit, .. } => {
+                [Some(target.0 as usize), Some(exit.0 as usize)]
+            }
+            _ => [None, None],
+        };
+        if targets
+            .into_iter()
+            .flatten()
+            .any(|target| call_pc < target && target <= end)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// 由 P05 local storage 與 guest register 存取區間配置實體槽；每個暫存槽
 /// 在保守的 first..last 區間內獨占，因此回邊也不會覆蓋仍可讀的值。
 fn compact_map_peak_bytes(
     proto: &BytecodePrototype,
     storage_count: usize,
+    call_count: usize,
+    temporary_count: usize,
 ) -> Result<usize, OfficialExportError> {
     let registers = usize::from(proto.register_count);
     let instructions = proto.instructions.len();
@@ -1616,10 +2612,20 @@ fn compact_map_peak_bytes(
                 .and_then(|extra| bytes.checked_add(extra))
         });
     let instruction_bytes = instructions
-        .checked_mul(size_of::<usize>() * 6 + 4 + size_of::<u16>())
+        .checked_mul(size_of::<usize>() * 6 + 4 + size_of::<u16>() + size_of::<[u8; 32]>())
         .and_then(|bytes| bytes.checked_add(size_of::<usize>()));
     register_bytes
         .and_then(|bytes| instruction_bytes.and_then(|extra| bytes.checked_add(extra)))
+        .and_then(|bytes| {
+            call_count
+                .checked_mul(size_of::<TemporaryCallLayout>())
+                .and_then(|extra| bytes.checked_add(extra))
+        })
+        .and_then(|bytes| {
+            temporary_count
+                .checked_mul(size_of::<(u8, usize, usize)>() * 2 + size_of::<PendingRelayPair>())
+                .and_then(|extra| bytes.checked_add(extra))
+        })
         .ok_or_else(|| {
             error(
                 OfficialExportErrorKind::LimitExceeded,
@@ -1635,9 +2641,11 @@ fn compact_register_map(
     proto: &BytecodePrototype,
     numeric: &[NumericPair],
     numeric_blocks: u16,
+    anonymous_vararg_slot: Option<u8>,
+    env_upvalue: Option<u16>,
     limits: &OfficialChunkLimits,
     work: &mut OfficialWorkBudget,
-) -> Result<(Vec<u8>, Vec<u8>, u16, Vec<u16>, Vec<u16>, u8), OfficialExportError> {
+) -> Result<(Vec<u8>, Vec<u8>, u16, Vec<u16>, Vec<u16>, Vec<[u8; 32]>, u8), OfficialExportError> {
     let debug = module
         .native_debug()
         .and_then(|debug| debug.prototype(proto.id));
@@ -1645,7 +2653,33 @@ fn compact_register_map(
         .native_debug()
         .and_then(|debug| debug.storage_for(proto.id))
         .unwrap_or(&[]);
-    if compact_map_peak_bytes(proto, storage.len())? > limits.max_allocated_bytes {
+    let fixed_count = storage.len() + usize::from(anonymous_vararg_slot.is_some());
+    work_charge(work, proto.instructions.len(), proto.id, 0)?;
+    let call_count = if debug.is_some() {
+        proto
+            .instructions
+            .iter()
+            .filter(|entry| {
+                matches!(entry.instruction, Instruction::Call { .. })
+                    || matches!(
+                        entry.instruction,
+                        Instruction::TailCall {
+                            arg_count: u16::MAX,
+                            ..
+                        }
+                    )
+            })
+            .count()
+    } else {
+        0
+    };
+    let temporary_count = module
+        .native_debug()
+        .and_then(|debug| debug.temporaries_for(proto.id))
+        .map_or(0, <[_]>::len);
+    if compact_map_peak_bytes(proto, fixed_count, call_count, temporary_count)?
+        > limits.max_allocated_bytes
+    {
         return Err(error(
             OfficialExportErrorKind::LimitExceeded,
             proto.id,
@@ -1654,6 +2688,7 @@ fn compact_register_map(
         ));
     }
     let count = usize::from(proto.register_count);
+    let call_layouts = temporary_call_layouts(module, proto, anonymous_vararg_slot, work)?;
     work_charge(
         work,
         count
@@ -1681,6 +2716,7 @@ fn compact_register_map(
     })?;
     mapped.resize(count, u8::MAX);
     for local in storage {
+        let official_slot = official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, 0)?;
         let slot = mapped
             .get_mut(usize::from(local.register.0))
             .ok_or_else(|| {
@@ -1691,7 +2727,7 @@ fn compact_register_map(
                     "native local register 超出 prototype",
                 )
             })?;
-        if *slot != u8::MAX && *slot != local.slot {
+        if *slot != u8::MAX && *slot != official_slot {
             return Err(error(
                 OfficialExportErrorKind::InvalidPrototype,
                 proto.id,
@@ -1699,7 +2735,7 @@ fn compact_register_map(
                 "native local register 對應衝突",
             ));
         }
-        *slot = local.slot;
+        *slot = official_slot;
     }
     let mut fixed = u16::from(debug.map_or(0, |entry| entry.max_active_locals));
     if debug.is_none() {
@@ -1743,6 +2779,23 @@ fn compact_register_map(
             fixed += 1;
         }
     }
+    if anonymous_vararg_slot.is_some() {
+        fixed = fixed.checked_add(1).ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                0,
+                "匿名 vararg fixed slot 溢位",
+            )
+        })?;
+    }
+    fixed = fixed.max(
+        call_layouts
+            .iter()
+            .map(|layout| layout.window_end)
+            .max()
+            .unwrap_or(0),
+    );
     if let Some(env) = mapped.get_mut(usize::from(proto.frame.environment.0)) {
         if *env == u8::MAX {
             *env = u8::try_from(fixed).map_err(|_| {
@@ -1837,6 +2890,234 @@ fn compact_register_map(
     if debug.is_none() {
         extend_capture_spans(module, proto, &mut span, &mut protected, work)?;
     }
+    let mut relay_reservations = Vec::new();
+    relay_reservations
+        .try_reserve_exact(temporary_count)
+        .map_err(|_| {
+            error(
+                OfficialExportErrorKind::AllocationFailed,
+                proto.id,
+                0,
+                "native relay 保留區配置失敗",
+            )
+        })?;
+    let mut relay_pairs: Vec<PendingRelayPair> = Vec::new();
+    relay_pairs
+        .try_reserve_exact(temporary_count)
+        .map_err(|_| {
+            error(
+                OfficialExportErrorKind::AllocationFailed,
+                proto.id,
+                0,
+                "native relay 配對配置失敗",
+            )
+        })?;
+    if let Some(debug) = module.native_debug() {
+        for call in &call_layouts {
+            let call_pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "native temporary PC 超出範圍",
+                )
+            })?);
+            let pending = debug.temporaries_at(proto.id, call_pc).unwrap_or(&[]);
+            work_charge(work, pending.len(), proto.id, call.pc)?;
+            for (ordinal, temporary) in pending.iter().enumerate() {
+                let slot = call
+                    .first_slot
+                    .checked_add(u16::try_from(ordinal).map_err(|_| {
+                        error(
+                            OfficialExportErrorKind::LimitExceeded,
+                            proto.id,
+                            call.pc,
+                            "native temporary ordinal 超出 stack",
+                        )
+                    })?)
+                    .and_then(|slot| u8::try_from(slot).ok())
+                    .ok_or_else(|| {
+                        error(
+                            OfficialExportErrorKind::LimitExceeded,
+                            proto.id,
+                            call.pc,
+                            "native temporary slot 超出 stack",
+                        )
+                    })?;
+                let mapped_slot = mapped
+                    .get_mut(usize::from(temporary.register.0))
+                    .ok_or_else(|| {
+                        error(
+                            OfficialExportErrorKind::InvalidPrototype,
+                            proto.id,
+                            call.pc,
+                            "native temporary register 超出 prototype",
+                        )
+                    })?;
+                if *mapped_slot != u8::MAX && *mapped_slot != slot {
+                    return Err(error(
+                        OfficialExportErrorKind::Unsupported,
+                        proto.id,
+                        call.pc,
+                        "native temporary 跨 Call slot 約束衝突",
+                    ));
+                }
+                *mapped_slot = slot;
+            }
+        }
+        let all_temporaries = debug.temporaries_for(proto.id).unwrap_or(&[]);
+        work_charge(work, all_temporaries.len(), proto.id, 0)?;
+        for temporary in all_temporaries {
+            let register = usize::from(temporary.register.0);
+            let slot = mapped[register];
+            if slot == u8::MAX {
+                continue;
+            }
+            work_charge(work, mapped.len(), proto.id, temporary.call_pc.0 as usize)?;
+            let original_end = span[register].1;
+            let mut relay_end = None;
+            let mut relay_pair = None;
+            for (other, &other_slot) in mapped.iter().enumerate() {
+                if other != register
+                    && slot == other_slot
+                    && span[register].0 < span[other].1
+                    && span[other].0 < original_end
+                {
+                    let mut reverse_pair = false;
+                    let mut terminal = None;
+                    for &pair in &relay_pairs {
+                        work_charge(work, 1, proto.id, temporary.call_pc.0 as usize)?;
+                        if pair.source != Register(other as u16)
+                            || pair.destination != temporary.register
+                            || pair.slot != slot
+                        {
+                            continue;
+                        }
+                        if terminal.is_none() {
+                            terminal = strict_open_call_terminal(
+                                proto,
+                                temporary.call_pc.0 as usize,
+                                work,
+                            )?;
+                            if let Some(end) = terminal {
+                                let plan_calls = module
+                                    .official_execution()
+                                    .map_or(&[][..], |plan| plan.calls());
+                                work_charge(
+                                    work,
+                                    plan_calls.len(),
+                                    proto.id,
+                                    temporary.call_pc.0 as usize,
+                                )?;
+                                if plan_calls.iter().any(|call| {
+                                    call.prototype == proto.id && call.call_pc.0 as usize == end
+                                }) {
+                                    terminal = None;
+                                }
+                            }
+                        }
+                        if pending_relay_reverse_revisit(
+                            pair,
+                            Register(other as u16),
+                            temporary.register,
+                            slot,
+                            temporary.call_pc.0 as usize,
+                            terminal,
+                            span[other],
+                            span[register],
+                            &relay_reservations,
+                        ) {
+                            reverse_pair = true;
+                            break;
+                        }
+                    }
+                    if reverse_pair {
+                        continue;
+                    }
+                    let proof_end = if let Some((relay, consumer)) = pending_move_relay_alias(
+                        &proto.instructions,
+                        proto.register_count,
+                        proto.id,
+                        temporary.call_pc.0 as usize,
+                        temporary.register,
+                        Register(other as u16),
+                        &debug
+                            .prototype(proto.id)
+                            .map_or(&[][..], |entry| &entry.locals),
+                        work,
+                    )? {
+                        if let Instruction::Move { dest, .. } =
+                            proto.instructions[relay].instruction
+                        {
+                            if dest == Register(other as u16) {
+                                let pair = PendingRelayPair {
+                                    source: temporary.register,
+                                    destination: dest,
+                                    move_pc: relay,
+                                    consumer_pc: consumer,
+                                    slot,
+                                };
+                                if relay_pair.is_some_and(|prior: PendingRelayPair| {
+                                    prior.source != pair.source
+                                        || prior.destination != pair.destination
+                                        || prior.move_pc != pair.move_pc
+                                        || prior.consumer_pc != pair.consumer_pc
+                                        || prior.slot != pair.slot
+                                }) {
+                                    return Err(error(
+                                        OfficialExportErrorKind::Unsupported,
+                                        proto.id,
+                                        temporary.call_pc.0 as usize,
+                                        "native temporary relay 配對衝突",
+                                    ));
+                                }
+                                relay_pair = Some(pair);
+                            }
+                        }
+                        Some(relay + 1)
+                    } else {
+                        pending_open_result_local_alias(
+                            &proto.instructions,
+                            proto.register_count,
+                            proto.id,
+                            temporary.call_pc.0 as usize,
+                            temporary.register,
+                            Register(other as u16),
+                            &debug
+                                .prototype(proto.id)
+                                .map_or(&[][..], |entry| &entry.locals),
+                            work,
+                        )?
+                    };
+                    if let Some(end) = proof_end {
+                        if relay_end.is_some_and(|prior| prior != end) {
+                            return Err(error(
+                                OfficialExportErrorKind::Unsupported,
+                                proto.id,
+                                temporary.call_pc.0 as usize,
+                                "native temporary relay 次序衝突",
+                            ));
+                        }
+                        relay_end = Some(end);
+                    } else {
+                        return Err(error(
+                            OfficialExportErrorKind::Unsupported,
+                            proto.id,
+                            temporary.call_pc.0 as usize,
+                            "native temporary 與固定 register 生命週期衝突",
+                        ));
+                    }
+                }
+            }
+            if let Some(end) = relay_end {
+                span[register].1 = end;
+                relay_reservations.push((slot, end, original_end));
+                if let Some(pair) = relay_pair {
+                    relay_pairs.push(pair);
+                }
+            }
+        }
+    }
     let mut intervals = Vec::new();
     intervals.try_reserve_exact(count).map_err(|_| {
         error(
@@ -1871,14 +3152,19 @@ fn compact_register_map(
     intervals.sort_unstable_by_key(|&(start, _, register)| (start, register));
     let mut fixed_intervals = Vec::new();
     fixed_intervals
-        .try_reserve_exact(count.checked_add(storage.len()).ok_or_else(|| {
-            error(
-                OfficialExportErrorKind::LimitExceeded,
-                proto.id,
-                0,
-                "native fixed interval 數溢位",
-            )
-        })?)
+        .try_reserve_exact(
+            count
+                .checked_add(fixed_count)
+                .and_then(|count| count.checked_add(relay_reservations.len()))
+                .ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        0,
+                        "native fixed interval 數溢位",
+                    )
+                })?,
+        )
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -1889,7 +3175,7 @@ fn compact_register_map(
         })?;
     work_charge(
         work,
-        mapped.len().checked_add(storage.len()).ok_or_else(|| {
+        mapped.len().checked_add(fixed_count).ok_or_else(|| {
             error(
                 OfficialExportErrorKind::LimitExceeded,
                 proto.id,
@@ -1906,7 +3192,12 @@ fn compact_register_map(
         }
     }
     for local in storage {
-        fixed_intervals.push((local.slot, local.start_pc as usize, local.end_pc as usize));
+        let slot = official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, 0)?;
+        fixed_intervals.push((slot, local.start_pc as usize, local.end_pc as usize));
+    }
+    fixed_intervals.extend_from_slice(&relay_reservations);
+    if let Some(slot) = anonymous_vararg_slot {
+        fixed_intervals.push((slot, 0, proto.instructions.len()));
     }
     work_charge(
         work,
@@ -1985,6 +3276,32 @@ fn compact_register_map(
             if slot_end[usize::from(slot)] > start {
                 continue;
             }
+            work_charge(work, call_layouts.len(), proto.id, start)?;
+            if call_layouts.iter().any(|call| {
+                if !(start <= call.pc
+                    && call.pc < end
+                    && call.window_start <= slot
+                    && slot < call.window_end)
+                {
+                    return false;
+                }
+                let Instruction::Call {
+                    base,
+                    arg_count,
+                    result_mode: ResultMode::Fixed(results),
+                } = proto.instructions[call.pc].instruction
+                else {
+                    return true;
+                };
+                let relative = register.checked_sub(usize::from(base.0));
+                let is_result = relative.is_some_and(|offset| offset < usize::from(results));
+                let dying_input = relative.is_some_and(|offset| offset <= usize::from(arg_count))
+                    && end <= call.pc + 1
+                    && protected[register] == 0;
+                !is_result && !dying_input
+            }) {
+                continue;
+            }
             let fixed = &fixed_intervals
                 [fixed_boundaries[usize::from(slot)]..fixed_boundaries[usize::from(slot) + 1]];
             work_charge(work, fixed.len(), proto.id, start)?;
@@ -2053,7 +3370,11 @@ fn compact_register_map(
     let mut pc = 0usize;
     work_charge(work, proto.instructions.len(), proto.id, 0)?;
     while pc < proto.instructions.len() {
-        let end = if matches!(
+        let selected_call = call_layouts.iter().find(|call| call.pc == pc);
+        work_charge(work, call_layouts.len(), proto.id, pc)?;
+        let end = if selected_call.is_some_and(|call| call.open_chain) {
+            pc
+        } else if matches!(
             proto.instructions[pc].instruction,
             Instruction::Call {
                 result_mode: ResultMode::All,
@@ -2068,7 +3389,7 @@ fn compact_register_map(
             pc
         };
         let mut width = 0u16;
-        let mut top = 0u16;
+        let mut top = anonymous_vararg_slot.map_or(0, |slot| u16::from(slot) + 1);
         work_charge(work, end - pc + 1, proto.id, pc)?;
         for at in pc..=end {
             let needed = scratch_width_at(proto, at, work)?;
@@ -2096,7 +3417,9 @@ fn compact_register_map(
             }
             for local in storage {
                 if (local.start_pc as usize) <= at && at < local.end_pc as usize {
-                    top = top.max(u16::from(local.slot) + 1);
+                    let slot =
+                        official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, at)?;
+                    top = top.max(u16::from(slot) + 1);
                 }
             }
             work_charge(work, numeric.len(), proto.id, at)?;
@@ -2128,6 +3451,202 @@ fn compact_register_map(
                     );
                 }
             }
+        }
+        if let Some(call) = selected_call {
+            if end != pc || width != call.window_width {
+                return Err(error(
+                    OfficialExportErrorKind::Unsupported,
+                    proto.id,
+                    pc,
+                    "native Call temporary window 與 open chain 衝突",
+                ));
+            }
+            let (base, arg_count, result_mode, tail) = match proto.instructions[pc].instruction {
+                Instruction::Call {
+                    base,
+                    arg_count,
+                    result_mode,
+                } => (base, arg_count, result_mode, false),
+                Instruction::TailCall {
+                    base,
+                    arg_count,
+                    result_mode,
+                } if call.open_chain => (base, arg_count, result_mode, true),
+                _ => {
+                    return Err(error(
+                        OfficialExportErrorKind::InvalidPrototype,
+                        proto.id,
+                        pc,
+                        "native Call 佈局 PC 無 Call",
+                    ));
+                }
+            };
+            work_charge(work, mapped.len(), proto.id, pc)?;
+            for (register, &slot) in mapped.iter().enumerate() {
+                let result_written = !tail
+                    && (matches!(result_mode, ResultMode::Fixed(results)
+                    if register >= usize::from(base.0)
+                        && register - usize::from(base.0) < usize::from(results))
+                        || matches!(result_mode, ResultMode::All)
+                            && register == usize::from(base.0));
+                let destructive_start = if call.open_chain {
+                    call.call_base
+                } else {
+                    call.window_start
+                };
+                let destructive_end = if call.open_chain && matches!(result_mode, ResultMode::All) {
+                    255
+                } else {
+                    call.window_end
+                };
+                if slot != u8::MAX
+                    && destructive_start <= u16::from(slot)
+                    && u16::from(slot) < destructive_end
+                    && span[register].0 <= pc
+                    && pc < span[register].1
+                    && (span[register].1 > pc + 1 || protected[register] != 0)
+                    && !result_written
+                {
+                    if call.open_chain
+                        && matches!(result_mode, ResultMode::All)
+                        && u16::from(slot) >= call.window_end
+                        && environment_cache_chain_safe(
+                            proto,
+                            pc,
+                            Register(register as u16),
+                            env_upvalue.is_some(),
+                            work,
+                        )?
+                    {
+                        let pending_env = if let Some(debug) = module.native_debug() {
+                            let terminal =
+                                strict_open_call_terminal(proto, pc, work)?.ok_or_else(|| {
+                                    error(
+                                        OfficialExportErrorKind::InvalidPrototype,
+                                        proto.id,
+                                        pc,
+                                        "environment cache 缺開放呼叫終點",
+                                    )
+                                })?;
+                            let mut found = false;
+                            for at in pc..=terminal {
+                                let call_pc =
+                                    InstructionOffset(u32::try_from(at).map_err(|_| {
+                                        error(
+                                            OfficialExportErrorKind::LimitExceeded,
+                                            proto.id,
+                                            at,
+                                            "environment cache PC 超限",
+                                        )
+                                    })?);
+                                let pending =
+                                    debug.temporaries_at(proto.id, call_pc).unwrap_or(&[]);
+                                work_charge(work, pending.len(), proto.id, at)?;
+                                found |= pending
+                                    .iter()
+                                    .any(|entry| entry.register == proto.global_environment);
+                            }
+                            found
+                        } else {
+                            false
+                        };
+                        if !pending_env
+                            && environment_cache_slot_exclusive(
+                                &fixed_intervals,
+                                slot,
+                                pc,
+                                proto.id,
+                                work,
+                            )?
+                        {
+                            continue;
+                        }
+                    }
+                    if call.open_chain
+                        && matches!(result_mode, ResultMode::All)
+                        && dead_after_open_call(proto, pc, Register(register as u16), work)?
+                    {
+                        continue;
+                    }
+                    return Err(error(
+                        OfficialExportErrorKind::Unsupported,
+                        proto.id,
+                        pc,
+                        "native Call window 與活躍固定 register 衝突",
+                    ));
+                }
+            }
+            let gather_base = if call.open_chain
+                && matches!(result_mode, ResultMode::All)
+                && arg_count != u16::MAX
+            {
+                open_root_base(proto, pc, work)?
+            } else {
+                base
+            };
+            let gathered = if arg_count == u16::MAX {
+                0
+            } else {
+                arg_count
+                    .checked_add(1)
+                    .and_then(|count| count.checked_add(base.0 - gather_base.0))
+                    .ok_or_else(|| {
+                        error(
+                            OfficialExportErrorKind::LimitExceeded,
+                            proto.id,
+                            pc,
+                            "native Call gather 數溢位",
+                        )
+                    })?
+            };
+            let scattered = match (tail, result_mode) {
+                (true, _) => 0,
+                (_, ResultMode::Fixed(count)) => count,
+                (_, ResultMode::All) => 0,
+            };
+            let spare = (top..255)
+                .find(|slot| *slot < call.window_start || *slot >= call.window_end)
+                .map(|slot| slot as u8);
+            let candidate = u8::try_from(call.window_start).map_err(|_| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    pc,
+                    "native Call window 起點超出 stack",
+                )
+            })?;
+            if parallel_copy_plan(
+                &mapped,
+                gather_base,
+                gathered,
+                candidate,
+                true,
+                spare,
+                proto.id,
+                pc,
+                work,
+            )?
+            .is_none()
+                || parallel_copy_plan(
+                    &mapped, base, scattered, candidate, false, spare, proto.id, pc, work,
+                )?
+                .is_none()
+            {
+                return Err(error(
+                    OfficialExportErrorKind::Unsupported,
+                    proto.id,
+                    pc,
+                    "native Call window 無安全 gather/scatter",
+                ));
+            }
+            scratch[pc] = call.window_start;
+            parallel_spare[pc] = spare.map_or(NO_SPARE_SLOT, u16::from);
+            max_stack = max_stack
+                .max(top)
+                .max(call.window_end)
+                .max(spare.map_or(0, |slot| u16::from(slot) + 1));
+            pc += 1;
+            continue;
         }
         if width > 0 {
             let peak = top.checked_add(width).ok_or_else(|| {
@@ -2169,6 +3688,9 @@ fn compact_register_map(
                     ));
                 };
                 let mut immutable = [false; 255];
+                if let Some(slot) = anonymous_vararg_slot {
+                    immutable[usize::from(slot)] = true;
+                }
                 let is_call =
                     matches!(proto.instructions[pc].instruction, Instruction::Call { .. });
                 let is_vararg = matches!(
@@ -2213,14 +3735,16 @@ fn compact_register_map(
                 }
                 for local in storage {
                     if local.start_pc as usize <= pc && pc < local.end_pc as usize {
+                        let slot =
+                            official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, pc)?;
                         let result_written = is_vararg
                             && local.register.0 >= guest.0
                             && local.register.0 - guest.0 < scattered;
                         if !result_written {
-                            immutable[usize::from(local.slot)] = true;
+                            immutable[usize::from(slot)] = true;
                         }
                         if is_call {
-                            call_floor = call_floor.max(u16::from(local.slot) + 1);
+                            call_floor = call_floor.max(u16::from(slot) + 1);
                         }
                     }
                 }
@@ -2363,6 +3887,156 @@ fn compact_register_map(
             "native maxstack 超過 255",
         )
     })?;
+    let mut call_cleanup_slots = Vec::new();
+    call_cleanup_slots
+        .try_reserve_exact(proto.instructions.len())
+        .map_err(|_| {
+            error(
+                OfficialExportErrorKind::AllocationFailed,
+                proto.id,
+                0,
+                "native call cleanup 佈局配置失敗",
+            )
+        })?;
+    call_cleanup_slots.resize(proto.instructions.len(), [0u8; 32]);
+    for pc in 0..proto.instructions.len() {
+        let Some((first, end)) = call_cleanup_range(proto, pc) else {
+            continue;
+        };
+        work_charge(
+            work,
+            count
+                .checked_mul(2)
+                .and_then(|units| units.checked_add(storage.len()))
+                .and_then(|units| {
+                    numeric
+                        .len()
+                        .checked_mul(4)
+                        .and_then(|numeric_units| units.checked_add(numeric_units))
+                })
+                .and_then(|units| units.checked_add(255))
+                .ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        pc,
+                        "native call cleanup work 溢位",
+                    )
+                })?,
+            proto.id,
+            pc,
+        )?;
+        let mut occupied = [false; 255];
+        if let Some(slot) = anonymous_vararg_slot {
+            occupied[usize::from(slot)] = true;
+        }
+        for (register, &(start, last)) in span.iter().enumerate() {
+            let slot = mapped[register];
+            if (register < first || register >= end) && start <= pc && pc < last && slot != u8::MAX
+            {
+                occupied[usize::from(slot)] = true;
+            }
+        }
+        for local in storage {
+            let register = usize::from(local.register.0);
+            if (register < first || register >= end)
+                && (local.start_pc as usize) <= pc
+                && pc < local.end_pc as usize
+            {
+                let official_slot =
+                    official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, pc)?;
+                let slot = occupied
+                    .get_mut(usize::from(official_slot))
+                    .ok_or_else(|| {
+                        error(
+                            OfficialExportErrorKind::InvalidPrototype,
+                            proto.id,
+                            pc,
+                            "native call cleanup local slot 超出官方 stack",
+                        )
+                    })?;
+                *slot = true;
+            }
+        }
+        if let Some(debug) = module
+            .native_debug()
+            .and_then(|debug| debug.prototype(proto.id))
+        {
+            work_charge(work, debug.locals.len(), proto.id, pc)?;
+            for local in &debug.locals {
+                let register = usize::from(local.register.0);
+                if (register < first || register >= end)
+                    && local.initialized_pc as usize <= pc
+                    && pc < local.end_pc as usize
+                {
+                    let slot =
+                        official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, pc)?;
+                    occupied[usize::from(slot)] = true;
+                }
+            }
+        }
+        for pair in numeric {
+            if pair.prepare_pc <= pc && pc <= pair.next_pc {
+                let base = usize::from(tuple_base) + usize::from(pair.block) * 4;
+                let slots = occupied.get_mut(base..base + 4).ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        pc,
+                        "native call cleanup numeric tuple 超出官方 stack",
+                    )
+                })?;
+                slots.fill(true);
+            }
+        }
+        let selected = &mut call_cleanup_slots[pc];
+        for &slot in &mapped[first..end] {
+            if slot != u8::MAX && !occupied[usize::from(slot)] {
+                cleanup_slot_set(selected, slot);
+            }
+        }
+        let call_pc = pc - 1;
+        let Instruction::Call { arg_count, .. } = proto.instructions[call_pc].instruction else {
+            return Err(error(
+                OfficialExportErrorKind::InvalidPrototype,
+                proto.id,
+                pc,
+                "native call cleanup 缺前置 Call",
+            ));
+        };
+        let scratch_first = usize::from(scratch[call_pc]);
+        let scratch_end = if arg_count == u16::MAX {
+            usize::from(max_stack)
+        } else {
+            scratch_first
+                .checked_add(usize::from(arg_count) + 1)
+                .ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        pc,
+                        "native call cleanup scratch 溢位",
+                    )
+                })?
+        };
+        if scratch_end > usize::from(max_stack) {
+            return Err(error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                pc,
+                "native call cleanup scratch 超出官方 stack",
+            ));
+        }
+        for slot in scratch_first..scratch_end {
+            if !occupied[slot] {
+                cleanup_slot_set(selected, slot as u8);
+            }
+        }
+        let spare = parallel_spare[call_pc];
+        if spare < u16::from(max_stack) && !occupied[usize::from(spare)] {
+            cleanup_slot_set(selected, spare as u8);
+        }
+    }
     work_charge(work, mapped.len(), proto.id, 0)?;
     for slot in &mut mapped {
         if *slot == u8::MAX {
@@ -2382,6 +4056,7 @@ fn compact_register_map(
         tuple_base,
         scratch,
         parallel_spare,
+        call_cleanup_slots,
         max_stack,
     ))
 }
@@ -2390,11 +4065,13 @@ fn layout(
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     root: bool,
+    profile: LuaProfile,
     numeric: &[NumericPair],
     numeric_blocks: u16,
     work: &mut OfficialWorkBudget,
     limits: &OfficialChunkLimits,
 ) -> Result<Layout, OfficialExportError> {
+    let anonymous_vararg_slot = anonymous_vararg_slot(proto, profile)?;
     let env_needed = needs_environment(module, proto, work, 1, limits)?;
     let synthetic = env_needed
         && matches!(
@@ -2417,12 +4094,23 @@ fn layout(
     } else {
         None
     };
-    let (mapped, protected, tuple_base, scratch, parallel_spare, max_stack) =
-        compact_register_map(module, proto, numeric, numeric_blocks, limits, work)?;
+    let (mapped, protected, tuple_base, scratch, parallel_spare, call_cleanup_slots, max_stack) =
+        compact_register_map(
+            module,
+            proto,
+            numeric,
+            numeric_blocks,
+            anonymous_vararg_slot,
+            env_upvalue,
+            limits,
+            work,
+        )?;
     Ok(Layout {
+        anonymous_vararg_slot,
         tuple_base,
         scratch,
         parallel_spare,
+        call_cleanup_slots,
         max_stack,
         guest_upvalue_offset,
         env_upvalue,
@@ -2958,7 +4646,17 @@ fn native_opcode_words(
     let words = match &entry.instruction {
         Instruction::Move { .. } if entry.close_path.is_some() => 2,
         Instruction::LoadConst { constant, .. } if constant.0 > 131_071 => 2,
-        Instruction::LoadNil { count, .. } => usize::from(*count),
+        Instruction::LoadNil { count, .. } => {
+            if call_cleanup_range(proto, pc).is_some() {
+                work_charge(work, 32, proto.id, pc)?;
+                meta.call_cleanup_slots[pc]
+                    .iter()
+                    .map(|byte| byte.count_ones() as usize)
+                    .sum()
+            } else {
+                usize::from(*count)
+            }
+        }
         Instruction::NewTable { .. } => 3,
         Instruction::Closure { .. } => 2,
         Instruction::JumpIfFalse { .. } | Instruction::NumericForNext { .. } => 2,
@@ -2978,15 +4676,15 @@ fn native_opcode_words(
             arg_count,
             result_mode,
         } => {
+            let gather_start = if *arg_count != u16::MAX && matches!(result_mode, ResultMode::All) {
+                open_root_base(proto, pc, work)?
+            } else {
+                *base
+            };
             let gathered = if *arg_count == u16::MAX {
                 0usize
             } else {
-                let root = if matches!(result_mode, ResultMode::All) {
-                    open_root_base(proto, pc, work)?
-                } else {
-                    *base
-                };
-                usize::from(base.0.checked_sub(root.0).ok_or_else(|| {
+                usize::from(base.0.checked_sub(gather_start.0).ok_or_else(|| {
                     error(
                         OfficialExportErrorKind::InvalidPrototype,
                         proto.id,
@@ -3007,7 +4705,7 @@ fn native_opcode_words(
             let gathered = if meta.parallel_spare[pc] != NO_PARALLEL_COPY {
                 planned_copy(
                     meta,
-                    *base,
+                    gather_start,
                     u16::try_from(gathered).map_err(|_| {
                         error(
                             OfficialExportErrorKind::LimitExceeded,
@@ -3124,7 +4822,7 @@ fn native_word_count(
     meta: &Layout,
     root: bool,
     work: &mut OfficialWorkBudget,
-) -> Result<usize, OfficialExportError> {
+) -> Result<(usize, Option<u32>), OfficialExportError> {
     let variadic = proto.is_variadic || root && proto.parent.is_none();
     let prologue = usize::from(variadic)
         .checked_add(usize::from(proto.parameter_count))
@@ -3180,13 +4878,52 @@ fn native_word_count(
                 )
             })?;
     }
-    Ok(words)
+    let end_line = native_missing_end_line(module, proto, work)?;
+    let words = words
+        .checked_add(usize::from(end_line.is_some()))
+        .ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                proto.instructions.len(),
+                "native 末行返回指令數溢位",
+            )
+        })?;
+    Ok((words, end_line))
+}
+
+fn native_missing_end_line(
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    work: &mut OfficialWorkBudget,
+) -> Result<Option<u32>, OfficialExportError> {
+    if proto.parent.is_none()
+        || !matches!(
+            proto.instructions.last().map(|entry| &entry.instruction),
+            Some(
+                Instruction::Return { .. }
+                    | Instruction::TailCall { .. }
+                    | Instruction::Jump { .. }
+            )
+        )
+    {
+        return Ok(None);
+    }
+    let Some(entry) = module
+        .native_debug()
+        .and_then(|debug| debug.prototype(proto.id))
+    else {
+        return Ok(None);
+    };
+    work_charge(work, entry.lines.len(), proto.id, proto.instructions.len())?;
+    Ok((!entry.lines.contains(&entry.last_line_defined)).then_some(entry.last_line_defined))
 }
 
 fn preflight_native_prototype(
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     root: bool,
+    profile: LuaProfile,
     strip: bool,
     depth: usize,
     limits: &OfficialChunkLimits,
@@ -3234,15 +4971,48 @@ fn preflight_native_prototype(
         .native_debug()
         .and_then(|debug| debug.storage_for(proto.id))
         .map_or(0, |storage| storage.len());
+    let anonymous_vararg_slot = anonymous_vararg_slot(proto, profile)?;
+    work_charge(work, proto.instructions.len(), proto.id, 0)?;
     stats.bytes(
         1,
-        compact_map_peak_bytes(proto, storage_count)?,
+        compact_map_peak_bytes(
+            proto,
+            storage_count + usize::from(anonymous_vararg_slot.is_some()),
+            if module.native_debug().is_some() {
+                proto
+                    .instructions
+                    .iter()
+                    .filter(|entry| {
+                        matches!(entry.instruction, Instruction::Call {
+                            arg_count,
+                            result_mode: ResultMode::Fixed(_),
+                            ..
+                        } if arg_count != u16::MAX)
+                    })
+                    .count()
+            } else {
+                0
+            },
+            module
+                .native_debug()
+                .and_then(|debug| debug.temporaries_for(proto.id))
+                .map_or(0, <[_]>::len),
+        )?,
         limits,
         proto.id,
     )?;
     let (numeric, numeric_blocks) = numeric_pairs(proto, work)?;
-    let meta = layout(module, proto, root, &numeric, numeric_blocks, work, limits)?;
-    let words = native_word_count(module, &close_groups, proto, &meta, root, work)?;
+    let meta = layout(
+        module,
+        proto,
+        root,
+        profile,
+        &numeric,
+        numeric_blocks,
+        work,
+        limits,
+    )?;
+    let (words, _) = native_word_count(module, &close_groups, proto, &meta, root, work)?;
     NativePreflight::add(
         &mut stats.instructions,
         words,
@@ -3273,7 +5043,7 @@ fn preflight_native_prototype(
             stats.bytes(words, size_of::<i8>(), limits, proto.id)?;
             stats.bytes(words, size_of::<OfficialAbsLine>(), limits, proto.id)?;
             stats.bytes(
-                entry.locals.len(),
+                entry.locals.len() + usize::from(meta.anonymous_vararg_slot.is_some()),
                 size_of::<OfficialLocal>(),
                 limits,
                 proto.id,
@@ -3285,6 +5055,9 @@ fn preflight_native_prototype(
                     .locals
                     .len()
                     .checked_add(entry.upvalue_names.len())
+                    .and_then(|count| {
+                        count.checked_add(usize::from(meta.anonymous_vararg_slot.is_some()))
+                    })
                     .ok_or_else(|| {
                         error(
                             OfficialExportErrorKind::LimitExceeded,
@@ -3298,6 +5071,9 @@ fn preflight_native_prototype(
             )?;
             for local in &entry.locals {
                 stats.string(&local.name, limits, proto.id)?;
+            }
+            if meta.anonymous_vararg_slot.is_some() {
+                stats.string(ANONYMOUS_VARARG_LOCAL, limits, proto.id)?;
             }
             for name in &entry.upvalue_names {
                 if let Some(name) = name {
@@ -3366,7 +5142,17 @@ fn preflight_native_prototype(
         .iter()
         .filter(|child| child.parent == Some(proto.id))
     {
-        preflight_native_prototype(module, child, false, strip, depth + 1, limits, work, stats)?;
+        preflight_native_prototype(
+            module,
+            child,
+            false,
+            profile,
+            strip,
+            depth + 1,
+            limits,
+            work,
+            stats,
+        )?;
     }
     Ok(())
 }
@@ -3578,8 +5364,18 @@ fn native_prototype(
     let close_groups = native_close_groups(module, proto, limits, work)?;
     let variadic = proto.is_variadic || root && proto.parent.is_none();
     let (mut numeric, numeric_blocks) = numeric_pairs(proto, work)?;
-    let meta = layout(module, proto, root, &numeric, numeric_blocks, work, limits)?;
-    let word_limit = native_word_count(module, &close_groups, proto, &meta, root, work)?;
+    let meta = layout(
+        module,
+        proto,
+        root,
+        profile,
+        &numeric,
+        numeric_blocks,
+        work,
+        limits,
+    )?;
+    let (word_limit, end_line) =
+        native_word_count(module, &close_groups, proto, &meta, root, work)?;
     verify_bare_close_layout(module, proto, &meta, &close_groups, work, limits)?;
     for pair in &mut numeric {
         pair.tuple = meta
@@ -3845,16 +5641,43 @@ fn native_prototype(
                 }
             }
             Instruction::LoadNil { start, count } => {
-                for offset in 0..*count {
-                    let register = start.0.checked_add(offset).ok_or_else(|| {
-                        error(
-                            OfficialExportErrorKind::LimitExceeded,
-                            id,
-                            pc,
-                            "LoadNil register 溢位",
-                        )
-                    })?;
-                    builder.push(abc(8, r(Register(register))?, 0, 0, false), pc)?;
+                if call_cleanup_range(proto, pc).is_some() {
+                    work_charge(builder.work, 255, id, pc)?;
+                    for slot in 0..=254u8 {
+                        if cleanup_slot_contains(&meta.call_cleanup_slots[pc], slot) {
+                            builder.push(abc(8, slot, 0, 0, false), pc)?;
+                        }
+                    }
+                } else {
+                    let mut occupied = [0u8; 32];
+                    if let Some(debug) = module.native_debug().and_then(|debug| debug.prototype(id))
+                    {
+                        work_charge(builder.work, debug.locals.len(), id, pc)?;
+                        let end = usize::from(start.0) + usize::from(*count);
+                        for local in &debug.locals {
+                            let register = usize::from(local.register.0);
+                            if (register < usize::from(start.0) || register >= end)
+                                && local.initialized_pc as usize <= pc
+                                && pc < local.end_pc as usize
+                            {
+                                cleanup_slot_set(&mut occupied, r(local.register)?);
+                            }
+                        }
+                    }
+                    for offset in 0..*count {
+                        let register = start.0.checked_add(offset).ok_or_else(|| {
+                            error(
+                                OfficialExportErrorKind::LimitExceeded,
+                                id,
+                                pc,
+                                "LoadNil register 溢位",
+                            )
+                        })?;
+                        let slot = r(Register(register))?;
+                        if !cleanup_slot_contains(&occupied, slot) {
+                            builder.push(abc(8, slot, 0, 0, false), pc)?;
+                        }
+                    }
                 }
             }
             Instruction::GetUpvalue { dest, upvalue } => {
@@ -4459,20 +6282,45 @@ fn native_prototype(
         builder.code[prepare_at] = abx(74, pair.tuple, prep_bx);
         builder.code[loop_at] = abx(73, pair.tuple, loop_bx);
     }
+    if let Some(end_line) = end_line {
+        if !matches!(
+            builder.code.last().map(|word| word & 0x7f),
+            Some(56 | 69..=72)
+        ) {
+            return Err(error(
+                OfficialExportErrorKind::InvalidPrototype,
+                id,
+                proto.instructions.len(),
+                "native 末行前缺少終止指令",
+            ));
+        }
+        builder.push(abc(71, 0, 0, 0, false), proto.instructions.len())?;
+        if let Some(line) = builder.lines.last_mut() {
+            *line = end_line;
+        }
+    }
     let debug = if let Some(entry) = debug_entry {
         let (line_info, abs_line_info) =
             native_line_info(id, &builder.lines, entry.line_defined, builder.work)?;
         let mut locals = Vec::new();
-        locals.try_reserve_exact(entry.locals.len()).map_err(|_| {
-            error(
-                OfficialExportErrorKind::AllocationFailed,
-                id,
-                0,
-                "native official locals 配置失敗",
+        locals
+            .try_reserve_exact(
+                entry.locals.len() + usize::from(meta.anonymous_vararg_slot.is_some()),
             )
-        })?;
+            .map_err(|_| {
+                error(
+                    OfficialExportErrorKind::AllocationFailed,
+                    id,
+                    0,
+                    "native official locals 配置失敗",
+                )
+            })?;
         for local in &entry.locals {
             work_charge(builder.work, 1, id, local.start_pc as usize)?;
+            let parameter = u16::from(local.slot) < proto.parameter_count
+                && local.register.0 == u16::from(local.slot) + 1
+                && local.initialized_pc == 0
+                && local.start_pc == 0;
             let source_pc = |pc: u32| -> Result<u32, OfficialExportError> {
                 let offset = if pc as usize == proto.instructions.len() {
                     builder.code.len()
@@ -4497,9 +6345,40 @@ fn native_prototype(
             };
             locals.push(OfficialLocal {
                 name: Some(copy_slice(&local.name, id, builder.work)?),
-                start_pc: source_pc(local.start_pc)?,
+                start_pc: if parameter {
+                    0
+                } else {
+                    source_pc(local.start_pc)?
+                },
                 end_pc: source_pc(local.end_pc)?,
             });
+        }
+        if meta.anonymous_vararg_slot.is_some() {
+            let position = usize::from(proto.parameter_count);
+            if position > locals.len() {
+                return Err(error(
+                    OfficialExportErrorKind::InvalidPrototype,
+                    id,
+                    0,
+                    "匿名 vararg 前缺少參數 debug local",
+                ));
+            }
+            work_charge(builder.work, locals.len() - position + 1, id, 0)?;
+            locals.insert(
+                position,
+                OfficialLocal {
+                    name: Some(copy_slice(ANONYMOUS_VARARG_LOCAL, id, builder.work)?),
+                    start_pc: 1,
+                    end_pc: u32::try_from(builder.code.len()).map_err(|_| {
+                        error(
+                            OfficialExportErrorKind::LimitExceeded,
+                            id,
+                            0,
+                            "匿名 vararg debug local PC 溢位",
+                        )
+                    })?,
+                },
+            );
         }
         let mut upvalue_names = Vec::new();
         upvalue_names
@@ -4599,7 +6478,17 @@ pub(super) fn emit_native_chunk(
                 "native selected prototype 不存在",
             )
         })?;
-    preflight_native_prototype(module, root, true, strip, 1, limits, work, &mut preflight)?;
+    preflight_native_prototype(
+        module,
+        root,
+        true,
+        profile,
+        strip,
+        1,
+        limits,
+        work,
+        &mut preflight,
+    )?;
     work_charge(work, preflight.allocated_bytes, selected, 0)?;
     let mut total_instructions = 0;
     let main = native_prototype(
@@ -4632,6 +6521,747 @@ pub(super) fn emit_native_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay_instructions(instructions: Vec<Instruction>) -> Vec<BytecodeInstruction> {
+        let span = super::super::codec::BytecodeSpan {
+            start_byte: 0,
+            end_byte: 1,
+        };
+        instructions
+            .into_iter()
+            .map(|instruction| BytecodeInstruction {
+                instruction,
+                span,
+                close_path: None,
+            })
+            .collect()
+    }
+
+    fn relay_fixture() -> Vec<Instruction> {
+        vec![
+            Instruction::LoadNil {
+                start: Register(2),
+                count: 2,
+            },
+            Instruction::NewTable { dest: Register(3) },
+            Instruction::Call {
+                base: Register(5),
+                arg_count: 0,
+                result_mode: ResultMode::Fixed(0),
+            },
+            Instruction::Move {
+                dest: Register(2),
+                src: Register(3),
+            },
+            Instruction::Call {
+                base: Register(2),
+                arg_count: 0,
+                result_mode: ResultMode::Fixed(1),
+            },
+            Instruction::Return {
+                base: Register(2),
+                result_mode: ResultMode::Fixed(1),
+            },
+        ]
+    }
+
+    fn relay_proof(instructions: Vec<Instruction>, call_pc: usize) -> Option<usize> {
+        pending_move_relay_alias(
+            &relay_instructions(instructions),
+            8,
+            ProtoId(0),
+            call_pc,
+            Register(3),
+            Register(2),
+            &[],
+            &mut OfficialWorkBudget::new(10_000),
+        )
+        .unwrap()
+        .map(|(relay, _)| relay)
+    }
+
+    #[test]
+    fn pending_relay_proof_accepts_straight_move_to_fixed_call() {
+        assert_eq!(relay_proof(relay_fixture(), 2), Some(3));
+    }
+
+    #[test]
+    fn pending_relay_proof_requires_adjacent_open_producer_for_dynamic_consumer() {
+        let mut open = relay_fixture();
+        open[3] = Instruction::Move {
+            dest: Register(4),
+            src: Register(3),
+        };
+        open[4] = Instruction::Call {
+            base: Register(5),
+            arg_count: 0,
+            result_mode: ResultMode::All,
+        };
+        open[5] = Instruction::TailCall {
+            base: Register(4),
+            arg_count: u16::MAX,
+            result_mode: ResultMode::All,
+        };
+        let prove = |instructions: Vec<Instruction>| {
+            pending_move_relay_alias(
+                &relay_instructions(instructions),
+                8,
+                ProtoId(0),
+                2,
+                Register(3),
+                Register(4),
+                &[],
+                &mut OfficialWorkBudget::new(10_000),
+            )
+            .unwrap()
+            .map(|(relay, _)| relay)
+        };
+        assert_eq!(prove(open.clone()), Some(3));
+        open.insert(
+            5,
+            Instruction::LoadNil {
+                start: Register(6),
+                count: 1,
+            },
+        );
+        assert_eq!(prove(open), None);
+    }
+
+    #[test]
+    fn pending_relay_proof_accepts_fixed_prefix_below_open_producer() {
+        let mut instructions = relay_fixture();
+        instructions[2] = Instruction::Call {
+            base: Register(7),
+            arg_count: 0,
+            result_mode: ResultMode::Fixed(0),
+        };
+        instructions[3] = Instruction::Move {
+            dest: Register(5),
+            src: Register(3),
+        };
+        instructions[4] = Instruction::Call {
+            base: Register(6),
+            arg_count: 0,
+            result_mode: ResultMode::All,
+        };
+        instructions[5] = Instruction::TailCall {
+            base: Register(4),
+            arg_count: u16::MAX,
+            result_mode: ResultMode::All,
+        };
+        let prove = |instructions: Vec<Instruction>| {
+            pending_move_relay_alias(
+                &relay_instructions(instructions),
+                8,
+                ProtoId(0),
+                2,
+                Register(3),
+                Register(5),
+                &[],
+                &mut OfficialWorkBudget::new(10_000),
+            )
+            .unwrap()
+        };
+        assert_eq!(prove(instructions.clone()), Some((3, 5)));
+        instructions[5] = Instruction::TailCall {
+            base: Register(6),
+            arg_count: u16::MAX,
+            result_mode: ResultMode::All,
+        };
+        assert_eq!(prove(instructions), None);
+    }
+
+    #[test]
+    fn pending_relay_reverse_revisit_requires_same_pair_and_open_consumer() {
+        let pair = PendingRelayPair {
+            source: Register(15),
+            destination: Register(19),
+            move_pc: 21,
+            consumer_pc: 27,
+            slot: 0,
+        };
+        let reservations = [(0, 22, 22)];
+        let revisit =
+            |source, destination, slot, call_pc, terminal, source_span, destination_span| {
+                pending_relay_reverse_revisit(
+                    pair,
+                    source,
+                    destination,
+                    slot,
+                    call_pc,
+                    terminal,
+                    source_span,
+                    destination_span,
+                    &reservations,
+                )
+            };
+        assert!(revisit(
+            Register(15),
+            Register(19),
+            0,
+            26,
+            Some(27),
+            (16, 22),
+            (21, 28)
+        ));
+        assert!(!revisit(
+            Register(15),
+            Register(20),
+            0,
+            26,
+            Some(27),
+            (16, 22),
+            (21, 28)
+        ));
+        assert!(!revisit(
+            Register(15),
+            Register(19),
+            0,
+            25,
+            Some(28),
+            (16, 22),
+            (21, 28)
+        ));
+        assert!(!revisit(
+            Register(15),
+            Register(19),
+            0,
+            26,
+            Some(27),
+            (16, 23),
+            (21, 28)
+        ));
+        assert!(!revisit(
+            Register(15),
+            Register(19),
+            1,
+            26,
+            Some(27),
+            (16, 22),
+            (21, 28)
+        ));
+    }
+
+    #[test]
+    fn pending_relay_proof_rejects_destination_read_or_write_while_source_is_live() {
+        let mut read = relay_fixture();
+        read.insert(
+            2,
+            Instruction::Move {
+                dest: Register(6),
+                src: Register(2),
+            },
+        );
+        assert_eq!(relay_proof(read, 3), None);
+        let mut write = relay_fixture();
+        write.insert(
+            2,
+            Instruction::LoadNil {
+                start: Register(2),
+                count: 1,
+            },
+        );
+        assert_eq!(relay_proof(write, 3), None);
+    }
+
+    #[test]
+    fn pending_relay_proof_rejects_nonrelay_branch_loop_and_simultaneous_use() {
+        let mut nonrelay = relay_fixture();
+        nonrelay[3] = Instruction::Move {
+            dest: Register(6),
+            src: Register(3),
+        };
+        assert_eq!(relay_proof(nonrelay, 2), None);
+
+        let mut branch = relay_fixture();
+        branch.insert(
+            2,
+            Instruction::JumpIfFalse {
+                condition: Register(7),
+                target: InstructionOffset(3),
+            },
+        );
+        assert_eq!(relay_proof(branch, 3), None);
+
+        let mut looped = relay_fixture();
+        looped.insert(
+            5,
+            Instruction::Jump {
+                target: InstructionOffset(1),
+            },
+        );
+        assert_eq!(relay_proof(looped, 2), None);
+
+        let mut simultaneous = relay_fixture();
+        simultaneous.insert(
+            4,
+            Instruction::Move {
+                dest: Register(6),
+                src: Register(3),
+            },
+        );
+        assert_eq!(relay_proof(simultaneous, 2), None);
+    }
+
+    fn result_local(source: Register, slot: u8, initialized_pc: u32) -> NativeLocal {
+        NativeLocal {
+            binding: super::super::codec::BytecodeBindingId {
+                function: 0,
+                ordinal: u32::from(slot),
+            },
+            register: source,
+            slot,
+            initialized_pc,
+            start_pc: initialized_pc,
+            end_pc: 10,
+            name: b"result".to_vec(),
+        }
+    }
+
+    fn open_result_local_fixture() -> Vec<Instruction> {
+        vec![
+            Instruction::LoadNil {
+                start: Register(2),
+                count: 3,
+            },
+            Instruction::NewTable { dest: Register(3) },
+            Instruction::Call {
+                base: Register(7),
+                arg_count: 0,
+                result_mode: ResultMode::Fixed(0),
+            },
+            Instruction::Call {
+                base: Register(4),
+                arg_count: 0,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Call {
+                base: Register(3),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::Fixed(1),
+            },
+            Instruction::Move {
+                dest: Register(2),
+                src: Register(3),
+            },
+            Instruction::LoadNil {
+                start: Register(3),
+                count: 2,
+            },
+            Instruction::Return {
+                base: Register(2),
+                result_mode: ResultMode::Fixed(1),
+            },
+        ]
+    }
+
+    fn open_result_local_proof(
+        instructions: Vec<Instruction>,
+        locals: &[NativeLocal],
+    ) -> Option<usize> {
+        pending_open_result_local_alias(
+            &relay_instructions(instructions),
+            9,
+            ProtoId(0),
+            2,
+            Register(3),
+            Register(2),
+            locals,
+            &mut OfficialWorkBudget::new(100_000),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pending_open_result_local_alias_accepts_straight_handoff() {
+        let local = result_local(Register(2), 0, 5);
+        assert_eq!(
+            open_result_local_proof(open_result_local_fixture(), &[local]),
+            Some(6)
+        );
+        let mut two = open_result_local_fixture();
+        two[4] = Instruction::Call {
+            base: Register(3),
+            arg_count: u16::MAX,
+            result_mode: ResultMode::Fixed(2),
+        };
+        two.insert(
+            6,
+            Instruction::Move {
+                dest: Register(6),
+                src: Register(4),
+            },
+        );
+        assert_eq!(
+            open_result_local_proof(
+                two,
+                &[
+                    result_local(Register(2), 0, 5),
+                    result_local(Register(6), 1, 6),
+                ]
+            ),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn pending_open_result_local_alias_rejects_early_or_wrong_handoff() {
+        let mut early = result_local(Register(2), 0, 4);
+        assert_eq!(
+            open_result_local_proof(open_result_local_fixture(), &[early.clone()]),
+            None
+        );
+        early.initialized_pc = 5;
+        early.start_pc = 5;
+        let mut nonadjacent = open_result_local_fixture();
+        nonadjacent.insert(
+            5,
+            Instruction::LoadNil {
+                start: Register(8),
+                count: 1,
+            },
+        );
+        assert_eq!(open_result_local_proof(nonadjacent, &[early.clone()]), None);
+        let mut wrong_source = open_result_local_fixture();
+        wrong_source[5] = Instruction::Move {
+            dest: Register(2),
+            src: Register(4),
+        };
+        assert_eq!(
+            open_result_local_proof(wrong_source, &[early.clone()]),
+            None
+        );
+        let mut later_read = open_result_local_fixture();
+        later_read.insert(
+            6,
+            Instruction::Move {
+                dest: Register(8),
+                src: Register(3),
+            },
+        );
+        assert_eq!(open_result_local_proof(later_read, &[early.clone()]), None);
+        let mut branch = open_result_local_fixture();
+        branch[0] = Instruction::Jump {
+            target: InstructionOffset(4),
+        };
+        assert_eq!(open_result_local_proof(branch, &[early]), None);
+    }
+
+    fn dead_open_fixture(instructions: Vec<Instruction>) -> BytecodePrototype {
+        let span = super::super::codec::BytecodeSpan {
+            start_byte: 0,
+            end_byte: 1,
+        };
+        BytecodePrototype {
+            id: ProtoId(0),
+            function: 0,
+            parent: None,
+            span,
+            register_count: 9,
+            parameter_count: 0,
+            is_variadic: false,
+            named_vararg: None,
+            frame: super::super::FrameLayout {
+                register_limit: 9,
+                initial_top: Register(0),
+                dynamic_top: Register(0),
+                return_base: Register(0),
+                environment: Register(0),
+                environment_source: EnvironmentSource::RootExternal,
+                registers_start_as_nil: true,
+            },
+            global_environment: Register(0),
+            global_environment_binding: super::super::codec::BytecodeBindingId {
+                function: 0,
+                ordinal: 0,
+            },
+            binding_registers: Vec::new(),
+            constants: Vec::new(),
+            upvalues: Vec::new(),
+            instructions: relay_instructions(instructions),
+            close_paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn strict_open_call_chain_rejects_gap_cleanup_jump_and_wrong_consumer() {
+        let chain = vec![
+            Instruction::Call {
+                base: Register(4),
+                arg_count: 0,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Call {
+                base: Register(3),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::All,
+            },
+            Instruction::TailCall {
+                base: Register(2),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::All,
+            },
+        ];
+        let prove = |instructions| {
+            strict_open_call_terminal(
+                &dead_open_fixture(instructions),
+                0,
+                &mut OfficialWorkBudget::new(10_000),
+            )
+        };
+        assert_eq!(prove(chain.clone()).unwrap(), Some(2));
+
+        let mut gap = chain.clone();
+        gap.insert(
+            1,
+            Instruction::LoadNil {
+                start: Register(7),
+                count: 1,
+            },
+        );
+        assert_eq!(prove(gap.clone()).unwrap(), None);
+        assert_eq!(
+            open_chain_end(
+                &dead_open_fixture(gap),
+                0,
+                &mut OfficialWorkBudget::new(10_000)
+            )
+            .unwrap_err()
+            .kind,
+            OfficialExportErrorKind::Unsupported
+        );
+
+        let mut cleanup = chain.clone();
+        cleanup.insert(
+            1,
+            Instruction::Close {
+                base: Register(7),
+                count: 1,
+            },
+        );
+        assert_eq!(
+            prove(cleanup).unwrap_err().kind,
+            OfficialExportErrorKind::Unsupported
+        );
+
+        let mut jump = chain.clone();
+        jump.push(Instruction::Jump {
+            target: InstructionOffset(1),
+        });
+        assert_eq!(
+            prove(jump).unwrap_err().kind,
+            OfficialExportErrorKind::Unsupported
+        );
+
+        let mut wrong = chain;
+        wrong[2] = Instruction::TailCall {
+            base: Register(2),
+            arg_count: 1,
+            result_mode: ResultMode::All,
+        };
+        assert_eq!(prove(wrong.clone()).unwrap(), None);
+        assert_eq!(
+            open_chain_end(
+                &dead_open_fixture(wrong),
+                0,
+                &mut OfficialWorkBudget::new(10_000)
+            )
+            .unwrap_err()
+            .kind,
+            OfficialExportErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn environment_cache_open_chain_requires_physical_upvalue_and_exact_register() {
+        let fixture = dead_open_fixture(vec![
+            Instruction::Call {
+                base: Register(4),
+                arg_count: 0,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Call {
+                base: Register(3),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::Fixed(0),
+            },
+            Instruction::Return {
+                base: Register(7),
+                result_mode: ResultMode::Fixed(1),
+            },
+        ]);
+        let check = |candidate, physical| {
+            environment_cache_chain_safe(
+                &fixture,
+                0,
+                candidate,
+                physical,
+                &mut OfficialWorkBudget::new(100_000),
+            )
+            .unwrap()
+        };
+        assert!(check(Register(0), true));
+        assert!(!check(Register(0), false));
+        assert!(!check(Register(7), true));
+    }
+
+    #[test]
+    fn environment_cache_open_chain_rejects_semantic_use_gap_close_and_jump() {
+        let chain = vec![
+            Instruction::Call {
+                base: Register(4),
+                arg_count: 0,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Call {
+                base: Register(3),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::Fixed(0),
+            },
+            Instruction::Move {
+                dest: Register(7),
+                src: Register(0),
+            },
+            Instruction::Return {
+                base: Register(7),
+                result_mode: ResultMode::Fixed(1),
+            },
+        ];
+        let check = |instructions: Vec<Instruction>, producer_pc| {
+            environment_cache_chain_safe(
+                &dead_open_fixture(instructions),
+                producer_pc,
+                Register(0),
+                true,
+                &mut OfficialWorkBudget::new(100_000),
+            )
+        };
+        assert_eq!(check(chain.clone(), 0).unwrap(), true);
+
+        let mut read = chain.clone();
+        read[0] = Instruction::Call {
+            base: Register(0),
+            arg_count: 0,
+            result_mode: ResultMode::All,
+        };
+        assert_eq!(check(read, 0).unwrap(), false);
+
+        let mut gap = chain.clone();
+        gap.insert(
+            1,
+            Instruction::LoadNil {
+                start: Register(0),
+                count: 1,
+            },
+        );
+        assert_eq!(check(gap, 0).unwrap(), false);
+
+        let mut close = chain.clone();
+        close.insert(
+            1,
+            Instruction::Close {
+                base: Register(0),
+                count: 1,
+            },
+        );
+        assert_eq!(
+            check(close, 0).unwrap_err().kind,
+            OfficialExportErrorKind::Unsupported
+        );
+
+        let mut jump = chain;
+        jump.insert(
+            0,
+            Instruction::Jump {
+                target: InstructionOffset(2),
+            },
+        );
+        assert_eq!(
+            check(jump, 1).unwrap_err().kind,
+            OfficialExportErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn environment_cache_slot_rejects_alias_local_and_relay_occupants() {
+        let id = ProtoId(0);
+        let check = |intervals: &[(u8, usize, usize)]| {
+            environment_cache_slot_exclusive(
+                intervals,
+                5,
+                3,
+                id,
+                &mut OfficialWorkBudget::new(100_000),
+            )
+            .unwrap()
+        };
+        let env = (5, 0, 10);
+        assert!(check(&[env]));
+        assert!(!check(&[]));
+        for occupied in [(5, 1, 9), (5, 3, 4), (5, 0, 10)] {
+            assert!(!check(&[env, occupied]));
+        }
+        assert!(check(&[env, (5, 4, 9), (6, 0, 10)]));
+    }
+
+    #[test]
+    fn open_call_dead_value_proof_accepts_consumed_dynamic_tail_only() {
+        let instructions = vec![
+            Instruction::Call {
+                base: Register(4),
+                arg_count: 1,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Call {
+                base: Register(3),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::Fixed(1),
+            },
+            Instruction::LoadNil {
+                start: Register(5),
+                count: 1,
+            },
+            Instruction::Return {
+                base: Register(2),
+                result_mode: ResultMode::Fixed(1),
+            },
+        ];
+        let check = |instructions| {
+            dead_after_open_call(
+                &dead_open_fixture(instructions),
+                0,
+                Register(5),
+                &mut OfficialWorkBudget::new(100_000),
+            )
+            .unwrap()
+        };
+        assert!(check(instructions.clone()));
+        let mut later_read = instructions.clone();
+        later_read.insert(
+            2,
+            Instruction::Move {
+                dest: Register(8),
+                src: Register(5),
+            },
+        );
+        assert!(!check(later_read));
+        let mut jump_in = instructions;
+        jump_in.insert(
+            0,
+            Instruction::Jump {
+                target: InstructionOffset(2),
+            },
+        );
+        assert!(
+            dead_after_open_call(
+                &dead_open_fixture(jump_in),
+                1,
+                Register(5),
+                &mut OfficialWorkBudget::new(100_000),
+            )
+            .is_err()
+        );
+    }
 
     fn run(mapped: &[u8], gather: bool, spare: Option<u8>, original: &[i32]) -> Option<Vec<i32>> {
         let mut work = OfficialWorkBudget::new(10_000);

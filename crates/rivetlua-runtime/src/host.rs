@@ -487,17 +487,34 @@ pub trait HostEntropy {
 #[repr(u8)]
 /// 各權限只開啟下列受限操作；缺少可靠 RVLU metadata 的選項仍拒絕。
 pub enum DebugPermission {
-    /// `getinfo(function, "f")`；`u` 僅無獨立 environment 的 closure。
-    /// 不支援 stack level、source、line、名稱。
+    /// 查詢已驗證的函式來源、行號、參數與身分資料。
     Info,
+    /// 查詢目前執行緒的數值 stack level 與實際呼叫位置。
+    StackInspection,
+    /// 查詢已驗證 native local、參數與暫停中協程的 frame/vararg。
+    LocalInspection,
+    /// 修改已驗證 native local 或 vararg，維持 frame root 與協程 GC 強邊。
+    LocalMutation,
+    /// 修改 closure 的 open/closed upvalue，沿用 frame root 與 GC barrier。
+    UpvalueMutation,
+    /// 查詢或改接 closure 共享的 upvalue 物件身分。
+    UpvalueIdentity,
+    /// 讀取 VM 專屬、由 root 保護的 guest-owned 相容 registry。
+    RegistryRead,
+    /// 讀取 File userdata；因無 uservalue 槽而回傳 nil。
+    UserValueRead,
+    /// 嘗試修改 File userdata；因無 uservalue 槽而回傳 nil。
+    UserValueWrite,
     /// `getupvalue` 只讀取無獨立 environment 的 closure 捕捉值；
     /// 名稱固定為 `(no name)`，其餘明確拒絕。
     Upvalues,
     /// 只輸出帶 prototype/PC 的即時 RVLU Lua frame。
     Traceback,
-    /// 只開啟 instruction-count hook；call/return/line 與 hook 自身 yield 拒絕。
+    /// 開啟 instruction-count hook；hook 自身 yield 拒絕。
     /// 任一 hook callback 執行期間會抑制整個 VM 的巢狀 hook；其他 coroutine 仍可 yield。
     CountHook,
+    /// 開啟已驗證來源行號的 line hook 與 call/return hook。
+    EventHook,
     /// 只讀取目前可驗證的 table/file/string metatable。
     MetatableRead,
     /// 只允許 table 的 metatable 設定，沿既有 write barrier。
@@ -518,7 +535,7 @@ impl Default for DebugLimits {
             max_frames: 64,
             max_trace_bytes: 16 * 1024,
             max_work_units: 100_000,
-            max_hook_count: 100_000,
+            max_hook_count: (1 << 24) - 1,
         }
     }
 }
@@ -526,7 +543,7 @@ impl Default for DebugLimits {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// 預設全部拒絕；`allow` 只解除相應受限操作的 host policy。
 pub struct DebugCapability {
-    permissions: u8,
+    permissions: u32,
     limits: DebugLimits,
 }
 
@@ -536,7 +553,7 @@ impl DebugCapability {
     }
 
     pub fn allow(mut self, permission: DebugPermission) -> Self {
-        self.permissions |= 1 << permission as u8;
+        self.permissions |= 1_u32 << permission as u8;
         self
     }
 
@@ -546,7 +563,7 @@ impl DebugCapability {
     }
 
     pub(crate) fn allows(self, permission: DebugPermission) -> bool {
-        self.permissions & (1 << permission as u8) != 0
+        self.permissions & (1_u32 << permission as u8) != 0
     }
 
     pub(crate) fn limits(self) -> DebugLimits {

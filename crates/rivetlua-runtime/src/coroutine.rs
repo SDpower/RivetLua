@@ -41,6 +41,13 @@ pub(crate) struct ThreadContext {
     ledger: AllocationLedger,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ParkedLocalSlot {
+    Register(Register),
+    Vararg(usize),
+    VarargTable,
+}
+
 impl ThreadContext {
     pub(crate) fn new(frame: CallFrame, ledger: &AllocationLedger) -> Self {
         Self {
@@ -143,6 +150,52 @@ impl ThreadContext {
                     .filter(|index| *index < frame.register_limit)
                     .map(|index| frame.registers[index])
             })
+    }
+
+    pub(crate) fn debug_frame(&self, level: usize) -> Option<&CallFrame> {
+        match level {
+            0 => None,
+            1 => Some(&self.frame),
+            _ => self.callers.iter().rev().nth(level - 2),
+        }
+    }
+
+    pub(crate) fn write_parked_debug_local(
+        &mut self,
+        level: usize,
+        slot: ParkedLocalSlot,
+        value: Value,
+    ) -> bool {
+        let frame = match level {
+            0 => return false,
+            1 => &mut self.frame,
+            _ => match self.callers.iter_mut().rev().nth(level - 2) {
+                Some(frame) => frame,
+                None => return false,
+            },
+        };
+        match slot {
+            ParkedLocalSlot::Register(register) => {
+                let index = usize::from(register.0);
+                if index >= frame.register_limit || frame.roots[index].is_some() {
+                    return false;
+                }
+                frame.registers[index] = value;
+            }
+            ParkedLocalSlot::Vararg(index) => {
+                if index >= frame.varargs.len() || frame.vararg_roots[index].is_some() {
+                    return false;
+                }
+                frame.varargs[index] = value;
+            }
+            ParkedLocalSlot::VarargTable => {
+                if frame.debug_vararg_table_root.is_some() {
+                    return false;
+                }
+                frame.debug_vararg_table = value;
+            }
+        }
+        true
     }
 
     pub(crate) fn write_parked_slot(&mut self, slot: usize, value: Value) -> bool {

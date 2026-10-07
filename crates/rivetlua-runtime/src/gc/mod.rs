@@ -34,6 +34,12 @@ pub enum GcMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GcParameter {
+    Pause,
+    StepMultiplier,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GcCycleKind {
     Full,
     Minor,
@@ -94,6 +100,10 @@ pub struct GcTrace {
 }
 
 pub(crate) struct GcState {
+    pub(crate) automatic_running: bool,
+    pub(crate) pause_code: u8,
+    pub(crate) stepmul_code: u8,
+    pub(crate) debt_threshold_override: Option<usize>,
     pub phase: GcPhase,
     pub mode: GcMode,
     pub cycle: GcCycleKind,
@@ -105,6 +115,7 @@ pub(crate) struct GcState {
     pub sweep_cursor: usize,
     pub debt_bytes: usize,
     pub debt_threshold: usize,
+    pub(crate) incremental_debt_threshold: usize,
     pub major_debt_bytes: usize,
     pub major_threshold_bytes: usize,
     pub promotion_survivals: u8,
@@ -127,8 +138,12 @@ pub(crate) struct GcState {
 impl GcState {
     pub fn new(ledger: AllocationLedger) -> Self {
         Self {
+            automatic_running: true,
+            pause_code: 0x54,
+            stepmul_code: 0x50,
+            debt_threshold_override: None,
             phase: GcPhase::Pause,
-            mode: GcMode::Incremental,
+            mode: GcMode::Generational,
             cycle: GcCycleKind::Full,
             colors: Vec::new(),
             work: Vec::new(),
@@ -138,6 +153,7 @@ impl GcState {
             sweep_cursor: 0,
             debt_bytes: 0,
             debt_threshold: 1024 * 1024,
+            incremental_debt_threshold: 1024 * 1024,
             major_debt_bytes: 0,
             major_threshold_bytes: 4 * 1024 * 1024,
             promotion_survivals: 2,
@@ -156,6 +172,29 @@ impl GcState {
             charge: 0,
             ledger,
         }
+    }
+
+    pub(crate) fn code_param(value: i64) -> u8 {
+        let value = value.max(0) as u128;
+        if value >= 396_800 {
+            return u8::MAX;
+        }
+        let scaled = (value * 128 + 99) / 100;
+        if scaled < 16 {
+            return scaled as u8;
+        }
+        let log = (u128::BITS - scaled.leading_zeros()) - 5;
+        (((scaled >> log) - 16) as u8) | (((log + 1) as u8) << 4)
+    }
+
+    pub(crate) fn apply_param(code: u8) -> usize {
+        let high = usize::from(code >> 4);
+        let mantissa = if high == 0 {
+            usize::from(code)
+        } else {
+            usize::from((code & 15) + 16) << (high - 1)
+        };
+        mantissa.saturating_mul(100) / 128
     }
 
     pub fn transition(&mut self, next: GcPhase) {

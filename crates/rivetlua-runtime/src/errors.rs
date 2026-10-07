@@ -3,7 +3,7 @@
 use core::mem::size_of;
 use std::rc::Rc;
 
-use rivetlua_core::{Register, ResultMode, Value};
+use rivetlua_core::{ObjectRef, Register, ResultMode, Value};
 
 use crate::alloc::AllocationLedger;
 use crate::call::PendingCloseSnapshot;
@@ -47,6 +47,7 @@ pub(crate) enum Builtin {
         pattern: Value,
         next: usize,
         last: Option<usize>,
+        upvalue_identities: [ObjectRef; 3],
     },
 }
 

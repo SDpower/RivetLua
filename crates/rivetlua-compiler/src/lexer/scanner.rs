@@ -1,14 +1,16 @@
 use rivetlua_core::Number;
 
 use super::{
-    CompileLimits, Diagnostic, DiagnosticCode, Keyword, LexedChunk, Literal, SourcePosition, Span,
-    Symbol, Token, TokenKind, cursor::Cursor, push_token,
+    CompileLimits, Diagnostic, DiagnosticCode, Keyword, LexedChunk, Literal, NumericBudget,
+    NumericCharge, ScanError, SourcePosition, Span, Symbol, Token, TokenKind, cursor::Cursor,
+    push_token,
 };
 
-pub(super) fn scan(
+pub(super) fn scan<B: NumericBudget>(
     cursor: &mut Cursor<'_>,
     limits: &CompileLimits,
-) -> Result<LexedChunk, Diagnostic> {
+    budget: &mut B,
+) -> Result<LexedChunk, ScanError<B::Error>> {
     let mut tokens = Vec::new();
     while let Some(byte) = cursor.peek() {
         if is_space(byte) {
@@ -21,12 +23,9 @@ pub(super) fn scan(
                     let start = cursor.position();
                     let start_byte = cursor.offset();
                     advance(cursor, limits, start_byte, start)?;
-                    return Err(lex_error(
-                        cursor,
-                        start_byte,
-                        start,
-                        "long delimiter 不合法",
-                    ));
+                    return Err(
+                        lex_error(cursor, start_byte, start, "long delimiter 不合法").into(),
+                    );
                 }
             }
         } else if is_name_start(byte) {
@@ -34,7 +33,7 @@ pub(super) fn scan(
         } else if byte.is_ascii_digit()
             || (byte == b'.' && cursor.peek_n(1).is_some_and(|next| next.is_ascii_digit()))
         {
-            scan_number(cursor, limits, &mut tokens)?;
+            scan_number(cursor, limits, &mut tokens, budget)?;
         } else if matches!(byte, b'\'' | b'"') {
             scan_short_string(cursor, limits, &mut tokens)?;
         } else if byte == b'-' && cursor.peek_n(1) == Some(b'-') {
@@ -98,11 +97,12 @@ fn scan_name(
     emit(tokens, cursor, limits, start_byte, start, kind, literal)
 }
 
-fn scan_number(
+fn scan_number<B: NumericBudget>(
     cursor: &mut Cursor<'_>,
     limits: &CompileLimits,
     tokens: &mut Vec<Token>,
-) -> Result<(), Diagnostic> {
+    budget: &mut B,
+) -> Result<(), ScanError<B::Error>> {
     let start = cursor.position();
     let start_byte = cursor.offset();
     let mut bytes = Vec::new();
@@ -123,12 +123,7 @@ fn scan_number(
             }
         }
         if digits == 0 {
-            return Err(lex_error(
-                cursor,
-                start_byte,
-                start,
-                "十六進位 numeral 缺少數字",
-            ));
+            return Err(lex_error(cursor, start_byte, start, "十六進位 numeral 缺少數字").into());
         }
         if matches!(cursor.peek(), Some(b'p' | b'P')) {
             consume_number_byte(&mut bytes, cursor, limits, start_byte, start)?;
@@ -140,12 +135,9 @@ fn scan_number(
                 consume_number_byte(&mut bytes, cursor, limits, start_byte, start)?;
             }
             if bytes.len() == exponent_start {
-                return Err(lex_error(
-                    cursor,
-                    start_byte,
-                    start,
-                    "十六進位 exponent 不合法",
-                ));
+                return Err(
+                    lex_error(cursor, start_byte, start, "十六進位 exponent 不合法").into(),
+                );
             }
         }
     } else {
@@ -168,12 +160,7 @@ fn scan_number(
                 consume_number_byte(&mut bytes, cursor, limits, start_byte, start)?;
             }
             if bytes.len() == exponent_start {
-                return Err(lex_error(
-                    cursor,
-                    start_byte,
-                    start,
-                    "decimal exponent 不合法",
-                ));
+                return Err(lex_error(cursor, start_byte, start, "decimal exponent 不合法").into());
             }
         }
     }
@@ -181,20 +168,19 @@ fn scan_number(
         while cursor.peek().is_some_and(is_name_continue) {
             consume_number_byte(&mut bytes, cursor, limits, start_byte, start)?;
         }
-        return Err(lex_error(
-            cursor,
-            start_byte,
-            start,
-            "numeral 不可黏接識別字",
-        ));
+        return Err(lex_error(cursor, start_byte, start, "numeral 不可黏接識別字").into());
     }
-    let number =
-        parse_number(&bytes).map_err(|message| lex_error(cursor, start_byte, start, message))?;
+    let number = parse_number(&bytes, budget).map_err(|error| match error {
+        NumberError::Syntax(message) => {
+            ScanError::Diagnostic(lex_error(cursor, start_byte, start, message))
+        }
+        NumberError::Budget(error) => ScanError::Budget(error),
+    })?;
     let (kind, literal) = match number {
         Number::Integer(_) => (TokenKind::Integer, Literal::Integer(number)),
         Number::Float(_) => (TokenKind::Float, Literal::Float(number)),
     };
-    emit(
+    Ok(emit(
         tokens,
         cursor,
         limits,
@@ -202,7 +188,7 @@ fn scan_number(
         start,
         kind,
         Some(literal),
-    )
+    )?)
 }
 
 fn scan_short_string(
@@ -700,8 +686,104 @@ fn keyword(cursor: &Cursor<'_>, name: &[u8]) -> Option<Keyword> {
     Some(keyword)
 }
 
-fn parse_number(bytes: &[u8]) -> Result<Number, &'static str> {
-    let text = core::str::from_utf8(bytes).map_err(|_| "numeral 不是 ASCII")?;
+enum NumberError<E> {
+    Syntax(&'static str),
+    Budget(E),
+}
+
+impl<E> From<&'static str> for NumberError<E> {
+    fn from(value: &'static str) -> Self {
+        Self::Syntax(value)
+    }
+}
+
+// 這僅辨識 Rust 1.98.1 Decimal::try_fast_path 必定接受的普通分支；
+// 其餘所有形式保守計入完整 f64 慢路徑。掃描已讀取的 token bytes，
+// 不計算浮點值，也不配置或更動 scanner 的接受語法。
+fn decimal_native_fast_subset(bytes: &[u8]) -> bool {
+    let exponent_at = bytes
+        .iter()
+        .position(|byte| matches!(byte, b'e' | b'E'))
+        .unwrap_or(bytes.len());
+    let (significand, exponent_with_marker) = bytes.split_at(exponent_at);
+    let mut digits = 0usize;
+    let mut mantissa = 0u64;
+    let mut fractional_digits = 0i32;
+    let mut fractional = false;
+    for &byte in significand {
+        if byte == b'.' {
+            fractional = true;
+            continue;
+        }
+        if !byte.is_ascii_digit() {
+            return false;
+        }
+        let Some(next_digits) = digits.checked_add(1) else {
+            return false;
+        };
+        if next_digits > 19 {
+            return false;
+        }
+        digits = next_digits;
+        let Some(next_mantissa) = mantissa
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(byte - b'0')))
+        else {
+            return false;
+        };
+        mantissa = next_mantissa;
+        if fractional {
+            let Some(next_fractional_digits) = fractional_digits.checked_add(1) else {
+                return false;
+            };
+            fractional_digits = next_fractional_digits;
+        }
+    }
+    if digits == 0 || mantissa > (1u64 << 53) {
+        return false;
+    }
+    let mut explicit_exponent = 0i32;
+    if !exponent_with_marker.is_empty() {
+        let mut exponent = &exponent_with_marker[1..];
+        let negative = exponent.first() == Some(&b'-');
+        if matches!(exponent.first(), Some(b'-' | b'+')) {
+            exponent = &exponent[1..];
+        }
+        if exponent.is_empty() {
+            return false;
+        }
+        for &byte in exponent {
+            if !byte.is_ascii_digit() {
+                return false;
+            }
+            let digit = i32::from(byte - b'0');
+            let next = if negative {
+                explicit_exponent
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_sub(digit))
+            } else {
+                explicit_exponent
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add(digit))
+            };
+            let Some(next) = next else {
+                return false;
+            };
+            explicit_exponent = next;
+        }
+    }
+    let Some(effective_exponent) = explicit_exponent.checked_sub(fractional_digits) else {
+        return false;
+    };
+    (-22..=22).contains(&effective_exponent)
+}
+
+fn parse_number<B: NumericBudget>(
+    bytes: &[u8],
+    budget: &mut B,
+) -> Result<Number, NumberError<B::Error>> {
+    let text =
+        core::str::from_utf8(bytes).map_err(|_| NumberError::Syntax("numeral 不是 ASCII"))?;
     let hexadecimal = text.starts_with("0x") || text.starts_with("0X");
     if hexadecimal {
         let body = &text[2..];
@@ -729,7 +811,7 @@ fn parse_number(bytes: &[u8]) -> Result<Number, &'static str> {
         for byte in mantissa.bytes() {
             if byte == b'.' {
                 if fractional {
-                    return Err("十六進位小數點不合法");
+                    return Err(NumberError::Syntax("十六進位小數點不合法"));
                 }
                 fractional = true;
                 continue;
@@ -742,27 +824,41 @@ fn parse_number(bytes: &[u8]) -> Result<Number, &'static str> {
                 value = value * 16.0 + digit;
             }
         }
+        budget
+            .before_conversion(NumericCharge::HexPowi)
+            .map_err(NumberError::Budget)?;
         let value = value * 2f64.powi(exponent);
         return value
             .is_finite()
             .then_some(Number::Float(value))
-            .ok_or("十六進位浮點數超出範圍");
+            .ok_or(NumberError::Syntax("十六進位浮點數超出範圍"));
     }
     if text.contains(['.', 'e', 'E']) {
+        let charge = if decimal_native_fast_subset(bytes) {
+            NumericCharge::DecimalFast(bytes.len())
+        } else {
+            NumericCharge::DecimalConservative(bytes.len())
+        };
+        budget
+            .before_conversion(charge)
+            .map_err(NumberError::Budget)?;
         let value = text.parse::<f64>().map_err(|_| "浮點 numeral 不合法")?;
         return value
             .is_finite()
             .then_some(Number::Float(value))
-            .ok_or("浮點數超出範圍");
+            .ok_or(NumberError::Syntax("浮點數超出範圍"));
     }
     match text.parse::<i64>() {
         Ok(value) => Ok(Number::Integer(value)),
         Err(_) => {
+            budget
+                .before_conversion(NumericCharge::DecimalConservative(bytes.len()))
+                .map_err(NumberError::Budget)?;
             let value = text.parse::<f64>().map_err(|_| "整數 numeral 不合法")?;
             value
                 .is_finite()
                 .then_some(Number::Float(value))
-                .ok_or("整數超出範圍")
+                .ok_or(NumberError::Syntax("整數超出範圍"))
         }
     }
 }
