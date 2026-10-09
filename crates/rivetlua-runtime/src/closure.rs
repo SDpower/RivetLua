@@ -1,11 +1,9 @@
 //! Closure 保存已驗證模組身分及共享 upvalue 物件參照。
 
-use core::mem::size_of;
-
-use rivetlua_core::{ObjectRef, ProtoId, Value};
+use rivetlua_core::{HostFunctionId, ObjectRef, ProtoId, Value};
 
 use crate::VmError;
-use crate::alloc::{AllocationLedger, FailPoint, checked_bytes, reserve_vec};
+use crate::alloc::{AllocationCharge, AllocationLedger, FailPoint, reserve_vec};
 
 pub struct Closure {
     module: ObjectRef,
@@ -13,8 +11,7 @@ pub struct Closure {
     upvalues: Vec<ObjectRef>,
     environment: Option<Value>,
     environment_cell: Option<ObjectRef>,
-    ledger: AllocationLedger,
-    charge: usize,
+    _charge: Option<AllocationCharge>,
 }
 
 impl Closure {
@@ -26,8 +23,7 @@ impl Closure {
         ledger: &AllocationLedger,
     ) -> Result<Self, VmError> {
         let mut upvalues = Vec::new();
-        let charge = checked_bytes(captures.len(), size_of::<ObjectRef>())?;
-        if !captures.is_empty() {
+        let charge = if !captures.is_empty() {
             let ticket = reserve_vec(
                 ledger,
                 &mut upvalues,
@@ -35,16 +31,17 @@ impl Closure {
                 FailPoint::ClosureCapturesReserve,
             )?;
             upvalues.extend_from_slice(captures);
-            ticket.commit()?;
-        }
+            Some(ticket.commit_charge()?)
+        } else {
+            None
+        };
         Ok(Self {
             module,
             prototype,
             upvalues,
             environment,
             environment_cell: None,
-            ledger: ledger.clone(),
-            charge,
+            _charge: charge,
         })
     }
 
@@ -101,11 +98,59 @@ impl Closure {
     }
 }
 
-impl Drop for Closure {
-    fn drop(&mut self) {
-        if self.charge != 0 {
-            self.ledger.refund_lua_on_drop(self.charge);
-            self.charge = 0;
+/// C closure 僅保存宿主函式 capability；真正的 C 指標由 C API group 持有。
+pub(crate) struct CClosure {
+    function: HostFunctionId,
+    upvalues: Vec<ObjectRef>,
+    _charge: Option<AllocationCharge>,
+}
+
+impl CClosure {
+    pub(crate) fn new(
+        function: HostFunctionId,
+        captures: &[Option<ObjectRef>],
+        ledger: &AllocationLedger,
+    ) -> Result<Self, VmError> {
+        let mut upvalues = Vec::new();
+        if captures.iter().any(Option::is_none) {
+            return Err(VmError::LedgerInvariant);
         }
+        let charge = if !captures.is_empty() {
+            let ticket = reserve_vec(
+                ledger,
+                &mut upvalues,
+                captures.len(),
+                FailPoint::ClosureCapturesReserve,
+            )?;
+            for &cell in captures {
+                upvalues.push(cell.ok_or(VmError::LedgerInvariant)?);
+            }
+            Some(ticket.commit_charge()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            function,
+            upvalues,
+            _charge: charge,
+        })
+    }
+
+    pub(crate) const fn function(&self) -> HostFunctionId {
+        self.function
+    }
+
+    pub(crate) fn upvalue(&self, index: usize) -> Option<ObjectRef> {
+        self.upvalues.get(index).copied()
+    }
+
+    pub(crate) fn trace_children(
+        &self,
+        mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
+    ) -> Result<(), VmError> {
+        for &cell in &self.upvalues {
+            visit(cell)?;
+        }
+        Ok(())
     }
 }

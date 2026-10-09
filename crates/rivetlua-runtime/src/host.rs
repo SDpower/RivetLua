@@ -3,7 +3,7 @@
 use rivetlua_core::{LuaProfile, VerifiedModule, VerifyLimits};
 
 use crate::VmError;
-use crate::alloc::AllocationLedger;
+use crate::alloc::{AllocationCharges, AllocationLedger};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostLoadErrorKind {
@@ -76,47 +76,21 @@ struct LoadMeter<'a> {
     finalizer_steps: &'a mut u64,
     finalizer_running: bool,
     ledger: AllocationLedger,
-    temporary_charge: usize,
-    module_charge: usize,
+    temporary_charge: AllocationCharges,
+    module_charge: AllocationCharges,
 }
 
 pub(crate) struct LoadTemporaryCharge {
-    ledger: AllocationLedger,
-    bytes: usize,
-}
-
-impl Drop for LoadTemporaryCharge {
-    fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.bytes);
-    }
-}
-
-impl Drop for LoadMeter<'_> {
-    fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.temporary_charge);
-        self.ledger.refund_on_drop(self.module_charge);
-    }
+    charges: AllocationCharges,
 }
 
 impl LoadTemporaryCharge {
-    pub(crate) fn transfer(&mut self, actual: usize) -> Result<(), VmError> {
-        let excess = self
-            .bytes
-            .checked_sub(actual)
-            .ok_or(VmError::ArithmeticOverflow)?;
-        self.ledger.refund(excess)?;
-        self.bytes = 0;
-        Ok(())
+    pub(crate) fn transfer(&mut self, actual: usize) -> Result<AllocationCharges, VmError> {
+        self.charges.normalize(actual)
     }
 
     pub(crate) fn absorb(&mut self, other: &mut Self) -> Result<(), VmError> {
-        let total = self
-            .bytes
-            .checked_add(other.bytes)
-            .ok_or(VmError::ArithmeticOverflow)?;
-        self.bytes = total;
-        other.bytes = 0;
-        Ok(())
+        self.charges.try_absorb(&mut other.charges)
     }
 }
 
@@ -148,8 +122,8 @@ impl<'a> LoadBudget<'a> {
                 finalizer_steps,
                 finalizer_running,
                 ledger,
-                temporary_charge: 0,
-                module_charge: 0,
+                temporary_charge: AllocationCharges::new(),
+                module_charge: AllocationCharges::new(),
             }),
             stop: None,
         }
@@ -165,8 +139,7 @@ impl<'a> LoadBudget<'a> {
 
     pub(crate) fn take_temporary_charge(&mut self) -> Option<LoadTemporaryCharge> {
         self.meter.as_mut().map(|meter| LoadTemporaryCharge {
-            ledger: meter.ledger.clone(),
-            bytes: core::mem::replace(&mut meter.temporary_charge, 0),
+            charges: core::mem::take(&mut meter.temporary_charge),
         })
     }
 
@@ -181,8 +154,7 @@ impl<'a> LoadBudget<'a> {
 
     pub(crate) fn take_module_charge(&mut self) -> Option<LoadTemporaryCharge> {
         self.meter.as_mut().map(|meter| LoadTemporaryCharge {
-            ledger: meter.ledger.clone(),
-            bytes: core::mem::replace(&mut meter.module_charge, 0),
+            charges: core::mem::take(&mut meter.module_charge),
         })
     }
 
@@ -197,17 +169,18 @@ impl<'a> LoadBudget<'a> {
             return Err(self.fail(LoadBudgetStop::Limit));
         }
         if let Some(meter) = self.meter.as_mut() {
-            let Some(total) = meter.module_charge.checked_add(bytes) else {
-                return Err(self.fail(LoadBudgetStop::Limit));
-            };
             let reservation = match meter.ledger.reserve(bytes) {
                 Ok(reservation) => reservation,
                 Err(error) => return Err(self.fail(LoadBudgetStop::Allocation(error))),
             };
-            if let Err(error) = reservation.commit() {
+            let charge = match reservation.commit_charge() {
+                Ok(charge) => charge,
+                Err(error) => return Err(self.fail(LoadBudgetStop::Allocation(error))),
+            };
+            if let Err((error, charge)) = meter.module_charge.try_push(charge) {
+                drop(charge);
                 return Err(self.fail(LoadBudgetStop::Allocation(error)));
             }
-            meter.module_charge = total;
         }
         self.module_claimed = claimed;
         Ok(())
@@ -254,17 +227,18 @@ impl<'a> LoadBudget<'a> {
             return Err(self.fail(LoadBudgetStop::Limit));
         };
         if let Some(meter) = self.meter.as_mut() {
-            let Some(total) = meter.temporary_charge.checked_add(bytes) else {
-                return Err(self.fail(LoadBudgetStop::Limit));
-            };
             let reservation = match meter.ledger.reserve(bytes) {
                 Ok(reservation) => reservation,
                 Err(error) => return Err(self.fail(LoadBudgetStop::Allocation(error))),
             };
-            if let Err(error) = reservation.commit() {
+            let charge = match reservation.commit_charge() {
+                Ok(charge) => charge,
+                Err(error) => return Err(self.fail(LoadBudgetStop::Allocation(error))),
+            };
+            if let Err((error, charge)) = meter.temporary_charge.try_push(charge) {
+                drop(charge);
                 return Err(self.fail(LoadBudgetStop::Allocation(error)));
             }
-            meter.temporary_charge = total;
         }
         self.temporary_left = remaining;
         self.temporary_claimed = claimed;

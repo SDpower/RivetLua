@@ -220,11 +220,14 @@ pub(super) fn raw_concat(
         total,
         FailPoint::StringBytesReserve,
     )?;
-    append_concat_piece(vm, left, &a, &mut bytes)?;
-    append_concat_piece(vm, right, &b, &mut bytes)?;
-    let object = vm.allocate_byte_string(&bytes)?;
+    let result = (|| {
+        append_concat_piece(vm, left, &a, &mut bytes)?;
+        append_concat_piece(vm, right, &b, &mut bytes)?;
+        vm.allocate_byte_string(&bytes).map_err(RuntimeError::from)
+    })();
+    drop(bytes);
     drop(ticket);
-    Ok(Some(Value::Object(object)))
+    Ok(Some(Value::Object(result?)))
 }
 
 fn number(value: Value) -> Result<Number, RuntimeError> {
@@ -271,10 +274,12 @@ pub(super) fn length(vm: &Vm, operand: Value) -> Result<Value, RuntimeError> {
         ObjectKind::Table => vm.with_table(object, |table| table.border_len())?,
         ObjectKind::Value
         | ObjectKind::Closure
+        | ObjectKind::CClosure
         | ObjectKind::Builtin
         | ObjectKind::Coroutine
         | ObjectKind::Upvalue
-        | ObjectKind::Module => {
+        | ObjectKind::Module
+        | ObjectKind::Userdata => {
             return Err(RuntimeError::new(
                 RuntimeErrorKind::UnsupportedUnaryOperation(UnaryOperation::Length),
             ));

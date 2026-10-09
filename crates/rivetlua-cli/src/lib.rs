@@ -894,6 +894,20 @@ fn write_bytes(writer: &mut dyn Write, bytes: &[u8]) -> CliResult<()> {
         .map_err(|error| CliFailure::failed(format!("輸出失敗：{error}")))
 }
 
+fn report_unsupported_run_outcome(
+    operation: &str,
+    outcome: &RunOutcome,
+    errors: &mut dyn Write,
+) -> CliResult<CliFailure> {
+    let failure = CliFailure::failed(format!(
+        "{operation} 遇到 CLI 不支援的 VM outcome：{outcome:?}"
+    ));
+    write_bytes(errors, b"rivetlua: ")?;
+    write_bytes(errors, &failure.message)?;
+    write_bytes(errors, b"\n")?;
+    Ok(failure)
+}
+
 fn run_module(
     vm: &mut Vm,
     module: &Module,
@@ -936,6 +950,13 @@ fn run_module(
                 format!("rivetlua: close continuation 尚未完成：{snapshot:?}\n").as_bytes(),
             )?;
             Err(CliFailure::failed("close continuation 尚未完成"))
+        }
+        outcome @ (RunOutcome::External(_)
+        | RunOutcome::CloseBoundaryA5 { .. }
+        | RunOutcome::NestedReturned(_)
+        | RunOutcome::NestedErrored(_)
+        | RunOutcome::NestedFailed(_)) => {
+            Err(report_unsupported_run_outcome("VM 執行", &outcome, errors)?)
         }
     }
 }
@@ -986,6 +1007,15 @@ fn print_interactive_values(
             )?;
             Err(CliFailure::failed("REPL print close continuation 尚未完成"))
         }
+        outcome @ (RunOutcome::External(_)
+        | RunOutcome::CloseBoundaryA5 { .. }
+        | RunOutcome::NestedReturned(_)
+        | RunOutcome::NestedErrored(_)
+        | RunOutcome::NestedFailed(_)) => Err(report_unsupported_run_outcome(
+            "REPL print",
+            &outcome,
+            errors,
+        )?),
     }
 }
 
@@ -1116,6 +1146,15 @@ fn run_require_action(vm: &mut Vm, argument: &[u8], errors: &mut dyn Write) -> C
         RunOutcome::PendingClose(_) => {
             Err(CliFailure::failed("-l 載入模組等待 close continuation"))
         }
+        outcome @ (RunOutcome::External(_)
+        | RunOutcome::CloseBoundaryA5 { .. }
+        | RunOutcome::NestedReturned(_)
+        | RunOutcome::NestedErrored(_)
+        | RunOutcome::NestedFailed(_)) => Err(report_unsupported_run_outcome(
+            "-l 載入模組",
+            &outcome,
+            errors,
+        )?),
     }
 }
 
@@ -1357,7 +1396,8 @@ mod cli_unit_tests {
     use super::OsEntropy;
     use super::{
         CLI_EXECUTION_FUEL, CliResourceDeadline, atomic_write, cli_resource_capability,
-        debug_capability, dump_limits, load_limits, read_entropy_seed, unix_epoch_seconds,
+        debug_capability, dump_limits, load_limits, read_entropy_seed,
+        report_unsupported_run_outcome, unix_epoch_seconds,
     };
     use rivetlua::{
         DebugCapability, DebugPermission, Engine, HostEntropyError, HostResourceErrorKind,
@@ -1397,6 +1437,23 @@ mod cli_unit_tests {
             }
         );
         assert_eq!(CLI_EXECUTION_FUEL, 8_000_000_000);
+    }
+
+    #[test]
+    fn cli_rejects_nested_returned_values_with_a_nonzero_diagnostic() {
+        let outcome = RunOutcome::NestedReturned(vec![Value::Integer(42)]);
+        let mut errors = Vec::new();
+
+        let failure = report_unsupported_run_outcome("-l 載入模組", &outcome, &mut errors)
+            .expect("診斷輸出應成功");
+
+        assert_eq!(failure.status, 1);
+        assert!(
+            errors
+                .windows(b"NestedReturned".len())
+                .any(|window| window == b"NestedReturned")
+        );
+        assert!(errors.ends_with(b"\n"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use super::{manifest, parser, result};
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,10 +18,62 @@ fn validate_environment() -> Result<(), String> {
     Ok(())
 }
 
-fn build(root: &Path, source: &manifest::Source) -> Result<PathBuf, String> {
-    let target = root
+fn build_paths(
+    root: &Path,
+    profile: &str,
+    configured_target: Option<&OsStr>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let artifact_dir = root
         .join("target/rivetlua-p15")
-        .join(format!("build-{}", source.profile));
+        .join(format!("build-{profile}"));
+    let target = match configured_target {
+        Some(value) => {
+            let path = Path::new(value);
+            if !path.is_absolute() {
+                return Err("P15 CARGO_TARGET_DIR 必須為既有的絕對外接目錄".into());
+            }
+            let target = fs::canonicalize(path)
+                .map_err(|error| format!("P15 CARGO_TARGET_DIR 無效：{error}"))?;
+            if !target.is_dir() {
+                return Err("P15 CARGO_TARGET_DIR 必須是目錄".into());
+            }
+            let root = fs::canonicalize(root)
+                .map_err(|error| format!("P15 workspace 路徑無效：{error}"))?;
+            if target.starts_with(root) {
+                return Err("P15 CARGO_TARGET_DIR 必須位於 workspace 以外".into());
+            }
+            target
+        }
+        None => artifact_dir.clone(),
+    };
+    Ok((target, artifact_dir.join("debug/rivetlua")))
+}
+
+fn archive_binary(target: &Path, artifact: &Path) -> Result<PathBuf, String> {
+    let built = fs::canonicalize(target.join("debug/rivetlua"))
+        .map_err(|error| format!("P15 建置 binary 不存在：{error}"))?;
+    let parent = artifact.parent().ok_or("P15 binary 封存路徑沒有父目錄")?;
+    fs::create_dir_all(parent).map_err(|error| format!("建立 P15 binary 封存目錄失敗：{error}"))?;
+    let destination = fs::canonicalize(parent)
+        .map_err(|error| format!("P15 binary 封存目錄不可讀：{error}"))?
+        .join("rivetlua");
+    if built != destination {
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("P15 binary 封存目標不得是 symlink".into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("檢查 P15 binary 封存目標失敗：{error}")),
+        }
+        fs::copy(&built, &destination).map_err(|error| format!("封存 P15 binary 失敗：{error}"))?;
+    }
+    fs::canonicalize(artifact).map_err(|error| format!("P15 封存 binary 不存在：{error}"))
+}
+
+fn build(root: &Path, source: &manifest::Source) -> Result<PathBuf, String> {
+    let configured_target = env::var_os("CARGO_TARGET_DIR");
+    let (target, artifact) = build_paths(root, source.profile, configured_target.as_deref())?;
     let mut command = Command::new("cargo");
     command
         .current_dir(root)
@@ -54,8 +107,7 @@ fn build(root: &Path, source: &manifest::Source) -> Result<PathBuf, String> {
             build_log.display()
         ));
     }
-    fs::canonicalize(target.join("debug/rivetlua"))
-        .map_err(|error| format!("P15 binary 不存在：{error}"))
+    archive_binary(&target, &artifact)
 }
 
 fn version(binary: &Path, expected: &str) -> Result<String, String> {
@@ -218,4 +270,150 @@ pub(super) fn official_tests(args: &[String]) -> Result<(), String> {
         }
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{archive_binary, build_paths};
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_SCRATCH_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn scratch() -> std::path::PathBuf {
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        scratch_with_timestamp(time)
+    }
+
+    fn scratch_with_timestamp(time: u128) -> std::path::PathBuf {
+        loop {
+            let id = NEXT_SCRATCH_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rivetlua-p15-build-paths-{}-{time}-{id}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return path,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("建立 P15 測試暫存目錄失敗：{error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn p15_scratch_is_unique_for_parallel_callers_at_the_same_timestamp() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let callers = 8;
+        let barrier = Arc::new(Barrier::new(callers));
+        let handles = (0..callers)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    scratch_with_timestamp(0)
+                })
+            })
+            .collect::<Vec<_>>();
+        let paths = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.iter().collect::<HashSet<_>>().len(), callers);
+        for path in paths {
+            assert!(path.is_dir());
+            fs::remove_dir(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn p15_build_paths_use_external_target_and_reject_invalid_values() {
+        let scratch = scratch();
+        let root = scratch.join("repo");
+        let external = scratch.join("shared-cache");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+
+        let artifact = root.join("target/rivetlua-p15/build-lua55-i64f64/debug/rivetlua");
+        let (target, selected_artifact) =
+            build_paths(&root, "lua55-i64f64", Some(external.as_os_str())).unwrap();
+        assert_eq!(target, fs::canonicalize(&external).unwrap());
+        assert_eq!(selected_artifact, artifact);
+        assert_eq!(
+            build_paths(&root, "lua55-i64f64", None).unwrap(),
+            (
+                artifact.parent().unwrap().parent().unwrap().to_path_buf(),
+                artifact
+            )
+        );
+        assert!(build_paths(&root, "lua55-i64f64", Some(OsStr::new(""))).is_err());
+        assert!(build_paths(&root, "lua55-i64f64", Some(OsStr::new("relative"))).is_err());
+        assert!(build_paths(&root, "lua55-i64f64", Some(root.join("target").as_os_str())).is_err());
+        assert!(
+            build_paths(
+                &root,
+                "lua55-i64f64",
+                Some(scratch.join("missing").as_os_str())
+            )
+            .is_err()
+        );
+
+        fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p15_shared_target_archives_both_profiles_and_skips_self_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let scratch = scratch();
+        let root = scratch.join("repo");
+        let target = scratch.join("shared-cache");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir_all(target.join("debug")).unwrap();
+        let built = target.join("debug/rivetlua");
+        let artifact55 = root.join("target/rivetlua-p15/build-lua55-i64f64/debug/rivetlua");
+        let artifact54 = root.join("target/rivetlua-p15/build-lua54-i64f64/debug/rivetlua");
+
+        fs::write(&built, b"#!/bin/sh\nprintf '55\\n'\n").unwrap();
+        fs::set_permissions(&built, fs::Permissions::from_mode(0o755)).unwrap();
+        let archived55 = archive_binary(&target, &artifact55).unwrap();
+        assert_eq!(archived55, fs::canonicalize(&artifact55).unwrap());
+        assert_eq!(Command::new(&archived55).output().unwrap().stdout, b"55\n");
+
+        fs::write(&built, b"#!/bin/sh\nprintf '54\\n'\n").unwrap();
+        let archived54 = archive_binary(&target, &artifact54).unwrap();
+        assert_eq!(Command::new(&archived54).output().unwrap().stdout, b"54\n");
+        assert_eq!(Command::new(&archived55).output().unwrap().stdout, b"55\n");
+        assert_ne!(
+            fs::read(&archived55).unwrap(),
+            fs::read(&archived54).unwrap()
+        );
+        assert_ne!(
+            fs::metadata(&archived55).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        assert_ne!(
+            fs::metadata(&archived54).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        let legacy_target = artifact55.parent().unwrap().parent().unwrap();
+        assert_eq!(
+            archive_binary(legacy_target, &artifact55).unwrap(),
+            archived55
+        );
+        assert_eq!(Command::new(&archived55).output().unwrap().stdout, b"55\n");
+
+        fs::remove_dir_all(scratch).unwrap();
+    }
 }

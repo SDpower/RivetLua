@@ -23,8 +23,9 @@ mod upvalue;
 mod vm;
 
 pub use alloc::{
-    AllocationAttempt, AllocationDomain, AllocationFailure, AllocationFailureKind,
-    AllocationLedger, AllocationSite, AllocationTrace, FailPoint, LedgerProbe, LedgerSnapshot,
+    AllocationAdmission, AllocationAttempt, AllocationCharge, AllocationCharges, AllocationDomain,
+    AllocationFailure, AllocationFailureKind, AllocationLedger, AllocationSite, AllocationTrace,
+    FailPoint, LedgerProbe, LedgerSnapshot,
 };
 pub use call::PendingCloseSnapshot;
 pub use callback::{CallbackContext, CallbackContinuation, CallbackFn, CallbackResult};
@@ -32,9 +33,14 @@ pub use closure::Closure;
 pub use coroutine::CoroutineState;
 pub use errors::LuaError;
 pub use gc::trace::ActiveRootKind;
-pub use gc::{FinalizerState, GcAge, GcColor, GcCycleKind, GcMode, GcPhase, GcTrace, WeakMode};
+pub use gc::{
+    FinalizerState, GcAge, GcColor, GcControl, GcControlResult, GcCycleKind, GcMode, GcPhase,
+    GcTrace, WeakMode,
+};
 pub use handle::HostHandle;
-pub use heap::{ObjectKind, SlotState, Vm, VmError};
+pub use heap::{
+    HostAllocationCharge, HostAllocationReservation, ObjectKind, SlotState, Vm, VmError,
+};
 pub use host::{
     DebugCapability, DebugLimits, DebugPermission, DumpCapability, DumpLimits, FileOperation,
     FileReadFormat, FileSeekOrigin, HostCalendar, HostCloseResult, HostDeadline, HostEntropy,
@@ -49,10 +55,14 @@ pub use metamethod::MetamethodEvent;
 pub use rivetlua_core::{Generation, ObjectId, SlotId, VmId};
 pub use roots::{RootId, RootKind, RootSet};
 pub use stdlib::table::{TableSortStop, TableSortTrace};
-pub use string::ByteString;
+pub use string::{ByteString, ExternalStringStorage};
 pub use table::{CanonicalKey, CanonicalKeyClass, Table};
 pub use upvalue::{Upvalue, UpvalueState};
-pub use vm::{AbortReason, Execution, RunOutcome, RuntimeError, RuntimeErrorKind};
+pub use vm::{
+    AbortReason, CapiDumpBytes, DebugFrameHandle, DebugFrameInfo, DebugFrameKind, DebugHookConfig,
+    DebugLocal, DebugLocalKind, DebugParameterName, Execution, ExternalCommand, ExternalEventView,
+    ExternalResumeA5, ExternalToken, RunOutcome, RuntimeError, RuntimeErrorKind, ValueOperation,
+};
 
 #[cfg(test)]
 mod tests {

@@ -194,7 +194,8 @@ pub(crate) struct TableOpState {
     roots: [Option<RootId>; 7],
     output_roots: Vec<Option<RootId>>,
     ledger: AllocationLedger,
-    output_charge: usize,
+    output_owner: Option<crate::alloc::AllocationCharge>,
+    roots_owner: Option<crate::alloc::AllocationCharge>,
 }
 
 impl TableOpState {
@@ -228,7 +229,8 @@ impl TableOpState {
             roots: [None; 7],
             output_roots: Vec::new(),
             ledger: vm.allocation_ledger().clone(),
-            output_charge: 0,
+            output_owner: None,
+            roots_owner: None,
         };
         if let Err(error) = state.restore_roots(vm) {
             state.clear_roots(vm)?;
@@ -265,29 +267,49 @@ impl TableOpState {
     }
 
     pub(crate) fn push_output(&mut self, vm: &mut Vm, value: Value) -> Result<(), VmError> {
-        let ticket = reserve_vec(&self.ledger, &mut self.output, 1, FailPoint::ReturnReserve)?;
-        ticket.commit()?;
-        self.output_charge = self
-            .output_charge
-            .checked_add(core::mem::size_of::<Value>())
+        let next = self
+            .output
+            .len()
+            .checked_add(1)
             .ok_or(VmError::ArithmeticOverflow)?;
-        let ticket = reserve_vec(
-            &self.ledger,
-            &mut self.output_roots,
-            1,
-            FailPoint::WorkReserve,
-        )?;
-        ticket.commit()?;
-        self.output_charge = self
-            .output_charge
-            .checked_add(core::mem::size_of::<Option<RootId>>())
-            .ok_or(VmError::ArithmeticOverflow)?;
+        let mut output = Vec::new();
+        let output_ticket = reserve_vec(&self.ledger, &mut output, next, FailPoint::ReturnReserve)?;
+        output.extend_from_slice(&self.output);
+        output.push(value);
+        let mut roots = Vec::new();
+        let roots_ticket = match reserve_vec(&self.ledger, &mut roots, next, FailPoint::WorkReserve)
+        {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                drop(roots);
+                drop(output);
+                drop(output_ticket);
+                return Err(error);
+            }
+        };
+        roots.extend_from_slice(&self.output_roots);
+        let output_owner = output_ticket.commit_charge()?;
+        let roots_owner = roots_ticket.commit_charge()?;
         let root = match value {
-            Value::Object(object) => Some(vm.add_root(RootKind::Temporary, object)?),
+            Value::Object(object) => match vm.add_root(RootKind::Temporary, object) {
+                Ok(root) => Some(root),
+                Err(error) => {
+                    drop(roots);
+                    drop(output);
+                    drop(roots_owner);
+                    drop(output_owner);
+                    return Err(error);
+                }
+            },
             _ => None,
         };
-        self.output.push(value);
-        self.output_roots.push(root);
+        roots.push(root);
+        let old_output = core::mem::replace(&mut self.output, output);
+        let old_roots = core::mem::replace(&mut self.output_roots, roots);
+        drop(old_output);
+        drop(old_roots);
+        self.output_owner = Some(output_owner);
+        self.roots_owner = Some(roots_owner);
         Ok(())
     }
 
@@ -343,12 +365,6 @@ impl TableOpState {
             }
         }
         Ok(())
-    }
-}
-
-impl Drop for TableOpState {
-    fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.output_charge);
     }
 }
 
@@ -430,7 +446,7 @@ pub(crate) fn result(
 pub(crate) struct Buffer {
     pub(crate) bytes: Vec<u8>,
     ledger: AllocationLedger,
-    charge: usize,
+    charge: Option<crate::alloc::AllocationCharge>,
 }
 
 impl Buffer {
@@ -438,31 +454,28 @@ impl Buffer {
         Self {
             bytes: Vec::new(),
             ledger: vm.allocation_ledger().clone(),
-            charge: 0,
+            charge: None,
         }
     }
 
     fn append(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
         let next = self
-            .charge
+            .bytes
+            .len()
             .checked_add(bytes.len())
             .ok_or(VmError::ArithmeticOverflow)?;
-        let ticket = reserve_vec(
-            &self.ledger,
-            &mut self.bytes,
-            bytes.len(),
-            FailPoint::WorkReserve,
-        )?;
-        ticket.commit()?;
-        self.bytes.extend_from_slice(bytes);
-        self.charge = next;
+        let mut replacement = Vec::new();
+        let ticket = reserve_vec(&self.ledger, &mut replacement, next, FailPoint::WorkReserve)?;
+        let charge = ticket.commit_charge()?;
+        replacement.extend_from_slice(&self.bytes);
+        replacement.extend_from_slice(bytes);
+        let old = core::mem::replace(&mut self.bytes, replacement);
+        drop(old);
+        self.charge = Some(charge);
         Ok(())
-    }
-}
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.charge);
     }
 }
 

@@ -2,6 +2,7 @@
 
 use core::cell::Cell;
 use core::mem::size_of;
+use core::num::NonZeroUsize;
 use core::panic::Location;
 use std::rc::Rc;
 
@@ -15,8 +16,11 @@ pub enum FailPoint {
     ObjectInitialize,
     ModuleConstantsReserve,
     StringBytesReserve,
+    UserdataBytesReserve,
+    UserdataUservaluesReserve,
     TableArrayReserve,
     TableHashReserve,
+    TableKeyReserve,
     TableInsert,
     TableArrayGrow,
     TableHashGrow,
@@ -48,8 +52,11 @@ impl FailPoint {
             | Self::ObjectReserve
             | Self::ModuleConstantsReserve
             | Self::StringBytesReserve
+            | Self::UserdataBytesReserve
+            | Self::UserdataUservaluesReserve
             | Self::TableArrayReserve
             | Self::TableHashReserve
+            | Self::TableKeyReserve
             | Self::TableArrayGrow
             | Self::TableHashGrow
             | Self::ChildReserve
@@ -105,7 +112,27 @@ pub enum AllocationFailureKind {
     Arithmetic,
     Budget,
     Injection,
+    Admission,
     RustReserve,
+}
+
+/// 宿主對邏輯配置的安全 admission 介面。實際 FFI 指標只由 CAPI 層解讀。
+pub trait AllocationAdmission {
+    /// 非零要求成功時回傳唯一、非零且須以相同大小釋放的 token。
+    fn admit(&self, bytes: usize) -> Option<NonZeroUsize>;
+
+    /// 釋放先前成功 admission 的 token；呼叫者已先丟棄對應 backing。
+    fn release(&self, token: NonZeroUsize, bytes: usize);
+}
+
+struct InternalAdmission;
+
+impl AllocationAdmission for InternalAdmission {
+    fn admit(&self, _bytes: usize) -> Option<NonZeroUsize> {
+        NonZeroUsize::new(1)
+    }
+
+    fn release(&self, _token: NonZeroUsize, _bytes: usize) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,6 +174,22 @@ struct LedgerState {
 #[derive(Clone)]
 pub struct AllocationLedger {
     inner: Rc<Cell<LedgerState>>,
+    admission: Rc<dyn AllocationAdmission>,
+    external_admission: bool,
+}
+
+struct PendingAdmission {
+    admission: Rc<dyn AllocationAdmission>,
+    token: Option<NonZeroUsize>,
+    bytes: usize,
+}
+
+impl Drop for PendingAdmission {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.admission.release(token, self.bytes);
+        }
+    }
 }
 
 /// 只讀的 VM 帳本探針，可在 VM 析構後核對計帳基線。
@@ -165,6 +208,18 @@ impl LedgerProbe {
 
 impl AllocationLedger {
     pub fn new(limit: usize) -> Self {
+        Self::with_admission_kind(limit, Rc::new(InternalAdmission), false)
+    }
+
+    pub fn with_admission(limit: usize, admission: Rc<dyn AllocationAdmission>) -> Self {
+        Self::with_admission_kind(limit, admission, true)
+    }
+
+    fn with_admission_kind(
+        limit: usize,
+        admission: Rc<dyn AllocationAdmission>,
+        external_admission: bool,
+    ) -> Self {
         Self {
             inner: Rc::new(Cell::new(LedgerState {
                 snapshot: LedgerSnapshot {
@@ -186,6 +241,8 @@ impl AllocationLedger {
                 },
                 fail_at_ordinal: None,
             })),
+            admission,
+            external_admission,
         }
     }
 
@@ -280,6 +337,21 @@ impl AllocationLedger {
         self.reserve_at(bytes, AllocationDomain::Host, None)
     }
 
+    /// Rust allocator 若把單元素 Vec 擴為較大容量，額外 backing 仍屬 Lua heap。
+    #[track_caller]
+    pub(crate) fn reserve_lua_backing_excess(
+        &self,
+        bytes: usize,
+        point: FailPoint,
+    ) -> Result<Reservation, VmError> {
+        let ticket = self.reserve_at(bytes, AllocationDomain::LuaHeap, Some(point))?;
+        if let Err(error) = self.checkpoint(point) {
+            self.record_failure(ticket.attempt, AllocationFailureKind::Injection);
+            return Err(error);
+        }
+        Ok(ticket)
+    }
+
     #[track_caller]
     fn reserve_at(
         &self,
@@ -339,6 +411,29 @@ impl AllocationLedger {
             self.inner.set(state);
             return Err(VmError::InjectedAllocation(attempt));
         }
+        // callback 可在 CAPI 層 fail-closed；先發布 trace，再呼叫它，絕不在
+        // admission 拒絕後預留 Rust backing 或修改 committed/reserved。
+        self.inner.set(state);
+        let token = if bytes == 0 {
+            None
+        } else {
+            match self.admission.admit(bytes) {
+                Some(token) => Some(token),
+                None => {
+                    self.record_failure(attempt, AllocationFailureKind::Admission);
+                    return Err(VmError::AllocationFailed);
+                }
+            }
+        };
+        let mut admission = PendingAdmission {
+            admission: Rc::clone(&self.admission),
+            token,
+            bytes,
+        };
+        let mut state = self.inner.get();
+        if state.poisoned {
+            return Err(VmError::LedgerInvariant);
+        }
         state.snapshot.reserved = state
             .snapshot
             .reserved
@@ -364,6 +459,7 @@ impl AllocationLedger {
             bytes,
             domain,
             attempt,
+            token: admission.token.take(),
             active: true,
         })
     }
@@ -439,7 +535,290 @@ pub struct Reservation {
     bytes: usize,
     domain: AllocationDomain,
     attempt: AllocationAttempt,
+    token: Option<NonZeroUsize>,
     active: bool,
+}
+
+/// 唯一持有一筆已提交邏輯配置與宿主 token；不得複製。
+pub struct AllocationCharge {
+    ledger: AllocationLedger,
+    bytes: usize,
+    domain: AllocationDomain,
+    token: Option<NonZeroUsize>,
+}
+
+/// 同一 Lua 物件的兩塊 backing 共用帳本，各自保存 admission token 與費用。
+#[derive(Default)]
+struct LuaChargePart {
+    bytes: usize,
+    token: Option<NonZeroUsize>,
+}
+
+pub(crate) struct PairedLuaCharges {
+    ledger: AllocationLedger,
+    first: LuaChargePart,
+    second: LuaChargePart,
+}
+
+impl PairedLuaCharges {
+    pub(crate) fn new(ledger: AllocationLedger) -> Self {
+        Self {
+            ledger,
+            first: LuaChargePart::default(),
+            second: LuaChargePart::default(),
+        }
+    }
+
+    fn take_part(&self, mut charge: AllocationCharge) -> LuaChargePart {
+        debug_assert!(Rc::ptr_eq(&self.ledger.inner, &charge.ledger.inner));
+        debug_assert!(Rc::ptr_eq(&self.ledger.admission, &charge.ledger.admission));
+        debug_assert_eq!(charge.domain, AllocationDomain::LuaHeap);
+        let part = LuaChargePart {
+            bytes: core::mem::replace(&mut charge.bytes, 0),
+            token: charge.token.take(),
+        };
+        part
+    }
+
+    fn release_part(&self, mut part: LuaChargePart) {
+        if let Some(token) = part.token.take() {
+            self.ledger.admission.release(token, part.bytes);
+        }
+        self.ledger
+            .refund_on_drop_domain(part.bytes, AllocationDomain::LuaHeap);
+    }
+
+    pub(crate) fn replace_first(&mut self, charge: AllocationCharge) {
+        let next = self.take_part(charge);
+        let old = core::mem::replace(&mut self.first, next);
+        self.release_part(old);
+    }
+
+    pub(crate) fn replace_second(&mut self, charge: AllocationCharge) {
+        let next = self.take_part(charge);
+        let old = core::mem::replace(&mut self.second, next);
+        self.release_part(old);
+    }
+
+    pub(crate) fn clear_second(&mut self) {
+        let old = core::mem::take(&mut self.second);
+        self.release_part(old);
+    }
+}
+
+impl Drop for PairedLuaCharges {
+    fn drop(&mut self) {
+        let first = core::mem::take(&mut self.first);
+        let second = core::mem::take(&mut self.second);
+        self.release_part(first);
+        self.release_part(second);
+    }
+}
+
+/// 同一 owner 的多筆原始 admission；每筆 token 在合計或移交前保持獨立。
+#[derive(Default)]
+pub struct AllocationCharges {
+    entries: Vec<AllocationCharge>,
+}
+
+/// replacement backing 已備妥之後才使用的兩階段 charge 正規化。
+pub(crate) enum PreparedNormalization {
+    Equal,
+    Zero,
+    Partial(PreparedPartialNormalization),
+}
+
+pub(crate) struct PreparedPartialNormalization {
+    actual: usize,
+    ledger: AllocationLedger,
+    domain: AllocationDomain,
+    excess: usize,
+    before: LedgerState,
+    pending: PendingAdmission,
+    next: AllocationCharges,
+}
+
+impl AllocationCharges {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn total_bytes(&self) -> Result<usize, VmError> {
+        self.entries.iter().try_fold(0usize, |total, charge| {
+            total
+                .checked_add(charge.bytes)
+                .ok_or(VmError::ArithmeticOverflow)
+        })
+    }
+
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), VmError> {
+        self.entries
+            .try_reserve_exact(additional)
+            .map_err(|_| VmError::AllocationFailed)
+    }
+
+    /// 呼叫者已在發布共享狀態前預留 metadata 容量，並確認帳本與 domain 相同。
+    pub(crate) fn push_prepared(&mut self, charge: AllocationCharge) {
+        debug_assert!(self.entries.len() < self.entries.capacity());
+        self.entries.push(charge);
+    }
+
+    pub fn try_push(
+        &mut self,
+        charge: AllocationCharge,
+    ) -> Result<(), (VmError, AllocationCharge)> {
+        if let Some(first) = self.entries.first() {
+            if !Rc::ptr_eq(&first.ledger.inner, &charge.ledger.inner)
+                || first.domain != charge.domain
+            {
+                return Err((VmError::LedgerInvariant, charge));
+            }
+        }
+        if self.entries.try_reserve_exact(1).is_err() {
+            return Err((VmError::AllocationFailed, charge));
+        }
+        self.entries.push(charge);
+        Ok(())
+    }
+
+    pub fn try_absorb(&mut self, other: &mut Self) -> Result<(), VmError> {
+        if let (Some(first), Some(next)) = (self.entries.first(), other.entries.first()) {
+            if !Rc::ptr_eq(&first.ledger.inner, &next.ledger.inner) || first.domain != next.domain {
+                return Err(VmError::LedgerInvariant);
+            }
+        }
+        self.entries
+            .try_reserve_exact(other.entries.len())
+            .map_err(|_| VmError::AllocationFailed)?;
+        self.entries.append(&mut other.entries);
+        Ok(())
+    }
+
+    /// prepare 只配置新 metadata 與 current-binding token；拒絕時原集合不變。
+    pub(crate) fn prepare_normalize(
+        &self,
+        actual: usize,
+    ) -> Result<PreparedNormalization, VmError> {
+        let total = self.total_bytes()?;
+        if actual > total {
+            return Err(VmError::ArithmeticOverflow);
+        }
+        if actual == total || actual == 0 {
+            return Ok(if actual == total {
+                PreparedNormalization::Equal
+            } else {
+                PreparedNormalization::Zero
+            });
+        }
+        let first = self.entries.first().ok_or(VmError::LedgerInvariant)?;
+        let ledger = first.ledger.clone();
+        let domain = first.domain;
+        let before = ledger.inner.get();
+        let domain_committed = match domain {
+            AllocationDomain::LuaHeap => before.snapshot.lua_heap_bytes,
+            AllocationDomain::Host => before.snapshot.host_allocation_bytes,
+        };
+        let excess = total - actual;
+        if before.poisoned || before.snapshot.committed < excess || domain_committed < excess {
+            return Err(VmError::LedgerInvariant);
+        }
+        let token = ledger
+            .admission
+            .admit(actual)
+            .ok_or(VmError::AllocationFailed)?;
+        let pending = PendingAdmission {
+            admission: Rc::clone(&ledger.admission),
+            token: Some(token),
+            bytes: actual,
+        };
+        let mut next = Self::new();
+        next.entries
+            .try_reserve_exact(1)
+            .map_err(|_| VmError::AllocationFailed)?;
+        let state = ledger.inner.get();
+        if state.poisoned
+            || state.snapshot.committed != before.snapshot.committed
+            || state.snapshot.reserved != before.snapshot.reserved
+            || (match domain {
+                AllocationDomain::LuaHeap => state.snapshot.lua_heap_bytes,
+                AllocationDomain::Host => state.snapshot.host_allocation_bytes,
+            }) != domain_committed
+        {
+            return Err(VmError::LedgerInvariant);
+        }
+        Ok(PreparedNormalization::Partial(
+            PreparedPartialNormalization {
+                actual,
+                ledger,
+                domain,
+                excess,
+                before,
+                pending,
+                next,
+            },
+        ))
+    }
+
+    /// 呼叫者先 drop 舊 backing，兩者之間不得執行其他 ledger 動作。
+    pub(crate) fn commit_normalize(&mut self, prepared: PreparedNormalization) -> Self {
+        let mut partial = match prepared {
+            PreparedNormalization::Equal => return core::mem::take(self),
+            PreparedNormalization::Zero => {
+                self.entries.clear();
+                return Self::new();
+            }
+            PreparedNormalization::Partial(partial) => partial,
+        };
+        let mut state = partial.before;
+        // 此後不再有 fallible 動作；舊 backing 已由 caller 丟棄。
+        for charge in &mut self.entries {
+            if let Some(old) = charge.token.take() {
+                partial.ledger.admission.release(old, charge.bytes);
+            }
+            charge.bytes = 0;
+        }
+        self.entries.clear();
+        state.snapshot.committed -= partial.excess;
+        match partial.domain {
+            AllocationDomain::LuaHeap => state.snapshot.lua_heap_bytes -= partial.excess,
+            AllocationDomain::Host => state.snapshot.host_allocation_bytes -= partial.excess,
+        }
+        partial.ledger.inner.set(state);
+        partial.next.entries.push(AllocationCharge {
+            ledger: partial.ledger,
+            bytes: partial.actual,
+            domain: partial.domain,
+            token: partial.pending.token.take(),
+        });
+        partial.next
+    }
+
+    /// 同一 backing 仍由 caller 持有時只可用於 ledger-only 正規化。
+    pub fn normalize(&mut self, actual: usize) -> Result<Self, VmError> {
+        let prepared = self.prepare_normalize(actual)?;
+        Ok(self.commit_normalize(prepared))
+    }
+}
+
+impl AllocationCharge {
+    pub const fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// 僅供舊帳本入口在未綁定宿主 allocator 時遞移使用。
+    fn detach_internal(mut self) {
+        self.token = None;
+        self.bytes = 0;
+    }
+}
+
+impl Drop for AllocationCharge {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.ledger.admission.release(token, self.bytes);
+        }
+        self.ledger.refund_on_drop_domain(self.bytes, self.domain);
+    }
 }
 
 impl Reservation {
@@ -449,7 +828,15 @@ impl Reservation {
         VmError::AllocationFailed
     }
 
-    pub fn commit(mut self) -> Result<(), VmError> {
+    pub fn commit(self) -> Result<(), VmError> {
+        if self.ledger.external_admission {
+            return Err(VmError::LedgerInvariant);
+        }
+        self.commit_charge()?.detach_internal();
+        Ok(())
+    }
+
+    pub fn commit_charge(mut self) -> Result<AllocationCharge, VmError> {
         let mut state = self.ledger.inner.get();
         if state.poisoned {
             return Err(VmError::LedgerInvariant);
@@ -482,13 +869,21 @@ impl Reservation {
         state.snapshot.committed = committed;
         self.ledger.inner.set(state);
         self.active = false;
-        Ok(())
+        Ok(AllocationCharge {
+            ledger: self.ledger.clone(),
+            bytes: self.bytes,
+            domain: self.domain,
+            token: self.token.take(),
+        })
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         if self.active {
+            if let Some(token) = self.token.take() {
+                self.ledger.admission.release(token, self.bytes);
+            }
             let mut state = self.ledger.inner.get();
             if let Some(reserved) = state.snapshot.reserved.checked_sub(self.bytes) {
                 state.snapshot.reserved = reserved;
@@ -677,5 +1072,153 @@ mod tests {
         assert_eq!(snapshot.lua_heap_bytes, 0);
         assert_eq!(snapshot.committed, 8);
         ledger.refund(8).unwrap();
+    }
+
+    #[test]
+    fn p16_a50_admission_rejection_and_owned_charge_release() {
+        use core::cell::Cell;
+        use core::num::NonZeroUsize;
+        use std::rc::Rc;
+
+        use super::{AllocationAdmission, AllocationFailureKind};
+
+        struct Admission {
+            reject: Cell<bool>,
+            calls: Cell<usize>,
+            releases: Cell<usize>,
+        }
+
+        impl AllocationAdmission for Admission {
+            fn admit(&self, _bytes: usize) -> Option<NonZeroUsize> {
+                self.calls.set(self.calls.get() + 1);
+                if self.reject.replace(false) {
+                    None
+                } else {
+                    NonZeroUsize::new(self.calls.get())
+                }
+            }
+
+            fn release(&self, _token: NonZeroUsize, _bytes: usize) {
+                self.releases.set(self.releases.get() + 1);
+            }
+        }
+
+        let admission = Rc::new(Admission {
+            reject: Cell::new(true),
+            calls: Cell::new(0),
+            releases: Cell::new(0),
+        });
+        let ledger = AllocationLedger::with_admission(100, admission.clone());
+        let mut values = Vec::<u8>::new();
+        assert_eq!(
+            reserve_vec(&ledger, &mut values, 8, FailPoint::WorkReserve).err(),
+            Some(VmError::AllocationFailed),
+        );
+        assert_eq!(values.capacity(), 0);
+        assert_eq!(ledger.snapshot().reserved, 0);
+        assert_eq!(ledger.snapshot().committed, 0);
+        assert_eq!(
+            ledger.trace().last_failure.unwrap().kind,
+            AllocationFailureKind::Admission,
+        );
+
+        let zero = ledger.reserve(0).unwrap().commit_charge().unwrap();
+        assert_eq!(admission.calls.get(), 1);
+        drop(zero);
+        assert_eq!(admission.releases.get(), 0);
+
+        let ticket = reserve_vec(&ledger, &mut values, 8, FailPoint::WorkReserve).unwrap();
+        values.extend_from_slice(b"12345678");
+        let charge = ticket.commit_charge().unwrap();
+        assert_eq!(ledger.snapshot().committed, 8);
+        drop(values);
+        drop(charge);
+        assert_eq!(admission.calls.get(), 2);
+        assert_eq!(admission.releases.get(), 1);
+        assert_eq!(ledger.snapshot().committed, 0);
+    }
+
+    #[test]
+    fn p16_a50_charge_collection_normalizes_zero_equal_partial_and_rejection() {
+        use core::cell::{Cell, RefCell};
+        use core::num::NonZeroUsize;
+        use std::rc::Rc;
+
+        use super::{AllocationAdmission, AllocationCharges};
+
+        struct Admission {
+            next: Cell<usize>,
+            reject: Cell<bool>,
+            releases: RefCell<Vec<(usize, usize)>>,
+        }
+
+        impl AllocationAdmission for Admission {
+            fn admit(&self, _bytes: usize) -> Option<NonZeroUsize> {
+                if self.reject.replace(false) {
+                    return None;
+                }
+                let next = self.next.get() + 1;
+                self.next.set(next);
+                NonZeroUsize::new(next)
+            }
+
+            fn release(&self, token: NonZeroUsize, bytes: usize) {
+                self.releases.borrow_mut().push((token.get(), bytes));
+            }
+        }
+
+        for actual in [0, 10, 7] {
+            let admission = Rc::new(Admission {
+                next: Cell::new(0),
+                reject: Cell::new(false),
+                releases: RefCell::new(Vec::new()),
+            });
+            let ledger = AllocationLedger::with_admission(100, admission.clone());
+            let mut charges = AllocationCharges::new();
+            charges
+                .try_push(ledger.reserve(4).unwrap().commit_charge().unwrap())
+                .unwrap_or_else(|_| panic!("charge collection 可預留第一筆"));
+            charges
+                .try_push(ledger.reserve(6).unwrap().commit_charge().unwrap())
+                .unwrap_or_else(|_| panic!("charge collection 可預留第二筆"));
+            assert_eq!(charges.total_bytes(), Ok(10));
+            let normalized = charges.normalize(actual).unwrap();
+            assert_eq!(charges.total_bytes(), Ok(0));
+            assert_eq!(normalized.total_bytes(), Ok(actual));
+            assert_eq!(ledger.snapshot().committed, actual);
+            assert_eq!(admission.next.get(), if actual == 7 { 3 } else { 2 },);
+            assert_eq!(
+                admission.releases.borrow().len(),
+                if actual == 10 { 0 } else { 2 },
+            );
+            drop(normalized);
+            assert_eq!(ledger.snapshot().committed, 0);
+            assert_eq!(
+                admission.releases.borrow().len(),
+                if actual == 7 { 3 } else { 2 }
+            );
+        }
+
+        let admission = Rc::new(Admission {
+            next: Cell::new(0),
+            reject: Cell::new(false),
+            releases: RefCell::new(Vec::new()),
+        });
+        let ledger = AllocationLedger::with_admission(100, admission.clone());
+        let mut charges = AllocationCharges::new();
+        charges
+            .try_push(ledger.reserve(4).unwrap().commit_charge().unwrap())
+            .unwrap_or_else(|_| panic!("charge collection 可預留第一筆"));
+        charges
+            .try_push(ledger.reserve(6).unwrap().commit_charge().unwrap())
+            .unwrap_or_else(|_| panic!("charge collection 可預留第二筆"));
+        admission.reject.set(true);
+        assert_eq!(charges.normalize(7).err(), Some(VmError::AllocationFailed));
+        assert_eq!(charges.total_bytes(), Ok(10));
+        assert_eq!(ledger.snapshot().committed, 10);
+        assert!(admission.releases.borrow().is_empty());
+        drop(charges);
+        assert_eq!(ledger.snapshot().committed, 0);
+        assert_eq!(admission.releases.borrow().len(), 2);
     }
 }

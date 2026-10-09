@@ -28,6 +28,7 @@ pub(crate) enum RefField {
     TableKey,
     TableValue,
     Metatable,
+    UserValue,
     Upvalue,
     Coroutine,
 }
@@ -38,7 +39,12 @@ pub(crate) fn trace_value(
 ) -> Result<(), VmError> {
     match value {
         Value::Object(object) => visit(object)?,
-        Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Float(_) => {}
+        Value::Nil
+        | Value::Boolean(_)
+        | Value::Integer(_)
+        | Value::Float(_)
+        | Value::LightUserdata(_)
+        | Value::CFunction(_) => {}
     }
     Ok(())
 }

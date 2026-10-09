@@ -2,7 +2,7 @@
 
 use rivetlua_core::{LuaProfile, ObjectRef, Value};
 
-use crate::alloc::AllocationLedger;
+use crate::alloc::AllocationCharges;
 use crate::stdlib::string::Buffer;
 use crate::vm::{RuntimeError, RuntimeErrorKind};
 use crate::{ObjectKind, RootId, RootKind, Vm, VmError};
@@ -357,26 +357,22 @@ impl LoadReaderState {
 }
 
 pub(crate) struct ModuleCharge {
-    ledger: AllocationLedger,
-    bytes: usize,
+    charges: AllocationCharges,
 }
 
 impl ModuleCharge {
-    pub(crate) fn new(vm: &Vm, bytes: usize) -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
-            ledger: vm.allocation_ledger().clone(),
-            bytes,
+            charges: AllocationCharges::new(),
         }
     }
 
-    pub(crate) fn take(&mut self) -> usize {
-        core::mem::replace(&mut self.bytes, 0)
+    pub(crate) fn from_charges(charges: AllocationCharges) -> Self {
+        Self { charges }
     }
-}
 
-impl Drop for ModuleCharge {
-    fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.bytes);
+    pub(crate) fn take(&mut self) -> AllocationCharges {
+        core::mem::take(&mut self.charges)
     }
 }
 

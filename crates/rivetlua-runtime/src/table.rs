@@ -6,7 +6,10 @@ use std::collections::hash_map::DefaultHasher;
 
 use rivetlua_core::{ObjectId, ObjectRef, Value};
 
-use crate::alloc::{AllocationLedger, FailPoint, Reservation, checked_bytes, reserve_vec};
+use crate::alloc::{
+    AllocationCharge, AllocationLedger, FailPoint, PairedLuaCharges, Reservation, checked_bytes,
+    reserve_vec,
+};
 use crate::gc::WeakMode;
 use crate::{ByteString, ObjectKind, Vm, VmError};
 
@@ -16,6 +19,7 @@ pub struct Table {
     weak_mode: WeakMode,
     array: Vec<Option<Value>>,
     hash: Vec<Option<(CanonicalKey, Value)>>,
+    charges: PairedLuaCharges,
 }
 
 impl Table {
@@ -33,12 +37,20 @@ impl Table {
         )?;
         array.resize_with(array_capacity, || None);
         let mut hash = Vec::new();
-        let hash_ticket = reserve_vec(
+        let hash_ticket = match reserve_vec(
             ledger,
             &mut hash,
             hash_capacity,
             FailPoint::TableHashReserve,
-        )?;
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                drop(hash);
+                drop(array);
+                drop(array_ticket);
+                return Err(error);
+            }
+        };
         hash.resize_with(hash_capacity, || None);
         Ok((
             Self {
@@ -46,10 +58,20 @@ impl Table {
                 weak_mode: WeakMode::Strong,
                 array,
                 hash,
+                charges: PairedLuaCharges::new(ledger.clone()),
             },
             array_ticket,
             hash_ticket,
         ))
+    }
+
+    pub(crate) fn install_initial_charges(
+        &mut self,
+        array: AllocationCharge,
+        hash: AllocationCharge,
+    ) {
+        self.charges.replace_first(array);
+        self.charges.replace_second(hash);
     }
 
     pub(crate) const fn metatable(&self) -> Option<ObjectRef> {
@@ -69,27 +91,35 @@ impl Table {
     }
 
     pub(crate) fn mode_value(&self) -> Value {
-        self.hash.iter().flatten().find_map(|(key, value)| {
-            if matches!(&key.kind, KeyKind::ByteString(string) if string.bytes.as_bytes() == b"__mode") {
-                Some(*value)
-            } else {
-                None
-            }
-        }).unwrap_or(Value::Nil)
+        self.hash
+            .iter()
+            .flatten()
+            .find_map(|(key, value)| {
+                if *value != Value::Nil && key.string_bytes() == Some(b"__mode".as_slice()) {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(Value::Nil)
     }
 
     pub(crate) fn finalizer_value(&self) -> Value {
-        self.hash.iter().flatten().find_map(|(key, value)| {
-            if matches!(&key.kind, KeyKind::ByteString(string) if string.bytes.as_bytes() == b"__gc") {
-                Some(*value)
-            } else {
-                None
-            }
-        }).unwrap_or(Value::Nil)
+        self.hash
+            .iter()
+            .flatten()
+            .find_map(|(key, value)| {
+                if *value != Value::Nil && key.string_bytes() == Some(b"__gc".as_slice()) {
+                    Some(*value)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(Value::Nil)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.array.iter().all(Option::is_none) && self.hash.iter().all(Option::is_none)
+        self.array.iter().all(Option::is_none) && self.live_hash_count() == 0
     }
 
     pub fn array_capacity(&self) -> usize {
@@ -122,6 +152,9 @@ impl Table {
             }
         }
         for (key, value) in self.hash.iter().flatten() {
+            if *value == Value::Nil {
+                continue;
+            }
             if let Some(object) = key.source_object() {
                 visit(object)?;
             }
@@ -151,6 +184,9 @@ impl Table {
             }
         }
         for (key, value) in self.hash.iter().flatten() {
+            if *value == Value::Nil {
+                continue;
+            }
             if let Some(object) = key.source_object() {
                 if self.weak_mode == WeakMode::Values
                     || key.class() == CanonicalKeyClass::ByteString
@@ -164,6 +200,7 @@ impl Table {
                     CanonicalKeyClass::Integer
                         | CanonicalKeyClass::Float
                         | CanonicalKeyClass::Boolean
+                        | CanonicalKeyClass::LightUserdata
                         | CanonicalKeyClass::ByteString
                 );
                 let strong_value = match self.weak_mode {
@@ -187,6 +224,9 @@ impl Table {
             return Ok(());
         }
         for (key, value) in self.hash.iter().flatten() {
+            if *value == Value::Nil {
+                continue;
+            }
             if let Value::Object(value) = value {
                 let key = match &key.kind {
                     KeyKind::Object(key) => Some(key.source),
@@ -223,6 +263,9 @@ impl Table {
             let Some((key, value)) = entry else {
                 continue;
             };
+            if *value == Value::Nil {
+                continue;
+            }
             let dead_key = if clear_keys && matches!(self.weak_mode, WeakMode::Keys | WeakMode::All)
             {
                 match &key.kind {
@@ -242,14 +285,18 @@ impl Table {
                     false
                 };
             if dead_key || dead_value {
-                *entry = None;
+                if dead_key {
+                    *entry = None;
+                } else {
+                    key.make_dead(ledger)?;
+                    *value = Value::Nil;
+                }
                 cleared += 1;
             }
         }
         if !self.hash.is_empty() && self.hash.iter().all(Option::is_none) {
-            let bytes = checked_bytes(self.hash.len(), size_of::<Option<(CanonicalKey, Value)>>())?;
-            ledger.refund_lua(bytes)?;
             self.hash = Vec::new();
+            self.charges.clear_second();
         }
         Ok(cleared)
     }
@@ -269,6 +316,22 @@ impl Table {
     }
 
     fn find_hash(&self, key: &CanonicalKey) -> Option<usize> {
+        self.find_any_hash(key).filter(|&index| {
+            self.hash[index]
+                .as_ref()
+                .is_some_and(|(_, value)| *value != Value::Nil)
+        })
+    }
+
+    fn live_hash_count(&self) -> usize {
+        self.hash
+            .iter()
+            .flatten()
+            .filter(|(_, value)| *value != Value::Nil)
+            .count()
+    }
+
+    fn find_any_hash(&self, key: &CanonicalKey) -> Option<usize> {
         let count = self.hash.len();
         if count == 0 {
             return None;
@@ -343,15 +406,87 @@ impl Table {
             }
         }
         for (key, value) in self.hash.iter().flatten() {
-            visit(key.as_value(), *value)?;
+            if *value != Value::Nil {
+                visit(key.as_value(), *value)?;
+            }
         }
         Ok(())
+    }
+
+    /// Lua next 以 bucket 位置續走；已刪除的欄位仍可作為前一鍵。
+    pub(crate) fn next_raw(
+        &self,
+        vm: &Vm,
+        previous: Value,
+    ) -> Result<Option<(Value, Value)>, crate::vm::RuntimeError> {
+        use crate::vm::{RuntimeError, RuntimeErrorKind};
+        let mut array_start = 0;
+        let mut hash_start = 0;
+        if previous != Value::Nil {
+            let mut found = false;
+            let mut empty_array_match = None;
+            for index in 0..self.array.len() {
+                let number = i64::try_from(index)
+                    .ok()
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(VmError::ArithmeticOverflow)?;
+                if vm.raw_equal_value(Value::Integer(number), previous)? {
+                    if self.array[index].is_some() {
+                        array_start = index + 1;
+                        found = true;
+                    } else {
+                        empty_array_match = Some(index);
+                    }
+                    break;
+                }
+            }
+            if !found {
+                let mut matched_hash = None;
+                for (index, entry) in self.hash.iter().enumerate() {
+                    if let Some((key, _)) = entry
+                        && key.matches_previous(vm, previous)?
+                    {
+                        matched_hash = Some(index);
+                        break;
+                    }
+                }
+                if let Some(index) = matched_hash {
+                    hash_start = index + 1;
+                    array_start = self.array.len();
+                    found = true;
+                }
+                if !found {
+                    if let Some(index) = empty_array_match {
+                        array_start = index + 1;
+                        found = true;
+                    }
+                }
+            }
+            if !found {
+                return Err(RuntimeError::new(RuntimeErrorKind::InvalidNextKey));
+            }
+        }
+        for index in array_start..self.array.len() {
+            if let Some(value) = self.array[index] {
+                let number = i64::try_from(index)
+                    .ok()
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or(VmError::ArithmeticOverflow)?;
+                return Ok(Some((Value::Integer(number), value)));
+            }
+        }
+        for (key, value) in self.hash.iter().skip(hash_start).flatten() {
+            if *value != Value::Nil {
+                return Ok(Some((key.as_value(), *value)));
+            }
+        }
+        Ok(None)
     }
 
     fn prepare_set(
         &self,
         ledger: &AllocationLedger,
-        key: CanonicalKey,
+        mut key: CanonicalKey,
         value: Value,
     ) -> Result<PreparedTableMutation, VmError> {
         let array_index = key.array_index();
@@ -361,19 +496,28 @@ impl Table {
             }
         }
         if let Some(index) = self.find_hash(&key) {
-            if value == Value::Nil && self.hash.iter().filter(|entry| entry.is_some()).count() == 1
-            {
-                return Ok(PreparedTableMutation::ClearHash {
-                    refund_bytes: checked_bytes(
-                        self.hash.len(),
-                        size_of::<Option<(CanonicalKey, Value)>>(),
-                    )?,
-                });
+            if value == Value::Nil {
+                key.make_dead(ledger)?;
             }
-            return Ok(PreparedTableMutation::HashSlot { index, value });
+            return Ok(PreparedTableMutation::HashSlot {
+                index,
+                value,
+                dead_key: (value == Value::Nil).then_some(key),
+            });
         }
         if value == Value::Nil {
             return Ok(PreparedTableMutation::Noop);
+        }
+        if let Some(index) = self.find_any_hash(&key) {
+            let needed = self
+                .live_hash_count()
+                .checked_add(1)
+                .ok_or(VmError::ArithmeticOverflow)?;
+            let capacity = self.hash.len();
+            if needed <= capacity - capacity / 4 {
+                ledger.checkpoint(FailPoint::TableInsert)?;
+                return Ok(PreparedTableMutation::HashReplace { index, key, value });
+            }
         }
         if let Some(index) = array_index {
             if index < self.array.len() {
@@ -398,16 +542,18 @@ impl Table {
                 return Ok(PreparedTableMutation::GrowArray {
                     next,
                     ticket: Some(ticket),
+                    charge: None,
                     old_bytes,
                     new_bytes,
                     value,
                 });
             }
         }
-        let count = self.hash.iter().filter(|entry| entry.is_some()).count();
+        let count = self.live_hash_count();
+        let occupied = self.hash.iter().filter(|entry| entry.is_some()).count();
         let capacity = self.hash.len();
         let needed = count.checked_add(1).ok_or(VmError::ArithmeticOverflow)?;
-        if capacity == 0 || count >= capacity || needed > capacity - capacity / 4 {
+        if capacity == 0 || occupied >= capacity || needed > capacity - capacity / 4 {
             let new_capacity = capacity
                 .checked_mul(2)
                 .map(|doubled| doubled.max(1))
@@ -426,6 +572,7 @@ impl Table {
             Ok(PreparedTableMutation::GrowHash {
                 next,
                 ticket: Some(ticket),
+                charge: None,
                 old_bytes,
                 new_bytes,
                 existing_count: count,
@@ -439,16 +586,205 @@ impl Table {
         }
     }
 
+    /// refs 的兩個非 nil 整數欄位在原表上共同預備；任何配置或 checkpoint
+    /// 失敗時，原 array/hash、GC edge 與帳本提交狀態都尚未改變。
+    fn prepare_ref_pair(
+        &self,
+        ledger: &AllocationLedger,
+        first: (i64, Value),
+        second: (i64, Value),
+    ) -> Result<PreparedRefPair, VmError> {
+        let values = if first.0 == second.0 {
+            [None, Some(second)]
+        } else {
+            [Some(first), Some(second)]
+        };
+        if values
+            .iter()
+            .flatten()
+            .any(|(_, value)| *value == Value::Nil)
+        {
+            return Err(VmError::LedgerInvariant);
+        }
+
+        // 低整數鍵可使兩次寫入共用一次 array grow；稀疏鍵仍留在 hash。
+        let mut array_len = self.array.len();
+        for _ in 0..2 {
+            let boundary = values.iter().flatten().any(|(key, _)| {
+                let canonical = CanonicalKey {
+                    kind: KeyKind::Integer(*key),
+                };
+                canonical.array_index() == Some(array_len) && self.find_hash(&canonical).is_none()
+            });
+            if !boundary {
+                break;
+            }
+            array_len = array_len
+                .checked_mul(2)
+                .map(|doubled| doubled.max(4))
+                .ok_or(VmError::ArithmeticOverflow)?;
+        }
+
+        let mut slots = [None; 2];
+        let mut hash_inserts = 0usize;
+        for (ordinal, item) in values.iter().enumerate() {
+            let Some((key, _)) = item else { continue };
+            let canonical = CanonicalKey {
+                kind: KeyKind::Integer(*key),
+            };
+            let array_index = canonical.array_index();
+            slots[ordinal] = Some(
+                if let Some(index) = array_index
+                    && self.array.get(index).is_some_and(Option::is_some)
+                {
+                    RefPairSlot::Array(index)
+                } else if let Some(index) = self.find_any_hash(&canonical) {
+                    if self.hash[index]
+                        .as_ref()
+                        .is_some_and(|(_, value)| *value == Value::Nil)
+                    {
+                        ledger.checkpoint(FailPoint::TableInsert)?;
+                        hash_inserts = hash_inserts
+                            .checked_add(1)
+                            .ok_or(VmError::ArithmeticOverflow)?;
+                    }
+                    RefPairSlot::HashExisting(index)
+                } else if let Some(index) = array_index.filter(|index| *index < array_len) {
+                    ledger.checkpoint(FailPoint::TableInsert)?;
+                    RefPairSlot::Array(index)
+                } else {
+                    ledger.checkpoint(FailPoint::TableInsert)?;
+                    hash_inserts = hash_inserts
+                        .checked_add(1)
+                        .ok_or(VmError::ArithmeticOverflow)?;
+                    RefPairSlot::HashNew(0)
+                },
+            );
+        }
+
+        let array_growth = if array_len > self.array.len() {
+            let old_bytes = checked_bytes(self.array.len(), size_of::<Option<Value>>())?;
+            let new_bytes = checked_bytes(array_len, size_of::<Option<Value>>())?;
+            let mut next = Vec::new();
+            let ticket = reserve_vec(ledger, &mut next, array_len, FailPoint::TableArrayGrow)?;
+            next.resize_with(array_len, || None);
+            next[..self.array.len()].copy_from_slice(&self.array);
+            Some(RefPairGrowth {
+                next,
+                ticket: Some(ticket),
+                charge: None,
+                old_bytes,
+                new_bytes,
+            })
+        } else {
+            None
+        };
+
+        let old_hash_count = self.live_hash_count();
+        let occupied_hash_count = self.hash.iter().filter(|entry| entry.is_some()).count();
+        let required_hash = old_hash_count
+            .checked_add(hash_inserts)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let mut hash_len = self.hash.len();
+        while required_hash > hash_len.saturating_sub(hash_len / 4)
+            || occupied_hash_count
+                .checked_add(hash_inserts)
+                .ok_or(VmError::ArithmeticOverflow)?
+                > hash_len
+        {
+            hash_len = hash_len
+                .checked_mul(2)
+                .map(|doubled| doubled.max(1))
+                .ok_or(VmError::ArithmeticOverflow)?;
+        }
+        let hash_growth = if hash_len > self.hash.len() {
+            let old_bytes =
+                checked_bytes(self.hash.len(), size_of::<Option<(CanonicalKey, Value)>>())?;
+            let new_bytes = checked_bytes(hash_len, size_of::<Option<(CanonicalKey, Value)>>())?;
+            let mut next = Vec::new();
+            let ticket = reserve_vec(ledger, &mut next, hash_len, FailPoint::TableHashGrow)?;
+            next.resize_with(hash_len, || None);
+            ledger.checkpoint(FailPoint::TableRehash)?;
+            Some(RefPairGrowth {
+                next,
+                ticket: Some(ticket),
+                charge: None,
+                old_bytes,
+                new_bytes,
+            })
+        } else {
+            None
+        };
+
+        let mut next_hash_slot = old_hash_count;
+        let mut claimed = [None; 2];
+        for (ordinal, slot) in slots.iter_mut().enumerate() {
+            match slot {
+                Some(RefPairSlot::HashExisting(index)) if hash_growth.is_some() => {
+                    if self.hash[*index]
+                        .as_ref()
+                        .is_some_and(|(_, value)| *value == Value::Nil)
+                    {
+                        *slot = Some(RefPairSlot::HashNew(next_hash_slot));
+                        next_hash_slot += 1;
+                    } else {
+                        *index = self.hash[..*index]
+                            .iter()
+                            .flatten()
+                            .filter(|(_, value)| *value != Value::Nil)
+                            .count();
+                    }
+                }
+                Some(RefPairSlot::HashNew(index)) if hash_growth.is_some() => {
+                    *index = next_hash_slot;
+                    next_hash_slot += 1;
+                }
+                Some(RefPairSlot::HashNew(index)) => {
+                    let Some((key, _)) = values[ordinal] else {
+                        return Err(VmError::LedgerInvariant);
+                    };
+                    let canonical = CanonicalKey {
+                        kind: KeyKind::Integer(key),
+                    };
+                    let start = Self::bucket(&canonical, self.hash.len());
+                    let Some(empty) = (0..self.hash.len())
+                        .map(|step| Self::probe(start, step, self.hash.len()))
+                        .find(|candidate| {
+                            self.hash[*candidate].is_none() && !claimed.contains(&Some(*candidate))
+                        })
+                    else {
+                        return Err(VmError::LedgerInvariant);
+                    };
+                    *index = empty;
+                    claimed[ordinal] = Some(empty);
+                }
+                _ => {}
+            }
+        }
+        Ok(PreparedRefPair {
+            entries: [
+                values[0]
+                    .zip(slots[0])
+                    .map(|((key, value), slot)| RefPairEntry { key, value, slot }),
+                values[1]
+                    .zip(slots[1])
+                    .map(|((key, value), slot)| RefPairEntry { key, value, slot }),
+            ],
+            array_growth,
+            hash_growth,
+        })
+    }
+
     /// 僅供 installer 的已存在 byte-key rollback；不重新建立 canonical key。
     fn restore_existing_byte_key(
         &mut self,
-        ledger: &AllocationLedger,
+        _ledger: &AllocationLedger,
         name: &[u8],
         value: Value,
     ) -> Result<(), VmError> {
         let Some(index) = self.hash.iter().position(|entry| {
-            entry.as_ref().is_some_and(|(key, _)| {
-                matches!(&key.kind, KeyKind::ByteString(string) if string.bytes.as_bytes() == name)
+            entry.as_ref().is_some_and(|(key, stored)| {
+                *stored != Value::Nil && key.string_bytes() == Some(name)
             })
         }) else {
             return Err(VmError::LedgerInvariant);
@@ -456,10 +792,8 @@ impl Table {
         if value == Value::Nil {
             self.hash[index] = None;
             if self.hash.iter().all(Option::is_none) {
-                let bytes =
-                    checked_bytes(self.hash.len(), size_of::<Option<(CanonicalKey, Value)>>())?;
-                ledger.refund_lua(bytes)?;
                 self.hash = Vec::new();
+                self.charges.clear_second();
             }
         } else if let Some((_, stored)) = &mut self.hash[index] {
             *stored = value;
@@ -478,9 +812,12 @@ pub(crate) enum PreparedTableMutation {
     HashSlot {
         index: usize,
         value: Value,
+        dead_key: Option<CanonicalKey>,
     },
-    ClearHash {
-        refund_bytes: usize,
+    HashReplace {
+        index: usize,
+        key: CanonicalKey,
+        value: Value,
     },
     HashInsert {
         index: usize,
@@ -490,6 +827,7 @@ pub(crate) enum PreparedTableMutation {
     GrowArray {
         next: Vec<Option<Value>>,
         ticket: Option<Reservation>,
+        charge: Option<AllocationCharge>,
         old_bytes: usize,
         new_bytes: usize,
         value: Value,
@@ -497,6 +835,7 @@ pub(crate) enum PreparedTableMutation {
     GrowHash {
         next: Vec<Option<(CanonicalKey, Value)>>,
         ticket: Option<Reservation>,
+        charge: Option<AllocationCharge>,
         old_bytes: usize,
         new_bytes: usize,
         existing_count: usize,
@@ -508,13 +847,13 @@ pub(crate) enum PreparedTableMutation {
 impl PreparedTableMutation {
     pub(crate) fn new_edges(&self) -> (Option<ObjectRef>, Option<ObjectRef>) {
         let (key, value) = match self {
-            Self::Noop | Self::ClearHash { .. } => return (None, None),
+            Self::Noop => return (None, None),
             Self::ArraySlot { value, .. }
             | Self::HashSlot { value, .. }
             | Self::GrowArray { value, .. } => (None, value),
-            Self::HashInsert { key, value, .. } | Self::GrowHash { key, value, .. } => {
-                (key.source_object(), value)
-            }
+            Self::HashReplace { key, value, .. }
+            | Self::HashInsert { key, value, .. }
+            | Self::GrowHash { key, value, .. } => (key.source_object(), value),
         };
         let value = match value {
             Value::Object(object) => Some(*object),
@@ -525,34 +864,18 @@ impl PreparedTableMutation {
 
     fn commit_growth(
         ticket: &mut Option<Reservation>,
-        ledger: &AllocationLedger,
-        old_bytes: usize,
-        new_bytes: usize,
+        charge: &mut Option<AllocationCharge>,
     ) -> Result<(), VmError> {
         let ticket = ticket.take().ok_or(VmError::LedgerInvariant)?;
-        ticket.commit()?;
-        if let Err(error) = ledger.refund_lua(old_bytes) {
-            ledger.refund_lua(new_bytes)?;
-            return Err(error);
-        }
+        *charge = Some(ticket.commit_charge()?);
         Ok(())
     }
 
-    pub(crate) fn commit_accounting(&mut self, ledger: &AllocationLedger) -> Result<(), VmError> {
+    pub(crate) fn commit_accounting(&mut self, _ledger: &AllocationLedger) -> Result<(), VmError> {
         match self {
-            Self::GrowArray {
-                ticket,
-                old_bytes,
-                new_bytes,
-                ..
+            Self::GrowArray { ticket, charge, .. } | Self::GrowHash { ticket, charge, .. } => {
+                Self::commit_growth(ticket, charge)
             }
-            | Self::GrowHash {
-                ticket,
-                old_bytes,
-                new_bytes,
-                ..
-            } => Self::commit_growth(ticket, ledger, *old_bytes, *new_bytes),
-            Self::ClearHash { refund_bytes } => ledger.refund_lua(*refund_bytes),
             _ => Ok(()),
         }
     }
@@ -563,22 +886,33 @@ impl PreparedTableMutation {
             Self::ArraySlot { index, value } => {
                 table.array[index] = (value != Value::Nil).then_some(value);
             }
-            Self::HashSlot { index, value } => {
+            Self::HashSlot {
+                index,
+                value,
+                dead_key,
+            } => {
                 if value == Value::Nil {
-                    table.hash[index] = None;
+                    table.hash[index] = dead_key.map(|key| (key, Value::Nil));
                 } else if let Some((_, stored)) = &mut table.hash[index] {
                     *stored = value;
                 }
             }
-            Self::ClearHash { .. } => table.hash = Vec::new(),
+            Self::HashReplace { index, key, value } => {
+                table.hash[index] = Some((key, value));
+            }
             Self::HashInsert { index, key, value } => {
                 table.hash[index] = Some((key, value));
             }
-            Self::GrowArray { next, .. } => {
-                table.array = next;
+            Self::GrowArray { next, charge, .. } => {
+                let old = core::mem::replace(&mut table.array, next);
+                drop(old);
+                if let Some(charge) = charge {
+                    table.charges.replace_first(charge);
+                }
             }
             Self::GrowHash {
                 mut next,
+                charge,
                 existing_count,
                 key,
                 value,
@@ -587,11 +921,142 @@ impl PreparedTableMutation {
                 // prepare 已證明 existing_count + 1 <= next.len()；find_hash 掃遍
                 // 所有 bucket，因此連續 placement 與原先從 hash 起點探測等價。
                 let old = core::mem::take(&mut table.hash);
-                for (index, entry) in old.into_iter().flatten().enumerate() {
+                for (index, entry) in old
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, value)| *value != Value::Nil)
+                    .enumerate()
+                {
                     next[index] = Some(entry);
                 }
                 next[existing_count] = Some((key, value));
                 table.hash = next;
+                if let Some(charge) = charge {
+                    table.charges.replace_second(charge);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RefPairSlot {
+    Array(usize),
+    HashExisting(usize),
+    HashNew(usize),
+}
+
+#[derive(Clone, Copy)]
+struct RefPairEntry {
+    key: i64,
+    value: Value,
+    slot: RefPairSlot,
+}
+
+struct RefPairGrowth<T> {
+    next: Vec<T>,
+    ticket: Option<Reservation>,
+    charge: Option<AllocationCharge>,
+    old_bytes: usize,
+    new_bytes: usize,
+}
+
+/// 最多兩個整數欄位的共同預備結果；提交後不再配置或檢查失敗點。
+pub(crate) struct PreparedRefPair {
+    entries: [Option<RefPairEntry>; 2],
+    array_growth: Option<RefPairGrowth<Option<Value>>>,
+    hash_growth: Option<RefPairGrowth<Option<(CanonicalKey, Value)>>>,
+}
+
+impl PreparedRefPair {
+    fn value_edges(&self) -> [Option<ObjectRef>; 2] {
+        self.entries
+            .map(|entry| match entry.map(|entry| entry.value) {
+                Some(Value::Object(object)) => Some(object),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn commit_accounting(&mut self, _ledger: &AllocationLedger) -> Result<(), VmError> {
+        // 先驗證總量，避免已提交第一張票據後才因第二筆加總溢位退出。
+        self.array_growth
+            .as_ref()
+            .map_or(0, |growth| growth.new_bytes)
+            .checked_add(
+                self.hash_growth
+                    .as_ref()
+                    .map_or(0, |growth| growth.new_bytes),
+            )
+            .ok_or(VmError::ArithmeticOverflow)?;
+        self.array_growth
+            .as_ref()
+            .map_or(0, |growth| growth.old_bytes)
+            .checked_add(
+                self.hash_growth
+                    .as_ref()
+                    .map_or(0, |growth| growth.old_bytes),
+            )
+            .ok_or(VmError::ArithmeticOverflow)?;
+        if let Some(growth) = &mut self.array_growth {
+            growth.charge = Some(
+                growth
+                    .ticket
+                    .take()
+                    .ok_or(VmError::LedgerInvariant)?
+                    .commit_charge()?,
+            );
+        }
+        if let Some(growth) = &mut self.hash_growth {
+            growth.charge = Some(
+                growth
+                    .ticket
+                    .take()
+                    .ok_or(VmError::LedgerInvariant)?
+                    .commit_charge()?,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply(self, table: &mut Table) {
+        if let Some(growth) = self.array_growth {
+            let old = core::mem::replace(&mut table.array, growth.next);
+            drop(old);
+            if let Some(charge) = growth.charge {
+                table.charges.replace_first(charge);
+            }
+        }
+        if let Some(mut growth) = self.hash_growth {
+            let old = core::mem::take(&mut table.hash);
+            for (ordinal, entry) in old
+                .into_iter()
+                .flatten()
+                .filter(|(_, value)| *value != Value::Nil)
+                .enumerate()
+            {
+                growth.next[ordinal] = Some(entry);
+            }
+            table.hash = growth.next;
+            if let Some(charge) = growth.charge {
+                table.charges.replace_second(charge);
+            }
+        }
+        for entry in self.entries.into_iter().flatten() {
+            match entry.slot {
+                RefPairSlot::Array(index) => table.array[index] = Some(entry.value),
+                RefPairSlot::HashExisting(index) => {
+                    if let Some((_, value)) = &mut table.hash[index] {
+                        *value = entry.value;
+                    }
+                }
+                RefPairSlot::HashNew(index) => {
+                    table.hash[index] = Some((
+                        CanonicalKey {
+                            kind: KeyKind::Integer(entry.key),
+                        },
+                        entry.value,
+                    ));
+                }
             }
         }
     }
@@ -602,6 +1067,8 @@ pub enum CanonicalKeyClass {
     Integer,
     Float,
     Boolean,
+    LightUserdata,
+    CFunction,
     ByteString,
     Object,
 }
@@ -609,12 +1076,53 @@ pub enum CanonicalKeyClass {
 struct StringKey {
     source: ObjectRef,
     bytes: ByteString,
-    ledger: AllocationLedger,
+    _charge: Option<crate::alloc::AllocationCharge>,
+    _slot_charge: crate::alloc::AllocationCharge,
+    _slot_extra_charge: Option<crate::alloc::AllocationCharge>,
 }
 
-impl Drop for StringKey {
+struct LongStringKey(Vec<StringKey>);
+
+impl LongStringKey {
+    fn get(&self) -> &StringKey {
+        &self.0[0]
+    }
+
+    fn get_mut(&mut self) -> &mut StringKey {
+        &mut self.0[0]
+    }
+}
+
+impl Drop for LongStringKey {
     fn drop(&mut self) {
-        self.ledger.refund_lua_on_drop(self.bytes.len());
+        let entry = self.0.pop();
+        self.0 = Vec::new();
+        drop(entry);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InlineStringKey {
+    source: ObjectRef,
+    len: u8,
+    bytes: [u8; 8],
+}
+
+impl InlineStringKey {
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl StringKey {
+    fn make_dead(&mut self, ledger: &AllocationLedger) -> Result<(), VmError> {
+        if self.bytes.shared_external().is_some() {
+            let (copy, ticket) = ByteString::try_from_bytes(ledger, self.bytes.as_bytes())?;
+            let charge = ticket.commit_charge()?;
+            self.bytes = copy;
+            self._charge = Some(charge);
+        }
+        Ok(())
     }
 }
 
@@ -627,7 +1135,11 @@ enum KeyKind {
     Integer(i64),
     Float(f64),
     Boolean(bool),
-    ByteString(StringKey),
+    LightUserdata(usize),
+    CFunction(rivetlua_core::HostFunctionId),
+    ShortString(InlineStringKey),
+    ByteString(LongStringKey),
+    DeadShortString(InlineStringKey),
     Object(ObjectKey),
 }
 
@@ -637,12 +1149,50 @@ pub struct CanonicalKey {
 }
 
 impl CanonicalKey {
+    fn make_dead(&mut self, ledger: &AllocationLedger) -> Result<(), VmError> {
+        if let KeyKind::ShortString(key) = &self.kind {
+            self.kind = KeyKind::DeadShortString(*key);
+            return Ok(());
+        }
+        if let KeyKind::ByteString(key) = &mut self.kind {
+            key.get_mut().make_dead(ledger)?;
+        }
+        Ok(())
+    }
+
+    fn string_bytes(&self) -> Option<&[u8]> {
+        match &self.kind {
+            KeyKind::ShortString(key) | KeyKind::DeadShortString(key) => Some(key.as_bytes()),
+            KeyKind::ByteString(key) => Some(key.get().bytes.as_bytes()),
+            _ => None,
+        }
+    }
+
+    fn matches_previous(&self, vm: &Vm, previous: Value) -> Result<bool, crate::vm::RuntimeError> {
+        if let Some(bytes) = self.string_bytes() {
+            return match previous {
+                Value::Object(object) if vm.object_kind(object)? == ObjectKind::ByteString => {
+                    Ok(vm.with_byte_string(object, |value| value.as_bytes() == bytes)?)
+                }
+                _ => Ok(false),
+            };
+        }
+        match (&self.kind, previous) {
+            (KeyKind::Object(key), Value::Object(object)) => Ok(object.identity() == Some(key.id)),
+            (KeyKind::Object(_), _) => Ok(false),
+            _ => vm.raw_equal_value(self.as_value(), previous),
+        }
+    }
     pub fn class(&self) -> CanonicalKeyClass {
         match self.kind {
             KeyKind::Integer(_) => CanonicalKeyClass::Integer,
             KeyKind::Float(_) => CanonicalKeyClass::Float,
             KeyKind::Boolean(_) => CanonicalKeyClass::Boolean,
-            KeyKind::ByteString(_) => CanonicalKeyClass::ByteString,
+            KeyKind::LightUserdata(_) => CanonicalKeyClass::LightUserdata,
+            KeyKind::CFunction(_) => CanonicalKeyClass::CFunction,
+            KeyKind::ShortString(_) | KeyKind::ByteString(_) | KeyKind::DeadShortString(_) => {
+                CanonicalKeyClass::ByteString
+            }
             KeyKind::Object(_) => CanonicalKeyClass::Object,
         }
     }
@@ -650,7 +1200,9 @@ impl CanonicalKey {
     /// 供 table 之後的 trace 使用；基本值不持有 heap 參照。
     pub(crate) fn source_object(&self) -> Option<ObjectRef> {
         match &self.kind {
-            KeyKind::ByteString(key) => Some(key.source),
+            KeyKind::ShortString(key) => Some(key.source),
+            KeyKind::ByteString(key) => Some(key.get().source),
+            KeyKind::DeadShortString(key) => Some(key.source),
             KeyKind::Object(key) => Some(key.source),
             _ => None,
         }
@@ -669,7 +1221,11 @@ impl CanonicalKey {
             KeyKind::Integer(value) => Value::Integer(*value),
             KeyKind::Float(value) => Value::Float(*value),
             KeyKind::Boolean(value) => Value::Boolean(*value),
-            KeyKind::ByteString(key) => Value::Object(key.source),
+            KeyKind::LightUserdata(value) => Value::LightUserdata(*value),
+            KeyKind::CFunction(value) => Value::CFunction(*value),
+            KeyKind::ShortString(key) => Value::Object(key.source),
+            KeyKind::ByteString(key) => Value::Object(key.get().source),
+            KeyKind::DeadShortString(key) => Value::Object(key.source),
             KeyKind::Object(key) => Value::Object(key.source),
         }
     }
@@ -686,11 +1242,15 @@ impl core::fmt::Debug for CanonicalKey {
 
 impl PartialEq for CanonicalKey {
     fn eq(&self, other: &Self) -> bool {
+        if let (Some(left), Some(right)) = (self.string_bytes(), other.string_bytes()) {
+            return left == right;
+        }
         match (&self.kind, &other.kind) {
             (KeyKind::Integer(a), KeyKind::Integer(b)) => a == b,
             (KeyKind::Float(a), KeyKind::Float(b)) => a == b,
             (KeyKind::Boolean(a), KeyKind::Boolean(b)) => a == b,
-            (KeyKind::ByteString(a), KeyKind::ByteString(b)) => a.bytes == b.bytes,
+            (KeyKind::LightUserdata(a), KeyKind::LightUserdata(b)) => a == b,
+            (KeyKind::CFunction(a), KeyKind::CFunction(b)) => a == b,
             (KeyKind::Object(a), KeyKind::Object(b)) => a.id == b.id,
             _ => false,
         }
@@ -714,9 +1274,25 @@ impl Hash for CanonicalKey {
                 2u8.hash(state);
                 value.hash(state);
             }
+            KeyKind::LightUserdata(value) => {
+                5u8.hash(state);
+                value.hash(state);
+            }
+            KeyKind::CFunction(value) => {
+                6u8.hash(state);
+                value.hash(state);
+            }
+            KeyKind::ShortString(key) => {
+                3u8.hash(state);
+                key.as_bytes().hash(state);
+            }
             KeyKind::ByteString(key) => {
                 3u8.hash(state);
-                key.bytes.hash(state);
+                key.get().bytes.hash(state);
+            }
+            KeyKind::DeadShortString(key) => {
+                3u8.hash(state);
+                key.as_bytes().hash(state);
             }
             KeyKind::Object(key) => {
                 4u8.hash(state);
@@ -747,6 +1323,13 @@ impl Vm {
             Value::Nil => return Ok(None),
             Value::Integer(value) => KeyKind::Integer(value),
             Value::Boolean(value) => KeyKind::Boolean(value),
+            Value::LightUserdata(value) => KeyKind::LightUserdata(value),
+            Value::CFunction(value) => {
+                if value.vm() != self.id() {
+                    return Err(VmError::WrongVm);
+                }
+                KeyKind::CFunction(value)
+            }
             Value::Float(value) if value.is_nan() => return Ok(None),
             Value::Float(value) => {
                 const TWO_TO_63: f64 = 9_223_372_036_854_775_808.0;
@@ -761,20 +1344,52 @@ impl Vm {
                 }
             }
             Value::Object(source) => match self.object_kind(source)? {
-                ObjectKind::ByteString => {
-                    let (bytes, ticket) = self.with_byte_string(source, |string| {
-                        ByteString::try_from_bytes(self.allocation_ledger(), string.as_bytes())
-                    })??;
-                    ticket.commit()?;
-                    KeyKind::ByteString(StringKey {
+                ObjectKind::ByteString => self.with_byte_string(source, |string| {
+                    if string.len() <= 8 {
+                        let mut bytes = [0; 8];
+                        bytes[..string.len()].copy_from_slice(string.as_bytes());
+                        return Ok(KeyKind::ShortString(InlineStringKey {
+                            source,
+                            len: string.len() as u8,
+                            bytes,
+                        }));
+                    }
+                    let ledger = self.allocation_ledger();
+                    let (bytes, byte_charge) = if let Some(shared) = string.shared_external() {
+                        (shared, None)
+                    } else {
+                        let (copy, byte_ticket) =
+                            ByteString::try_from_bytes(ledger, string.as_bytes())?;
+                        (copy, Some(byte_ticket.commit_charge()?))
+                    };
+                    let mut stored = Vec::new();
+                    let ticket = reserve_vec(ledger, &mut stored, 1, FailPoint::TableKeyReserve)?;
+                    let extra = stored.capacity() - 1;
+                    let extra_charge = if extra == 0 {
+                        None
+                    } else {
+                        let bytes = checked_bytes(extra, size_of::<StringKey>())?;
+                        Some(
+                            ledger
+                                .reserve_lua_backing_excess(bytes, FailPoint::TableKeyReserve)?
+                                .commit_charge()?,
+                        )
+                    };
+                    let slot_charge = ticket.commit_charge()?;
+                    stored.push(StringKey {
                         source,
                         bytes,
-                        ledger: self.allocation_ledger().clone(),
-                    })
-                }
+                        _charge: byte_charge,
+                        _slot_charge: slot_charge,
+                        _slot_extra_charge: extra_charge,
+                    });
+                    Ok(KeyKind::ByteString(LongStringKey(stored)))
+                })??,
                 ObjectKind::Value
                 | ObjectKind::Table
+                | ObjectKind::Userdata
                 | ObjectKind::Closure
+                | ObjectKind::CClosure
                 | ObjectKind::Builtin
                 | ObjectKind::Coroutine
                 | ObjectKind::Upvalue
@@ -802,8 +1417,24 @@ impl Vm {
     }
 
     pub fn raw_set(&mut self, table: ObjectRef, key: Value, value: Value) -> Result<(), VmError> {
+        self.raw_set_with_new_key_source(table, key, value)
+            .map(|_| ())
+    }
+
+    /// 與一般 raw_set 共用同一預備／發布交易；只回報本次真正新增的 key edge 來源。
+    pub(crate) fn raw_set_with_new_key_source(
+        &mut self,
+        table: ObjectRef,
+        key: Value,
+        value: Value,
+    ) -> Result<Option<ObjectRef>, VmError> {
         if self.object_kind(table)? != ObjectKind::Table {
             return Err(VmError::WrongObjectType);
+        }
+        if let Value::CFunction(id) = value {
+            if id.vm() != self.id() {
+                return Err(VmError::WrongVm);
+            }
         }
         match key {
             Value::Nil => return Err(VmError::NilTableKey),
@@ -820,7 +1451,35 @@ impl Vm {
         let (key_edge, value_edge) = mutation.new_edges();
         let barrier = self.prepare_table_write_barrier(table, key_edge, value_edge)?;
         self.commit_prepared_table_write(table, barrier, mutation)?;
-        Ok(())
+        Ok(key_edge)
+    }
+
+    /// C auxiliary refs 專用：兩個非 nil 整數欄位共用一次準備與發布。
+    /// key 相同時依參數順序以第二個值為最終欄位值。
+    #[doc(hidden)]
+    pub fn raw_set_ref_pair(
+        &mut self,
+        table: ObjectRef,
+        first: (i64, Value),
+        second: (i64, Value),
+    ) -> Result<(), VmError> {
+        if self.object_kind(table)? != ObjectKind::Table {
+            return Err(VmError::WrongObjectType);
+        }
+        for value in [first.1, second.1] {
+            if let Value::CFunction(id) = value {
+                if id.vm() != self.id() {
+                    return Err(VmError::WrongVm);
+                }
+            }
+        }
+        let ledger = self.allocation_ledger().clone();
+        let mutation = self.with_table(table, |stored| {
+            stored.prepare_ref_pair(&ledger, first, second)
+        })??;
+        let [first_edge, second_edge] = mutation.value_edges();
+        let barrier = self.prepare_table_ref_barrier(table, first_edge, second_edge)?;
+        self.commit_prepared_ref_pair(table, barrier, mutation)
     }
 }
 
@@ -830,17 +1489,238 @@ mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    use rivetlua_core::{LuaProfile, SlotId, Value};
+    use rivetlua_core::{LuaProfile, ObjectRef, SlotId, Value};
 
     use crate::{
-        CanonicalKey, CanonicalKeyClass, FailPoint, GcAge, GcColor, GcMode, GcPhase, HostHandle,
-        ObjectKind, RootKind, Table, Vm, VmError, WeakMode,
+        AllocationDomain, CanonicalKey, CanonicalKeyClass, FailPoint, GcAge, GcColor, GcMode,
+        GcPhase, HostHandle, ObjectKind, RootKind, Table, Vm, VmError, WeakMode,
     };
+
+    #[test]
+    fn b13_dead_key_layout_preserves_live_bucket_and_table() {
+        #[allow(dead_code)]
+        struct BaselineTableFields {
+            metatable: Option<ObjectRef>,
+            weak_mode: WeakMode,
+            array: Vec<Option<Value>>,
+            hash: Vec<Option<(CanonicalKey, Value)>>,
+            charges: crate::alloc::PairedLuaCharges,
+        }
+        assert!(std::mem::size_of::<CanonicalKey>() <= std::mem::size_of::<super::StringKey>());
+        assert_eq!(
+            std::mem::size_of::<Table>(),
+            std::mem::size_of::<BaselineTableFields>()
+        );
+        eprintln!(
+            "B13 layout table={} key={} bucket={} string_key={}",
+            std::mem::size_of::<Table>(),
+            std::mem::size_of::<CanonicalKey>(),
+            std::mem::size_of::<Option<(CanonicalKey, Value)>>(),
+            std::mem::size_of::<super::StringKey>(),
+        );
+    }
+
+    #[test]
+    fn b14_table_charge_metadata_fits_shared_ledger_layout() {
+        assert!(std::mem::size_of::<Table>() <= 160);
+    }
+
+    #[test]
+    fn b14_short_key_does_not_expand_live_hash_bucket() {
+        assert!(std::mem::size_of::<Option<(CanonicalKey, Value)>>() <= 104);
+    }
+
+    #[test]
+    fn b14_short_embedded_nul_key_uses_charged_bucket_without_key_copy() {
+        let mut vm = Vm::new().unwrap();
+        let table = vm.allocate_table_with_capacity(0, 1).unwrap();
+        let table_root = vm.add_root(RootKind::Host, table).unwrap();
+        let key = vm.allocate_byte_string(&[0, b'a', 0]).unwrap();
+        let key_root = vm.add_root(RootKind::Host, key).unwrap();
+        let before = vm.ledger_snapshot().lua_heap_bytes;
+        vm.raw_set(table, Value::Object(key), Value::Integer(7))
+            .unwrap();
+        assert_eq!(vm.ledger_snapshot().lua_heap_bytes, before);
+        let equal = vm.allocate_byte_string(&[0, b'a', 0]).unwrap();
+        assert_eq!(
+            vm.raw_get(table, Value::Object(equal)),
+            Ok(Value::Integer(7))
+        );
+        vm.raw_set(table, Value::Object(key), Value::Nil).unwrap();
+        assert_eq!(vm.raw_get(table, Value::Object(equal)), Ok(Value::Nil));
+        assert_eq!(
+            vm.raw_next_value(table, Value::Object(equal)).unwrap(),
+            None
+        );
+        vm.remove_root(key_root).unwrap();
+        vm.remove_root(table_root).unwrap();
+        vm.collect_major().unwrap();
+        assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(table), Err(VmError::StaleObject));
+    }
+
+    #[test]
+    fn b14_long_key_charges_actual_slot_capacity_until_rehash() {
+        let mut vm = Vm::new().unwrap();
+        let probe = vm.ledger_probe();
+        let table = vm.allocate_table_with_capacity(0, 1).unwrap();
+        let table_root = vm.add_root(RootKind::Host, table).unwrap();
+        let bytes = [0, 0x80, 0xff, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let key = vm.allocate_byte_string(&bytes).unwrap();
+        let key_root = vm.add_root(RootKind::Host, key).unwrap();
+        let before_insert = vm.ledger_snapshot().lua_heap_bytes;
+        vm.raw_set(table, Value::Object(key), Value::Integer(1))
+            .unwrap();
+        let slot_capacity = vm
+            .with_table(table, |stored| {
+                let Some((canonical, _)) = stored.hash[0].as_ref() else {
+                    unreachable!("已插入的唯一 hash 欄位須存在")
+                };
+                let super::KeyKind::ByteString(long) = &canonical.kind else {
+                    unreachable!("長 byte key 應使用已計費的 slot backing")
+                };
+                long.0.capacity()
+            })
+            .unwrap();
+        assert!(slot_capacity >= 1);
+        let slot_bytes = slot_capacity * core::mem::size_of::<super::StringKey>();
+        assert_eq!(
+            vm.ledger_snapshot().lua_heap_bytes - before_insert,
+            bytes.len() + slot_bytes
+        );
+        vm.raw_set(table, Value::Object(key), Value::Nil).unwrap();
+        vm.remove_root(key_root).unwrap();
+        vm.collect_major().unwrap();
+        assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
+        let before_rehash = vm.ledger_snapshot().lua_heap_bytes;
+        vm.raw_set(table, Value::Boolean(true), Value::Integer(2))
+            .unwrap();
+        let bucket_bytes = core::mem::size_of::<Option<(CanonicalKey, Value)>>();
+        assert_eq!(
+            vm.ledger_snapshot().lua_heap_bytes + bytes.len() + slot_bytes,
+            before_rehash + bucket_bytes
+        );
+        vm.remove_root(table_root).unwrap();
+        vm.collect_major().unwrap();
+        drop(vm);
+        assert_eq!(probe.snapshot().committed, 0);
+        assert_eq!(probe.snapshot().reserved, 0);
+    }
 
     fn hash(key: &CanonicalKey) -> u64 {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         hasher.finish()
+    }
+
+    #[test]
+    fn ref_pair_atomic_sparse_growth_barrier_and_weak_value_lifetime() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut failures = Vec::new();
+            let mut successes = Vec::new();
+            for offset in 0..10 {
+                let mut vm = Vm::new_with_profile(profile).unwrap();
+                let table = vm.allocate_table().unwrap();
+                let root = vm.add_root(RootKind::Host, table).unwrap();
+                let before = (
+                    vm.ledger_snapshot(),
+                    vm.gc_trace(),
+                    vm.roots().total_count(),
+                );
+                let next = vm.allocation_trace().next_ordinal;
+                vm.inject_allocation_failure_at(next + offset);
+                let result =
+                    vm.raw_set_ref_pair(table, (3, Value::Integer(0)), (100, Value::Integer(7)));
+                if result.is_err() {
+                    assert_eq!(vm.raw_get(table, Value::Integer(3)), Ok(Value::Nil));
+                    assert_eq!(vm.raw_get(table, Value::Integer(100)), Ok(Value::Nil));
+                    assert_eq!(
+                        (
+                            vm.ledger_snapshot(),
+                            vm.gc_trace(),
+                            vm.roots().total_count()
+                        ),
+                        before,
+                    );
+                    let failure = vm.allocation_trace().last_failure.unwrap();
+                    assert_eq!(failure.attempt.ordinal, next + offset);
+                    assert!(failure.attempt.site.file.ends_with("table.rs"));
+                    failures.push((offset, failure.attempt.domain, failure.attempt.point));
+                } else {
+                    assert_eq!(vm.raw_get(table, Value::Integer(3)), Ok(Value::Integer(0)));
+                    assert_eq!(
+                        vm.raw_get(table, Value::Integer(100)),
+                        Ok(Value::Integer(7))
+                    );
+                    vm.inject_allocation_failure_at(u64::MAX);
+                    vm.raw_set_ref_pair(table, (3, Value::Integer(8)), (101, Value::Integer(9)))
+                        .unwrap();
+                    assert_eq!(
+                        vm.raw_get(table, Value::Integer(100)),
+                        Ok(Value::Integer(7))
+                    );
+                    assert_eq!(
+                        vm.raw_get(table, Value::Integer(101)),
+                        Ok(Value::Integer(9))
+                    );
+                    successes.push(offset);
+                }
+                vm.remove_root(root).unwrap();
+            }
+            assert_eq!(
+                failures,
+                vec![(0, AllocationDomain::LuaHeap, Some(FailPoint::TableHashGrow))]
+            );
+            assert_eq!(successes, (1..10).collect::<Vec<_>>());
+
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.set_gc_debt_threshold(usize::MAX);
+            vm.set_gc_mode(GcMode::Generational).unwrap();
+            vm.set_gc_promotion_survivals(1).unwrap();
+            let table = vm.allocate_table().unwrap();
+            let root = vm.add_root(RootKind::Host, table).unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.gc_age(table), Ok(GcAge::Old));
+            let child = vm.allocate_table().unwrap();
+            let before = (vm.ledger_snapshot(), vm.gc_trace());
+            vm.inject_failure_once(FailPoint::RememberedReserve);
+            assert_eq!(
+                vm.raw_set_ref_pair(table, (3, Value::Integer(0)), (100, Value::Object(child))),
+                Err(VmError::InjectedFailure(FailPoint::RememberedReserve)),
+            );
+            assert_eq!(vm.raw_get(table, Value::Integer(3)), Ok(Value::Nil));
+            assert_eq!(vm.raw_get(table, Value::Integer(100)), Ok(Value::Nil));
+            assert_eq!((vm.ledger_snapshot(), vm.gc_trace()), before);
+            vm.raw_set_ref_pair(table, (3, Value::Integer(0)), (100, Value::Object(child)))
+                .unwrap();
+            assert_eq!(vm.gc_trace().remembered_len, 1);
+            vm.collect_minor().unwrap();
+            assert_eq!(vm.object_kind(child), Ok(ObjectKind::Table));
+            vm.raw_set_ref_pair(table, (3, Value::Integer(0)), (100, Value::Integer(0)))
+                .unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(child), Err(VmError::StaleObject));
+            vm.remove_root(root).unwrap();
+
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let table = vm.allocate_table().unwrap();
+            let root = vm.add_root(RootKind::Host, table).unwrap();
+            let metatable = vm.allocate_table().unwrap();
+            let mode_key = vm.allocate_byte_string(b"__mode").unwrap();
+            let weak_mode = vm.allocate_byte_string(b"v").unwrap();
+            vm.raw_set(metatable, Value::Object(mode_key), Value::Object(weak_mode))
+                .unwrap();
+            vm.set_metatable(table, Some(metatable)).unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.with_table(table, Table::weak_mode), Ok(WeakMode::Values));
+            let child = vm.allocate_table().unwrap();
+            vm.raw_set_ref_pair(table, (3, Value::Integer(0)), (100, Value::Object(child)))
+                .unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(child), Err(VmError::StaleObject));
+            assert_eq!(vm.raw_get(table, Value::Integer(100)), Ok(Value::Nil));
+            vm.remove_root(root).unwrap();
+        }
     }
 
     #[test]
@@ -896,10 +1776,12 @@ mod tests {
     fn canonical_key_string_bytes_and_full_object_identity() {
         let mut a = Vm::new().unwrap();
         let mut b = Vm::new().unwrap();
-        let first = a.allocate_byte_string(&[0, 0x80, 0xff]).unwrap();
-        let second = a.allocate_byte_string(&[0, 0x80, 0xff]).unwrap();
-        let different = a.allocate_byte_string(&[0, 0x80, 0xfe]).unwrap();
-        let foreign = b.allocate_byte_string(&[0, 0x80, 0xff]).unwrap();
+        let bytes = [0, 0x80, 0xff, 1, 2, 3, 4, 5, 6];
+        let different_bytes = [0, 0x80, 0xff, 1, 2, 3, 4, 5, 7];
+        let first = a.allocate_byte_string(&bytes).unwrap();
+        let second = a.allocate_byte_string(&bytes).unwrap();
+        let different = a.allocate_byte_string(&different_bytes).unwrap();
+        let foreign = b.allocate_byte_string(&bytes).unwrap();
         assert_eq!(a.object_kind(first), Ok(ObjectKind::ByteString));
         let before_keys = a.ledger_snapshot().committed;
         a.set_allocation_limit(before_keys);
@@ -914,6 +1796,13 @@ mod tests {
         assert_eq!(
             a.canonical_key(Value::Object(first)),
             Err(VmError::InjectedFailure(FailPoint::StringBytesReserve))
+        );
+        assert_eq!(a.ledger_snapshot().committed, before_keys);
+        assert_eq!(a.ledger_snapshot().reserved, 0);
+        a.inject_failure_once(FailPoint::TableKeyReserve);
+        assert_eq!(
+            a.canonical_key(Value::Object(first)),
+            Err(VmError::InjectedFailure(FailPoint::TableKeyReserve))
         );
         assert_eq!(a.ledger_snapshot().committed, before_keys);
         assert_eq!(a.ledger_snapshot().reserved, 0);
@@ -1284,7 +2173,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_final_hash_entry_refunds_all_buckets_without_disturbing_remaining_entries() {
+    fn deleting_final_hash_entry_keeps_dead_positions_until_rehash() {
         let mut vm = Vm::new().unwrap();
         let table = vm.allocate_table().unwrap();
         let root = vm.add_root(RootKind::Host, table).unwrap();
@@ -1311,8 +2200,15 @@ mod tests {
             4 * bucket_bytes
         );
         vm.raw_set(table, Value::Integer(102), Value::Nil).unwrap();
-        assert_eq!(vm.with_table(table, |stored| stored.hash_capacity()), Ok(0));
-        assert_eq!(vm.ledger_snapshot().lua_heap_bytes, baseline);
+        assert_eq!(vm.with_table(table, |stored| stored.hash_capacity()), Ok(4));
+        assert_eq!(
+            vm.ledger_snapshot().lua_heap_bytes,
+            baseline + 4 * bucket_bytes
+        );
+        for key in [100, 101, 102] {
+            assert_eq!(vm.raw_get(table, Value::Integer(key)), Ok(Value::Nil));
+            assert_eq!(vm.raw_next_value(table, Value::Integer(key)).unwrap(), None);
+        }
         assert_eq!(vm.ledger_snapshot().reserved, 0);
         vm.raw_set(table, Value::Integer(103), Value::Integer(103))
             .unwrap();
@@ -1320,7 +2216,17 @@ mod tests {
             vm.raw_get(table, Value::Integer(103)),
             Ok(Value::Integer(103))
         );
+        vm.raw_set(table, Value::Integer(104), Value::Integer(104))
+            .unwrap();
+        assert_eq!(vm.with_table(table, |stored| stored.hash_capacity()), Ok(8));
+        assert_eq!(
+            vm.ledger_snapshot().lua_heap_bytes,
+            baseline + 8 * bucket_bytes
+        );
         vm.remove_root(root).unwrap();
+        vm.collect_major().unwrap();
+        assert_eq!(vm.object_kind(table), Err(VmError::StaleObject));
+        assert!(vm.ledger_snapshot().lua_heap_bytes < baseline);
     }
 
     #[test]
@@ -1392,6 +2298,12 @@ mod tests {
         for key in [1, 100] {
             let mut vm = Vm::new().unwrap();
             let table = vm.allocate_table().unwrap();
+            if key == 100 {
+                // 壓縮後單一 bucket 小於暫時 root；先占一格，讓拒絕發生於
+                // 同時需要 root 與兩格 hash grow 的交易，而非把上限放寬。
+                vm.raw_set(table, Value::Integer(99), Value::Integer(9))
+                    .unwrap();
+            }
             let base = vm.ledger_snapshot().committed;
             let probe = vm.add_root(RootKind::Temporary, table).unwrap();
             let root_charge = vm.ledger_snapshot().committed - base;
@@ -1399,9 +2311,16 @@ mod tests {
             vm.set_allocation_limit(base + root_charge);
             assert_eq!(
                 vm.raw_set(table, Value::Integer(key), Value::Integer(7)),
-                Err(VmError::AllocationFailed)
+                Err(VmError::AllocationFailed),
+                "key={key}"
             );
-            assert!(vm.with_table(table, |stored| stored.is_empty()).unwrap());
+            if key == 100 {
+                assert_eq!(vm.raw_get(table, Value::Integer(99)), Ok(Value::Integer(9)));
+                assert_eq!(vm.raw_get(table, Value::Integer(key)), Ok(Value::Nil));
+                assert_eq!(vm.with_table(table, |stored| stored.hash_capacity()), Ok(1));
+            } else {
+                assert!(vm.with_table(table, |stored| stored.is_empty()).unwrap());
+            }
             assert_eq!(vm.ledger_snapshot().committed, base);
             assert_eq!(vm.ledger_snapshot().reserved, 0);
             assert_eq!(vm.roots().total_count(), 0);
@@ -1448,7 +2367,9 @@ mod tests {
             vm.raw_set(table, Value::Integer(key), Value::Integer(key))
                 .unwrap();
         }
-        let key = vm.allocate_byte_string(&[0, 0x80, 0xff]).unwrap();
+        let key = vm
+            .allocate_byte_string(&[0, 0x80, 0xff, 1, 2, 3, 4, 5, 6])
+            .unwrap();
         let base = vm.ledger_snapshot().committed;
         let probe = vm.add_root(RootKind::Temporary, table).unwrap();
         let root_charge = vm.ledger_snapshot().committed - base;
@@ -1683,7 +2604,7 @@ mod tests {
         let before_key_delete = vm.ledger_snapshot().committed;
         vm.raw_set(table, Value::Object(string_key), Value::Nil)
             .unwrap();
-        assert_eq!(vm.ledger_snapshot().committed + 3, before_key_delete);
+        assert_eq!(vm.ledger_snapshot().committed, before_key_delete);
         vm.raw_set(table, Value::Object(object_key), Value::Nil)
             .unwrap();
         vm.raw_set(table, Value::Integer(1), Value::Nil).unwrap();
@@ -1812,7 +2733,9 @@ mod tests {
             assert_eq!(vm.roots().total_count(), roots);
             assert_eq!(vm.collect().unwrap(), 0);
         }
-        let string_key = vm.allocate_byte_string(&[0, 0x80]).unwrap();
+        let string_key = vm
+            .allocate_byte_string(&[0, 0x80, 1, 2, 3, 4, 5, 6, 7])
+            .unwrap();
         let snapshot = vm.ledger_snapshot();
         vm.inject_failure_once(FailPoint::StringBytesReserve);
         assert_eq!(

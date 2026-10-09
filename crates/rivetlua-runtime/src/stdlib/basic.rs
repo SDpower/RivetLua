@@ -106,6 +106,16 @@ fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
             text.bytes[..len].copy_from_slice(&bytes[..len]);
             text.len = len;
         }
+        Value::LightUserdata(address) => {
+            write!(text, "userdata: 0x{address:x}").map_err(|_| VmError::ArithmeticOverflow)?;
+        }
+        Value::CFunction(id) => {
+            if id.vm() != vm.id() {
+                return Err(VmError::WrongVm.into());
+            }
+            text.write_str("function")
+                .map_err(|_| VmError::ArithmeticOverflow)?;
+        }
         Value::Object(object) => {
             let kind = vm.object_kind(object)?;
             if kind == ObjectKind::ByteString {
@@ -113,9 +123,12 @@ fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
             }
             let name = match kind {
                 ObjectKind::Table => "table",
-                ObjectKind::Closure | ObjectKind::Builtin => "function",
+                ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin => "function",
                 ObjectKind::Coroutine => "thread",
-                ObjectKind::Value | ObjectKind::Upvalue | ObjectKind::Module => "userdata",
+                ObjectKind::Value
+                | ObjectKind::Upvalue
+                | ObjectKind::Module
+                | ObjectKind::Userdata => "userdata",
                 ObjectKind::ByteString => unreachable!(),
                 ObjectKind::File => {
                     if vm.with_file(object, |file| file.lease.is_some())? {
@@ -139,7 +152,7 @@ fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
 pub(crate) struct PrintBuffer {
     bytes: Vec<u8>,
     ledger: AllocationLedger,
-    charge: usize,
+    charge: Option<crate::alloc::AllocationCharge>,
 }
 
 impl PrintBuffer {
@@ -147,35 +160,32 @@ impl PrintBuffer {
         Self {
             bytes: Vec::new(),
             ledger: vm.allocation_ledger().clone(),
-            charge: 0,
+            charge: None,
         }
     }
 
     pub(crate) fn append(&mut self, bytes: &[u8]) -> Result<(), RuntimeError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
         let next = self
-            .charge
+            .bytes
+            .len()
             .checked_add(bytes.len())
             .ok_or(VmError::ArithmeticOverflow)?;
-        let ticket = reserve_vec(
-            &self.ledger,
-            &mut self.bytes,
-            bytes.len(),
-            FailPoint::WorkReserve,
-        )?;
-        ticket.commit()?;
-        self.bytes.extend_from_slice(bytes);
-        self.charge = next;
+        let mut replacement = Vec::new();
+        let ticket = reserve_vec(&self.ledger, &mut replacement, next, FailPoint::WorkReserve)?;
+        let charge = ticket.commit_charge()?;
+        replacement.extend_from_slice(&self.bytes);
+        replacement.extend_from_slice(bytes);
+        let old = core::mem::replace(&mut self.bytes, replacement);
+        drop(old);
+        self.charge = Some(charge);
         Ok(())
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes
-    }
-}
-
-impl Drop for PrintBuffer {
-    fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.charge);
     }
 }
 
@@ -241,12 +251,16 @@ fn type_name(vm: &Vm, value: Value) -> Result<&'static [u8], RuntimeError> {
         Value::Nil => b"nil",
         Value::Boolean(_) => b"boolean",
         Value::Integer(_) | Value::Float(_) => b"number",
+        Value::LightUserdata(_) => b"userdata",
+        Value::CFunction(_) => b"function",
         Value::Object(object) => match vm.object_kind(object)? {
             ObjectKind::ByteString => b"string",
             ObjectKind::Table => b"table",
-            ObjectKind::Closure | ObjectKind::Builtin => b"function",
+            ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin => b"function",
             ObjectKind::Coroutine => b"thread",
-            ObjectKind::Value | ObjectKind::Upvalue | ObjectKind::Module => b"userdata",
+            ObjectKind::Value | ObjectKind::Upvalue | ObjectKind::Module | ObjectKind::Userdata => {
+                b"userdata"
+            }
             ObjectKind::File => b"userdata",
         },
     })
@@ -317,6 +331,34 @@ fn lua_hex_number(text: &str) -> Option<Value> {
     Some(Value::Float(if negative { -number } else { number }))
 }
 
+/// `tonumber` 與 C API 共用的無 base 數值字串解析；不配置或改動 VM。
+pub(crate) fn parse_number_bytes(bytes: &[u8]) -> Option<Value> {
+    let text = core::str::from_utf8(bytes).ok()?;
+    let text = text.trim_matches(|ch: char| ch.is_ascii_whitespace());
+    if text
+        .as_bytes()
+        .get(..2)
+        .is_some_and(|prefix| prefix == b"0x" || prefix == b"0X")
+        || text
+            .as_bytes()
+            .get(1..3)
+            .is_some_and(|prefix| prefix == b"0x" || prefix == b"0X")
+    {
+        return lua_hex_number(text);
+    }
+    if let Ok(value) = text.parse::<i64>() {
+        return Some(Value::Integer(value));
+    }
+    let word = text.trim_start_matches(['-', '+']);
+    if word.eq_ignore_ascii_case("nan")
+        || word.eq_ignore_ascii_case("inf")
+        || word.eq_ignore_ascii_case("infinity")
+    {
+        return None;
+    }
+    text.parse::<f64>().ok().map(Value::Float)
+}
+
 pub(crate) fn number(vm: &Vm, value: Value, base: Option<Value>) -> Result<Value, RuntimeError> {
     if base.is_none() || base == Some(Value::Nil) {
         if matches!(value, Value::Integer(_) | Value::Float(_)) {
@@ -380,74 +422,8 @@ pub(crate) fn number(vm: &Vm, value: Value, base: Option<Value>) -> Result<Value
                 n as i64
             }));
         }
-        let Ok(text) = core::str::from_utf8(bytes) else {
-            return Ok(Value::Nil);
-        };
-        let text = text.trim_matches(|ch: char| ch.is_ascii_whitespace());
-        if text
-            .as_bytes()
-            .get(..2)
-            .is_some_and(|prefix| prefix == b"0x" || prefix == b"0X")
-            || text
-                .as_bytes()
-                .get(1..3)
-                .is_some_and(|prefix| prefix == b"0x" || prefix == b"0X")
-        {
-            return Ok(lua_hex_number(text).unwrap_or(Value::Nil));
-        }
-        if let Ok(value) = text.parse::<i64>() {
-            return Ok(Value::Integer(value));
-        }
-        let word = text.trim_start_matches(['-', '+']);
-        if word.eq_ignore_ascii_case("nan")
-            || word.eq_ignore_ascii_case("inf")
-            || word.eq_ignore_ascii_case("infinity")
-        {
-            return Ok(Value::Nil);
-        }
-        if let Ok(value) = text.parse::<f64>() {
-            return Ok(Value::Float(value));
-        }
-        Ok(Value::Nil)
+        Ok(parse_number_bytes(bytes).unwrap_or(Value::Nil))
     })?
-}
-
-fn next_pair(
-    vm: &Vm,
-    table: ObjectRef,
-    previous: Value,
-) -> Result<Option<(Value, Value)>, RuntimeError> {
-    let previous_key = if previous == Value::Nil {
-        None
-    } else {
-        vm.canonical_key(previous)?
-    };
-    if previous != Value::Nil && previous_key.is_none() {
-        return Err(RuntimeError::new(RuntimeErrorKind::InvalidNextKey));
-    }
-    let mut seen = previous_key.is_none();
-    let mut found = false;
-    let mut pair = None;
-    vm.with_table(table, |stored| {
-        stored.for_each_raw(|key, value| {
-            if pair.is_some() {
-                return Ok(());
-            }
-            if seen {
-                pair = Some((key, value));
-                return Ok(());
-            }
-            if vm.canonical_key(key)? == previous_key {
-                seen = true;
-                found = true;
-            }
-            Ok(())
-        })
-    })??;
-    if previous_key.is_some() && !found {
-        return Err(RuntimeError::new(RuntimeErrorKind::InvalidNextKey));
-    }
-    Ok(pair)
 }
 
 fn protected_metatable(vm: &mut Vm, table: ObjectRef) -> Result<Option<Value>, RuntimeError> {
@@ -669,7 +645,7 @@ pub(crate) fn execute(
         BasicBuiltin::ToNumber => result(vm, &[number(vm, arg(args, 0)?, args.get(1).copied())?]),
         BasicBuiltin::Next => {
             let table = table_arg(vm, args, 0)?;
-            match next_pair(vm, table, args.get(1).copied().unwrap_or(Value::Nil))? {
+            match vm.raw_next_value(table, args.get(1).copied().unwrap_or(Value::Nil))? {
                 Some((key, value)) => result(vm, &[key, value]),
                 None => result(vm, &[Value::Nil]),
             }
@@ -718,7 +694,9 @@ pub(crate) fn execute(
                 return result(vm, &[Value::Nil]);
             };
             let value = match vm.object_kind(object)? {
-                ObjectKind::Table => protected_metatable(vm, object)?.unwrap_or(Value::Nil),
+                ObjectKind::Table | ObjectKind::Userdata => {
+                    protected_metatable(vm, object)?.unwrap_or(Value::Nil)
+                }
                 ObjectKind::ByteString => match vm.string_metatable() {
                     Some(metatable) => protected_metatable_value(vm, metatable)?,
                     None => Value::Nil,
@@ -794,6 +772,21 @@ mod p13_a_tests {
     use super::*;
     use crate::HostHandle;
     use rivetlua_core::{LuaProfile, Value};
+
+    #[test]
+    fn lightuserdata_type_and_text_use_address_without_heap_reference() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let vm = Vm::new_with_profile(profile).unwrap();
+            for (address, expected) in [
+                (0, b"userdata: 0x0".as_slice()),
+                (0x1234, b"userdata: 0x1234".as_slice()),
+            ] {
+                let value = Value::LightUserdata(address);
+                assert_eq!(type_name(&vm, value).unwrap(), b"userdata");
+                assert_eq!(text_for(&vm, value).unwrap().unwrap().as_bytes(), expected);
+            }
+        }
+    }
 
     #[test]
     fn collectgarbage_count_reads_only_lua_heap_and_retries_after_result_failure() {

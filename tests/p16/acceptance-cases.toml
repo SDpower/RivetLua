@@ -1,0 +1,122 @@
+# P16 正式驗收矩陣；本檔只宣告案例與可追溯來源，不宣告執行成功。
+schema = "rivetlua-p16-acceptance-cases-v1"
+
+[[case]]
+id = "ABI-001"
+execution_kind = "CDriver"
+step = "P16-3"
+fixture = "tests/p16/acceptance/abi001.c"
+local_test = "callback_execution:fixed_and_multret_callback_results_follow_c_stack_contract_b4"
+assertions = "stack,results,multret,roots"
+
+[[case]]
+id = "ABI-002"
+execution_kind = "CDriver"
+step = "P16-3"
+fixture = "tests/p16/acceptance/abi002.c"
+local_test = "public_callback_error:nested_bytecode_error_reparks_outer_c_callback_and_leaves_reusable_state"
+assertions = "nested_error,classification,frame_cleanup,rust_boundary"
+
+[[case]]
+id = "ABI-003"
+execution_kind = "CDriver"
+step = "P16-3"
+fixture = "tests/p16/acceptance/abi003.c"
+local_test = "abi_acceptance:abi003_refs_userdata_survive_gc_and_release_ledger"
+assertions = "gc,parameters,refs,userdata,root_ledger"
+
+[[case]]
+id = "ABI-004"
+execution_kind = "CDriver"
+step = "P16-5"
+fixture = "tests/p16/acceptance/abi004.c"
+local_test = "abi_acceptance:abi004_internal_adapter_ledger_every_allocation_ordinal_rolls_back"
+assertions = "allocation_ordinals,structured_failure,no_fallback,cleanup"
+
+[[case]]
+id = "ABI-005"
+execution_kind = "RustTest"
+step = "P16-5"
+fixture = ""
+local_test = "native_modes:abi_005_every_identity_field_rejected_before_loader"
+assertions = "header,layout,revision,target,profile,numeric,preload"
+
+[[case]]
+id = "ABI-006"
+execution_kind = "RustTest"
+step = "P16-4"
+fixture = ""
+local_test = "worker:abi_006_worker_primitives_bytes_gc_crash_timeout_malformed_and_fresh_reuse"
+assertions = "crash,timeout,malformed,private_vm,heap_cleanup"
+
+[[case]]
+id = "ABI-007"
+execution_kind = "RustTest"
+step = "P16-5"
+fixture = ""
+local_test = "native_modes:abi_007_denied_digest_and_foreign_unwind_rejected_before_loader"
+assertions = "policy,preload,no_constructor"
+
+[[case]]
+id = "ABI-NEG-001"
+execution_kind = "CDriver"
+step = "P16-3"
+fixture = "tests/p16/acceptance/abi_neg001.c"
+local_test = "abi_acceptance:abi_neg001_live_rust_guard_rejects_missing_c_checkpoint"
+assertions = "reject_rust_frame_longjmp"
+
+[[case]]
+id = "ABI-NEG-002"
+execution_kind = "RustTest"
+step = "P16-3"
+fixture = ""
+local_test = "abi_acceptance:abi_neg002_panic_is_caught_and_foreign_unwind_boundary_is_static"
+assertions = "reject_foreign_unwind,panic_boundary"
+
+[[case]]
+id = "ABI-NEG-003"
+execution_kind = "RustTest"
+step = "P16-2"
+fixture = ""
+local_test = "abi_negative_handles:abi_neg003_rejects_foreign_and_stale_handles_without_mutation"
+assertions = "reject_cross_vm,reject_stale"
+
+[[case]]
+id = "ABI-NEG-004"
+execution_kind = "CDriver"
+step = "P16-5"
+fixture = "tests/p16/acceptance/abi_neg004.c"
+local_test = "allocator_state:rejected_admission_does_not_fallback_and_state_can_retry"
+assertions = "reject_allocator_fallback"
+
+[[case]]
+id = "ABI-NEG-005"
+execution_kind = "RustTest"
+step = "P16-4"
+fixture = ""
+local_test = "worker:neg_005_pointer_state_function_tags_and_noncopyable_rejected"
+assertions = "reject_pointer_sharing,reject_vm_sharing"
+
+[[case]]
+id = "ABI-NEG-006"
+execution_kind = "BuildAudit"
+step = "P16-5"
+fixture = "tests/p16/acceptance/abi_neg006.py"
+local_test = ""
+assertions = "reject_c_lua_fallback"
+
+[[case]]
+id = "SDK-MODULE"
+execution_kind = "SdkModules"
+step = "P16-1"
+fixture = ""
+local_test = "sdk_modules:sdk_modules_official_five_load_execute_and_p1"
+assertions = "fixed_sdk_build,module_link,module_load,module_run"
+
+[[case]]
+id = "ABI-STRESS"
+execution_kind = "CDriver"
+step = "P16-5"
+fixture = "tests/p16/acceptance/abi_stress.c"
+local_test = ""
+assertions = "callback_longrun,gc,coroutine,debug_ref,no_leak"

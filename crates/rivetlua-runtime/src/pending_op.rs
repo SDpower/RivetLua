@@ -36,6 +36,7 @@ pub(crate) enum BasicPending {
         tail_return: bool,
     },
     DebugHook {
+        hook_function: ObjectRef,
         original: Value,
         dynamic_top: usize,
         resume_instruction: bool,
@@ -259,11 +260,20 @@ impl HostCallbackPending {
 pub(crate) struct PrintArguments {
     values: Vec<Value>,
     roots: Vec<RootId>,
-    ledger: AllocationLedger,
-    charge: usize,
+    _values_charge: Option<crate::alloc::AllocationCharge>,
+    _roots_charge: Option<crate::alloc::AllocationCharge>,
 }
 
 impl PrintArguments {
+    pub(crate) fn empty() -> Self {
+        Self {
+            values: Vec::new(),
+            roots: Vec::new(),
+            _values_charge: None,
+            _roots_charge: None,
+        }
+    }
+
     pub(crate) fn new(vm: &mut Vm, values: &[Value]) -> Result<Self, VmError> {
         let ledger = vm.allocation_ledger().clone();
         let mut owned = Vec::new();
@@ -271,19 +281,13 @@ impl PrintArguments {
         owned.extend_from_slice(values);
         let mut roots = Vec::new();
         let roots_ticket = reserve_vec(&ledger, &mut roots, values.len(), FailPoint::WorkReserve)?;
-        let charge = checked_bytes(values.len(), core::mem::size_of::<Value>())?
-            .checked_add(checked_bytes(values.len(), core::mem::size_of::<RootId>())?)
-            .ok_or(VmError::ArithmeticOverflow)?;
-        values_ticket.commit()?;
-        if let Err(error) = roots_ticket.commit() {
-            ledger.refund_on_drop(checked_bytes(values.len(), core::mem::size_of::<Value>())?);
-            return Err(error);
-        }
+        let values_charge = values_ticket.commit_charge()?;
+        let roots_charge = roots_ticket.commit_charge()?;
         let mut arguments = Self {
             values: owned,
             roots,
-            ledger,
-            charge,
+            _values_charge: Some(values_charge),
+            _roots_charge: Some(roots_charge),
         };
         if let Err(error) = arguments.restore_roots(vm) {
             arguments.clear_roots(vm)?;
@@ -328,12 +332,6 @@ impl PrintArguments {
             }
         }
         Ok(())
-    }
-}
-
-impl Drop for PrintArguments {
-    fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.charge);
     }
 }
 
@@ -505,11 +503,15 @@ impl PendingOp {
             state.trace_children(&mut visit)?;
         }
         if let Some(BasicPending::DebugHook {
-            builtin_return: Some(result),
+            hook_function,
+            builtin_return,
             ..
         }) = self.basic.as_ref()
         {
-            result.values.trace_children(&mut visit)?;
+            visit(*hook_function)?;
+            if let Some(result) = builtin_return {
+                result.values.trace_children(&mut visit)?;
+            }
         }
         if let Some(BasicPending::Print { arguments, .. }) = self.basic.as_ref() {
             arguments.trace_children(&mut visit)?;
@@ -549,21 +551,14 @@ pub(crate) struct PendingStack {
     entries: Vec<PendingOp>,
     ledger: AllocationLedger,
     charge: usize,
+    charges: [Option<crate::alloc::AllocationCharge>; 2],
 }
 
 /// 成長候選容器尚未取代現有堆疊；呼叫建 frame 失敗時 Drop 即回復帳額。
 pub(crate) struct PreparedPush {
     replacement: Option<Vec<PendingOp>>,
-    ledger: AllocationLedger,
     charge: usize,
-}
-
-impl Drop for PreparedPush {
-    fn drop(&mut self) {
-        if self.charge != 0 {
-            self.ledger.refund_on_drop(self.charge);
-        }
-    }
+    charges: [Option<crate::alloc::AllocationCharge>; 2],
 }
 
 impl PendingStack {
@@ -572,6 +567,7 @@ impl PendingStack {
             entries: Vec::new(),
             ledger,
             charge: 0,
+            charges: [None, None],
         }
     }
 
@@ -656,22 +652,26 @@ impl PendingStack {
             let extra = charge
                 .checked_sub(minimum_charge)
                 .ok_or(VmError::LedgerInvariant)?;
-            let extra_ticket = self.ledger.reserve(extra)?;
-            ticket.commit()?;
-            if let Err(error) = extra_ticket.commit() {
-                self.ledger.refund_on_drop(minimum_charge);
-                return Err(error);
-            }
+            let extra_ticket = match self.ledger.reserve(extra) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    drop(replacement);
+                    drop(ticket);
+                    return Err(error);
+                }
+            };
+            let base_charge = ticket.commit_charge()?;
+            let extra_charge = extra_ticket.commit_charge()?;
             return Ok(PreparedPush {
                 replacement: Some(replacement),
-                ledger: self.ledger.clone(),
                 charge,
+                charges: [Some(base_charge), Some(extra_charge)],
             });
         }
         Ok(PreparedPush {
             replacement: None,
-            ledger: self.ledger.clone(),
             charge: 0,
+            charges: [None, None],
         })
     }
 
@@ -680,8 +680,9 @@ impl PendingStack {
             debug_assert!(replacement.capacity() >= self.entries.len() + 1);
             replacement.append(&mut self.entries);
             replacement.push(pending);
-            self.entries = replacement;
-            self.ledger.refund_on_drop(self.charge);
+            let old_entries = core::mem::replace(&mut self.entries, replacement);
+            drop(old_entries);
+            self.charges = [prepared.charges[0].take(), prepared.charges[1].take()];
             self.charge = prepared.charge;
             prepared.charge = 0;
         } else {
@@ -697,7 +698,7 @@ impl PendingStack {
     pub(crate) fn release_empty(&mut self) -> Result<(), VmError> {
         if self.entries.is_empty() && self.charge != 0 {
             self.entries = Vec::new();
-            self.ledger.refund(self.charge)?;
+            self.charges = [None, None];
             self.charge = 0;
         }
         Ok(())
@@ -813,14 +814,5 @@ mod p13_a_tests {
             baseline.host_allocation_bytes
         );
         assert_eq!(vm.ledger_snapshot().reserved, baseline.reserved);
-    }
-}
-
-impl Drop for PendingStack {
-    fn drop(&mut self) {
-        if self.charge != 0 {
-            self.ledger.refund_on_drop(self.charge);
-            self.charge = 0;
-        }
     }
 }

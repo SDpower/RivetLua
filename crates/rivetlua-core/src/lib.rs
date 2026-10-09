@@ -56,7 +56,8 @@ pub use number::{
     multiply, negate, number_from_value, power, shift_left, shift_right, subtract,
 };
 pub use value::{
-    Generation, ObjectId, ObjectRef, SlotId, Value, ValueKind, VmId, select_and, select_or,
+    Generation, HostFunctionId, ObjectId, ObjectRef, SlotId, Value, ValueKind, VmId, select_and,
+    select_or,
 };
 
 /// P00 骨架版本，不能當成 bytecode 或語言相容性版本。

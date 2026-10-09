@@ -3,7 +3,7 @@
 use core::mem::size_of;
 use rivetlua_core::{LuaProfile, Value};
 
-use crate::alloc::{FailPoint, Reservation, checked_bytes, reserve_vec};
+use crate::alloc::{FailPoint, Reservation, reserve_vec};
 use crate::roots::{RootId, RootKind};
 use crate::stdlib::basic;
 use crate::stdlib::string::{self, Buffer, StringBuiltin};
@@ -469,8 +469,7 @@ fn unpack(vm: &mut Vm, args: &[Value]) -> Result<(Vec<Value>, Option<Reservation
         count,
         FailPoint::WorkReserve,
     )?;
-    roots_ticket.commit()?;
-    let roots_charge = checked_bytes(count, size_of::<RootId>())?;
+    let roots_owner = roots_ticket.commit_charge()?;
     let produced = (|| {
         let mut parser = Parser::new(&format.bytes, vm.language_profile());
         let mut position = initial;
@@ -546,7 +545,7 @@ fn unpack(vm: &mut Vm, args: &[Value]) -> Result<(Vec<Value>, Option<Reservation
     for root in roots {
         vm.remove_root(root)?;
     }
-    vm.allocation_ledger().refund_on_drop(roots_charge);
+    drop(roots_owner);
     produced?;
     Ok((output, Some(output_ticket)))
 }

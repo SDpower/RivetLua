@@ -1,12 +1,12 @@
 //! VM 集中持有的六類強參照來源。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::rc::Rc;
 
 use rivetlua_core::{ObjectRef, VmId};
 
-use crate::alloc::{AllocationLedger, FailPoint};
+use crate::alloc::{AllocationCharge, AllocationLedger, FailPoint};
 use crate::heap::VmError;
 
 /// 最小收集器必須逐類掃描的 root。
@@ -43,7 +43,7 @@ struct RootEntry {
     kind: RootKind,
     object: ObjectRef,
     lease: Option<RootLease>,
-    charge: usize,
+    charge: Option<AllocationCharge>,
 }
 
 impl RootEntry {
@@ -58,16 +58,14 @@ pub(crate) struct RootLease(Rc<RootLeaseState>);
 
 struct RootLeaseState {
     active: Cell<bool>,
-    ledger: AllocationLedger,
-    charge: usize,
+    charge: RefCell<Option<AllocationCharge>>,
 }
 
 impl RootLease {
-    fn new(ledger: &AllocationLedger, charge: usize) -> Self {
+    fn new(charge: AllocationCharge) -> Self {
         Self(Rc::new(RootLeaseState {
             active: Cell::new(true),
-            ledger: ledger.clone(),
-            charge,
+            charge: RefCell::new(Some(charge)),
         }))
     }
 
@@ -78,7 +76,7 @@ impl RootLease {
     pub(crate) fn deactivate(&self) {
         if self.0.active.replace(false) {
             // VM 可已析構；此處只改共享帳本的 Cell，不借用 heap 或配置。
-            self.0.ledger.refund_on_drop(self.0.charge);
+            self.0.charge.borrow_mut().take();
         }
     }
 }
@@ -123,14 +121,14 @@ impl RootSet {
         self.entries
             .try_reserve_exact(1)
             .map_err(|_| ticket.rust_reserve_failure())?;
-        ticket.commit()?;
+        let charge = ticket.commit_charge()?;
         self.next_sequence += 1;
         self.entries.push(RootEntry {
             id,
             kind,
             object,
             lease: None,
-            charge,
+            charge: Some(charge),
         });
         Ok(id)
     }
@@ -156,22 +154,22 @@ impl RootSet {
             .try_reserve_exact(1)
             .map_err(|_| ticket.rust_reserve_failure())?;
         ledger.checkpoint(FailPoint::HostLease)?;
-        let lease = RootLease::new(ledger, charge);
-        ticket.commit()?;
+        let charge = ticket.commit_charge()?;
+        let lease = RootLease::new(charge);
         self.next_sequence += 1;
         self.entries.push(RootEntry {
             id,
             kind: RootKind::Host,
             object,
             lease: Some(lease.clone()),
-            charge,
+            charge: None,
         });
         Ok((id, lease))
     }
 
     pub(crate) fn remove(
         &mut self,
-        ledger: &AllocationLedger,
+        _ledger: &AllocationLedger,
         id: RootId,
     ) -> Result<ObjectRef, VmError> {
         if id.vm != self.vm {
@@ -186,10 +184,9 @@ impl RootSet {
         if let Some(lease) = &self.entries[index].lease {
             // 已釋放的 handle 已退還費用；移除墓碑不再重複退費。
             lease.deactivate();
-        } else {
-            ledger.refund(self.entries[index].charge)?;
         }
         let entry = self.entries.swap_remove(index);
+        drop(entry.charge);
         if was_active {
             Ok(entry.object)
         } else {
@@ -202,13 +199,12 @@ impl RootSet {
         self.entries.retain(RootEntry::is_active);
     }
 
-    pub(crate) fn release_all_on_vm_drop(&mut self, ledger: &AllocationLedger) {
+    pub(crate) fn release_all_on_vm_drop(&mut self, _ledger: &AllocationLedger) {
         for entry in self.entries.drain(..) {
             if let Some(lease) = entry.lease {
                 lease.deactivate();
-            } else {
-                ledger.refund_on_drop(entry.charge);
             }
+            drop(entry.charge);
         }
     }
 

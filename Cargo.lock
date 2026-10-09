@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "cc"
+version = "1.2.66"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5d6cac793997bd970000024b2934968efe83b382de4fdcf4fcb46b6ee4ad996"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
+]
+
+[[package]]
 name = "cpu-time"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11,6 +21,12 @@ dependencies = [
  "libc",
  "winapi",
 ]
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "libc"
@@ -22,6 +38,16 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 name = "rivetlua"
 version = "0.0.0"
 dependencies = [
+ "rivetlua-compiler",
+ "rivetlua-core",
+ "rivetlua-runtime",
+]
+
+[[package]]
+name = "rivetlua-capi"
+version = "0.0.0"
+dependencies = [
+ "cc",
  "rivetlua-compiler",
  "rivetlua-core",
  "rivetlua-runtime",
@@ -57,6 +83,12 @@ dependencies = [
 [[package]]
 name = "rivetlua-xtask"
 version = "0.0.0"
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "winapi"

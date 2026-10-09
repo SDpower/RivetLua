@@ -1,30 +1,36 @@
 //! P06-1 最小非移動 heap 與 slot 生命週期。
 
+use core::cell::Cell;
 use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
+use std::any::Any;
+use std::rc::Rc;
 
+use rivetlua_core::bytecode::native_debug::NativeSemanticUpvalue;
 use rivetlua_core::{
-    Generation, LuaProfile, ObjectId, ObjectRef, SlotId, Value, VerifiedModule, VmId,
+    Generation, HostFunctionId, LuaProfile, ObjectId, ObjectRef, SlotId, Value, VerifiedModule,
+    VmId,
 };
 
 use crate::alloc::{
-    AllocationAttempt, AllocationLedger, AllocationTrace, FailPoint, LedgerProbe, LedgerSnapshot,
-    Reservation, checked_bytes, reserve_vec,
+    AllocationAttempt, AllocationCharge, AllocationCharges, AllocationLedger, AllocationTrace,
+    FailPoint, LedgerProbe, LedgerSnapshot, PairedLuaCharges, Reservation, checked_bytes,
+    reserve_vec,
 };
 use crate::callback::CallbackFn;
-use crate::closure::Closure;
+use crate::closure::{CClosure, Closure};
 use crate::coroutine::{Coroutine, CoroutineState, ParkedLocalSlot, ThreadContext};
 use crate::errors::Builtin;
 use crate::gc::trace::RefField;
 use crate::gc::{
-    AtomicFinalizerStage, FinalizerState, GcAge, GcColor, GcCycleKind, GcMode, GcParameter,
-    GcPhase, GcState, GcTrace, WeakMode,
+    AtomicFinalizerStage, FinalizerState, GcAge, GcColor, GcControl, GcControlResult, GcCycleKind,
+    GcMode, GcParameter, GcPhase, GcState, GcTrace, WeakMode,
 };
 use crate::host::{
-    DebugCapability, DumpCapability, HostEntropyServiceError, HostFileLease, HostOsOperation,
-    HostOsValue, HostResourceError, HostResourceErrorKind, HostServiceError, HostServices,
-    LoadBudget, LoadLimits, LoadServiceError, LoadTemporaryCharge, PathEncoding, ResourceBudget,
-    ResourceLimits,
+    DebugCapability, DumpCapability, DumpLimits, HostEntropyServiceError, HostFileLease,
+    HostOsOperation, HostOsValue, HostResourceError, HostResourceErrorKind, HostServiceError,
+    HostServices, LoadBudget, LoadLimits, LoadServiceError, LoadTemporaryCharge, PathEncoding,
+    ResourceBudget, ResourceLimits,
 };
 use crate::roots::{RootId, RootKind, RootLease, RootSet};
 use crate::stdlib::basic::BasicBuiltin;
@@ -37,8 +43,8 @@ use crate::stdlib::package::LoadBuiltin;
 use crate::stdlib::string::StringBuiltin;
 use crate::stdlib::table::TableBuiltin;
 use crate::stdlib::utf8::{self as utf8_lib, Utf8Builtin};
-use crate::string::ByteString;
-use crate::table::{PreparedTableMutation, Table};
+use crate::string::{ByteString, ExternalStringStorage};
+use crate::table::{PreparedRefPair, PreparedTableMutation, Table};
 use crate::upvalue::{Upvalue, UpvalueState};
 
 /// 公開的 slot 狀態，不暴露 heap 配置或可變借用。
@@ -47,6 +53,91 @@ pub enum SlotState {
     Occupied,
     Free,
     Retired,
+}
+
+#[cfg(test)]
+mod p16_b3_load_configuration_tests {
+    use super::{Vm, VmError};
+    use crate::LoadLimits;
+
+    #[test]
+    fn capi_limits_change_only_idle_resources_and_preserve_guest_policy() {
+        let mut vm = Vm::new().unwrap();
+        let original = LoadLimits::default();
+        assert_eq!(vm.capi_load_limits(), original);
+        assert!(vm.host_services.load.compiler.is_none());
+        assert!(vm.host_services.load.reader.is_none());
+        assert!(!vm.host_services.load.allow_bytecode);
+        assert!(!vm.host_services.load.allow_official_bytecode);
+
+        let raised = LoadLimits {
+            max_work_units: 2_000_000,
+            ..original
+        };
+        vm.set_execution_running(true);
+        assert_eq!(
+            vm.capi_configure_load_limits(raised),
+            Err(VmError::HostConfigurationBusy)
+        );
+        vm.set_execution_running(false);
+        assert_eq!(vm.capi_load_limits(), original);
+        vm.capi_configure_load_limits(raised).unwrap();
+        assert_eq!(vm.capi_load_limits(), raised);
+        assert!(vm.host_services.load.compiler.is_none());
+        assert!(vm.host_services.load.reader.is_none());
+        assert!(!vm.host_services.load.allow_bytecode);
+        assert!(!vm.host_services.load.allow_official_bytecode);
+    }
+}
+
+#[cfg(test)]
+mod full_userdata_a27_internal_tests {
+    use core::mem::{align_of, size_of};
+
+    use rivetlua_core::{LuaProfile, Value};
+
+    use super::{HeapObject, HeapPayload, Slot, UserdataWord, Vm};
+
+    #[test]
+    fn safe_cell_bytes_and_exact_reclaim_refund() {
+        for profile in [LuaProfile::Lua55, LuaProfile::Lua54] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.set_gc_debt_threshold(usize::MAX);
+            let probe = vm.ledger_probe();
+            let object = vm.allocate_userdata(17, 3).unwrap();
+            let expected = size_of::<Slot>()
+                + size_of::<HeapObject>()
+                + 2 * size_of::<UserdataWord>()
+                + 3 * size_of::<Value>();
+            assert_eq!(size_of::<UserdataWord>(), 16);
+            assert_eq!(align_of::<UserdataWord>(), 16);
+            assert_eq!(vm.ledger_snapshot().lua_heap_bytes, expected);
+            let slot = vm.checked_slot(object).unwrap();
+            let Slot::Occupied { object: stored, .. } = slot else {
+                panic!("userdata slot must be occupied")
+            };
+            let HeapPayload::Userdata(userdata) = &stored[0].payload else {
+                panic!("full userdata must keep its own payload")
+            };
+            assert_eq!(userdata.bytes.len(), 2);
+            let first = userdata.bytes[0].0.as_ptr() as usize;
+            let second = userdata.bytes[1].0.as_ptr() as usize;
+            assert_eq!(second - first, 16);
+            assert_eq!(userdata.bytes[0].0.get(), [0; 16]);
+            assert_eq!(userdata.bytes[1].0.get(), [0; 16]);
+            assert_eq!(userdata.uservalues, [Value::Nil; 3]);
+            userdata.bytes[0].0.set([0x5a; 16]);
+            userdata.bytes[1].0.set([0xa5; 16]);
+            assert_eq!(userdata.bytes[0].0.get(), [0x5a; 16]);
+            assert_eq!(userdata.bytes[1].0.get(), [0xa5; 16]);
+            vm.reclaim(object).unwrap();
+            assert_eq!(vm.ledger_snapshot().lua_heap_bytes, size_of::<Slot>());
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            drop(vm);
+            assert_eq!(probe.snapshot().committed, 0);
+            assert_eq!(probe.snapshot().reserved, 0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -77,6 +168,7 @@ mod p15_debug_iterator_identity_tests {
                     vm.string_iterator_upvalue(iterator, 0).unwrap().unwrap().1,
                     identity
                 );
+                vm.collect().unwrap();
                 vm.set_gc_mode(GcMode::Generational).unwrap();
                 vm.collect_minor().unwrap();
                 assert_eq!(vm.object_kind(identity), Ok(ObjectKind::Value));
@@ -338,6 +430,7 @@ mod gc_param_step_tests {
     use rivetlua_core::{LuaProfile, ObjectRef, Value};
 
     use super::{GcCycleKind, GcMode, GcPhase, RootKind, Vm};
+    use crate::GcControl;
     use crate::stdlib::basic::{self, BasicBuiltin};
 
     fn call_gc(vm: &mut Vm, args: &[Value]) -> Vec<Value> {
@@ -350,6 +443,183 @@ mod gc_param_step_tests {
         let object = vm.allocate_byte_string(bytes).unwrap();
         vm.add_root(RootKind::Host, object).unwrap();
         object
+    }
+
+    #[test]
+    fn typed_gc_control_profile_defaults_b8() {
+        let lua54 = Vm::new_with_profile(LuaProfile::Lua54).unwrap();
+        assert_eq!(lua54.gc_minor_mul_percent(), 20);
+        assert_eq!(lua54.gc_minor_major_percent(), 100);
+        assert_eq!(lua54.gc_step_size_bytes(), 8192);
+
+        let lua55 = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        assert_eq!(lua55.gc_minor_mul_percent(), 20);
+        assert_eq!(lua55.gc_minor_major_percent(), 68);
+        assert_eq!(lua55.gc_step_size_bytes(), 9600);
+    }
+
+    #[test]
+    fn typed_gc_control_minor_debt_keeps_last_major_base_b8() {
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        vm.stop_automatic_gc();
+        let baseline = vm.allocate_byte_string(&[b'a'; 4096]).unwrap();
+        vm.add_root(RootKind::Host, baseline).unwrap();
+        vm.collect_major().unwrap();
+        let major_base = vm.gc.last_major_lua_heap_bytes;
+        let minor_debt = vm.gc.debt_threshold;
+        let added = vm.allocate_byte_string(&[b'b'; 8192]).unwrap();
+        vm.add_root(RootKind::Host, added).unwrap();
+        vm.collect_minor().unwrap();
+        assert_eq!(vm.gc.last_major_lua_heap_bytes, major_base);
+        assert_eq!(vm.gc.debt_threshold, minor_debt);
+        vm.collect_minor().unwrap();
+        assert_eq!(vm.gc.debt_threshold, minor_debt);
+        vm.collect_major().unwrap();
+        assert!(vm.gc.last_major_lua_heap_bytes > major_base);
+        assert!(vm.gc.debt_threshold > minor_debt);
+    }
+
+    #[test]
+    fn typed_gc_control_lua54_minor_major_refreshes_cached_threshold_b8() {
+        for (percent, expected_kind) in [(20, GcCycleKind::Major), (200, GcCycleKind::Minor)] {
+            let mut vm = Vm::new_with_profile(LuaProfile::Lua54).unwrap();
+            vm.stop_automatic_gc();
+            let baseline = vm.allocate_byte_string(&[b'a'; 8192]).unwrap();
+            vm.add_root(RootKind::Host, baseline).unwrap();
+            vm.collect_major().unwrap();
+            let base = vm.ledger_snapshot().lua_heap_bytes;
+            let added = vm.allocate_byte_string(&[b'b'; 4096]).unwrap();
+            vm.add_root(RootKind::Host, added).unwrap();
+            vm.gc.major_followup = false;
+            vm.gc_control(GcControl::Generational {
+                minor_mul: 0,
+                minor_major: percent,
+            })
+            .unwrap();
+            assert_eq!(vm.gc.major_threshold_bytes, base * percent as usize / 100);
+            vm.incremental_step(1).unwrap();
+            assert_eq!(vm.gc_trace().cycle, expected_kind);
+        }
+    }
+
+    #[test]
+    fn typed_gc_control_major_followup_ignores_host_charges_b8() {
+        for major_minor in [0, 200] {
+            let mut decisions = [false; 2];
+            let mut lua_bases = [0usize; 2];
+            let mut committed = [0usize; 2];
+            for (index, host_charge) in [0, 1024 * 1024].into_iter().enumerate() {
+                let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+                vm.stop_automatic_gc();
+                let baseline = vm.allocate_byte_string(&[b'a'; 4096]).unwrap();
+                vm.add_root(RootKind::Host, baseline).unwrap();
+                vm.collect_major().unwrap();
+                let added = vm.allocate_byte_string(&[b'b'; 4096]).unwrap();
+                vm.add_root(RootKind::Host, added).unwrap();
+                let host_owner = vm
+                    .reserve_host_allocation(host_charge)
+                    .unwrap()
+                    .commit()
+                    .unwrap();
+                vm.gc_control(GcControl::Parameter {
+                    index: 1,
+                    value: major_minor,
+                })
+                .unwrap();
+                vm.collect_major().unwrap();
+                decisions[index] = vm.gc.major_followup;
+                lua_bases[index] = vm.gc.last_major_lua_heap_bytes;
+                committed[index] = vm.ledger_snapshot().committed;
+                drop(host_owner);
+            }
+            assert_eq!(decisions, [major_minor != 0; 2]);
+            assert_eq!(lua_bases[0], lua_bases[1]);
+            assert!(committed[0] < committed[1]);
+        }
+    }
+
+    #[test]
+    fn typed_gc_control_inc_to_gen_resets_followup_and_bases_b8() {
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        vm.stop_automatic_gc();
+        let baseline = vm.allocate_byte_string(&[b'a'; 4096]).unwrap();
+        vm.add_root(RootKind::Host, baseline).unwrap();
+        vm.collect_major().unwrap();
+        let added = vm.allocate_byte_string(&[b'b'; 4096]).unwrap();
+        vm.add_root(RootKind::Host, added).unwrap();
+        vm.gc_control(GcControl::Parameter {
+            index: 1,
+            value: 200,
+        })
+        .unwrap();
+        vm.collect_major().unwrap();
+        assert!(vm.gc.major_followup);
+        vm.gc_control(GcControl::Incremental {
+            pause: 0,
+            step_mul: 0,
+            step_size: 0,
+        })
+        .unwrap();
+        let after_switch = vm.allocate_byte_string(&[b'c'; 2048]).unwrap();
+        vm.add_root(RootKind::Host, after_switch).unwrap();
+        vm.gc_control(GcControl::Generational {
+            minor_mul: 0,
+            minor_major: 0,
+        })
+        .unwrap();
+        let live = vm.ledger_snapshot().lua_heap_bytes;
+        assert!(!vm.gc.major_followup);
+        assert_eq!(vm.gc.last_major_lua_heap_bytes, live);
+        assert_eq!(
+            vm.gc.debt_threshold,
+            (live * vm.gc_minor_mul_percent() / 100).max(1)
+        );
+        assert_eq!(
+            vm.gc.major_threshold_bytes,
+            (live * vm.gc_minor_major_percent() / 100).max(1)
+        );
+        vm.incremental_step(1).unwrap();
+        assert_eq!(vm.gc_trace().cycle, GcCycleKind::Minor);
+    }
+
+    #[test]
+    fn typed_gc_control_zero_step_uses_profile_step_size_b8() {
+        for (step_size, completed) in [(1, false), (100_000, true)] {
+            let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+            vm.stop_automatic_gc();
+            vm.set_gc_mode(GcMode::Incremental).unwrap();
+            for _ in 0..100 {
+                let held = vm.allocate_table().unwrap();
+                vm.add_root(RootKind::Host, held).unwrap();
+            }
+            vm.gc_control(GcControl::Parameter { index: 4, value: 2 })
+                .unwrap();
+            vm.gc_control(GcControl::Parameter {
+                index: 5,
+                value: step_size,
+            })
+            .unwrap();
+            let super::GcControlResult::Integer(result) =
+                vm.gc_control(GcControl::Step(0)).unwrap();
+            assert_eq!(result != 0, completed);
+        }
+        for (exponent, completed) in [(1, false), (20, true)] {
+            let mut vm = Vm::new_with_profile(LuaProfile::Lua54).unwrap();
+            vm.stop_automatic_gc();
+            vm.gc_control(GcControl::Incremental {
+                pause: 0,
+                step_mul: 4,
+                step_size: exponent,
+            })
+            .unwrap();
+            for _ in 0..100 {
+                let held = vm.allocate_table().unwrap();
+                vm.add_root(RootKind::Host, held).unwrap();
+            }
+            let super::GcControlResult::Integer(result) =
+                vm.gc_control(GcControl::Step(0)).unwrap();
+            assert_eq!(result != 0, completed);
+        }
     }
 
     #[test]
@@ -541,6 +811,115 @@ mod gc_param_step_tests {
         assert_eq!(Vm::scaled_gc_work(51, 2), 2);
         assert_eq!(Vm::scaled_gc_work(1, 0), usize::MAX);
     }
+
+    #[test]
+    fn typed_gc_control_generational_parameters_change_cycle_selection() {
+        let mut thresholds = [0usize; 2];
+        for (index, minor_mul) in [10, 80].into_iter().enumerate() {
+            let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+            vm.stop_automatic_gc();
+            let held = vm.allocate_byte_string(&[b'x'; 4096]).unwrap();
+            vm.add_root(RootKind::Host, held).unwrap();
+            vm.gc_control(GcControl::Parameter {
+                index: 0,
+                value: minor_mul,
+            })
+            .unwrap();
+            vm.collect_major().unwrap();
+            thresholds[index] = vm.gc.debt_threshold;
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+        assert!(thresholds[0] < thresholds[1]);
+
+        for (major_minor, expected) in [(0, GcCycleKind::Minor), (200, GcCycleKind::Major)] {
+            let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+            vm.stop_automatic_gc();
+            let held = vm.allocate_byte_string(&[b'x'; 4096]).unwrap();
+            vm.add_root(RootKind::Host, held).unwrap();
+            vm.gc_control(GcControl::Parameter {
+                index: 1,
+                value: major_minor,
+            })
+            .unwrap();
+            vm.gc_control(GcControl::Parameter { index: 2, value: 0 })
+                .unwrap();
+            assert_eq!(vm.gc.major_threshold_bytes, usize::MAX);
+            vm.collect_major().unwrap();
+            vm.incremental_step(1).unwrap();
+            assert_eq!(vm.gc_trace().cycle, expected);
+            while vm.gc.phase != GcPhase::Pause {
+                vm.incremental_step(1024).unwrap();
+            }
+            vm.gc_control(GcControl::Parameter {
+                index: 2,
+                value: 100,
+            })
+            .unwrap();
+            assert!(vm.gc.major_threshold_bytes < usize::MAX);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn typed_gc_control_incremental_parameters_change_threshold_and_work() {
+        let mut pauses = [0usize; 2];
+        for (index, pause) in [100, 500].into_iter().enumerate() {
+            let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+            vm.stop_automatic_gc();
+            vm.set_gc_mode(GcMode::Incremental).unwrap();
+            let held = vm.allocate_byte_string(&[b'x'; 16 * 1024]).unwrap();
+            vm.add_root(RootKind::Host, held).unwrap();
+            vm.gc_control(GcControl::Parameter {
+                index: 3,
+                value: pause,
+            })
+            .unwrap();
+            vm.gc_control(GcControl::Collect).unwrap();
+            pauses[index] = vm.gc.incremental_debt_threshold;
+            vm.set_gc_debt_threshold(7);
+            vm.gc_control(GcControl::Collect).unwrap();
+            assert_eq!(vm.gc.debt_threshold_override, Some(7));
+        }
+        assert!(pauses[0] < pauses[1]);
+
+        for (stepmul, completed) in [(2, false), (0, true)] {
+            let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+            vm.stop_automatic_gc();
+            vm.set_gc_mode(GcMode::Incremental).unwrap();
+            for _ in 0..100 {
+                let held = vm.allocate_table().unwrap();
+                vm.add_root(RootKind::Host, held).unwrap();
+            }
+            vm.gc_control(GcControl::Parameter {
+                index: 4,
+                value: stepmul,
+            })
+            .unwrap();
+            let super::GcControlResult::Integer(done) = vm.gc_control(GcControl::Step(1)).unwrap();
+            assert_eq!(done != 0, completed);
+        }
+
+        for (stepsize, completed) in [(1, false), (100_000, true)] {
+            let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+            vm.stop_automatic_gc();
+            vm.set_gc_mode(GcMode::Incremental).unwrap();
+            for _ in 0..1000 {
+                let held = vm.allocate_table().unwrap();
+                vm.add_root(RootKind::Host, held).unwrap();
+            }
+            vm.gc_control(GcControl::Parameter {
+                index: 5,
+                value: stepsize,
+            })
+            .unwrap();
+            vm.restart_automatic_gc();
+            vm.set_gc_debt_threshold(1);
+            vm.allocate_table().unwrap();
+            vm.allocate_table().unwrap();
+            assert_eq!(vm.gc_trace().phase == GcPhase::Pause, completed);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
 }
 
 /// table raw_set 的屏障預備。prepare 不更動 GC 顏色、work 或 remembered。
@@ -548,7 +927,7 @@ pub(crate) struct PreparedTableBarrier {
     owner: ObjectRef,
     remembered_ticket: Option<Reservation>,
     remembered_charge: Option<usize>,
-    remembered_accounted: bool,
+    remembered_accounted: Option<AllocationCharge>,
     marks: [Option<(ObjectRef, usize)>; 2],
     barrier_count: usize,
 }
@@ -556,24 +935,22 @@ pub(crate) struct PreparedTableBarrier {
 impl PreparedTableBarrier {
     fn commit_accounting(&mut self) -> Result<(), VmError> {
         if let Some(ticket) = self.remembered_ticket.take() {
-            ticket.commit()?;
-            self.remembered_accounted = true;
+            self.remembered_accounted = Some(ticket.commit_charge()?);
         }
         Ok(())
     }
 
-    fn rollback_accounting(&mut self, ledger: &AllocationLedger) -> Result<(), VmError> {
-        if self.remembered_accounted {
-            ledger.refund(size_of::<ObjectRef>())?;
-            self.remembered_accounted = false;
-        }
-        Ok(())
+    fn rollback_accounting(&mut self) {
+        self.remembered_accounted.take();
     }
 
-    fn apply(self, gc: &mut GcState) {
+    fn apply(mut self, gc: &mut GcState) {
         if let Some(charge) = self.remembered_charge {
             gc.remembered.push(self.owner);
             gc.remembered_charge = charge;
+            if let Some(accounted) = self.remembered_accounted.take() {
+                gc.remembered_charges.push_prepared(accounted);
+            }
         }
         for (child, index) in self.marks.into_iter().flatten() {
             gc.colors[index] = GcColor::Gray;
@@ -583,6 +960,38 @@ impl PreparedTableBarrier {
             }
         }
         gc.barrier_count = self.barrier_count;
+    }
+}
+
+/// 兩個 Lua closure 共享同一個新 cell 前的強邊屏障；預備期不發布欄位或 GC 狀態。
+struct PreparedClosureJoinBarrier {
+    remembered: [Option<ObjectRef>; 2],
+    remembered_count: usize,
+    remembered_charge: usize,
+    remembered_ticket: Option<Reservation>,
+    mark: Option<(ObjectRef, usize)>,
+    barrier_count: usize,
+}
+
+impl PreparedClosureJoinBarrier {
+    fn commit(mut self, vm: &mut Vm) -> Result<(), VmError> {
+        if let Some(ticket) = self.remembered_ticket.take() {
+            let charge = ticket.commit_charge()?;
+            vm.gc.remembered_charge = self.remembered_charge;
+            for owner in self.remembered[..self.remembered_count].iter().flatten() {
+                vm.gc.remembered.push(*owner);
+            }
+            vm.gc.remembered_charges.push_prepared(charge);
+        }
+        if let Some((cell, index)) = self.mark {
+            vm.gc.colors[index] = GcColor::Gray;
+            vm.gc.work.push(cell);
+            if vm.gc.phase == GcPhase::Sweep {
+                vm.gc.transition(GcPhase::Propagate);
+            }
+        }
+        vm.gc.barrier_count = self.barrier_count;
+        Ok(())
     }
 }
 
@@ -616,12 +1025,20 @@ pub enum ObjectKind {
     Value,
     ByteString,
     Table,
+    Userdata,
     Closure,
+    CClosure,
     Builtin,
     Coroutine,
     Upvalue,
     Module,
     File,
+}
+
+#[derive(Clone, Copy)]
+enum CapiLuaUpvalueLocation {
+    Environment,
+    Capture(usize),
 }
 
 /// VM 邊界的可檢查結果。P06 後續步驟補上配置計帳。
@@ -643,6 +1060,7 @@ pub enum VmError {
     WrongGcPhase,
     InvalidGcConfig,
     FinalizerGcReentry,
+    HostConfigurationBusy,
     InjectedFailure(FailPoint),
     InjectedAllocation(AllocationAttempt),
     HostResource(HostResourceErrorKind),
@@ -667,6 +1085,7 @@ impl VmError {
             Self::WrongGcPhase => "E_GC_PHASE",
             Self::InvalidGcConfig => "E_GC_CONFIG",
             Self::FinalizerGcReentry => "E_GC_FINALIZER_REENTRY",
+            Self::HostConfigurationBusy => "E_HOST_CONFIG_BUSY",
             Self::InjectedFailure(_) => "E_ALLOCATION_FAILED",
             Self::InjectedAllocation(_) => "E_ALLOCATION_FAILED",
             Self::HostResource(kind) => match kind {
@@ -686,13 +1105,16 @@ impl VmError {
 struct HeapObject {
     payload: HeapPayload,
     children: Vec<ObjectRef>,
+    charges: PairedLuaCharges,
 }
 
 enum HeapPayload {
     Value(Value),
     ByteString(ByteString),
     Table(Table),
+    Userdata(UserdataPayload),
     Closure(Closure),
+    CClosure(CClosure),
     Builtin(Builtin),
     Coroutine(IndirectPayload<Coroutine>),
     Upvalue(Upvalue),
@@ -700,12 +1122,80 @@ enum HeapPayload {
     File(FilePayload),
 }
 
+#[repr(C, align(16))]
+struct UserdataWord(Cell<[u8; 16]>);
+
+struct UserdataPayload {
+    // Vec 長度建立後固定；搬移 Vec header 或 HeapObject 不會移動 bytes。
+    bytes: Vec<UserdataWord>,
+    requested_len: usize,
+    bytes_charge: usize,
+    bytes_owner: Option<crate::alloc::AllocationCharge>,
+    uservalues: Vec<Value>,
+    uservalues_charge: usize,
+    uservalues_owner: Option<crate::alloc::AllocationCharge>,
+    metatable: Option<ObjectRef>,
+}
+
+impl UserdataPayload {
+    fn prepare(
+        ledger: &AllocationLedger,
+        size: usize,
+        uservalue_count: usize,
+    ) -> Result<Self, VmError> {
+        let words = (size.checked_add(15).ok_or(VmError::ArithmeticOverflow)? / 16).max(1);
+        let bytes_charge = checked_bytes(words, size_of::<UserdataWord>())?;
+        let uservalues_charge = checked_bytes(uservalue_count, size_of::<Value>())?;
+        let mut bytes = Vec::new();
+        let bytes_ticket = reserve_vec(ledger, &mut bytes, words, FailPoint::UserdataBytesReserve)?;
+        bytes.resize_with(words, || UserdataWord(Cell::new([0; 16])));
+        let mut uservalues = Vec::new();
+        let uservalues_ticket = match reserve_vec(
+            ledger,
+            &mut uservalues,
+            uservalue_count,
+            FailPoint::UserdataUservaluesReserve,
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                drop(uservalues);
+                drop(bytes);
+                drop(bytes_ticket);
+                return Err(error);
+            }
+        };
+        uservalues.resize(uservalue_count, Value::Nil);
+        let bytes_owner = bytes_ticket.commit_charge()?;
+        let uservalues_owner = uservalues_ticket.commit_charge()?;
+        Ok(Self {
+            bytes,
+            requested_len: size,
+            bytes_charge,
+            bytes_owner: Some(bytes_owner),
+            uservalues,
+            uservalues_charge,
+            uservalues_owner: Some(uservalues_owner),
+            metatable: None,
+        })
+    }
+
+    fn charge_bytes(&self) -> Result<usize, VmError> {
+        self.bytes_charge
+            .checked_add(self.uservalues_charge)
+            .ok_or(VmError::ArithmeticOverflow)
+    }
+
+    fn ptr(&self) -> *mut u8 {
+        self.bytes[0].0.as_ptr().cast::<u8>()
+    }
+}
+
 /// 單一 payload 的穩定儲存；Vec 的預留可失敗且以 Lua heap 帳本計費。
 /// 長度自建構起固定為一，移動 slot 時只搬移 Vec header。
 struct IndirectPayload<T> {
     storage: Vec<T>,
-    ledger: AllocationLedger,
     charge: usize,
+    _owner: AllocationCharge,
 }
 
 impl<T> IndirectPayload<T> {
@@ -713,16 +1203,12 @@ impl<T> IndirectPayload<T> {
         let mut storage = Vec::new();
         let ticket = reserve_vec(ledger, &mut storage, 1, FailPoint::ObjectReserve)?;
         storage.push(value);
-        ticket.commit()?;
+        let owner = ticket.commit_charge()?;
         Ok(Self {
             storage,
-            ledger: ledger.clone(),
             charge: size_of::<T>(),
+            _owner: owner,
         })
-    }
-
-    fn disarm_refund(&mut self) {
-        self.charge = 0;
     }
 }
 
@@ -737,14 +1223,6 @@ impl<T> Deref for IndirectPayload<T> {
 impl<T> DerefMut for IndirectPayload<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.storage[0]
-    }
-}
-
-impl<T> Drop for IndirectPayload<T> {
-    fn drop(&mut self) {
-        if self.charge != 0 {
-            self.ledger.refund_lua_on_drop(self.charge);
-        }
     }
 }
 
@@ -767,15 +1245,16 @@ struct ModulePayload {
     constant_offsets: Vec<usize>,
     constant_children: Vec<usize>,
     constant_charge: usize,
-    ledger: AllocationLedger,
-    host_charge: usize,
+    _offsets_owner: Option<AllocationCharge>,
+    _children_owner: Option<AllocationCharge>,
+    _host_charges: AllocationCharges,
 }
 
 impl ModulePayload {
     fn new(
         module: VerifiedModule,
         ledger: &AllocationLedger,
-        host_charge: usize,
+        host_charges: AllocationCharges,
     ) -> Result<Self, VmError> {
         // 先讓 payload 擁有 host_charge；後續任一預留失敗均由 Drop 退款。
         let mut payload = Self {
@@ -783,8 +1262,9 @@ impl ModulePayload {
             constant_offsets: Vec::new(),
             constant_children: Vec::new(),
             constant_charge: 0,
-            ledger: ledger.clone(),
-            host_charge,
+            _offsets_owner: None,
+            _children_owner: None,
+            _host_charges: host_charges,
         };
         let prototypes = &payload.module.module().prototypes;
         if !prototypes.iter().any(|prototype| {
@@ -824,7 +1304,7 @@ impl ModulePayload {
             next += prototype.constants.len();
             payload.constant_offsets.push(next);
         }
-        ticket.commit()?;
+        payload._offsets_owner = Some(ticket.commit_charge()?);
         payload.constant_charge = offset_bytes;
         let ticket = reserve_vec(
             ledger,
@@ -833,7 +1313,7 @@ impl ModulePayload {
             FailPoint::ModuleConstantsReserve,
         )?;
         payload.constant_children.resize(constant_count, usize::MAX);
-        ticket.commit()?;
+        payload._children_owner = Some(ticket.commit_charge()?);
         payload.constant_charge += constant_bytes;
         Ok(payload)
     }
@@ -858,18 +1338,6 @@ impl ModulePayload {
     }
 }
 
-impl Drop for ModulePayload {
-    fn drop(&mut self) {
-        if self.constant_charge != 0 {
-            self.ledger.refund_lua_on_drop(self.constant_charge);
-            self.constant_charge = 0;
-        }
-        if self.host_charge != 0 {
-            self.ledger.refund_on_drop(self.host_charge);
-        }
-    }
-}
-
 pub(crate) fn module_allocation_bytes(module: &VerifiedModule) -> Result<usize, VmError> {
     // VerifiedModule 的固定儲存由間接 payload 計入 Lua heap；Core 持有巢狀容量算法。
     let retained = rivetlua_core::verified_module_allocation_bytes(module)
@@ -882,10 +1350,12 @@ pub(crate) fn module_allocation_bytes(module: &VerifiedModule) -> Result<usize, 
 impl HeapObject {
     fn debt_bytes(&self) -> Result<usize, VmError> {
         let payload = match &self.payload {
-            HeapPayload::ByteString(string) => string.len(),
+            HeapPayload::ByteString(string) => string.managed_payload_len(),
             HeapPayload::Table(table) => table.charge_bytes()?,
+            HeapPayload::Userdata(userdata) => userdata.charge_bytes()?,
             HeapPayload::Value(_)
             | HeapPayload::Closure(_)
+            | HeapPayload::CClosure(_)
             | HeapPayload::Builtin(_)
             | HeapPayload::Upvalue(_) => 0,
             HeapPayload::Coroutine(coroutine) => coroutine.charge,
@@ -907,11 +1377,27 @@ impl HeapObject {
         match &self.payload {
             HeapPayload::Value(Value::Object(child)) => visit(*child)?,
             HeapPayload::Value(
-                Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Float(_),
+                Value::Nil
+                | Value::Boolean(_)
+                | Value::Integer(_)
+                | Value::Float(_)
+                | Value::LightUserdata(_)
+                | Value::CFunction(_),
             ) => {}
             HeapPayload::ByteString(_) => {}
             HeapPayload::Table(table) => table.trace_children(&mut visit)?,
+            HeapPayload::Userdata(userdata) => {
+                if let Some(metatable) = userdata.metatable {
+                    visit(metatable)?;
+                }
+                for &value in &userdata.uservalues {
+                    if let Value::Object(child) = value {
+                        visit(child)?;
+                    }
+                }
+            }
             HeapPayload::Closure(closure) => closure.trace_children(&mut visit)?,
+            HeapPayload::CClosure(closure) => closure.trace_children(&mut visit)?,
             HeapPayload::Builtin(Builtin::CoroutineWrapped(coroutine)) => visit(*coroutine)?,
             HeapPayload::Builtin(Builtin::Utf8(Utf8Builtin::Codes { strict, lax })) => {
                 visit(*strict)?;
@@ -1029,6 +1515,7 @@ enum Slot {
         finalizer_remarked: bool,
         // 唯一元素不再增減；Vec 只搬移指標，中間的物件配置維持原址。
         object: Vec<HeapObject>,
+        object_charge: crate::alloc::AllocationCharge,
     },
     Free {
         generation: Generation,
@@ -1115,21 +1602,29 @@ pub struct Vm {
     id: VmId,
     profile: LuaProfile,
     slots: Vec<Slot>,
+    slot_charges: Vec<crate::alloc::AllocationCharge>,
     roots: RootSet,
     ledger: AllocationLedger,
     gc: GcState,
     collect_every_allocation: bool,
     finalizer_queue: Vec<FinalizerEntry>,
     finalizer_queue_charge: usize,
+    finalizer_queue_charges: AllocationCharges,
     finalizer_next_order: u64,
     finalizer_warnings: usize,
     finalizer_deferred_terminals: usize,
     finalizer_running: bool,
     execution_running: bool,
+    gc_control_collecting: bool,
+    pub(crate) parked_executions: Vec<crate::vm::ParkedExecution>,
+    pub(crate) parked_charge: usize,
+    pub(crate) parked_charge_owners: AllocationCharges,
+    pub(crate) parked_next_generation: u64,
     host_services: HostServices,
     math_rng: Option<[u64; 4]>,
     table_sort_trace: crate::stdlib::table::TableSortTrace,
     string_metatable: Option<(ObjectRef, RootId)>,
+    primitive_metatables: [Option<(ObjectRef, RootId)>; 6],
     package_registry: Option<PackageRegistry>,
     io_registry: Option<(ObjectRef, RootId)>,
     debug_registry: Option<(ObjectRef, RootId)>,
@@ -1137,12 +1632,61 @@ pub struct Vm {
     debug_hook_running: bool,
     callbacks: Vec<Option<CallbackEntry>>,
     callbacks_charge: usize,
+    callbacks_charge_owner: AllocationCharges,
+}
+
+#[derive(Clone, Copy)]
+enum ValueMetatableTarget {
+    Instance(ObjectRef),
+    String,
+    Primitive(usize),
+}
+
+pub(crate) struct AutomaticGcDeferral {
+    running: bool,
+    debt_bytes: usize,
+    major_debt_bytes: usize,
+}
+
+/// 宿主配置的預留票據；尚未提交時依既有 `Reservation` 規則自動回滾。
+pub struct HostAllocationReservation {
+    ticket: crate::alloc::Reservation,
+}
+
+impl HostAllocationReservation {
+    /// 實體 Rust 配置失敗時記錄原票據的配置點；丟棄票據即回滾預留。
+    pub fn rust_reserve_failure(&self) -> VmError {
+        self.ticket.rust_reserve_failure()
+    }
+
+    /// 配置成功後才提交；回傳的所有權票據在丟棄時精確退費。
+    pub fn commit(self) -> Result<HostAllocationCharge, VmError> {
+        let charge = self.ticket.commit_charge()?;
+        Ok(HostAllocationCharge { charge })
+    }
+
+    /// C API compiler／binary admission 將預付 retained 配額交給模組 owner。
+    #[doc(hidden)]
+    pub fn commit_module_charge(self) -> Result<AllocationCharge, VmError> {
+        self.ticket.commit_charge()
+    }
+}
+
+/// 僅代表宿主配置帳面費用，不持有 VM 或 heap borrow。
+pub struct HostAllocationCharge {
+    charge: crate::alloc::AllocationCharge,
+}
+
+impl HostAllocationCharge {
+    pub fn bytes(&self) -> usize {
+        self.charge.bytes()
+    }
 }
 
 struct CallbackEntry {
     callback: std::rc::Rc<CallbackFn>,
     captures: Vec<Value>,
-    charge: usize,
+    _capture_charges: AllocationCharges,
 }
 
 #[derive(Clone, Copy)]
@@ -1182,27 +1726,54 @@ impl Vm {
         profile: LuaProfile,
         host_services: HostServices,
     ) -> Result<Self, VmError> {
+        Self::new_with_ledger(profile, host_services, AllocationLedger::new(usize::MAX))
+    }
+
+    /// C state 在第一筆 VM 邏輯配置前安裝宿主 admission 橋接。
+    pub fn new_with_profile_and_admission(
+        profile: LuaProfile,
+        admission: std::rc::Rc<dyn crate::alloc::AllocationAdmission>,
+    ) -> Result<Self, VmError> {
+        Self::new_with_ledger(
+            profile,
+            HostServices::deny_all(),
+            AllocationLedger::with_admission(usize::MAX, admission),
+        )
+    }
+
+    fn new_with_ledger(
+        profile: LuaProfile,
+        host_services: HostServices,
+        ledger: AllocationLedger,
+    ) -> Result<Self, VmError> {
         let id = VmId::new_unique().ok_or(VmError::VmIdExhausted)?;
-        let ledger = AllocationLedger::new(usize::MAX);
         Ok(Self {
             id,
             profile,
             slots: Vec::new(),
+            slot_charges: Vec::new(),
             roots: RootSet::new(id),
-            gc: GcState::new(ledger.clone()),
+            gc: GcState::new(profile, ledger.clone()),
             ledger,
             collect_every_allocation: false,
             finalizer_queue: Vec::new(),
             finalizer_queue_charge: 0,
+            finalizer_queue_charges: AllocationCharges::new(),
             finalizer_next_order: 1,
             finalizer_warnings: 0,
             finalizer_deferred_terminals: 0,
             finalizer_running: false,
             execution_running: false,
+            gc_control_collecting: false,
+            parked_executions: Vec::new(),
+            parked_charge: 0,
+            parked_charge_owners: AllocationCharges::new(),
+            parked_next_generation: 1,
             host_services,
             math_rng: None,
             table_sort_trace: crate::stdlib::table::TableSortTrace::default(),
             string_metatable: None,
+            primitive_metatables: [None; 6],
             package_registry: None,
             io_registry: None,
             debug_registry: None,
@@ -1210,6 +1781,7 @@ impl Vm {
             debug_hook_running: false,
             callbacks: Vec::new(),
             callbacks_charge: 0,
+            callbacks_charge_owner: AllocationCharges::new(),
         })
     }
 
@@ -1538,6 +2110,33 @@ impl Vm {
         self.host_services.load.verify_limits
     }
 
+    /// C API 特權載入沿用同一 VM 的既有資源與驗證上限，不讀 guest policy 開關。
+    #[doc(hidden)]
+    pub fn capi_load_limits(&self) -> LoadLimits {
+        self.host_services.load.limits
+    }
+
+    /// 宿主在 VM 閒置時調整 C 載入的既有資源上限；不變更 guest 載入權限。
+    #[doc(hidden)]
+    pub fn capi_configure_load_limits(&mut self, limits: LoadLimits) -> Result<(), VmError> {
+        if self.execution_running || self.finalizer_running || !self.parked_executions.is_empty() {
+            return Err(VmError::HostConfigurationBusy);
+        }
+        self.host_services.load.limits = limits;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn capi_load_verify_limits(&self) -> rivetlua_core::VerifyLimits {
+        self.host_services.load.verify_limits
+    }
+
+    /// C API 特權輸出沿用同一 VM 的既有上限，不改 guest string.dump 權限。
+    #[doc(hidden)]
+    pub fn capi_dump_limits(&self) -> DumpLimits {
+        self.host_services.dump.limits
+    }
+
     pub(crate) fn load_allows_bytecode(&self) -> bool {
         self.host_services.load.allow_bytecode
     }
@@ -1700,6 +2299,16 @@ impl Vm {
         self.ledger.snapshot()
     }
 
+    /// 為 C API overlay 等宿主配置預留同一 VM 的帳本費用；不借出帳本本體。
+    pub fn reserve_host_allocation(
+        &self,
+        bytes: usize,
+    ) -> Result<HostAllocationReservation, VmError> {
+        Ok(HostAllocationReservation {
+            ticket: self.ledger.reserve(bytes)?,
+        })
+    }
+
     pub fn ledger_probe(&self) -> LedgerProbe {
         self.ledger.probe()
     }
@@ -1769,6 +2378,89 @@ impl Vm {
 
     pub fn gc_mode(&self) -> GcMode {
         self.gc.mode
+    }
+
+    /// 僅供同步 C 控制器決定是否需建立 finalizer execution。
+    pub fn gc_finalizers_pending(&self) -> bool {
+        !self.finalizer_queue.is_empty()
+    }
+
+    fn shutdown_registered_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot,
+                    Slot::Occupied {
+                        finalizer: FinalizerState::Registered,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// 在 main TBC callback 前只預備佇列容量，不提早執行 finalizer。
+    pub fn preflight_shutdown_finalizers(&mut self) -> Result<(), VmError> {
+        if self.execution_running() || self.finalizer_running() {
+            return Err(VmError::FinalizerGcReentry);
+        }
+        let candidates = self.shutdown_registered_count();
+        if candidates == 0 {
+            return Ok(());
+        }
+        let needed_entries = self
+            .finalizer_queue
+            .len()
+            .checked_add(candidates)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let charged_entries = self.finalizer_queue_charge / size_of::<FinalizerEntry>();
+        if charged_entries >= needed_entries && self.finalizer_queue.capacity() >= needed_entries {
+            return Ok(());
+        }
+        let uncharged = needed_entries.saturating_sub(charged_entries);
+        let charge = checked_bytes(uncharged, size_of::<FinalizerEntry>())?;
+        let next_charge = self
+            .finalizer_queue_charge
+            .checked_add(charge)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        self.finalizer_queue_charges.try_reserve(1)?;
+        let ticket = reserve_vec(
+            &self.ledger,
+            &mut self.finalizer_queue,
+            candidates,
+            FailPoint::WorkReserve,
+        )?;
+        let new_charge = ticket.commit_charge()?;
+        self.finalizer_queue_charges.push_prepared(new_charge);
+        self.finalizer_queue_charge = next_charge;
+        Ok(())
+    }
+
+    /// 關閉 VM 前將所有已註冊 finalizer 排入既有佇列；配置失敗不改變註冊狀態。
+    pub fn queue_shutdown_finalizers(&mut self) -> Result<(), VmError> {
+        self.preflight_shutdown_finalizers()?;
+        for slot in &mut self.slots {
+            let Slot::Occupied {
+                reference,
+                finalizer,
+                finalizer_order,
+                ..
+            } = slot
+            else {
+                continue;
+            };
+            if *finalizer == FinalizerState::Registered {
+                *finalizer = FinalizerState::Pending;
+                self.finalizer_queue.push(FinalizerEntry {
+                    object: *reference,
+                    order: *finalizer_order,
+                });
+            }
+        }
+        self.finalizer_queue
+            .sort_unstable_by_key(|entry| entry.order);
+        Ok(())
     }
 
     pub fn gc_age(&self, object: ObjectRef) -> Result<GcAge, VmError> {
@@ -1926,7 +2618,7 @@ impl Vm {
         self.finalizer_running = false;
         if self.finalizer_queue.is_empty() {
             self.finalizer_queue = Vec::new();
-            self.ledger.refund(self.finalizer_queue_charge)?;
+            self.finalizer_queue_charges = AllocationCharges::new();
             self.finalizer_queue_charge = 0;
         }
         Ok(())
@@ -1940,11 +2632,13 @@ impl Vm {
         self.finalizer_deferred_terminals += 1;
     }
 
-    pub(crate) fn execution_running(&self) -> bool {
+    #[doc(hidden)]
+    pub fn execution_running(&self) -> bool {
         self.execution_running
     }
 
-    pub(crate) fn finalizer_running(&self) -> bool {
+    #[doc(hidden)]
+    pub fn finalizer_running(&self) -> bool {
         self.finalizer_running
     }
 
@@ -1952,8 +2646,45 @@ impl Vm {
         self.gc.automatic_running
     }
 
+    /// C adapter 將剛返回的多個值全部建成 stack roots 期間，暫緩自動 GC。
+    /// 原有模式與 debt 在正常返回及 panic 後都會恢復。
+    pub fn with_host_result_rooting<R>(&mut self, action: impl FnOnce(&mut Vm) -> R) -> R {
+        let automatic_running = self.gc.automatic_running;
+        self.gc.automatic_running = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self)));
+        self.gc.automatic_running = automatic_running;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     pub(crate) fn stop_automatic_gc(&mut self) {
         self.gc.automatic_running = false;
+    }
+
+    /// 未發布的多配置交易暫緩自動步進；失敗須回復原 debt。
+    /// 與 `prepare_unpublished_c_closure` 一致，成功保留 debt，下一安全配置點再步進。
+    pub(crate) fn defer_automatic_gc(&mut self) -> AutomaticGcDeferral {
+        let state = AutomaticGcDeferral {
+            running: self.gc.automatic_running,
+            debt_bytes: self.gc.debt_bytes,
+            major_debt_bytes: self.gc.major_debt_bytes,
+        };
+        self.gc.automatic_running = false;
+        state
+    }
+
+    pub(crate) fn finish_deferred_automatic_gc(
+        &mut self,
+        state: AutomaticGcDeferral,
+        committed: bool,
+    ) {
+        if !committed {
+            self.gc.debt_bytes = state.debt_bytes;
+            self.gc.major_debt_bytes = state.major_debt_bytes;
+        }
+        self.gc.automatic_running = state.running;
     }
 
     pub(crate) fn restart_automatic_gc(&mut self) {
@@ -1966,15 +2697,228 @@ impl Vm {
             GcParameter::Pause => self.gc.pause_code,
             GcParameter::StepMultiplier => self.gc.stepmul_code,
         };
-        GcState::apply_param(code)
+        self.decode_gc_percent(code)
     }
 
     pub(crate) fn set_gc_param(&mut self, parameter: GcParameter, value: i64) {
-        let code = GcState::code_param(value);
+        let code = self.encode_gc_percent(value);
         match parameter {
             GcParameter::Pause => self.gc.pause_code = code,
             GcParameter::StepMultiplier => self.gc.stepmul_code = code,
         }
+    }
+
+    fn encode_gc_percent(&self, value: i64) -> u8 {
+        match self.profile {
+            LuaProfile::Lua54 => ((value as i32) / 4) as u8,
+            LuaProfile::Lua55 => GcState::code_param(value),
+        }
+    }
+
+    fn decode_gc_percent(&self, code: u8) -> usize {
+        match self.profile {
+            LuaProfile::Lua54 => usize::from(code) * 4,
+            LuaProfile::Lua55 => GcState::apply_param(code),
+        }
+    }
+
+    fn gc_step_size_bytes(&self) -> usize {
+        match self.profile {
+            LuaProfile::Lua54 => 1usize
+                .checked_shl(u32::from(self.gc.stepsize_exponent))
+                .unwrap_or(usize::MAX),
+            LuaProfile::Lua55 => GcState::apply_param(self.gc.stepsize_code),
+        }
+    }
+
+    /// `lua_gc` 的型別化核心；會完成 cycle 的要求暫緩 direct-host finalizer。
+    /// 呼叫端須再以 `gc_finalizer_execution` 同步處理佇列，才能返回 C。
+    pub fn gc_control(&mut self, control: GcControl) -> Result<GcControlResult, VmError> {
+        if self.finalizer_running {
+            return Err(VmError::FinalizerGcReentry);
+        }
+        let value = match control {
+            GcControl::Stop => {
+                self.stop_automatic_gc();
+                0
+            }
+            GcControl::Restart => {
+                self.restart_automatic_gc();
+                0
+            }
+            GcControl::Collect => {
+                self.with_gc_control_collection(|vm| vm.collect())?;
+                0
+            }
+            GcControl::Count => (self.ledger.snapshot().committed / 1024) as i32,
+            GcControl::CountBytes => (self.ledger.snapshot().committed % 1024) as i32,
+            GcControl::Step(bytes) => {
+                let bytes = if bytes == 0 {
+                    self.gc_step_size_bytes().max(1)
+                } else {
+                    bytes
+                };
+                let done =
+                    self.with_gc_control_collection(|vm| vm.explicit_gc_step_bytes(bytes))?;
+                i32::from(done)
+            }
+            GcControl::SetPause(value) if self.profile == LuaProfile::Lua54 => {
+                let old = self.gc_param(GcParameter::Pause) as i32;
+                self.set_gc_param(GcParameter::Pause, i64::from(value));
+                old
+            }
+            GcControl::SetStepMultiplier(value) if self.profile == LuaProfile::Lua54 => {
+                let old = self.gc_param(GcParameter::StepMultiplier) as i32;
+                self.set_gc_param(GcParameter::StepMultiplier, i64::from(value));
+                old
+            }
+            GcControl::IsRunning => i32::from(self.gc.automatic_running),
+            GcControl::Generational {
+                minor_mul,
+                minor_major,
+            } => {
+                let old = self.gc_mode_command();
+                let entering = self.gc.mode == GcMode::Incremental;
+                if self.profile == LuaProfile::Lua54 {
+                    if minor_mul != 0 {
+                        self.gc.minor_mul_code = minor_mul as u8;
+                    }
+                    if minor_major != 0 {
+                        self.gc.minor_major_code = self.encode_gc_percent(i64::from(minor_major));
+                        self.refresh_major_threshold();
+                    }
+                }
+                self.with_gc_control_collection(|vm| vm.finish_gc_cycle_for_mode())?;
+                self.set_gc_mode(GcMode::Generational)?;
+                self.gc.major_followup = false;
+                if entering {
+                    self.gc.last_major_lua_heap_bytes = self.ledger.snapshot().lua_heap_bytes;
+                    self.refresh_major_threshold();
+                }
+                if entering || self.profile == LuaProfile::Lua54 && minor_mul != 0 {
+                    self.refresh_minor_debt_threshold();
+                }
+                old
+            }
+            GcControl::Incremental {
+                pause,
+                step_mul,
+                step_size,
+            } => {
+                let old = self.gc_mode_command();
+                if self.profile == LuaProfile::Lua54 {
+                    if pause != 0 {
+                        self.set_gc_param(GcParameter::Pause, i64::from(pause));
+                    }
+                    if step_mul != 0 {
+                        self.set_gc_param(GcParameter::StepMultiplier, i64::from(step_mul));
+                    }
+                    if step_size != 0 {
+                        self.gc.stepsize_exponent = step_size as u8;
+                    }
+                }
+                self.with_gc_control_collection(|vm| vm.finish_gc_cycle_for_mode())?;
+                self.set_gc_mode(GcMode::Incremental)?;
+                old
+            }
+            GcControl::Parameter { index, value } if self.profile == LuaProfile::Lua55 => {
+                let code = match index {
+                    0 => &mut self.gc.minor_mul_code,
+                    1 => &mut self.gc.major_minor_code,
+                    2 => &mut self.gc.minor_major_code,
+                    3 => &mut self.gc.pause_code,
+                    4 => &mut self.gc.stepmul_code,
+                    5 => &mut self.gc.stepsize_code,
+                    _ => return Err(VmError::InvalidGcConfig),
+                };
+                let old = GcState::apply_param(*code) as i32;
+                if value >= 0 {
+                    *code = GcState::code_param(i64::from(value));
+                }
+                if index == 2 && value >= 0 {
+                    self.refresh_major_threshold();
+                }
+                old
+            }
+            _ => return Err(VmError::InvalidGcConfig),
+        };
+        Ok(GcControlResult::Integer(value))
+    }
+
+    fn gc_mode_command(&self) -> i32 {
+        match (self.profile, self.gc.mode) {
+            (LuaProfile::Lua54, GcMode::Generational) => 10,
+            (LuaProfile::Lua54, GcMode::Incremental) => 11,
+            (LuaProfile::Lua55, GcMode::Generational) => 7,
+            (LuaProfile::Lua55, GcMode::Incremental) => 8,
+        }
+    }
+
+    fn gc_minor_mul_percent(&self) -> usize {
+        match self.profile {
+            LuaProfile::Lua54 => usize::from(self.gc.minor_mul_code),
+            LuaProfile::Lua55 => GcState::apply_param(self.gc.minor_mul_code),
+        }
+    }
+
+    fn gc_minor_major_percent(&self) -> usize {
+        match self.profile {
+            LuaProfile::Lua54 => usize::from(self.gc.minor_major_code) * 4,
+            LuaProfile::Lua55 => GcState::apply_param(self.gc.minor_major_code),
+        }
+    }
+
+    fn refresh_major_threshold(&mut self) {
+        if self.gc.major_threshold_override {
+            return;
+        }
+        let percent = self.gc_minor_major_percent();
+        self.gc.major_threshold_bytes = if percent == 0 {
+            usize::MAX
+        } else {
+            self.gc
+                .last_major_lua_heap_bytes
+                .saturating_mul(percent)
+                .saturating_div(100)
+                .max(1)
+        };
+    }
+
+    fn refresh_minor_debt_threshold(&mut self) {
+        if self.gc.debt_threshold_override.is_none() {
+            self.gc.debt_threshold = self
+                .gc
+                .last_major_lua_heap_bytes
+                .saturating_mul(self.gc_minor_mul_percent())
+                .saturating_div(100)
+                .max(1);
+        }
+    }
+
+    fn with_gc_control_collection<R>(&mut self, action: impl FnOnce(&mut Vm) -> R) -> R {
+        let previous = self.gc_control_collecting;
+        self.gc_control_collecting = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self)));
+        self.gc_control_collecting = previous;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn finish_gc_cycle_for_mode(&mut self) -> Result<(), VmError> {
+        while self.gc.phase != GcPhase::Pause {
+            self.incremental_step(1024)?;
+        }
+        Ok(())
+    }
+
+    fn explicit_gc_step_bytes(&mut self, bytes: usize) -> Result<bool, VmError> {
+        let bytes = if bytes == 0 { 1024 } else { bytes };
+        let multiplier = self.decode_gc_percent(self.gc.stepmul_code);
+        let trace = self.incremental_step(Self::scaled_gc_work(bytes, multiplier))?;
+        Ok(trace.phase == GcPhase::Pause
+            && matches!(trace.cycle, GcCycleKind::Full | GcCycleKind::Major))
     }
 
     pub(crate) fn explicit_gc_step(&mut self, size: i64) -> Result<bool, VmError> {
@@ -1987,11 +2931,7 @@ impl Vm {
                 LuaProfile::Lua55 => positive,
             }
         };
-        let multiplier = GcState::apply_param(self.gc.stepmul_code);
-        let work = Self::scaled_gc_work(bytes, multiplier);
-        let trace = self.incremental_step(work)?;
-        Ok(trace.phase == GcPhase::Pause
-            && matches!(trace.cycle, GcCycleKind::Full | GcCycleKind::Major))
+        self.explicit_gc_step_bytes(bytes)
     }
 
     fn scaled_gc_work(bytes: usize, multiplier: usize) -> usize {
@@ -2044,6 +2984,7 @@ impl Vm {
             return Err(VmError::WrongGcPhase);
         }
         self.gc.major_threshold_bytes = bytes;
+        self.gc.major_threshold_override = true;
         Ok(())
     }
 
@@ -2152,9 +3093,9 @@ impl Vm {
                                     || self.gc_age(*reference)? != GcAge::Old)
                             {
                                 let reference = *reference;
-                                let before = self.ledger.snapshot().committed;
+                                let before = self.ledger.snapshot().lua_heap_bytes;
                                 self.reclaim(reference)?;
-                                let after = self.ledger.snapshot().committed;
+                                let after = self.ledger.snapshot().lua_heap_bytes;
                                 self.gc.reclaimed_bytes += before.saturating_sub(after);
                                 self.gc.reclaimed_objects += 1;
                             }
@@ -2163,10 +3104,30 @@ impl Vm {
                     } else {
                         self.roots.compact();
                         self.promote_gc_survivors();
+                        if self.gc.mode == GcMode::Generational {
+                            if self.gc.cycle == GcCycleKind::Major {
+                                let reclaimed = self
+                                    .gc
+                                    .reclaimed_bytes
+                                    .saturating_sub(self.gc.cycle_start_reclaimed);
+                                let added = self
+                                    .gc
+                                    .cycle_start_lua_heap_bytes
+                                    .saturating_sub(self.gc.last_major_lua_heap_bytes);
+                                let required = added
+                                    .saturating_mul(GcState::apply_param(self.gc.major_minor_code))
+                                    / 100;
+                                self.gc.major_followup = required != 0 && reclaimed < required;
+                                self.gc.last_major_lua_heap_bytes =
+                                    self.ledger.snapshot().lua_heap_bytes;
+                                self.refresh_major_threshold();
+                                self.refresh_minor_debt_threshold();
+                            }
+                        }
                         self.gc.clear_cycle()?;
                         if self.gc.mode == GcMode::Incremental {
                             let live = self.ledger.snapshot().lua_heap_bytes;
-                            let pause = GcState::apply_param(self.gc.pause_code);
+                            let pause = self.decode_gc_percent(self.gc.pause_code);
                             self.gc.incremental_debt_threshold =
                                 (live.saturating_mul(pause.saturating_sub(100)) / 100).max(1);
                         }
@@ -2174,7 +3135,8 @@ impl Vm {
                 }
             }
         }
-        if self.gc.phase == GcPhase::Pause && !self.execution_running {
+        if self.gc.phase == GcPhase::Pause && !self.execution_running && !self.gc_control_collecting
+        {
             self.run_pending_finalizers()?;
         }
         Ok(self.gc_trace())
@@ -2188,7 +3150,10 @@ impl Vm {
     pub(crate) fn begin_gc_cycle(&mut self) -> Result<(), VmError> {
         let kind = match self.gc.mode {
             GcMode::Incremental => GcCycleKind::Full,
-            GcMode::Generational if self.gc.major_debt_bytes >= self.gc.major_threshold_bytes => {
+            GcMode::Generational
+                if self.gc.major_followup
+                    || self.gc.major_debt_bytes >= self.gc.major_threshold_bytes =>
+            {
                 GcCycleKind::Major
             }
             GcMode::Generational => GcCycleKind::Minor,
@@ -2254,18 +3219,15 @@ impl Vm {
             .checked_add(work_bytes)
             .and_then(|bytes| bytes.checked_add(root_bytes))
             .ok_or(VmError::ArithmeticOverflow)?;
-        mark_ticket.commit()?;
-        if let Err(error) = work_ticket.commit() {
-            self.ledger.refund(mark_bytes)?;
-            return Err(error);
-        }
-        if let Err(error) = root_ticket.commit() {
-            self.ledger.refund(mark_bytes + work_bytes)?;
-            return Err(error);
-        }
+        let mut cycle_charges = AllocationCharges::new();
+        cycle_charges.try_reserve(3)?;
+        cycle_charges.push_prepared(mark_ticket.commit_charge()?);
+        cycle_charges.push_prepared(work_ticket.commit_charge()?);
+        cycle_charges.push_prepared(root_ticket.commit_charge()?);
         self.gc.colors = colors;
         self.gc.work = work;
         self.gc.roots = roots;
+        self.gc.cycle_charges = cycle_charges;
         self.gc.root_cursor = 0;
         self.gc.remembered_cursor = 0;
         self.gc.sweep_cursor = 0;
@@ -2276,6 +3238,8 @@ impl Vm {
         self.gc.weak_cleared_pairs = 0;
         self.gc.atomic_finalizer_stage = AtomicFinalizerStage::BeforeWeakValues;
         self.gc.charge = charge;
+        self.gc.cycle_start_lua_heap_bytes = self.ledger.snapshot().lua_heap_bytes;
+        self.gc.cycle_start_reclaimed = self.gc.reclaimed_bytes;
         self.gc.cycle = kind;
         self.gc.transition(GcPhase::RootMark);
         Ok(())
@@ -2507,13 +3471,15 @@ impl Vm {
             .finalizer_queue_charge
             .checked_add(charge)
             .ok_or(VmError::ArithmeticOverflow)?;
+        self.finalizer_queue_charges.try_reserve(1)?;
         let ticket = reserve_vec(
             &self.ledger,
             &mut self.finalizer_queue,
             candidates,
             FailPoint::WorkReserve,
         )?;
-        ticket.commit()?;
+        let new_charge = ticket.commit_charge()?;
+        self.finalizer_queue_charges.push_prepared(new_charge);
         self.finalizer_queue_charge = next_charge;
         Ok(())
     }
@@ -2631,7 +3597,22 @@ impl Vm {
             return Ok(true);
         }
         let mut next = Vec::new();
-        let ticket = reserve_vec(&self.ledger, &mut next, count, FailPoint::RememberedReserve)?;
+        let next_bytes = checked_bytes(count, size_of::<ObjectRef>())?;
+        let mut replacement_charges = AllocationCharges::new();
+        let replacement_ticket = if next_bytes > self.gc.remembered_charge {
+            replacement_charges.try_reserve(1)?;
+            Some(reserve_vec(
+                &self.ledger,
+                &mut next,
+                count,
+                FailPoint::RememberedReserve,
+            )?)
+        } else {
+            self.ledger.checkpoint(FailPoint::RememberedReserve)?;
+            next.try_reserve_exact(count)
+                .map_err(|_| VmError::AllocationFailed)?;
+            None
+        };
         for index in 0..self.slots.len() {
             if self.future_gc_age_at(index)? != Some(GcAge::Old) {
                 continue;
@@ -2643,11 +3624,20 @@ impl Vm {
                 next.push(*reference);
             }
         }
-        let charge = checked_bytes(count, size_of::<ObjectRef>())?;
-        self.gc.clear_remembered()?;
-        ticket.commit()?;
-        self.gc.remembered = next;
-        self.gc.remembered_charge = charge;
+        if let Some(ticket) = replacement_ticket {
+            let charge = ticket.commit_charge()?;
+            replacement_charges.push_prepared(charge);
+            let old = core::mem::replace(&mut self.gc.remembered, next);
+            drop(old);
+            self.gc.remembered_charges = replacement_charges;
+        } else {
+            let prepared = self.gc.remembered_charges.prepare_normalize(next_bytes)?;
+            let old = core::mem::replace(&mut self.gc.remembered, next);
+            drop(old);
+            self.gc.remembered_charges = self.gc.remembered_charges.commit_normalize(prepared);
+        }
+        self.gc.remembered_charge = next_bytes;
+        self.gc.remembered_cursor = 0;
         Ok(true)
     }
 
@@ -2680,15 +3670,17 @@ impl Vm {
             .remembered_charge
             .checked_add(size_of::<ObjectRef>())
             .ok_or(VmError::ArithmeticOverflow)?;
+        self.gc.remembered_charges.try_reserve(1)?;
         let ticket = reserve_vec(
             &self.ledger,
             &mut self.gc.remembered,
             1,
             FailPoint::RememberedReserve,
         )?;
-        ticket.commit()?;
+        let charge = ticket.commit_charge()?;
         self.gc.remembered.push(owner);
         self.gc.remembered_charge = next_charge;
+        self.gc.remembered_charges.push_prepared(charge);
         Ok(())
     }
 
@@ -2711,8 +3703,13 @@ impl Vm {
 
     pub fn add_root(&mut self, kind: RootKind, object: ObjectRef) -> Result<RootId, VmError> {
         self.checked_slot(object)?;
-        self.mark_gc_object(object)?;
-        self.roots.add(&self.ledger, kind, object)
+        // RootReserve 與 Vec 配置先完成，失敗不可改變 active GC 的三色狀態。
+        let root = self.roots.add(&self.ledger, kind, object)?;
+        if let Err(error) = self.mark_gc_object(object) {
+            self.roots.remove(&self.ledger, root)?;
+            return Err(error);
+        }
+        Ok(root)
     }
 
     pub fn remove_root(&mut self, root: RootId) -> Result<ObjectRef, VmError> {
@@ -2724,35 +3721,658 @@ impl Vm {
         object: ObjectRef,
     ) -> Result<(RootId, RootLease), VmError> {
         self.checked_slot(object)?;
-        self.mark_gc_object(object)?;
-        self.roots.add_host(&self.ledger, object)
+        // HostLease 亦須在標記前建立；標記失敗則撤銷 lease 與帳款。
+        let (root, lease) = self.roots.add_host(&self.ledger, object)?;
+        if let Err(error) = self.mark_gc_object(object) {
+            self.roots.remove(&self.ledger, root)?;
+            return Err(error);
+        }
+        Ok((root, lease))
     }
 
     pub fn allocate(&mut self, value: Value) -> Result<ObjectRef, VmError> {
         if let Value::Object(child) = value {
             self.checked_slot(child)?;
+        } else if let Value::CFunction(id) = value {
+            if id.vm() != self.id {
+                return Err(VmError::WrongVm);
+            }
         }
         self.allocate_payload(HeapPayload::Value(value))
+    }
+
+    /// 供宿主 C stack 執行無 metamethod 的原始相等比較；先驗證所有物件身分。
+    #[doc(hidden)]
+    pub fn raw_equal_value(
+        &self,
+        left: Value,
+        right: Value,
+    ) -> Result<bool, crate::vm::RuntimeError> {
+        for value in [left, right] {
+            if let Value::Object(object) = value {
+                self.object_kind(object)?;
+            } else if let Value::CFunction(id) = value {
+                if id.vm() != self.id {
+                    return Err(VmError::WrongVm.into());
+                }
+            }
+        }
+        crate::vm::basic_raw_equal(self, left, right)
+    }
+
+    /// 供 Basic `next` 與 C stack 共用的無配置原始遍歷。
+    #[doc(hidden)]
+    pub fn raw_next_value(
+        &self,
+        table: ObjectRef,
+        previous: Value,
+    ) -> Result<Option<(Value, Value)>, crate::vm::RuntimeError> {
+        if let Value::Object(object) = previous {
+            self.object_kind(object)?;
+        }
+        self.with_table(table, |stored| stored.next_raw(self, previous))?
+    }
+
+    /// 供宿主 C stack 讀取原始長度；先驗證物件身分，再依實際 payload 分派。
+    #[doc(hidden)]
+    pub fn raw_len_value(&self, value: Value) -> Result<usize, crate::vm::RuntimeError> {
+        let Value::Object(object) = value else {
+            return Ok(0);
+        };
+        match self.object_kind(object)? {
+            ObjectKind::ByteString => Ok(self.with_byte_string(object, ByteString::len)?),
+            ObjectKind::Table => Ok(usize::try_from(self.with_table(object, Table::border_len)?)
+                .map_err(|_| VmError::ArithmeticOverflow)?),
+            ObjectKind::Userdata => Ok(self.userdata_len(object)?),
+            _ => Ok(0),
+        }
     }
 
     /// 建立完整內容的 byte string；失敗時 payload 與帳本票據均丟棄。
     pub fn allocate_byte_string(&mut self, bytes: &[u8]) -> Result<ObjectRef, VmError> {
         let (string, ticket) = ByteString::try_from_bytes(&self.ledger, bytes)?;
-        let reference = self.allocate_payload(HeapPayload::ByteString(string))?;
-        ticket.commit()?;
-        Ok(reference)
+        let charge = ticket.commit_charge()?;
+        self.allocate_payload_with_charge(HeapPayload::ByteString(string), Some(charge))
+    }
+
+    /// 接收不可變 external storage；任何配置失敗都由 RAII 釋放傳入的 owner。
+    #[doc(hidden)]
+    pub fn allocate_external_byte_string(
+        &mut self,
+        owner: Rc<dyn ExternalStringStorage>,
+    ) -> Result<ObjectRef, VmError> {
+        self.allocate_payload(HeapPayload::ByteString(ByteString::from_external(owner)))
+    }
+
+    /// 供宿主在發布 C stack slot 前建立 byte string；發布失敗會撤銷新物件。
+    /// `publish` 回傳錯誤時不得留下該物件的 root 或外部參照。
+    #[doc(hidden)]
+    pub fn with_unpublished_byte_string<R, E>(
+        &mut self,
+        bytes: &[u8],
+        publish: impl FnOnce(&mut Self, ObjectRef) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<VmError>,
+    {
+        let previous_slots = self.slots.len();
+        let object = self.allocate_byte_string(bytes).map_err(E::from)?;
+        match publish(self, object) {
+            Ok(published) => Ok(published),
+            Err(error) => {
+                self.rollback_unpublished_created_object(
+                    object,
+                    previous_slots,
+                    ObjectKind::ByteString,
+                )
+                .map_err(E::from)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// external 物件在 stack 發佈失敗時撤銷；最後一個 owner 在回滾時釋放。
+    #[doc(hidden)]
+    pub fn with_unpublished_external_byte_string<R, E>(
+        &mut self,
+        owner: Rc<dyn ExternalStringStorage>,
+        publish: impl FnOnce(&mut Self, ObjectRef) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<VmError>,
+    {
+        let previous_slots = self.slots.len();
+        let object = self.allocate_external_byte_string(owner).map_err(E::from)?;
+        match publish(self, object) {
+            Ok(published) => Ok(published),
+            Err(error) => {
+                self.rollback_unpublished_created_object(
+                    object,
+                    previous_slots,
+                    ObjectKind::ByteString,
+                )
+                .map_err(E::from)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// 供 C API 以任意位元組查表；callback 只能使用暫時 key，不得將它發布、儲存或回傳。
+    /// callback 可先根住查得的結果；本函式在回傳前退 key root 並撤銷 key 物件與帳款。
+    #[doc(hidden)]
+    pub fn with_temporary_byte_string<R, E>(
+        &mut self,
+        bytes: &[u8],
+        callback: impl FnOnce(&mut Self, ObjectRef) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<VmError>,
+    {
+        let previous_slots = self.slots.len();
+        let key = self.allocate_byte_string(bytes).map_err(E::from)?;
+        let root = match self.add_root(RootKind::Temporary, key) {
+            Ok(root) => root,
+            Err(error) => {
+                self.rollback_unpublished_created_object(
+                    key,
+                    previous_slots,
+                    ObjectKind::ByteString,
+                )
+                .map_err(E::from)?;
+                return Err(E::from(error));
+            }
+        };
+        let result = callback(self, key);
+        // 必須先退根再撤銷 key；退根失敗時保留 key，避免留下指向已回收物件的 root。
+        self.remove_root(root).map_err(E::from)?;
+        self.rollback_unpublished_created_object(key, previous_slots, ObjectKind::ByteString)
+            .map_err(E::from)?;
+        result
+    }
+
+    /// C 具名 setter 專用。方法先根住 table/value，再建立並暫根 byte-string key；
+    /// 只有新增 canonical key edge 時保留新物件，其餘成功路徑與失敗路徑立即撤銷。
+    /// 呼叫者不必預先根住 table/value；本方法的公開安全介面自行保護配置期間的生命週期。
+    #[doc(hidden)]
+    pub fn raw_set_byte_string_key(
+        &mut self,
+        table: ObjectRef,
+        name: &[u8],
+        value: Value,
+    ) -> Result<(), VmError> {
+        if self.object_kind(table)? != ObjectKind::Table {
+            return Err(VmError::WrongObjectType);
+        }
+        if let Value::Object(object) = value {
+            self.checked_slot(object)?;
+        }
+        let table_root = self.add_root(RootKind::Temporary, table)?;
+        let value_root = match value {
+            Value::Object(object) => match self.add_root(RootKind::Temporary, object) {
+                Ok(root) => Some(root),
+                Err(error) => {
+                    self.remove_root(table_root)?;
+                    return Err(error);
+                }
+            },
+            _ => None,
+        };
+        let result = self.raw_set_byte_string_key_rooted(table, name, value);
+        if let Some(root) = value_root {
+            self.remove_root(root)?;
+        }
+        self.remove_root(table_root)?;
+        result
+    }
+
+    fn raw_set_byte_string_key_rooted(
+        &mut self,
+        table: ObjectRef,
+        name: &[u8],
+        value: Value,
+    ) -> Result<(), VmError> {
+        let previous_slots = self.slots.len();
+        let key = self.allocate_byte_string(name)?;
+        let key_root = match self.add_root(RootKind::Temporary, key) {
+            Ok(root) => root,
+            Err(error) => {
+                self.rollback_unpublished_created_object(
+                    key,
+                    previous_slots,
+                    ObjectKind::ByteString,
+                )?;
+                return Err(error);
+            }
+        };
+        let mutation = self.raw_set_with_new_key_source(table, Value::Object(key), value);
+        // 退根失敗時保留 key 物件，避免 root 指向已回收的 slot。
+        self.remove_root(key_root)?;
+        if matches!(mutation, Ok(Some(source)) if source == key) {
+            return Ok(());
+        }
+        self.rollback_unpublished_created_object(key, previous_slots, ObjectKind::ByteString)?;
+        mutation.map(|_| ())
+    }
+
+    /// C auxiliary get-or-create 專用；回傳的 HostHandle 在 caller 發布 stack slot 前保活結果。
+    /// `prepare` 僅借用 VM，必須完成 caller 的可失敗 stack 容量預備；欄位發布後不再配置。
+    #[doc(hidden)]
+    pub fn get_or_create_byte_named_subtable<E>(
+        &mut self,
+        table: ObjectRef,
+        name: &[u8],
+        prepare: impl FnOnce(&Self) -> Result<(), E>,
+    ) -> Result<(ObjectRef, crate::HostHandle<Value>, bool), E>
+    where
+        E: From<VmError>,
+    {
+        if self.object_kind(table).map_err(E::from)? != ObjectKind::Table {
+            return Err(E::from(VmError::WrongObjectType));
+        }
+        // 安全公開介面自行保護未根住的 target；Drop 不會引入可失敗清理。
+        let _table_root = crate::HostHandle::<Value>::new(self, table).map_err(E::from)?;
+        // 查值 key 先完整撤銷；新 table 之後才配置，讓發布用 key 必為最後配置的物件。
+        let (existing, _old_value_root) = self.with_temporary_byte_string(name, |vm, key| {
+            let value = vm.raw_get(table, Value::Object(key)).map_err(E::from)?;
+            if let Value::Object(object) = value {
+                let kind = vm.object_kind(object).map_err(E::from)?;
+                let root = crate::HostHandle::<Value>::new(vm, object).map_err(E::from)?;
+                return Ok::<_, E>(if kind == ObjectKind::Table {
+                    (Some((object, root)), None)
+                } else {
+                    (None, Some(root))
+                });
+            }
+            Ok::<_, E>((None, None))
+        })?;
+        if let Some((object, root)) = existing {
+            prepare(self)?;
+            return Ok((object, root, true));
+        }
+        // 非 table 的舊弱值物件維持暫根，直到 mutation 成功或失敗回滾。
+        let previous_table_slots = self.slots.len();
+        let (created, root) = self.prepare_unpublished_host_table(0, 0, prepare)?;
+        match self.raw_set_byte_string_key(table, name, Value::Object(created)) {
+            Ok(()) => Ok((created, root, false)),
+            Err(error) => {
+                drop(root);
+                self.rollback_unpublished_created_object(
+                    created,
+                    previous_table_slots,
+                    ObjectKind::Table,
+                )
+                .map_err(E::from)?;
+                Err(E::from(error))
+            }
+        }
+    }
+
+    /// C auxiliary newmetatable 專用；registry 非 nil 時保留原值，新建時先完成
+    /// `__name` 欄位，最後才以單次原始寫入發布 registry 邊。
+    #[doc(hidden)]
+    pub fn new_named_metatable<E>(
+        &mut self,
+        registry: ObjectRef,
+        name: &[u8],
+        prepare: impl FnOnce(&Self) -> Result<(), E>,
+    ) -> Result<(Value, Option<crate::HostHandle<Value>>, bool), E>
+    where
+        E: From<VmError>,
+    {
+        if self.object_kind(registry).map_err(E::from)? != ObjectKind::Table {
+            return Err(E::from(VmError::WrongObjectType));
+        }
+        let _registry_root = crate::HostHandle::<Value>::new(self, registry).map_err(E::from)?;
+        let (existing, existing_root) = self.with_temporary_byte_string(name, |vm, key| {
+            let value = vm.raw_get(registry, Value::Object(key)).map_err(E::from)?;
+            let root = match value {
+                Value::Object(object) => {
+                    Some(crate::HostHandle::<Value>::new(vm, object).map_err(E::from)?)
+                }
+                _ => None,
+            };
+            Ok::<_, E>((value, root))
+        })?;
+        if existing != Value::Nil {
+            prepare(self)?;
+            return Ok((existing, existing_root, false));
+        }
+
+        // table 仍未發布；stack 容量、table 配置及 root 全部在 registry mutation 前預備。
+        let previous_table_slots = self.slots.len();
+        let (created, table_root) = self.prepare_unpublished_host_table(0, 2, prepare)?;
+        let mut name_object = None;
+        let mut name_root = None;
+        let mut field_key = None;
+        let mut field_key_root = None;
+        let publication = (|| -> Result<(), VmError> {
+            let previous_slots = self.slots.len();
+            let object = self.allocate_byte_string(name)?;
+            name_object = Some((object, previous_slots));
+            name_root = Some(crate::HostHandle::<Value>::new(self, object)?);
+
+            let previous_slots = self.slots.len();
+            let key = self.allocate_byte_string(b"__name")?;
+            field_key = Some((key, previous_slots));
+            field_key_root = Some(crate::HostHandle::<Value>::new(self, key)?);
+            self.raw_set_with_new_key_source(created, Value::Object(key), Value::Object(object))?;
+            self.raw_set_with_new_key_source(
+                registry,
+                Value::Object(object),
+                Value::Object(created),
+            )?;
+            Ok(())
+        })();
+        drop(field_key_root);
+        drop(name_root);
+        if let Err(error) = publication {
+            drop(table_root);
+            // 僅操作尚未對外發布的物件；依配置逆序撤銷，連 slot 與 GC work/debt 一併退款。
+            if let Some((key, previous_slots)) = field_key {
+                self.rollback_unpublished_created_object(
+                    key,
+                    previous_slots,
+                    ObjectKind::ByteString,
+                )
+                .map_err(E::from)?;
+            }
+            if let Some((object, previous_slots)) = name_object {
+                self.rollback_unpublished_created_object(
+                    object,
+                    previous_slots,
+                    ObjectKind::ByteString,
+                )
+                .map_err(E::from)?;
+            }
+            self.rollback_unpublished_created_object(
+                created,
+                previous_table_slots,
+                ObjectKind::Table,
+            )
+            .map_err(E::from)?;
+            return Err(E::from(error));
+        }
+        Ok((Value::Object(created), Some(table_root), true))
+    }
+
+    /// 供 C stack 先根住新 table，再只以不可變 VM 借用預備 stack 容量。
+    /// `prepare` 無法取得可變 VM 或 root 所有權；失敗時先退根再撤銷物件。
+    #[doc(hidden)]
+    pub fn prepare_unpublished_host_table<E>(
+        &mut self,
+        array_capacity: usize,
+        hash_capacity: usize,
+        prepare: impl FnOnce(&Self) -> Result<(), E>,
+    ) -> Result<(ObjectRef, crate::HostHandle<Value>), E>
+    where
+        E: From<VmError>,
+    {
+        let previous_slots = self.slots.len();
+        let object = self
+            .allocate_table_with_capacity(array_capacity, hash_capacity)
+            .map_err(E::from)?;
+        let root = match crate::HostHandle::<Value>::new(self, object) {
+            Ok(root) => root,
+            Err(error) => {
+                self.rollback_unpublished_created_object(object, previous_slots, ObjectKind::Table)
+                    .map_err(E::from)?;
+                return Err(E::from(error));
+            }
+        };
+        if let Err(error) = prepare(self) {
+            drop(root);
+            self.rollback_unpublished_created_object(object, previous_slots, ObjectKind::Table)
+                .map_err(E::from)?;
+            return Err(error);
+        }
+        Ok((object, root))
+    }
+
+    /// Debug `L` 專用：未發布 table 的所有行號與 root 共用一次可回滾交易。
+    #[doc(hidden)]
+    pub fn prepare_unpublished_host_line_table(
+        &mut self,
+        lines: &[u32],
+    ) -> Result<(ObjectRef, crate::HostHandle<Value>), VmError> {
+        let hash_capacity = lines
+            .len()
+            .checked_mul(2)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let previous_slots = self.slots.len();
+        let automatic_running = self.gc.automatic_running;
+        let debt_before = (self.gc.debt_bytes, self.gc.major_debt_bytes);
+        self.gc.automatic_running = false;
+        let mut created = None;
+        let transaction = (|| {
+            let object = self.allocate_table_with_capacity(0, hash_capacity)?;
+            created = Some(object);
+            let root = crate::HostHandle::<Value>::new(self, object)?;
+            for &line in lines {
+                self.raw_set(
+                    object,
+                    Value::Integer(i64::from(line)),
+                    Value::Boolean(true),
+                )?;
+            }
+            Ok((object, root))
+        })();
+        let rollback = if transaction.is_err() {
+            if let Some(object) = created {
+                self.rollback_unpublished_created_object(object, previous_slots, ObjectKind::Table)
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
+        if transaction.is_err() {
+            self.gc.debt_bytes = debt_before.0;
+            self.gc.major_debt_bytes = debt_before.1;
+        }
+        self.gc.automatic_running = automatic_running;
+        rollback?;
+        transaction
+    }
+
+    /// 供 C stack 在發布 slot 前根住 full userdata、取得穩定 bytes 位址並預備容量。
+    /// `prepare` 僅能唯讀 VM；任一前置步驟失敗時撤銷物件、root 與 GC 帳款。
+    #[doc(hidden)]
+    pub fn prepare_unpublished_host_userdata<E>(
+        &mut self,
+        size: usize,
+        uservalue_count: usize,
+        prepare: impl FnOnce(&Self) -> Result<(), E>,
+    ) -> Result<(ObjectRef, crate::HostHandle<Value>, *mut u8), E>
+    where
+        E: From<VmError>,
+    {
+        let previous_slots = self.slots.len();
+        let object = self
+            .allocate_userdata(size, uservalue_count)
+            .map_err(E::from)?;
+        let pointer = match self.userdata_ptr(object) {
+            Ok(pointer) => pointer,
+            Err(error) => {
+                self.rollback_unpublished_created_object(
+                    object,
+                    previous_slots,
+                    ObjectKind::Userdata,
+                )
+                .map_err(E::from)?;
+                return Err(E::from(error));
+            }
+        };
+        let root = match crate::HostHandle::<Value>::new(self, object) {
+            Ok(root) => root,
+            Err(error) => {
+                self.rollback_unpublished_created_object(
+                    object,
+                    previous_slots,
+                    ObjectKind::Userdata,
+                )
+                .map_err(E::from)?;
+                return Err(E::from(error));
+            }
+        };
+        if let Err(error) = prepare(self) {
+            drop(root);
+            self.rollback_unpublished_created_object(object, previous_slots, ObjectKind::Userdata)
+                .map_err(E::from)?;
+            return Err(error);
+        }
+        Ok((object, root, pointer))
+    }
+
+    /// 建立 C closure 並在同一交易中發布；任一預備失敗逆序撤銷物件與暫存 root。
+    #[doc(hidden)]
+    pub fn prepare_unpublished_c_closure<E>(
+        &mut self,
+        function: HostFunctionId,
+        captures: &[Value],
+        prepare: impl FnOnce(&mut Self, ObjectRef) -> Result<(), E>,
+        publish: impl FnOnce(ObjectRef, crate::HostHandle<Value>),
+    ) -> Result<ObjectRef, E>
+    where
+        E: From<VmError>,
+    {
+        if function.vm() != self.id || captures.is_empty() || captures.len() > 255 {
+            return Err(E::from(VmError::WrongVm));
+        }
+        for value in captures {
+            match value {
+                Value::Object(object) => {
+                    self.checked_slot(*object).map_err(E::from)?;
+                }
+                Value::CFunction(id) if id.vm() != self.id => {
+                    return Err(E::from(VmError::WrongVm));
+                }
+                _ => {}
+            }
+        }
+        // 未發布的多物件交易須維持原有 GC trace；成功發布 root 後，下一個
+        // 既有安全配置點會依保留的 debt 繼續 automatic GC。
+        let automatic_running = self.gc.automatic_running;
+        let debt_before = (self.gc.debt_bytes, self.gc.major_debt_bytes);
+        self.gc.automatic_running = false;
+        let transaction = (|| -> Result<ObjectRef, E> {
+            let mut cells: [Option<(ObjectRef, usize, Option<RootId>)>; 255] = [None; 255];
+            let mut count = 0usize;
+            let mut closure: Option<(ObjectRef, usize)> = None;
+            let result = (|| -> Result<(ObjectRef, crate::HostHandle<Value>), E> {
+                for &value in captures {
+                    let previous_slots = self.slots.len();
+                    let cell = self
+                        .allocate_upvalue(Upvalue::closed(value))
+                        .map_err(E::from)?;
+                    cells[count] = Some((cell, previous_slots, None));
+                    count += 1;
+                    let root = self.add_root(RootKind::Temporary, cell).map_err(E::from)?;
+                    cells[count - 1]
+                        .as_mut()
+                        .ok_or_else(|| E::from(VmError::LedgerInvariant))?
+                        .2 = Some(root);
+                }
+                let refs: [Option<ObjectRef>; 255] =
+                    core::array::from_fn(|index| cells[index].map(|(cell, _, _)| cell));
+                let payload =
+                    CClosure::new(function, &refs[..count], &self.ledger).map_err(E::from)?;
+                let previous_slots = self.slots.len();
+                let object = self
+                    .allocate_payload(HeapPayload::CClosure(payload))
+                    .map_err(E::from)?;
+                closure = Some((object, previous_slots));
+                let root = crate::HostHandle::<Value>::new(self, object).map_err(E::from)?;
+                prepare(self, object)?;
+                Ok((object, root))
+            })();
+            if result.is_err() {
+                if let Some((object, previous_slots)) = closure {
+                    self.rollback_unpublished_created_object(
+                        object,
+                        previous_slots,
+                        ObjectKind::CClosure,
+                    )
+                    .map_err(E::from)?;
+                }
+            }
+            for entry in cells[..count].iter_mut().rev() {
+                if let Some((cell, previous_slots, root)) = entry.take() {
+                    if let Some(root) = root {
+                        self.remove_root(root).map_err(E::from)?;
+                    }
+                    if result.is_err() {
+                        self.rollback_unpublished_created_object(
+                            cell,
+                            previous_slots,
+                            ObjectKind::Upvalue,
+                        )
+                        .map_err(E::from)?;
+                    }
+                }
+            }
+            let (object, root) = result?;
+            publish(object, root);
+            Ok(object)
+        })();
+        if transaction.is_err() {
+            self.gc.debt_bytes = debt_before.0;
+            self.gc.major_debt_bytes = debt_before.1;
+        }
+        self.gc.automatic_running = automatic_running;
+        transaction
+    }
+
+    fn rollback_unpublished_created_object(
+        &mut self,
+        object: ObjectRef,
+        previous_slots: usize,
+        expected_kind: ObjectKind,
+    ) -> Result<(), VmError> {
+        if self.object_kind(object)? != expected_kind {
+            return Err(VmError::WrongObjectType);
+        }
+        let slot = object.identity().ok_or(VmError::StaleObject)?.slot.index();
+        let appended_slot =
+            slot == previous_slots && previous_slots.checked_add(1) == Some(self.slots.len());
+        let debt = {
+            let Slot::Occupied { object, .. } = self.checked_slot(object)? else {
+                return Err(VmError::StaleObject);
+            };
+            object[0]
+                .debt_bytes()?
+                .checked_add(if appended_slot { size_of::<Slot>() } else { 0 })
+                .ok_or(VmError::ArithmeticOverflow)?
+        };
+        self.reclaim_unpublished_object(object)?;
+        self.gc.debt_bytes = self.gc.debt_bytes.saturating_sub(debt);
+        self.gc.major_debt_bytes = self.gc.major_debt_bytes.saturating_sub(debt);
+        if appended_slot {
+            // 新 slot 尚未發布；撤銷其邏輯 arena 帳款與當輪 GC color/work 帳款。
+            if self.gc.phase != GcPhase::Pause && self.gc.colors.len() == self.slots.len() {
+                self.gc.colors.pop();
+                self.release_gc_growth_for_slot(slot)?;
+            }
+            self.slots.pop();
+            self.slot_charges.pop();
+            self.gc.ephemeron_cursor = self.gc.ephemeron_cursor.min(self.slots.len());
+        }
+        Ok(())
     }
 
     /// 複製期間保護來源；建立新 payload 時也沿用配置器的短期 root。
     pub fn clone_byte_string(&mut self, source: ObjectRef) -> Result<ObjectRef, VmError> {
         let root = self.add_root(RootKind::Temporary, source)?;
         let result = (|| {
-            let (string, ticket) = self.with_byte_string(source, |string| {
-                ByteString::try_from_bytes(&self.ledger, string.as_bytes())
+            let (string, charge) = self.with_byte_string(source, |string| {
+                if let Some(shared) = string.shared_external() {
+                    Ok((shared, None))
+                } else {
+                    let (copy, ticket) =
+                        ByteString::try_from_bytes(&self.ledger, string.as_bytes())?;
+                    Ok((copy, Some(ticket.commit_charge()?)))
+                }
             })??;
-            let reference = self.allocate_payload(HeapPayload::ByteString(string))?;
-            ticket.commit()?;
-            Ok(reference)
+            self.allocate_payload_with_charge(HeapPayload::ByteString(string), charge)
         })();
         let removed = self.remove_root(root);
         removed?;
@@ -3713,6 +5333,90 @@ impl Vm {
         self.string_metatable.map(|(object, _)| object)
     }
 
+    fn value_metatable_target(&self, value: Value) -> Result<ValueMetatableTarget, VmError> {
+        Ok(match value {
+            Value::Nil => ValueMetatableTarget::Primitive(0),
+            Value::Boolean(_) => ValueMetatableTarget::Primitive(1),
+            Value::LightUserdata(_) => ValueMetatableTarget::Primitive(2),
+            Value::Integer(_) | Value::Float(_) => ValueMetatableTarget::Primitive(3),
+            Value::CFunction(function) if function.vm() == self.id => {
+                ValueMetatableTarget::Primitive(4)
+            }
+            Value::CFunction(_) => return Err(VmError::WrongVm),
+            Value::Object(object) => match self.object_kind(object)? {
+                ObjectKind::Table | ObjectKind::Userdata | ObjectKind::File => {
+                    ValueMetatableTarget::Instance(object)
+                }
+                ObjectKind::ByteString => ValueMetatableTarget::String,
+                ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin => {
+                    ValueMetatableTarget::Primitive(4)
+                }
+                ObjectKind::Coroutine => ValueMetatableTarget::Primitive(5),
+                ObjectKind::Value | ObjectKind::Upvalue | ObjectKind::Module => {
+                    return Err(VmError::WrongObjectType);
+                }
+            },
+        })
+    }
+
+    /// Lua 非 table／full userdata 值依型別共用 metatable；字串沿用標準函式庫的同一 root。
+    pub fn get_metatable_for_value(&self, value: Value) -> Result<Option<ObjectRef>, VmError> {
+        match self.value_metatable_target(value)? {
+            ValueMetatableTarget::Instance(object) => self.get_metatable(object),
+            ValueMetatableTarget::String => Ok(self.string_metatable()),
+            ValueMetatableTarget::Primitive(index) => {
+                Ok(self.primitive_metatables[index].map(|(object, _)| object))
+            }
+        }
+    }
+
+    /// 新型別 metatable 的 root 成功建立後才撤換舊 root；失敗維持原映射。
+    pub fn set_metatable_for_value(
+        &mut self,
+        value: Value,
+        metatable: Option<ObjectRef>,
+    ) -> Result<(), VmError> {
+        let target = self.value_metatable_target(value)?;
+        if let Some(object) = metatable {
+            if self.object_kind(object)? != ObjectKind::Table {
+                return Err(VmError::WrongObjectType);
+            }
+        }
+        if let ValueMetatableTarget::Instance(object) = target {
+            return self.set_metatable(object, metatable);
+        }
+        let previous = match target {
+            ValueMetatableTarget::String => self.string_metatable,
+            ValueMetatableTarget::Primitive(index) => self.primitive_metatables[index],
+            ValueMetatableTarget::Instance(_) => unreachable!("已由 instance 路徑處理"),
+        };
+        if previous.map(|(object, _)| object) == metatable {
+            return Ok(());
+        }
+        let replacement = metatable
+            .map(|object| {
+                self.add_root(RootKind::Registry, object)
+                    .map(|root| (object, root))
+            })
+            .transpose()?;
+        if let Some((_, old_root)) = previous {
+            if let Err(error) = self.remove_root(old_root) {
+                if let Some((_, new_root)) = replacement {
+                    self.remove_root(new_root)?;
+                }
+                return Err(error);
+            }
+        }
+        match target {
+            ValueMetatableTarget::String => self.string_metatable = replacement,
+            ValueMetatableTarget::Primitive(index) => {
+                self.primitive_metatables[index] = replacement
+            }
+            ValueMetatableTarget::Instance(_) => unreachable!("已由 instance 路徑處理"),
+        }
+        Ok(())
+    }
+
     pub(crate) fn string_index_event(&mut self) -> Result<Option<Value>, VmError> {
         let Some(metatable) = self.string_metatable() else {
             return Ok(None);
@@ -3830,10 +5534,11 @@ impl Vm {
                     .checked_sub(capture_base)
                     .ok_or(VmError::LedgerInvariant)?,
             )?;
+            let mut capture_charges = AllocationCharges::new();
+            capture_charges.try_reserve(2)?;
             let id = match self.callbacks.iter().position(Option::is_none) {
                 Some(id) => id,
                 None => {
-                    let old_charge = self.callbacks_charge;
                     let needed = self
                         .callbacks
                         .len()
@@ -3853,15 +5558,23 @@ impl Vm {
                         .checked_sub(minimum_charge)
                         .ok_or(VmError::LedgerInvariant)?;
                     let extra_ticket = self.ledger.reserve(extra)?;
-                    ticket.commit()?;
-                    if let Err(error) = extra_ticket.commit() {
-                        self.ledger.refund_on_drop(minimum_charge);
-                        return Err(error);
-                    }
+                    let mut replacement_charges = AllocationCharges::new();
+                    replacement_charges.try_reserve(2)?;
+                    let base_charge = ticket.commit_charge()?;
+                    let extra_charge = match extra_ticket.commit_charge() {
+                        Ok(charge) => charge,
+                        Err(error) => {
+                            drop(replacement);
+                            drop(base_charge);
+                            return Err(error);
+                        }
+                    };
+                    replacement_charges.push_prepared(base_charge);
+                    replacement_charges.push_prepared(extra_charge);
                     replacement.append(&mut self.callbacks);
                     replacement.push(None);
                     self.callbacks = replacement;
-                    self.ledger.refund_on_drop(old_charge);
+                    self.callbacks_charge_owner = replacement_charges;
                     self.callbacks_charge = new_charge;
                     self.callbacks.len() - 1
                 }
@@ -3875,11 +5588,17 @@ impl Vm {
                         self.add_child(function, object)?;
                     }
                 }
-                capture_ticket.commit()?;
-                if let Err(error) = capture_extra_ticket.commit() {
-                    self.ledger.refund(capture_base)?;
-                    return Err(error);
-                }
+                let base_charge = capture_ticket.commit_charge()?;
+                let extra_charge = match capture_extra_ticket.commit_charge() {
+                    Ok(charge) => charge,
+                    Err(error) => {
+                        drop(core::mem::take(&mut owned));
+                        drop(base_charge);
+                        return Err(error);
+                    }
+                };
+                capture_charges.push_prepared(base_charge);
+                capture_charges.push_prepared(extra_charge);
                 Ok(handle)
             })();
             let handle = match attached {
@@ -3892,7 +5611,7 @@ impl Vm {
             self.callbacks[id] = Some(CallbackEntry {
                 callback,
                 captures: owned,
-                charge,
+                _capture_charges: capture_charges,
             });
             Ok(handle)
         })();
@@ -3951,7 +5670,7 @@ impl Vm {
     ) -> Result<ObjectRef, VmError> {
         debug_assert!(matches!(
             builtin,
-            Builtin::CoroutineResume | Builtin::CoroutineYield
+            Builtin::CoroutineResume | Builtin::CoroutineYield | Builtin::CoroutineClose
         ));
         self.allocate_payload(HeapPayload::Builtin(builtin))
     }
@@ -4058,18 +5777,88 @@ impl Vm {
         self.allocate_payload(HeapPayload::Coroutine(payload))
     }
 
+    /// 宿主 C thread 交易：GC 暫緩至 control 與第一個 stack root 均已發布。
+    /// 失敗時逆序撤銷 root、payload、slot 與 GC debt。
+    #[doc(hidden)]
+    pub fn prepare_unpublished_host_coroutine<E, A>(
+        &mut self,
+        prepare: impl FnOnce(&mut Self, ObjectRef) -> Result<(A, Option<Box<dyn Any>>), E>,
+        publish: impl FnOnce(ObjectRef, crate::HostHandle<Value>, A),
+    ) -> Result<ObjectRef, E>
+    where
+        E: From<VmError>,
+    {
+        let automatic_running = self.gc.automatic_running;
+        let debt_before = (self.gc.debt_bytes, self.gc.major_debt_bytes);
+        let previous_slots = self.slots.len();
+        self.gc.automatic_running = false;
+        let result = (|| {
+            let object = self.allocate_coroutine(Value::Nil).map_err(E::from)?;
+            let staged = (|| {
+                let root = crate::HostHandle::<Value>::new(self, object).map_err(E::from)?;
+                let (value, attachment) = prepare(self, object)?;
+                self.with_coroutine_mut(object, &[], |coroutine| {
+                    coroutine.host_attachment = attachment;
+                })
+                .map_err(E::from)?;
+                Ok::<_, E>((root, value))
+            })();
+            match staged {
+                Ok((root, value)) => {
+                    publish(object, root, value);
+                    Ok(object)
+                }
+                Err(error) => {
+                    self.rollback_unpublished_created_object(
+                        object,
+                        previous_slots,
+                        ObjectKind::Coroutine,
+                    )
+                    .map_err(E::from)?;
+                    Err(error)
+                }
+            }
+        })();
+        if result.is_err() {
+            self.gc.debt_bytes = debt_before.0;
+            self.gc.major_debt_bytes = debt_before.1;
+        }
+        self.gc.automatic_running = automatic_running;
+        result
+    }
+
+    /// 僅短暫讀取宿主 attachment；呼叫者不能保留 heap 借用跨 GC。
+    #[doc(hidden)]
+    pub fn with_coroutine_host_attachment<T: 'static, R>(
+        &self,
+        object: ObjectRef,
+        read: impl FnOnce(Option<&T>) -> R,
+    ) -> Result<R, VmError> {
+        self.with_coroutine(object, |coroutine| {
+            read(
+                coroutine
+                    .host_attachment
+                    .as_ref()
+                    .and_then(|attachment| attachment.downcast_ref::<T>()),
+            )
+        })
+    }
+
     /// 以 VM 自身的 coroutine payload 建立可由宿主持有的協程。
     pub fn new_coroutine(&mut self, function: Value) -> Result<crate::HostHandle<Value>, VmError> {
-        let Value::Object(entry) = function else {
-            return Err(VmError::WrongObjectType);
+        let entry_root = match function {
+            Value::Object(entry)
+                if matches!(
+                    self.object_kind(entry)?,
+                    ObjectKind::Closure | ObjectKind::Builtin | ObjectKind::CClosure
+                ) =>
+            {
+                Some(self.add_root(RootKind::Temporary, entry)?)
+            }
+            Value::CFunction(id) if id.vm() == self.id() => None,
+            Value::CFunction(_) => return Err(VmError::WrongVm),
+            _ => return Err(VmError::WrongObjectType),
         };
-        if !matches!(
-            self.object_kind(entry)?,
-            ObjectKind::Closure | ObjectKind::Builtin
-        ) {
-            return Err(VmError::WrongObjectType);
-        }
-        let entry_root = self.add_root(RootKind::Temporary, entry)?;
         let result = (|| {
             let coroutine = self.allocate_coroutine(function)?;
             match crate::HostHandle::new(self, coroutine) {
@@ -4080,8 +5869,89 @@ impl Vm {
                 }
             }
         })();
-        self.remove_root(entry_root)?;
+        if let Some(root) = entry_root {
+            self.remove_root(root)?;
+        }
         result
+    }
+
+    /// B11 固定 C fixture 將已建立的宿主 thread 接上受驗證的 Lua closure。
+    #[doc(hidden)]
+    pub fn set_host_coroutine_entry_b11(
+        &mut self,
+        thread: ObjectRef,
+        entry: Value,
+    ) -> Result<(), VmError> {
+        let Value::Object(function) = entry else {
+            return Err(VmError::WrongObjectType);
+        };
+        if self.object_kind(function)? != ObjectKind::Closure {
+            return Err(VmError::WrongObjectType);
+        }
+        let ready = self.with_coroutine(thread, |co| {
+            co.state == CoroutineState::Suspended
+                && co.entry == Value::Nil
+                && co.context.is_none()
+                && co.unwind_context.is_none()
+        })?;
+        if !ready {
+            return Err(VmError::WrongObjectType);
+        }
+        self.with_coroutine_mut(thread, &[function], |co| co.entry = entry)?;
+        Ok(())
+    }
+
+    /// 公開 C resume 的首次入口可為 Lua、C 或帶 __call 的有效值。
+    #[doc(hidden)]
+    pub fn set_host_coroutine_entry_a5(
+        &mut self,
+        thread: ObjectRef,
+        entry: Value,
+    ) -> Result<(), VmError> {
+        if let Value::CFunction(id) = entry {
+            if id.vm() != self.id() {
+                return Err(VmError::WrongVm);
+            }
+        }
+        let reference = match entry {
+            Value::Object(object) => {
+                self.object_kind(object)?;
+                Some(object)
+            }
+            _ => None,
+        };
+        let ready = self.with_coroutine(thread, |co| {
+            co.state == CoroutineState::Suspended
+                && co.entry == Value::Nil
+                && co.context.is_none()
+                && co.unwind_context.is_none()
+                && co.external_suspended.is_none()
+        })?;
+        if !ready {
+            return Err(VmError::WrongObjectType);
+        }
+        self.with_coroutine_mut(thread, reference.as_slice(), |co| co.entry = entry)?;
+        Ok(())
+    }
+
+    /// 首次 resume 在建立 execution 失敗時，僅撤回尚未執行的入口欄位。
+    #[doc(hidden)]
+    pub fn clear_host_coroutine_entry_a5(
+        &mut self,
+        thread: ObjectRef,
+        expected: Value,
+    ) -> Result<(), VmError> {
+        let ready = self.with_coroutine(thread, |co| {
+            co.state == CoroutineState::Suspended
+                && co.entry == expected
+                && co.context.is_none()
+                && co.external_suspended.is_none()
+        })?;
+        if !ready {
+            return Err(VmError::WrongObjectType);
+        }
+        self.with_coroutine_mut(thread, &[], |co| co.entry = Value::Nil)?;
+        Ok(())
     }
 
     pub(crate) fn allocate_coroutine_wrapper(
@@ -4167,7 +6037,7 @@ impl Vm {
         })
     }
 
-    pub(crate) fn coroutine_state(&self, object: ObjectRef) -> Result<CoroutineState, VmError> {
+    pub fn coroutine_state(&self, object: ObjectRef) -> Result<CoroutineState, VmError> {
         self.with_coroutine(object, |co| co.state)
     }
 
@@ -4175,7 +6045,7 @@ impl Vm {
         &mut self,
         object: ObjectRef,
     ) -> Result<Option<ThreadContext>, VmError> {
-        self.with_coroutine_mut(object, &[], |co| co.context.take())
+        self.with_coroutine_mut(object, &[], Coroutine::take_context)
     }
 
     pub(crate) fn coroutine_stack_read(
@@ -4251,23 +6121,23 @@ impl Vm {
     }
 
     pub(crate) fn allocate_module(&mut self, module: VerifiedModule) -> Result<ObjectRef, VmError> {
-        self.allocate_module_payload(module, 0)
+        self.allocate_module_payload(module, AllocationCharges::new())
     }
 
     pub(crate) fn allocate_charged_module(
         &mut self,
         module: VerifiedModule,
-        host_charge: usize,
+        host_charges: AllocationCharges,
     ) -> Result<ObjectRef, VmError> {
-        self.allocate_module_payload(module, host_charge)
+        self.allocate_module_payload(module, host_charges)
     }
 
     fn allocate_module_payload(
         &mut self,
         module: VerifiedModule,
-        host_charge: usize,
+        host_charges: AllocationCharges,
     ) -> Result<ObjectRef, VmError> {
-        let payload = ModulePayload::new(module, &self.ledger, host_charge)?;
+        let payload = ModulePayload::new(module, &self.ledger, host_charges)?;
         let has_strings = !payload.constant_offsets.is_empty();
         let payload = IndirectPayload::new(&self.ledger, payload)?;
         let reference = self.allocate_payload(HeapPayload::Module(payload))?;
@@ -4400,7 +6270,30 @@ impl Vm {
     }
 
     fn remove_unpublished_gc_reference(&mut self, reference: ObjectRef) -> Result<(), VmError> {
-        // 暫存 root 已移除，但進行中的 GC 仍可能保留當時的 root 快照或 work。
+        if let Some(index) = self
+            .gc
+            .remembered
+            .iter()
+            .position(|object| *object == reference)
+        {
+            let next_len = self.gc.remembered.len() - 1;
+            let remaining = checked_bytes(next_len, size_of::<ObjectRef>())?;
+            let mut next = Vec::new();
+            self.ledger.checkpoint(FailPoint::RememberedReserve)?;
+            next.try_reserve_exact(next_len)
+                .map_err(|_| VmError::AllocationFailed)?;
+            next.extend_from_slice(&self.gc.remembered[..index]);
+            next.extend_from_slice(&self.gc.remembered[index + 1..]);
+            let prepared = self.gc.remembered_charges.prepare_normalize(remaining)?;
+            let old = core::mem::replace(&mut self.gc.remembered, next);
+            drop(old);
+            self.gc.remembered_charges = self.gc.remembered_charges.commit_normalize(prepared);
+            self.gc.remembered_charge = remaining;
+            if index < self.gc.remembered_cursor {
+                self.gc.remembered_cursor -= 1;
+            }
+        }
+        // 先完成可拒絕的 remembered 正規化，再更動無失敗的 root/work 快照。
         self.gc.work.retain(|object| *object != reference);
         let cursor = self.gc.root_cursor;
         let mut index = 0;
@@ -4414,25 +6307,6 @@ impl Vm {
             !remove
         });
         self.gc.root_cursor -= removed_before_cursor;
-        if let Some(index) = self
-            .gc
-            .remembered
-            .iter()
-            .position(|object| *object == reference)
-        {
-            let charge = size_of::<ObjectRef>();
-            let remaining = self
-                .gc
-                .remembered_charge
-                .checked_sub(charge)
-                .ok_or(VmError::LedgerInvariant)?;
-            self.ledger.refund(charge)?;
-            self.gc.remembered.remove(index);
-            self.gc.remembered_charge = remaining;
-            if index < self.gc.remembered_cursor {
-                self.gc.remembered_cursor -= 1;
-            }
-        }
         Ok(())
     }
 
@@ -4527,34 +6401,48 @@ impl Vm {
         array_capacity: usize,
         hash_capacity: usize,
     ) -> Result<ObjectRef, VmError> {
-        let (table, array_ticket, hash_ticket) =
+        let (mut table, array_ticket, hash_ticket) =
             Table::try_new(&self.ledger, array_capacity, hash_capacity)?;
-        let reference = self.allocate_payload(HeapPayload::Table(table))?;
-        array_ticket.commit()?;
-        hash_ticket.commit()?;
-        Ok(reference)
+        let array_charge = array_ticket.commit_charge()?;
+        let hash_charge = hash_ticket.commit_charge()?;
+        table.install_initial_charges(array_charge, hash_charge);
+        self.allocate_payload(HeapPayload::Table(table))
+    }
+
+    /// full userdata 的 bytes 和固定 uservalue 容量分別計入 LuaHeap。
+    /// 兩筆預留只有在 heap 物件完成發布後才提交。
+    pub fn allocate_userdata(
+        &mut self,
+        size: usize,
+        uservalue_count: usize,
+    ) -> Result<ObjectRef, VmError> {
+        let userdata = UserdataPayload::prepare(&self.ledger, size, uservalue_count)?;
+        self.allocate_payload(HeapPayload::Userdata(userdata))
     }
 
     fn allocate_payload(&mut self, payload: HeapPayload) -> Result<ObjectRef, VmError> {
+        self.allocate_payload_with_charge(payload, None)
+    }
+
+    fn allocate_payload_with_charge(
+        &mut self,
+        payload: HeapPayload,
+        payload_charge: Option<crate::alloc::AllocationCharge>,
+    ) -> Result<ObjectRef, VmError> {
+        let mut charges = PairedLuaCharges::new(self.ledger.clone());
+        if let Some(charge) = payload_charge {
+            charges.replace_first(charge);
+        }
         let candidate = HeapObject {
             payload,
             children: Vec::new(),
+            charges,
         };
         candidate.trace_children(|child| {
             self.checked_slot(child)?;
             Ok(())
         })?;
         let object_debt = candidate.debt_bytes()?;
-        if self.gc.automatic_running
-            && !self.finalizer_running
-            && self.collect_every_allocation
-            && self.gc.phase != GcPhase::Pause
-        {
-            candidate.trace_children(|child| self.mark_gc_object(child))?;
-            while self.gc.phase != GcPhase::Pause {
-                self.incremental_step(1024)?;
-            }
-        }
         let automatic_threshold = self
             .gc
             .debt_threshold_override
@@ -4562,17 +6450,16 @@ impl Vm {
                 GcMode::Incremental => self.gc.incremental_debt_threshold,
                 GcMode::Generational => self.gc.debt_threshold,
             });
-        if self.gc.automatic_running
+        let automatic_work = if self.gc.automatic_running
             && !self.finalizer_running
             && !self.collect_every_allocation
             && self.gc.debt_bytes >= automatic_threshold
         {
-            if self.gc.phase != GcPhase::Pause {
-                candidate.trace_children(|child| self.mark_gc_object(child))?;
-            }
             let work = if self.gc.mode == GcMode::Incremental {
-                let scaled =
-                    Self::scaled_gc_work(object_debt, GcState::apply_param(self.gc.stepmul_code));
+                let scaled = Self::scaled_gc_work(
+                    object_debt.max(self.gc_step_size_bytes()),
+                    self.decode_gc_percent(self.gc.stepmul_code),
+                );
                 if self.gc.phase == GcPhase::Atomic {
                     // 執行中的 Lua 可在每條指令加入新 root；至少完成本輪
                     // ephemeron 掃描，避免小物件持續重啟 Atomic 而餓死回收。
@@ -4592,8 +6479,10 @@ impl Vm {
             } else {
                 1
             };
-            self.incremental_step(work)?;
-        }
+            Some(work)
+        } else {
+            None
+        };
         let free = self
             .slots
             .iter()
@@ -4623,6 +6512,10 @@ impl Vm {
                 .charge
                 .checked_add(size_of::<GcColor>() + size_of::<ObjectRef>())
                 .ok_or(VmError::ArithmeticOverflow)?;
+            self.gc
+                .growth_charges
+                .try_reserve_exact(1)
+                .map_err(|_| VmError::AllocationFailed)?;
             let color_ticket =
                 reserve_vec(&self.ledger, &mut self.gc.colors, 1, FailPoint::MarkReserve)?;
             let work_ticket = self.ledger.reserve(size_of::<ObjectRef>())?;
@@ -4657,6 +6550,7 @@ impl Vm {
         };
         let reference = ObjectRef::new_runtime(ObjectId::new(self.id, slot, generation))
             .ok_or(VmError::IdentityExhausted)?;
+        let object_charge = object_ticket.commit_charge()?;
         let occupied = Slot::Occupied {
             generation,
             reference,
@@ -4666,6 +6560,7 @@ impl Vm {
             finalizer_order: 0,
             finalizer_remarked: false,
             object,
+            object_charge,
         };
         match free {
             Some(index) => self.slots[index] = occupied,
@@ -4678,36 +6573,50 @@ impl Vm {
             }
         }
         if let Some((color_ticket, work_ticket)) = gc_growth {
-            color_ticket.commit()?;
-            work_ticket.commit()?;
+            let color_charge = color_ticket.commit_charge()?;
+            let work_charge = work_ticket.commit_charge()?;
+            self.gc
+                .growth_charges
+                .push((slot.index(), color_charge, work_charge));
             self.gc.charge += size_of::<GcColor>() + size_of::<ObjectRef>();
         }
-        if self.gc.automatic_running && self.collect_every_allocation && !self.finalizer_running {
-            if let Err(error) = self.mark_gc_object(reference) {
-                self.rollback_new_object(slot.index(), free, generation);
-                return Err(error);
-            }
-            let temporary = match self.roots.add(&self.ledger, RootKind::Temporary, reference) {
+        if slot_ticket.is_some() && self.slot_charges.try_reserve_exact(1).is_err() {
+            self.rollback_new_object(slot.index(), free, generation)?;
+            return Err(VmError::AllocationFailed);
+        }
+        if self.gc.automatic_running
+            && !self.finalizer_running
+            && (self.collect_every_allocation || automatic_work.is_some())
+        {
+            let temporary = match self.add_root(RootKind::Temporary, reference) {
                 Ok(root) => root,
                 Err(error) => {
-                    self.rollback_new_object(slot.index(), free, generation);
+                    self.rollback_new_object(slot.index(), free, generation)?;
                     return Err(error);
                 }
             };
-            let collection = self.collect();
-            let removal = self.roots.remove(&self.ledger, temporary);
+            let collection = if self.collect_every_allocation {
+                self.collect().map(|_| ())
+            } else if let Some(work) = automatic_work {
+                self.incremental_step(work).map(|_| ())
+            } else {
+                Ok(())
+            };
+            let removal = self.remove_root(temporary);
             if let Err(error) = removal {
-                self.rollback_new_object(slot.index(), free, generation);
+                self.remove_unpublished_gc_reference(reference)?;
+                self.rollback_new_object(slot.index(), free, generation)?;
                 return Err(error);
             }
             if let Err(error) = collection {
-                self.rollback_new_object(slot.index(), free, generation);
+                self.remove_unpublished_gc_reference(reference)?;
+                self.rollback_new_object(slot.index(), free, generation)?;
                 return Err(error);
             }
         }
-        object_ticket.commit()?;
         if let Some(ticket) = slot_ticket {
-            ticket.commit()?;
+            let charge = ticket.commit_charge()?;
+            self.slot_charges.push(charge);
         }
         self.gc.debt_bytes = self.gc.debt_bytes.saturating_add(debt_charge);
         if self.gc.mode == GcMode::Generational {
@@ -4716,7 +6625,12 @@ impl Vm {
         Ok(reference)
     }
 
-    fn rollback_new_object(&mut self, index: usize, free: Option<usize>, generation: Generation) {
+    fn rollback_new_object(
+        &mut self,
+        index: usize,
+        free: Option<usize>,
+        generation: Generation,
+    ) -> Result<(), VmError> {
         if self.gc.phase != GcPhase::Pause {
             self.gc
                 .work
@@ -4725,6 +6639,7 @@ impl Vm {
                 self.gc.colors[index] = GcColor::White;
             } else if self.gc.colors.len() > self.slots.len().saturating_sub(1) {
                 self.gc.colors.pop();
+                self.release_gc_growth_for_slot(index)?;
             }
         }
         if free.is_some() {
@@ -4732,6 +6647,29 @@ impl Vm {
         } else {
             self.slots.pop();
         }
+        Ok(())
+    }
+
+    fn release_gc_growth_for_slot(&mut self, index: usize) -> Result<(), VmError> {
+        let position = self
+            .gc
+            .growth_charges
+            .iter()
+            .position(|entry| entry.0 == index);
+        // 物件可在 Pause 時建出 slot，隨後自動 GC 啟動，再於同一次操作
+        // 的錯誤路徑撤銷。此時 color/work 已由整輪 cycle_charge 付費，
+        // 不存在動態 growth_charge；只需移除 color，週期結束會釋放帳款。
+        let Some(position) = position else {
+            return Ok(());
+        };
+        self.gc.charge = self
+            .gc
+            .charge
+            .checked_sub(size_of::<GcColor>() + size_of::<ObjectRef>())
+            .ok_or(VmError::LedgerInvariant)?;
+        let entry = self.gc.growth_charges.swap_remove(position);
+        drop(entry);
+        Ok(())
     }
 
     /// 增加受驗證的物件欄位邊；失敗不修改原有邊。
@@ -4739,34 +6677,31 @@ impl Vm {
         self.write_ref(parent, RefField::Child, child)?;
         let id = parent.identity().ok_or(VmError::StaleObject)?;
         let index = id.slot.index();
-        let mut children = {
-            let Slot::Occupied { object, .. } = &mut self.slots[index] else {
-                return Err(VmError::StaleObject);
-            };
-            std::mem::take(&mut object[0].children)
+        let Slot::Occupied { object, .. } = &self.slots[index] else {
+            return Err(VmError::StaleObject);
         };
-
-        // 唯有受控帳本與 Vec 預留位於欄位暫離期間；不呼叫 GC 或宿主回呼。
-        let reservation = self.reserve_child_growth(&mut children);
-        {
-            let Slot::Occupied { object, .. } = &mut self.slots[index] else {
-                unreachable!("預留期間 VM 未重入，parent slot 必須仍為 occupied")
-            };
-            object[0].children = children;
-        }
-        let ticket = reservation?;
-        ticket.commit()?;
-        // 已有容量且無可失敗邊界；以短借用完成唯一圖變更。
+        let needed = object[0]
+            .children
+            .len()
+            .checked_add(1)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let mut replacement = Vec::new();
+        let ticket = reserve_vec(
+            &self.ledger,
+            &mut replacement,
+            needed,
+            FailPoint::ChildReserve,
+        )?;
+        replacement.extend_from_slice(&object[0].children);
+        replacement.push(child);
+        let charge = ticket.commit_charge()?;
         let Slot::Occupied { object, .. } = &mut self.slots[index] else {
-            unreachable!("提交後 parent slot 必須仍為 occupied")
+            unreachable!("預備期間 parent slot 未變，必須仍為 occupied")
         };
-        object[0].children.push(child);
+        let old = core::mem::replace(&mut object[0].children, replacement);
+        drop(old);
+        object[0].charges.replace_second(charge);
         Ok(())
-    }
-
-    /// `&self` 使呼叫端無法在借用 heap 內部 children 時跨越配置邊界。
-    fn reserve_child_growth(&self, children: &mut Vec<ObjectRef>) -> Result<Reservation, VmError> {
-        reserve_vec(&self.ledger, children, 1, FailPoint::ChildReserve)
     }
 
     /// 強邊提交前的共同檢查與三色寫入屏障；預留失敗不得提交欄位。
@@ -4835,6 +6770,22 @@ impl Vm {
         self.prepare_table_write_barrier_edges(
             owner,
             [(RefField::TableKey, key), (RefField::TableValue, value)],
+        )
+    }
+
+    /// 同一 table 的兩個整數欄位共用一次 remembered／mark 預備與記帳。
+    pub(crate) fn prepare_table_ref_barrier(
+        &mut self,
+        owner: ObjectRef,
+        first: Option<ObjectRef>,
+        second: Option<ObjectRef>,
+    ) -> Result<PreparedTableBarrier, VmError> {
+        self.prepare_table_write_barrier_edges(
+            owner,
+            [
+                (RefField::TableValue, first),
+                (RefField::TableValue, second),
+            ],
         )
     }
 
@@ -4915,6 +6866,7 @@ impl Vm {
                     .remembered_charge
                     .checked_add(size_of::<ObjectRef>())
                     .ok_or(VmError::ArithmeticOverflow)?;
+                self.gc.remembered_charges.try_reserve(1)?;
                 let ticket = reserve_vec(
                     &self.ledger,
                     &mut self.gc.remembered,
@@ -4929,7 +6881,7 @@ impl Vm {
             owner,
             remembered_ticket,
             remembered_charge,
-            remembered_accounted: false,
+            remembered_accounted: None,
             marks,
             barrier_count,
         })
@@ -4944,6 +6896,31 @@ impl Vm {
     ) -> Result<(), VmError> {
         let id = owner.identity().ok_or(VmError::StaleObject)?;
         self.checked_slot(owner)?;
+        let Slot::Occupied { object, .. } = &mut self.slots[id.slot.index()] else {
+            return Err(VmError::StaleObject);
+        };
+        let HeapPayload::Table(table) = &mut object[0].payload else {
+            return Err(VmError::WrongObjectType);
+        };
+        barrier.commit_accounting()?;
+        if let Err(error) = mutation.commit_accounting(&self.ledger) {
+            barrier.rollback_accounting();
+            return Err(error);
+        }
+        barrier.apply(&mut self.gc);
+        mutation.apply(table);
+        Ok(())
+    }
+
+    /// refs 的兩欄位準備與單一 write barrier 均成功後才共同發布。
+    pub(crate) fn commit_prepared_ref_pair(
+        &mut self,
+        owner: ObjectRef,
+        mut barrier: PreparedTableBarrier,
+        mut mutation: PreparedRefPair,
+    ) -> Result<(), VmError> {
+        let id = owner.identity().ok_or(VmError::StaleObject)?;
+        self.checked_slot(owner)?;
         let ledger = self.ledger.clone();
         let Slot::Occupied { object, .. } = &mut self.slots[id.slot.index()] else {
             return Err(VmError::StaleObject);
@@ -4953,7 +6930,7 @@ impl Vm {
         };
         barrier.commit_accounting()?;
         if let Err(error) = mutation.commit_accounting(&ledger) {
-            barrier.rollback_accounting(&ledger)?;
+            barrier.rollback_accounting();
             return Err(error);
         }
         barrier.apply(&mut self.gc);
@@ -5015,13 +6992,134 @@ impl Vm {
             HeapPayload::Value(_) => ObjectKind::Value,
             HeapPayload::ByteString(_) => ObjectKind::ByteString,
             HeapPayload::Table(_) => ObjectKind::Table,
+            HeapPayload::Userdata(_) => ObjectKind::Userdata,
             HeapPayload::Closure(_) => ObjectKind::Closure,
+            HeapPayload::CClosure(_) => ObjectKind::CClosure,
             HeapPayload::Builtin(_) => ObjectKind::Builtin,
             HeapPayload::Coroutine(_) => ObjectKind::Coroutine,
             HeapPayload::Upvalue(_) => ObjectKind::Upvalue,
             HeapPayload::Module(_) => ObjectKind::Module,
             HeapPayload::File(_) => ObjectKind::File,
         })
+    }
+
+    /// 僅供 C API 輸出不可解參照的物件資訊身分；先驗 VM、slot、世代及完整參照。
+    /// Userdata 的公開資訊指標另由其穩定 user-memory block 提供。
+    #[doc(hidden)]
+    pub fn opaque_identity_token(
+        &self,
+        reference: ObjectRef,
+    ) -> Result<Option<core::num::NonZeroU64>, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(reference)? else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        match object[0].payload {
+            HeapPayload::ByteString(_)
+            | HeapPayload::Table(_)
+            | HeapPayload::Closure(_)
+            | HeapPayload::CClosure(_)
+            | HeapPayload::Builtin(_)
+            | HeapPayload::Coroutine(_)
+            | HeapPayload::File(_) => reference
+                .runtime_token()
+                .map(Some)
+                .ok_or(VmError::StaleObject),
+            HeapPayload::Userdata(_)
+            | HeapPayload::Value(_)
+            | HeapPayload::Upvalue(_)
+            | HeapPayload::Module(_) => Ok(None),
+        }
+    }
+
+    fn with_userdata<R>(
+        &self,
+        object: ObjectRef,
+        f: impl FnOnce(&UserdataPayload) -> R,
+    ) -> Result<R, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(object)? else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        match &object[0].payload {
+            HeapPayload::Userdata(userdata) => Ok(f(userdata)),
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    fn with_userdata_mut<R>(
+        &mut self,
+        object: ObjectRef,
+        f: impl FnOnce(&mut UserdataPayload) -> R,
+    ) -> Result<R, VmError> {
+        let id = object.identity().ok_or(VmError::StaleObject)?;
+        self.checked_slot(object)?;
+        let Slot::Occupied { object, .. } = &mut self.slots[id.slot.index()] else {
+            unreachable!("checked_slot 只回傳 occupied")
+        };
+        match &mut object[0].payload {
+            HeapPayload::Userdata(userdata) => Ok(f(userdata)),
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    /// 指標只在此 userdata 存活期間有效；bytes 不縮放，VM 可移動 slot header。
+    /// 回傳 raw pointer 本身不解參；後續 C adapter 須維持物件 root。
+    pub fn userdata_ptr(&self, object: ObjectRef) -> Result<*mut u8, VmError> {
+        self.with_userdata(object, UserdataPayload::ptr)
+    }
+
+    /// 回傳要求的 byte 長度，不包含 16-byte 對齊填充或零長度的保底儲存。
+    pub fn userdata_len(&self, object: ObjectRef) -> Result<usize, VmError> {
+        self.with_userdata(object, |userdata| userdata.requested_len)
+    }
+
+    /// uservalue index 從 1 起算；None 精確表示索引無效。
+    pub fn get_uservalue(&self, object: ObjectRef, index: usize) -> Result<Option<Value>, VmError> {
+        self.with_userdata(object, |userdata| {
+            index
+                .checked_sub(1)
+                .and_then(|index| userdata.uservalues.get(index))
+                .copied()
+        })
+    }
+
+    /// 先完成新物件的強邊屏障，成功後才覆寫固定 uservalue 欄位。
+    /// 無效索引回 false，舊值與 GC 狀態不變。
+    pub fn set_uservalue(
+        &mut self,
+        object: ObjectRef,
+        index: usize,
+        value: Value,
+    ) -> Result<bool, VmError> {
+        let valid = self.with_userdata(object, |userdata| {
+            index
+                .checked_sub(1)
+                .is_some_and(|index| index < userdata.uservalues.len())
+        })?;
+        if !valid {
+            return Ok(false);
+        }
+        if let Value::Object(child) = value {
+            self.write_ref(object, RefField::UserValue, child)?;
+        }
+        self.with_userdata_mut(object, |userdata| {
+            userdata.uservalues[index - 1] = value;
+        })?;
+        Ok(true)
+    }
+
+    pub(crate) fn userdata_metatable(
+        &self,
+        object: ObjectRef,
+    ) -> Result<Option<ObjectRef>, VmError> {
+        self.with_userdata(object, |userdata| userdata.metatable)
+    }
+
+    pub(crate) fn set_userdata_metatable(
+        &mut self,
+        object: ObjectRef,
+        metatable: Option<ObjectRef>,
+    ) -> Result<(), VmError> {
+        self.with_userdata_mut(object, |userdata| userdata.metatable = metatable)
     }
 
     /// 借用僅限此回呼；呼叫者不能持有 heap 的可變借用。
@@ -5056,7 +7154,9 @@ impl Vm {
             HeapPayload::Value(value) => Ok(f(value)),
             HeapPayload::ByteString(_)
             | HeapPayload::Table(_)
+            | HeapPayload::Userdata(_)
             | HeapPayload::Closure(_)
+            | HeapPayload::CClosure(_)
             | HeapPayload::Builtin(_)
             | HeapPayload::Coroutine(_)
             | HeapPayload::Upvalue(_)
@@ -5078,13 +7178,45 @@ impl Vm {
             HeapPayload::ByteString(string) => Ok(f(string)),
             HeapPayload::Value(_)
             | HeapPayload::Table(_)
+            | HeapPayload::Userdata(_)
             | HeapPayload::Closure(_)
+            | HeapPayload::CClosure(_)
             | HeapPayload::Builtin(_)
             | HeapPayload::Coroutine(_)
             | HeapPayload::Upvalue(_)
             | HeapPayload::Module(_)
             | HeapPayload::File(_) => Err(VmError::WrongObjectType),
         }
+    }
+
+    /// 與 `tonumber` 共用無 base 解析，僅回傳值，不建立暫時 Lua 物件。
+    pub fn parse_lua_number_bytes(&self, bytes: &[u8]) -> Option<Value> {
+        crate::stdlib::basic::parse_number_bytes(bytes)
+    }
+
+    /// C stack 的數值讀取沿用 `tonumber` 的字串解析及物件身份檢查。
+    pub fn coerce_lua_number(&self, value: Value) -> Result<Option<Value>, VmError> {
+        match value {
+            Value::Integer(_) | Value::Float(_) => Ok(Some(value)),
+            Value::Object(object) if self.object_kind(object)? == ObjectKind::ByteString => self
+                .with_byte_string(object, |string| {
+                    self.parse_lua_number_bytes(string.as_bytes())
+                }),
+            _ => Ok(None),
+        }
+    }
+
+    /// 共用 runtime 的 profile-specific number 格式；無 VM heap borrow 逸出。
+    pub fn format_lua_number(
+        &self,
+        value: Value,
+    ) -> Result<([u8; 128], usize), crate::vm::RuntimeError> {
+        crate::vm::basic_number_bytes(value, self.profile)
+    }
+
+    /// 將已解析的 Lua 數值依 runtime 的整數邊界規則轉換。
+    pub fn lua_integer_from_value(&self, value: Value) -> Option<i64> {
+        crate::stdlib::basic::lua_integer(value)
     }
 
     pub fn with_table<R>(
@@ -5099,7 +7231,9 @@ impl Vm {
             HeapPayload::Table(table) => Ok(f(table)),
             HeapPayload::Value(_)
             | HeapPayload::ByteString(_)
+            | HeapPayload::Userdata(_)
             | HeapPayload::Closure(_)
+            | HeapPayload::CClosure(_)
             | HeapPayload::Builtin(_)
             | HeapPayload::Coroutine(_)
             | HeapPayload::Upvalue(_)
@@ -5120,6 +7254,400 @@ impl Vm {
             HeapPayload::Closure(closure) => Ok(f(closure)),
             _ => Err(VmError::WrongObjectType),
         }
+    }
+
+    /// C API 只取得 opaque 函式身分，不接觸 closure payload 或 C 指標。
+    #[doc(hidden)]
+    pub fn capi_c_closure_function(&self, object: ObjectRef) -> Result<HostFunctionId, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(object)? else {
+            return Err(VmError::StaleObject);
+        };
+        match &object[0].payload {
+            HeapPayload::CClosure(closure) => Ok(closure.function()),
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    pub(crate) fn debug_c_closure_upvalue_count(
+        &self,
+        object: ObjectRef,
+    ) -> Result<usize, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(object)? else {
+            return Err(VmError::StaleObject);
+        };
+        match &object[0].payload {
+            HeapPayload::CClosure(closure) => {
+                let mut count = 0;
+                while closure.upvalue(count).is_some() {
+                    count += 1;
+                }
+                Ok(count)
+            }
+            _ => Err(VmError::WrongObjectType),
+        }
+    }
+
+    /// 將 C closure 的一基 upvalue index 映至穩定 cell 身分。
+    #[doc(hidden)]
+    pub fn capi_c_upvalue_cell(
+        &self,
+        closure: ObjectRef,
+        index: usize,
+    ) -> Result<Option<ObjectRef>, VmError> {
+        let Slot::Occupied { object, .. } = self.checked_slot(closure)? else {
+            return Err(VmError::StaleObject);
+        };
+        let HeapPayload::CClosure(payload) = &object[0].payload else {
+            return Err(VmError::WrongObjectType);
+        };
+        Ok(index.checked_sub(1).and_then(|slot| payload.upvalue(slot)))
+    }
+
+    /// 將 C/Lua closure 的一基 upvalue index 映至穩定 cell 身分。
+    #[doc(hidden)]
+    pub fn capi_upvalue_cell(
+        &mut self,
+        function: Value,
+        index: usize,
+    ) -> Result<Option<ObjectRef>, VmError> {
+        let Value::Object(object) = function else {
+            return Ok(None);
+        };
+        match self.object_kind(object)? {
+            ObjectKind::CClosure => self.capi_c_upvalue_cell(object, index),
+            ObjectKind::Closure => match self.capi_lua_upvalue_location(object, index)? {
+                Some(CapiLuaUpvalueLocation::Environment) => {
+                    self.closure_environment_cell(object, None).map(Some)
+                }
+                Some(CapiLuaUpvalueLocation::Capture(slot)) => {
+                    self.with_closure(object, |closure| closure.upvalue(slot))
+                }
+                None => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn capi_lua_upvalue_location(
+        &self,
+        function: ObjectRef,
+        index: usize,
+    ) -> Result<Option<CapiLuaUpvalueLocation>, VmError> {
+        let Some(index) = index.checked_sub(1) else {
+            return Ok(None);
+        };
+        let (module, prototype, has_environment) = self.with_closure(function, |closure| {
+            (
+                closure.module(),
+                closure.prototype(),
+                closure.has_environment(),
+            )
+        })?;
+        let verified = self.module(module)?;
+        let proto = verified
+            .module()
+            .prototypes
+            .get(usize::try_from(prototype.0).map_err(|_| VmError::WrongObjectType)?)
+            .filter(|proto| proto.id == prototype)
+            .ok_or(VmError::WrongObjectType)?;
+        let count = if verified.native_debug().is_some() && verified.official_artifact().is_none() {
+            verified
+                .native_debug()
+                .and_then(|debug| debug.semantic_upvalue_count(prototype))
+                .ok_or(VmError::WrongObjectType)?
+        } else if let Some(plan) = verified.official_execution() {
+            usize::from(
+                plan.upvalue_map(prototype)
+                    .ok_or(VmError::WrongObjectType)?
+                    .guest_count,
+            )
+        } else {
+            proto.upvalues.len()
+        };
+        let external_environment = has_environment && count == 0;
+        if index >= count + usize::from(external_environment) {
+            return Ok(None);
+        }
+        if external_environment {
+            return Ok(Some(CapiLuaUpvalueLocation::Environment));
+        }
+        let semantic = if verified.official_artifact().is_none() {
+            verified
+                .native_debug()
+                .and_then(|debug| debug.semantic_upvalue(prototype, index))
+        } else {
+            None
+        };
+        Ok(Some(match semantic {
+            Some(NativeSemanticUpvalue::Environment) => CapiLuaUpvalueLocation::Environment,
+            Some(NativeSemanticUpvalue::Closure(physical)) => {
+                CapiLuaUpvalueLocation::Capture(usize::from(physical.0))
+            }
+            None => CapiLuaUpvalueLocation::Capture(index),
+        }))
+    }
+
+    /// Lua closure 的 debug 名稱由已驗證模組持有；缺少名稱時使用 Lua 的預設字樣。
+    #[doc(hidden)]
+    pub fn capi_lua_upvalue_name(
+        &self,
+        function: ObjectRef,
+        index: usize,
+    ) -> Result<Option<&[u8]>, VmError> {
+        if self.capi_lua_upvalue_location(function, index)?.is_none() {
+            return Ok(None);
+        }
+        let (module, prototype) =
+            self.with_closure(function, |closure| (closure.module(), closure.prototype()))?;
+        let verified = self.module(module)?;
+        Ok(Some(
+            verified
+                .official_artifact()
+                .and_then(|artifact| artifact.prototype(prototype))
+                .and_then(|proto| proto.debug.upvalue_names.get(index - 1))
+                .or_else(|| {
+                    verified
+                        .native_debug()
+                        .and_then(|debug| debug.prototype(prototype))
+                        .and_then(|proto| proto.upvalue_names.get(index - 1))
+                })
+                .and_then(|name| name.as_deref())
+                .unwrap_or(b"(no name)"),
+        ))
+    }
+
+    /// 只讀封閉 cell；open cell 由 VM 的 parked frame／暫停協程入口定位。
+    #[doc(hidden)]
+    pub fn capi_closed_upvalue(&self, cell: ObjectRef) -> Result<Option<Value>, VmError> {
+        Ok(match self.upvalue_state(cell)? {
+            UpvalueState::Closed(value) => Some(value),
+            UpvalueState::Open { .. } => None,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn capi_set_closed_upvalue(
+        &mut self,
+        cell: ObjectRef,
+        value: Value,
+    ) -> Result<bool, VmError> {
+        if !matches!(self.upvalue_state(cell)?, UpvalueState::Closed(_)) {
+            return Ok(false);
+        }
+        if let Value::CFunction(id) = value {
+            if id.vm() != self.id {
+                return Err(VmError::WrongVm);
+            }
+        }
+        self.set_closed_upvalue(cell, value)?;
+        Ok(true)
+    }
+
+    #[doc(hidden)]
+    pub fn capi_upvalue_identity_token(
+        &self,
+        cell: ObjectRef,
+    ) -> Result<core::num::NonZeroU64, VmError> {
+        self.upvalue_state(cell)?;
+        cell.runtime_token().ok_or(VmError::StaleObject)
+    }
+
+    #[doc(hidden)]
+    pub fn capi_join_lua_upvalues(
+        &mut self,
+        target: ObjectRef,
+        target_index: usize,
+        source: ObjectRef,
+        source_index: usize,
+    ) -> Result<bool, VmError> {
+        if self.object_kind(target)? != ObjectKind::Closure
+            || self.object_kind(source)? != ObjectKind::Closure
+        {
+            return Ok(false);
+        }
+        let Some(target_location) = self.capi_lua_upvalue_location(target, target_index)? else {
+            return Ok(false);
+        };
+        let Some(source_location) = self.capi_lua_upvalue_location(source, source_index)? else {
+            return Ok(false);
+        };
+        if matches!(source_location, CapiLuaUpvalueLocation::Environment)
+            && self
+                .with_closure(source, |closure| closure.environment_cell())?
+                .is_none()
+        {
+            self.capi_join_lazy_environment(target, target_location, source)?;
+            return Ok(true);
+        }
+        let Some(source_cell) = self.capi_upvalue_cell(Value::Object(source), source_index)? else {
+            return Ok(false);
+        };
+        match target_location {
+            CapiLuaUpvalueLocation::Environment => {
+                self.replace_closure_environment_cell(target, source_cell)?;
+            }
+            CapiLuaUpvalueLocation::Capture(slot) => {
+                self.replace_closure_upvalue(target, slot, source_cell)?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn prepare_closure_join_barrier(
+        &mut self,
+        source: ObjectRef,
+        target: ObjectRef,
+        cell: ObjectRef,
+    ) -> Result<PreparedClosureJoinBarrier, VmError> {
+        self.checked_slot(cell)?;
+        let mut remembered = [None, None];
+        let mut remembered_count = 0;
+        let mut mark = None;
+        for owner in [source, target] {
+            self.checked_slot(owner)?;
+            if self.gc.mode == GcMode::Generational
+                && self.gc_age(owner)? == GcAge::Old
+                && self.gc_age(cell)? != GcAge::Old
+                && !self.gc.remembered.contains(&owner)
+                && !remembered[..remembered_count].contains(&Some(owner))
+            {
+                remembered[remembered_count] = Some(owner);
+                remembered_count += 1;
+            }
+            if self.gc.phase != GcPhase::Pause {
+                let owner_index = owner.identity().ok_or(VmError::StaleObject)?.slot.index();
+                let cell_index = cell.identity().ok_or(VmError::StaleObject)?.slot.index();
+                if self.gc.colors.get(owner_index) == Some(&GcColor::Black)
+                    && self.gc.colors.get(cell_index) == Some(&GcColor::White)
+                {
+                    mark = Some((cell, cell_index));
+                }
+            }
+        }
+        if mark.is_some() && self.gc.work.len() == self.gc.work.capacity() {
+            return Err(VmError::AllocationFailed);
+        }
+        let barrier_count = self
+            .gc
+            .barrier_count
+            .checked_add(usize::from(mark.is_some()))
+            .ok_or(VmError::ArithmeticOverflow)?;
+        if mark.is_some() && self.gc.phase == GcPhase::Sweep {
+            self.gc
+                .transition_count
+                .checked_add(1)
+                .ok_or(VmError::ArithmeticOverflow)?;
+        }
+        let charge = checked_bytes(remembered_count, size_of::<ObjectRef>())?;
+        let remembered_charge = self
+            .gc
+            .remembered_charge
+            .checked_add(charge)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let remembered_ticket = if remembered_count > 0 {
+            self.gc.remembered_charges.try_reserve(1)?;
+            Some(reserve_vec(
+                &self.ledger,
+                &mut self.gc.remembered,
+                remembered_count,
+                FailPoint::RememberedReserve,
+            )?)
+        } else {
+            None
+        };
+        Ok(PreparedClosureJoinBarrier {
+            remembered,
+            remembered_count,
+            remembered_charge,
+            remembered_ticket,
+            mark,
+            barrier_count,
+        })
+    }
+
+    fn capi_join_lazy_environment(
+        &mut self,
+        target: ObjectRef,
+        target_location: CapiLuaUpvalueLocation,
+        source: ObjectRef,
+    ) -> Result<(), VmError> {
+        let value = self
+            .with_closure(source, Closure::environment)?
+            .ok_or(VmError::WrongObjectType)?;
+        match target_location {
+            CapiLuaUpvalueLocation::Environment => {
+                if !self.with_closure(target, Closure::has_environment)? {
+                    return Err(VmError::WrongObjectType);
+                }
+            }
+            CapiLuaUpvalueLocation::Capture(slot) => {
+                if self
+                    .with_closure(target, |closure| closure.upvalue(slot))?
+                    .is_none()
+                {
+                    return Err(VmError::WrongObjectType);
+                }
+            }
+        }
+        let source_slot = source.identity().ok_or(VmError::StaleObject)?.slot.index();
+        let target_slot = target.identity().ok_or(VmError::StaleObject)?.slot.index();
+        // cell 尚未連到 closure；僅暫緩這段交易的 automatic GC，成功後保留 debt。
+        let automatic_running = self.gc.automatic_running;
+        let debt_before = (self.gc.debt_bytes, self.gc.major_debt_bytes);
+        let previous_slots = self.slots.len();
+        let previous_free = self.slots.iter().enumerate().find_map(|(index, slot)| {
+            if let Slot::Free { generation } = slot {
+                Some((index, *generation, self.gc.colors.get(index).copied()))
+            } else {
+                None
+            }
+        });
+        self.gc.automatic_running = false;
+        let result = (|| {
+            let cell = self.allocate_upvalue(Upvalue::closed(value))?;
+            let joined = (|| {
+                let barrier = self.prepare_closure_join_barrier(source, target, cell)?;
+                barrier.commit(self)?;
+                for (index, location) in [
+                    (source_slot, CapiLuaUpvalueLocation::Environment),
+                    (target_slot, target_location),
+                ] {
+                    let Slot::Occupied { object, .. } = &mut self.slots[index] else {
+                        unreachable!("join 預備已驗證 closure");
+                    };
+                    let HeapPayload::Closure(closure) = &mut object[0].payload else {
+                        unreachable!("join 預備已驗證 closure");
+                    };
+                    match location {
+                        CapiLuaUpvalueLocation::Environment => closure.set_environment_cell(cell),
+                        CapiLuaUpvalueLocation::Capture(slot) => {
+                            closure.replace_upvalue(slot, cell);
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if joined.is_err() {
+                self.rollback_unpublished_created_object(
+                    cell,
+                    previous_slots,
+                    ObjectKind::Upvalue,
+                )?;
+                if let Some((index, generation, color)) = previous_free {
+                    self.slots[index] = Slot::Free { generation };
+                    if let Some(color) = color {
+                        self.gc.colors[index] = color;
+                    }
+                }
+            }
+            joined
+        })();
+        if result.is_err() {
+            self.gc.debt_bytes = debt_before.0;
+            self.gc.major_debt_bytes = debt_before.1;
+        }
+        self.gc.automatic_running = automatic_running;
+        result
     }
 
     pub(crate) fn replace_closure_upvalue(
@@ -5336,44 +7864,20 @@ impl Vm {
         let Slot::Occupied { object: stored, .. } = self.checked_slot(object)? else {
             return Err(VmError::StaleObject);
         };
-        let object_bytes = size_of::<HeapObject>();
-        let child_bytes = checked_bytes(stored[0].children.len(), size_of::<ObjectRef>())?;
-        let payload_bytes = match &stored[0].payload {
-            HeapPayload::ByteString(string) => string.len(),
-            HeapPayload::Value(_) => 0,
-            HeapPayload::Table(table) => table.charge_bytes()?,
-            HeapPayload::Closure(_)
-            | HeapPayload::Builtin(_)
-            | HeapPayload::Upvalue(_)
-            | HeapPayload::File(_) => 0,
-            HeapPayload::Coroutine(coroutine) => coroutine.charge,
-            HeapPayload::Module(module) => module.charge,
-        };
         let callback_id = match &stored[0].payload {
             HeapPayload::Builtin(Builtin::HostCallback(id)) => Some(*id),
             _ => None,
         };
-        let refund = object_bytes
-            .checked_add(child_bytes)
-            .and_then(|total| total.checked_add(payload_bytes))
-            .ok_or(VmError::ArithmeticOverflow)?;
-        self.ledger.refund_lua(refund)?;
+        // 增量週期的 root/work 快照可能仍持有已解除暫存 root 的物件。
+        // 回收 slot 前先移除它，避免後續標記讀取過期的 ObjectRef。
+        self.remove_unpublished_gc_reference(object)?;
         let slot = &mut self.slots[id.slot.index()];
-        if let Slot::Occupied { object, .. } = slot {
-            match &mut object[0].payload {
-                HeapPayload::Coroutine(coroutine) => coroutine.disarm_refund(),
-                HeapPayload::Module(module) => module.disarm_refund(),
-                _ => {}
-            }
-        }
         *slot = match id.generation.next() {
             Some(next) => Slot::Free { generation: next },
             None => Slot::Retired,
         };
         if let Some(callback_id) = callback_id {
-            if let Some(entry) = self.callbacks.get_mut(callback_id).and_then(Option::take) {
-                self.ledger.refund(entry.charge)?;
-            }
+            self.callbacks.get_mut(callback_id).and_then(Option::take);
         }
         Ok(())
     }
@@ -5403,45 +7907,276 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        let reset_cleanup = self.cancel_prepared_thread_reset_b11();
+        debug_assert!(reset_cleanup.is_ok());
+        self.cleanup_parked_on_drop();
         self.roots.release_all_on_vm_drop(&self.ledger);
-        self.ledger.refund_on_drop(self.callbacks_charge);
-        for entry in self.callbacks.iter().flatten() {
-            self.ledger.refund_on_drop(entry.charge);
-        }
-        self.ledger.refund_on_drop(self.finalizer_queue_charge);
         for slot in &self.slots {
             let Slot::Occupied { object, .. } = slot else {
                 continue;
             };
             let heap = &object[0];
-            self.ledger.refund_lua_on_drop(size_of::<HeapObject>());
-            match checked_bytes(heap.children.len(), size_of::<ObjectRef>()) {
-                Ok(bytes) => self.ledger.refund_lua_on_drop(bytes),
-                Err(_) => self.ledger.poison(),
-            }
             match &heap.payload {
-                HeapPayload::ByteString(string) => self.ledger.refund_lua_on_drop(string.len()),
-                HeapPayload::Table(table) => match table.charge_bytes() {
-                    Ok(bytes) => self.ledger.refund_lua_on_drop(bytes),
-                    Err(_) => self.ledger.poison(),
-                },
+                HeapPayload::ByteString(_) => {}
+                HeapPayload::Table(_) => {}
+                HeapPayload::Userdata(_) => {}
                 _ => {}
             }
-        }
-        match checked_bytes(self.slots.len(), size_of::<Slot>()) {
-            Ok(bytes) => self.ledger.refund_lua_on_drop(bytes),
-            Err(_) => self.ledger.poison(),
         }
     }
 }
 
 #[cfg(test)]
 mod p12_5_tests {
+    use core::cell::Cell;
+    use core::num::NonZeroUsize;
+    use std::rc::Rc;
+
     use rivetlua_core::Value;
 
     use super::{
         AtomicFinalizerStage, FailPoint, FinalizerState, GcPhase, ObjectKind, RootKind, Vm, VmError,
     };
+    use crate::alloc::AllocationAdmission;
+    use crate::call::CallFrame;
+    use crate::upvalue::Upvalue;
+    use crate::vm::RuntimeErrorKind;
+
+    struct RejectRememberedNormalization {
+        next: Cell<usize>,
+        outstanding: Cell<usize>,
+        reject_once: Cell<bool>,
+    }
+
+    impl AllocationAdmission for RejectRememberedNormalization {
+        fn admit(&self, bytes: usize) -> Option<NonZeroUsize> {
+            if self.reject_once.replace(false) {
+                return None;
+            }
+            let token = NonZeroUsize::new(self.next.get())?;
+            self.next.set(self.next.get() + 1);
+            self.outstanding.set(self.outstanding.get() + bytes);
+            Some(token)
+        }
+
+        fn release(&self, _token: NonZeroUsize, bytes: usize) {
+            self.outstanding.set(self.outstanding.get() - bytes);
+        }
+    }
+
+    #[test]
+    fn remembered_normalize_rejection_preserves_gc_and_object_then_retries() {
+        let admission = Rc::new(RejectRememberedNormalization {
+            next: Cell::new(1),
+            outstanding: Cell::new(0),
+            reject_once: Cell::new(false),
+        });
+        let mut vm =
+            Vm::new_with_profile_and_admission(rivetlua_core::LuaProfile::Lua54, admission.clone())
+                .unwrap();
+        vm.stop_automatic_gc();
+        let before = vm.allocate_table().unwrap();
+        let middle = vm.allocate_table().unwrap();
+        let after = vm.allocate_table().unwrap();
+        for object in [before, middle, after] {
+            vm.remember_gc_owner(object).unwrap();
+        }
+        vm.gc.remembered_cursor = 2;
+        let original_set = vm.gc.remembered.clone();
+        let original_cursor = vm.gc.remembered_cursor;
+        let original_ledger = vm.ledger_snapshot();
+        let original_outstanding = admission.outstanding.get();
+        admission.reject_once.set(true);
+        assert_eq!(
+            vm.remove_unpublished_gc_reference(middle),
+            Err(VmError::AllocationFailed)
+        );
+        assert_eq!(vm.gc.remembered, original_set);
+        assert_eq!(vm.gc.remembered_cursor, original_cursor);
+        assert_eq!(vm.ledger_snapshot(), original_ledger);
+        assert_eq!(admission.outstanding.get(), original_outstanding);
+        assert_eq!(vm.object_kind(middle), Ok(ObjectKind::Table));
+        vm.remove_unpublished_gc_reference(middle).unwrap();
+        assert_eq!(vm.gc.remembered, [before, after]);
+        assert_eq!(vm.gc.remembered_cursor, 1);
+        drop(vm);
+        assert_eq!(admission.outstanding.get(), 0);
+    }
+
+    #[test]
+    fn reclaim_after_temporary_root_release_drops_incremental_snapshot() {
+        for profile in [
+            rivetlua_core::LuaProfile::Lua54,
+            rivetlua_core::LuaProfile::Lua55,
+        ] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let key = vm.allocate_byte_string(b"__index").unwrap();
+            let temporary = vm.add_root(RootKind::Temporary, key).unwrap();
+            vm.incremental_step(1).unwrap();
+            assert_eq!(vm.gc.phase, GcPhase::RootMark);
+            assert!(vm.gc.roots.contains(&key));
+
+            vm.remove_root(temporary).unwrap();
+            vm.reclaim(key).unwrap();
+            assert!(!vm.gc.roots.contains(&key));
+            while vm.gc.phase != GcPhase::Pause {
+                vm.incremental_step(1024).unwrap();
+            }
+            assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn reclaim_processed_root_keeps_next_incremental_root_mark() {
+        for profile in [
+            rivetlua_core::LuaProfile::Lua54,
+            rivetlua_core::LuaProfile::Lua55,
+        ] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let first = vm.allocate_table().unwrap();
+            let next = vm.allocate_table().unwrap();
+            let first_root = vm.add_root(RootKind::Temporary, first).unwrap();
+            let next_root = vm.add_root(RootKind::Host, next).unwrap();
+            vm.incremental_step(1).unwrap();
+            let first_index = vm.gc.roots.iter().position(|root| *root == first).unwrap();
+            vm.incremental_step(first_index + 1).unwrap();
+            assert_eq!(vm.gc.phase, GcPhase::RootMark);
+            assert_eq!(vm.gc.root_cursor, first_index + 1);
+            assert!(vm.gc.work.contains(&first));
+
+            vm.remove_root(first_root).unwrap();
+            vm.reclaim(first).unwrap();
+            assert_eq!(vm.gc.root_cursor, first_index);
+            assert!(!vm.gc.roots.contains(&first));
+            assert!(!vm.gc.work.contains(&first));
+            while vm.gc.phase != GcPhase::Pause {
+                vm.incremental_step(1024).unwrap();
+            }
+            assert_eq!(vm.object_kind(first), Err(VmError::StaleObject));
+            assert_eq!(vm.object_kind(next), Ok(ObjectKind::Table));
+            vm.remove_root(next_root).unwrap();
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn reclaim_remembered_rejection_preserves_slot_then_retries() {
+        let admission = Rc::new(RejectRememberedNormalization {
+            next: Cell::new(1),
+            outstanding: Cell::new(0),
+            reject_once: Cell::new(false),
+        });
+        let mut vm =
+            Vm::new_with_profile_and_admission(rivetlua_core::LuaProfile::Lua54, admission.clone())
+                .unwrap();
+        vm.stop_automatic_gc();
+        let before = vm.allocate_table().unwrap();
+        let middle = vm.allocate_table().unwrap();
+        let after = vm.allocate_table().unwrap();
+        for object in [before, middle, after] {
+            vm.remember_gc_owner(object).unwrap();
+        }
+        vm.gc.remembered_cursor = 2;
+        let original_set = vm.gc.remembered.clone();
+        let original_ledger = vm.ledger_snapshot();
+        admission.reject_once.set(true);
+        assert_eq!(vm.reclaim(middle), Err(VmError::AllocationFailed));
+        assert_eq!(vm.gc.remembered, original_set);
+        assert_eq!(vm.gc.remembered_cursor, 2);
+        assert_eq!(vm.ledger_snapshot(), original_ledger);
+        assert_eq!(vm.object_kind(middle), Ok(ObjectKind::Table));
+
+        vm.reclaim(middle).unwrap();
+        assert_eq!(vm.gc.remembered, [before, after]);
+        assert_eq!(vm.gc.remembered_cursor, 1);
+        assert_eq!(vm.object_kind(middle), Err(VmError::StaleObject));
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        drop(vm);
+        assert_eq!(admission.outstanding.get(), 0);
+    }
+
+    #[test]
+    fn gc_growth_owner_follows_slot_across_interleaved_rollbacks() {
+        let admission = Rc::new(RejectRememberedNormalization {
+            next: Cell::new(1),
+            outstanding: Cell::new(0),
+            reject_once: Cell::new(false),
+        });
+        let mut vm =
+            Vm::new_with_profile_and_admission(rivetlua_core::LuaProfile::Lua54, admission.clone())
+                .unwrap();
+        vm.stop_automatic_gc();
+        vm.begin_gc_cycle_kind(super::GcCycleKind::Full).unwrap();
+        let first_previous = vm.slots.len();
+        let first = vm.allocate_table().unwrap();
+        let second_previous = vm.slots.len();
+        let second = vm.allocate_table().unwrap();
+        assert_eq!(vm.gc.growth_charges.len(), 2);
+        assert_eq!(vm.gc.growth_charges[0].0, first_previous);
+        assert_eq!(vm.gc.growth_charges[1].0, second_previous);
+        vm.rollback_unpublished_created_object(first, first_previous, ObjectKind::Table)
+            .unwrap();
+        assert_eq!(vm.gc.growth_charges.len(), 2);
+        assert_eq!(vm.gc.growth_charges[1].0, second_previous);
+        vm.rollback_unpublished_created_object(second, second_previous, ObjectKind::Table)
+            .unwrap();
+        assert_eq!(vm.gc.growth_charges.len(), 1);
+        assert_eq!(vm.gc.growth_charges[0].0, first_previous);
+        assert_eq!(
+            vm.gc.charge,
+            core::mem::size_of::<super::GcColor>()
+                + core::mem::size_of::<rivetlua_core::ObjectRef>()
+        );
+        vm.gc.clear_cycle().unwrap();
+        assert!(vm.gc.growth_charges.is_empty());
+        assert_eq!(vm.gc.charge, 0);
+        drop(vm);
+        assert_eq!(admission.outstanding.get(), 0);
+    }
+
+    #[test]
+    fn open_upvalue_prefix_rollback_rejection_then_retry_keeps_tokens_balanced() {
+        let admission = Rc::new(RejectRememberedNormalization {
+            next: Cell::new(1),
+            outstanding: Cell::new(0),
+            reject_once: Cell::new(false),
+        });
+        let mut vm =
+            Vm::new_with_profile_and_admission(rivetlua_core::LuaProfile::Lua54, admission.clone())
+                .unwrap();
+        vm.stop_automatic_gc();
+        let mut frame = CallFrame::new_native_finalizer(vm.allocation_ledger()).unwrap();
+        let first = vm
+            .allocate_upvalue(Upvalue::open(vm.id(), None, 0))
+            .unwrap();
+        frame.add_open(&mut vm, 0, first).unwrap();
+        let second = vm
+            .allocate_upvalue(Upvalue::open(vm.id(), None, 1))
+            .unwrap();
+        frame.add_open(&mut vm, 1, second).unwrap();
+        let original_ledger = vm.ledger_snapshot();
+        let original_outstanding = admission.outstanding.get();
+        admission.reject_once.set(true);
+        let error = frame.rollback_open_prefix(&mut vm, 1).err().unwrap();
+        assert_eq!(
+            error.kind,
+            RuntimeErrorKind::Heap(VmError::AllocationFailed)
+        );
+        assert_eq!(frame.open_upvalues.len(), 2);
+        assert_eq!(vm.ledger_snapshot(), original_ledger);
+        assert_eq!(admission.outstanding.get(), original_outstanding);
+        assert_eq!(vm.object_kind(second), Ok(ObjectKind::Upvalue));
+        frame.rollback_open_prefix(&mut vm, 1).unwrap();
+        assert_eq!(frame.open_upvalues.len(), 1);
+        assert_eq!(vm.object_kind(second), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(first), Ok(ObjectKind::Upvalue));
+        drop(frame);
+        drop(vm);
+        assert_eq!(admission.outstanding.get(), 0);
+    }
 
     #[test]
     fn p15_host_late_finalizer_registration_releases_child_after_finalization() {
@@ -5545,6 +8280,49 @@ mod p15_payload_accounting_tests {
     use rivetlua_core::{LuaProfile, Value, VerifiedModule, VerifyLimits};
 
     struct Unlimited;
+
+    #[test]
+    fn b14_compact_heap_object_and_weak_pair_account_exactly() {
+        use crate::CanonicalKey;
+
+        assert!(size_of::<HeapObject>() <= 312);
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        vm.stop_automatic_gc();
+        let before = vm.ledger_snapshot().lua_heap_bytes;
+        let table = vm.allocate_table().unwrap();
+        let table_root = vm.add_root(RootKind::Host, table).unwrap();
+        let after_table = vm.ledger_snapshot().lua_heap_bytes;
+        let metatable = vm.allocate_table().unwrap();
+        let metatable_root = vm.add_root(RootKind::Host, metatable).unwrap();
+        let after_metatable = vm.ledger_snapshot().lua_heap_bytes;
+        let key = vm.allocate_byte_string(b"__mode").unwrap();
+        let key_root = vm.add_root(RootKind::Host, key).unwrap();
+        let after_key = vm.ledger_snapshot().lua_heap_bytes;
+        let mode = vm.allocate_byte_string(b"kv").unwrap();
+        let mode_root = vm.add_root(RootKind::Host, mode).unwrap();
+        let after_mode = vm.ledger_snapshot().lua_heap_bytes;
+        vm.raw_set(metatable, Value::Object(key), Value::Object(mode))
+            .unwrap();
+        let after_field = vm.ledger_snapshot().lua_heap_bytes;
+        vm.set_metatable(table, Some(metatable)).unwrap();
+        let object_and_slot = size_of::<HeapObject>() + size_of::<Slot>();
+        assert_eq!(after_table - before, object_and_slot);
+        assert_eq!(after_metatable - after_table, object_and_slot);
+        assert_eq!(
+            after_key - after_metatable,
+            object_and_slot + b"__mode".len()
+        );
+        assert_eq!(after_mode - after_key, object_and_slot + b"kv".len());
+        assert_eq!(
+            after_field - after_mode,
+            size_of::<Option<(CanonicalKey, Value)>>()
+        );
+        for root in [mode_root, key_root, metatable_root, table_root] {
+            vm.remove_root(root).unwrap();
+        }
+        vm.collect_major().unwrap();
+        assert_eq!(vm.ledger_snapshot().lua_heap_bytes, 4 * size_of::<Slot>());
+    }
 
     #[test]
     fn new_slot_growth_adds_gc_debt_once_and_reuse_does_not() {
@@ -5891,7 +8669,7 @@ mod p15_payload_accounting_tests {
             Ok(address)
         );
         let expected = 4 * (size_of::<HeapObject>() + size_of::<Slot>())
-            + 2 * b"__mode".len()
+            + b"__mode".len()
             + b"kv".len()
             + hash_charge;
         assert_eq!(
@@ -6060,18 +8838,22 @@ mod p15_payload_accounting_tests {
 
         let mut vm = Vm::new().unwrap();
         let probe = vm.ledger_probe();
-        let host_ticket = vm.ledger.reserve(23).unwrap();
-        host_ticket.commit().unwrap();
+        let charged = |vm: &Vm| {
+            let mut charges = crate::alloc::AllocationCharges::new();
+            charges.try_reserve(1).unwrap();
+            charges.push_prepared(vm.ledger.reserve(23).unwrap().commit_charge().unwrap());
+            charges
+        };
         vm.inject_failure_once(super::FailPoint::ObjectReserve);
+        let charge = charged(&vm);
         assert_eq!(
-            vm.allocate_charged_module(small_module(), 23),
+            vm.allocate_charged_module(small_module(), charge),
             Err(VmError::InjectedFailure(super::FailPoint::ObjectReserve))
         );
         assert_eq!(vm.ledger_snapshot().committed, 0);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
-        let host_ticket = vm.ledger.reserve(23).unwrap();
-        host_ticket.commit().unwrap();
-        let module = vm.allocate_charged_module(small_module(), 23).unwrap();
+        let charge = charged(&vm);
+        let module = vm.allocate_charged_module(small_module(), charge).unwrap();
         let root = vm.add_root(RootKind::Host, module).unwrap();
         let address = vm.module(module).unwrap() as *const VerifiedModule as usize;
         vm.collect_major().unwrap();
@@ -6093,9 +8875,8 @@ mod p15_payload_accounting_tests {
 
         let mut vm = Vm::new().unwrap();
         let probe = vm.ledger_probe();
-        let host_ticket = vm.ledger.reserve(23).unwrap();
-        host_ticket.commit().unwrap();
-        vm.allocate_charged_module(small_module(), 23).unwrap();
+        let charge = charged(&vm);
+        vm.allocate_charged_module(small_module(), charge).unwrap();
         drop(vm);
         assert_eq!(probe.snapshot().committed, 0);
         assert_eq!(probe.snapshot().reserved, 0);
@@ -6175,10 +8956,53 @@ mod p12_6_tests {
 
 #[cfg(test)]
 mod gc_running_tests {
-    use rivetlua_core::{LuaProfile, Value};
+    use rivetlua_core::{HostFunctionId, LuaProfile, Value};
 
     use super::{GcColor, GcMode, GcPhase, ObjectKind, RootKind, Vm, VmError};
+    use crate::HostHandle;
     use crate::stdlib::basic::{self, BasicBuiltin};
+
+    #[test]
+    fn c_closure_transaction_defers_automatic_gc_to_next_safe_allocation() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            for mode in [GcMode::Incremental, GcMode::Generational] {
+                let mut vm = Vm::new_with_profile(profile).unwrap();
+                vm.set_gc_mode(mode).unwrap();
+                let captured = vm.allocate_table().unwrap();
+                let captured_root = HostHandle::<Value>::new(&mut vm, captured).unwrap();
+                vm.collect().unwrap();
+                vm.set_collect_every_allocation(true);
+                let before = vm.gc_trace();
+                let id = HostFunctionId::new_unique(vm.id()).unwrap();
+                let mut published = None;
+                let closure = vm
+                    .prepare_unpublished_c_closure::<VmError>(
+                        id,
+                        &[Value::Object(captured)],
+                        |_, _| Ok(()),
+                        |object, root| published = Some((object, root)),
+                    )
+                    .unwrap();
+                let (published_object, root) = published.unwrap();
+                assert_eq!(closure, published_object);
+                drop(captured_root);
+                let after = vm.gc_trace();
+                assert!(vm.automatic_gc_running());
+                assert!(after.debt_bytes > before.debt_bytes);
+                assert_eq!(after.transition_count, before.transition_count);
+                vm.allocate_byte_string(b"safe allocation").unwrap();
+                assert!(vm.gc_trace().transition_count > after.transition_count);
+                assert_eq!(vm.object_kind(closure), Ok(ObjectKind::CClosure));
+                assert_eq!(vm.object_kind(captured), Ok(ObjectKind::Table));
+                drop(root);
+                vm.collect().unwrap();
+                assert_eq!(vm.object_kind(closure), Err(VmError::StaleObject));
+                assert_eq!(vm.object_kind(captured), Err(VmError::StaleObject));
+                assert!(vm.automatic_gc_running());
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+            }
+        }
+    }
 
     #[test]
     fn finalizer_running_controls_return_nil_without_touching_gc_state() {
@@ -6341,6 +9165,841 @@ mod gc_running_tests {
             assert_eq!(vm.object_kind(third), Err(VmError::StaleObject));
             assert!(!vm.automatic_gc_running());
             assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod root_publication_a29_tests {
+    use rivetlua_core::LuaProfile;
+
+    use super::{FailPoint, GcColor, GcPhase, RootKind, Vm, VmError};
+
+    #[test]
+    fn root_publication_a29_active_failure_atomicity() {
+        for profile in [LuaProfile::Lua55, LuaProfile::Lua54] {
+            for host_lease in [false, true] {
+                let mut vm = Vm::new_with_profile(profile).unwrap();
+                vm.set_gc_debt_threshold(usize::MAX);
+                let object = vm.allocate_table().unwrap();
+                assert_eq!(vm.incremental_step(1).unwrap().phase, GcPhase::RootMark);
+                assert_eq!(vm.gc_color(object), Ok(GcColor::White));
+                for point in if host_lease {
+                    &[FailPoint::RootReserve, FailPoint::HostLease][..]
+                } else {
+                    &[FailPoint::RootReserve][..]
+                } {
+                    let before = (
+                        vm.ledger_snapshot(),
+                        vm.gc_trace(),
+                        vm.roots().count(RootKind::Host),
+                    );
+                    vm.inject_failure_once(*point);
+                    let failed = if host_lease {
+                        vm.add_host_root(object).map(|_| ())
+                    } else {
+                        vm.add_root(RootKind::Host, object).map(|_| ())
+                    };
+                    assert_eq!(failed, Err(VmError::InjectedFailure(*point)));
+                    assert_eq!(
+                        (
+                            vm.ledger_snapshot(),
+                            vm.gc_trace(),
+                            vm.roots().count(RootKind::Host),
+                        ),
+                        before,
+                        "{profile:?} {host_lease} {point:?}"
+                    );
+                    assert_eq!(vm.gc_color(object), Ok(GcColor::White));
+                }
+                if host_lease {
+                    let (root, lease) = vm.add_host_root(object).unwrap();
+                    assert_eq!(vm.gc_color(object), Ok(GcColor::Gray));
+                    vm.remove_root(root).unwrap();
+                    drop(lease);
+                } else {
+                    let root = vm.add_root(RootKind::Host, object).unwrap();
+                    assert_eq!(vm.gc_color(object), Ok(GcColor::Gray));
+                    vm.remove_root(root).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod opaque_identity_a37_tests {
+    use rivetlua_core::{LuaProfile, ObjectRef, Value};
+
+    use super::{Vm, VmError};
+
+    #[test]
+    fn validated_token_rejects_forged_wrong_vm_stale_and_slot_reuse() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let first = vm.allocate_table().unwrap();
+            let second = vm.allocate_table().unwrap();
+            let string = vm.allocate_byte_string(b"token").unwrap();
+            let internal = vm.allocate(Value::Nil).unwrap();
+            let first_token = vm.opaque_identity_token(first).unwrap().unwrap();
+            let second_token = vm.opaque_identity_token(second).unwrap().unwrap();
+            let string_token = vm.opaque_identity_token(string).unwrap().unwrap();
+            assert_ne!(first_token, second_token);
+            assert_ne!(first_token, string_token);
+            assert_ne!(second_token, string_token);
+            assert_eq!(vm.opaque_identity_token(internal), Ok(None));
+
+            let before = (vm.ledger_snapshot(), vm.allocation_trace(), vm.gc_trace());
+            assert_eq!(vm.opaque_identity_token(first), Ok(Some(first_token)));
+            assert_eq!(vm.opaque_identity_token(first), Ok(Some(first_token)));
+            assert_eq!(
+                vm.opaque_identity_token(ObjectRef::from_id(first.identity().unwrap())),
+                Err(VmError::StaleObject)
+            );
+            let other_vm = Vm::new_with_profile(profile).unwrap();
+            assert_eq!(other_vm.opaque_identity_token(first), Err(VmError::WrongVm));
+            assert_eq!(
+                (vm.ledger_snapshot(), vm.allocation_trace(), vm.gc_trace()),
+                before
+            );
+
+            vm.reclaim(first).unwrap();
+            assert_eq!(vm.opaque_identity_token(first), Err(VmError::StaleObject));
+            let replacement = vm.allocate_table().unwrap();
+            assert_eq!(
+                replacement.identity().unwrap().slot,
+                first.identity().unwrap().slot
+            );
+            assert_ne!(
+                replacement.identity().unwrap().generation,
+                first.identity().unwrap().generation
+            );
+            let replacement_token = vm.opaque_identity_token(replacement).unwrap().unwrap();
+            assert_ne!(replacement_token, first_token);
+            assert_ne!(replacement_token, second_token);
+            assert_eq!(vm.opaque_identity_token(first), Err(VmError::StaleObject));
+        }
+    }
+}
+
+#[cfg(test)]
+mod capi_join_lazy_environment_a43_tests {
+    use rivetlua_compiler::{
+        CompileBudgetSink, CompileLimits, IrLimits, LanguageProfile, compile_with_budget,
+    };
+    use rivetlua_core::{Generation, LuaProfile, ObjectRef, ProtoId, Value, VerifyLimits};
+
+    use super::{
+        FailPoint, GcAge, GcColor, GcCycleKind, GcMode, GcPhase, RootKind, Slot, Vm, VmError,
+    };
+    use crate::closure::Closure;
+    use crate::vm::RunOutcome;
+
+    struct Unlimited;
+
+    impl CompileBudgetSink for Unlimited {
+        type Error = ();
+
+        fn spend_work(&mut self, _: usize) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn claim_temporary(&mut self, _: usize) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn claim_module_allocation(&mut self, _: usize) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn environment_module(language: LanguageProfile) -> rivetlua_core::VerifiedModule {
+        compile_with_budget(
+            b"return 1",
+            b"=a43-lazy-environment",
+            language,
+            &CompileLimits::default(),
+            &IrLimits::default(),
+            &VerifyLimits::default(),
+            &mut Unlimited,
+        )
+        .unwrap()
+    }
+
+    fn heap_identity(vm: &Vm) -> Vec<(Option<ObjectRef>, Option<Generation>)> {
+        vm.slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Occupied { reference, .. } => (Some(*reference), None),
+                Slot::Free { generation } => (None, Some(*generation)),
+                Slot::Retired => (None, None),
+            })
+            .collect()
+    }
+
+    fn root_identity(vm: &Vm) -> Vec<(RootKind, crate::roots::RootId, ObjectRef)> {
+        let mut roots = Vec::new();
+        vm.roots()
+            .try_visit_labeled(|kind, id, object| {
+                roots.push((kind, id, object));
+                Ok(())
+            })
+            .unwrap();
+        roots
+    }
+
+    fn gc_identity(
+        vm: &Vm,
+    ) -> (
+        Vec<GcColor>,
+        Vec<ObjectRef>,
+        Vec<ObjectRef>,
+        Vec<ObjectRef>,
+        usize,
+        usize,
+        usize,
+        usize,
+        bool,
+    ) {
+        (
+            vm.gc.colors.clone(),
+            vm.gc.work.clone(),
+            vm.gc.roots.clone(),
+            vm.gc.remembered.clone(),
+            vm.gc.root_cursor,
+            vm.gc.remembered_cursor,
+            vm.gc.ephemeron_cursor,
+            vm.gc.charge,
+            vm.gc.automatic_running,
+        )
+    }
+
+    #[test]
+    fn lazy_source_environment_target_remembered_failure_rolls_back() {
+        for (profile, language) in [
+            (LuaProfile::Lua54, LanguageProfile::Lua54),
+            (LuaProfile::Lua55, LanguageProfile::Lua55),
+        ] {
+            let module = environment_module(language);
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            vm.set_gc_mode(GcMode::Generational).unwrap();
+            let module = vm.allocate_module(module).unwrap();
+            let target = Closure::new(
+                module,
+                ProtoId(0),
+                &[],
+                Some(Value::Integer(11)),
+                &vm.ledger,
+            )
+            .unwrap();
+            let target = vm.allocate_closure(target).unwrap();
+            let target_root = vm.add_root(RootKind::Host, target).unwrap();
+            vm.collect_major().unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.gc_age(target), Ok(GcAge::Old));
+            let source = Closure::new(
+                module,
+                ProtoId(0),
+                &[],
+                Some(Value::Integer(22)),
+                &vm.ledger,
+            )
+            .unwrap();
+            let source = vm.allocate_closure(source).unwrap();
+            let source_root = vm.add_root(RootKind::Host, source).unwrap();
+            assert_eq!(vm.gc_age(source), Ok(GcAge::Young));
+            assert!(!vm.gc.remembered.contains(&target));
+            let target_before = vm
+                .with_closure(target, |c| (c.environment_cell(), c.environment()))
+                .unwrap();
+            let source_before = vm
+                .with_closure(source, |c| (c.environment_cell(), c.environment()))
+                .unwrap();
+            assert_eq!(target_before.0, None);
+            assert_eq!(source_before.0, None);
+            let before = (
+                heap_identity(&vm),
+                root_identity(&vm),
+                vm.ledger_snapshot(),
+                vm.gc_trace(),
+                gc_identity(&vm),
+            );
+            assert!(
+                vm.slots
+                    .iter()
+                    .all(|slot| !matches!(slot, Slot::Free { .. }))
+            );
+            for point in [
+                FailPoint::SlotReserve,
+                FailPoint::ObjectReserve,
+                FailPoint::ObjectInitialize,
+                FailPoint::RememberedReserve,
+            ] {
+                let trace_before = vm.allocation_trace();
+                vm.inject_failure_once(point);
+                assert_eq!(
+                    vm.capi_join_lua_upvalues(target, 1, source, 1),
+                    Err(VmError::InjectedFailure(point)),
+                    "{profile:?} {point:?}"
+                );
+                assert_eq!(
+                    vm.with_closure(target, |c| (c.environment_cell(), c.environment())),
+                    Ok(target_before)
+                );
+                assert_eq!(
+                    vm.with_closure(source, |c| (c.environment_cell(), c.environment())),
+                    Ok(source_before)
+                );
+                assert_eq!(
+                    (
+                        heap_identity(&vm),
+                        root_identity(&vm),
+                        vm.ledger_snapshot(),
+                        vm.gc_trace(),
+                        gc_identity(&vm),
+                    ),
+                    before,
+                    "{profile:?} {point:?}"
+                );
+                if point != FailPoint::ObjectInitialize {
+                    assert_eq!(
+                        vm.allocation_trace().last_failure.unwrap().attempt.point,
+                        Some(point)
+                    );
+                }
+                assert!(vm.allocation_trace().next_ordinal > trace_before.next_ordinal);
+            }
+            assert_eq!(vm.capi_join_lua_upvalues(target, 1, source, 1), Ok(true));
+            let source_cell = vm
+                .with_closure(source, |c| c.environment_cell())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                vm.with_closure(target, |c| c.environment_cell()),
+                Ok(Some(source_cell))
+            );
+            assert_eq!(
+                vm.upvalue_state(source_cell),
+                Ok(crate::upvalue::UpvalueState::Closed(Value::Integer(22)))
+            );
+            vm.collect_minor().unwrap();
+            assert_eq!(vm.object_kind(source_cell), Ok(super::ObjectKind::Upvalue));
+            vm.remove_root(source_root).unwrap();
+            vm.remove_root(target_root).unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(source_cell), Err(VmError::StaleObject));
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn lazy_source_environment_active_mark_and_work_failures_roll_back() {
+        for (profile, language) in [
+            (LuaProfile::Lua54, LanguageProfile::Lua54),
+            (LuaProfile::Lua55, LanguageProfile::Lua55),
+        ] {
+            for mode in [GcMode::Incremental, GcMode::Generational] {
+                for point in [FailPoint::MarkReserve, FailPoint::WorkReserve] {
+                    let mut vm = Vm::new_with_profile(profile).unwrap();
+                    vm.stop_automatic_gc();
+                    vm.set_gc_mode(mode).unwrap();
+                    let module = vm.allocate_module(environment_module(language)).unwrap();
+                    let target = Closure::new(
+                        module,
+                        ProtoId(0),
+                        &[],
+                        Some(Value::Integer(11)),
+                        &vm.ledger,
+                    )
+                    .unwrap();
+                    let target = vm.allocate_closure(target).unwrap();
+                    let source = Closure::new(
+                        module,
+                        ProtoId(0),
+                        &[],
+                        Some(Value::Integer(22)),
+                        &vm.ledger,
+                    )
+                    .unwrap();
+                    let source = vm.allocate_closure(source).unwrap();
+                    let target_root = vm.add_root(RootKind::Host, target).unwrap();
+                    let source_root = vm.add_root(RootKind::Host, source).unwrap();
+                    assert!(
+                        vm.slots
+                            .iter()
+                            .all(|slot| !matches!(slot, Slot::Free { .. }))
+                    );
+                    vm.begin_gc_cycle_kind(match mode {
+                        GcMode::Incremental => GcCycleKind::Full,
+                        GcMode::Generational => GcCycleKind::Major,
+                    })
+                    .unwrap();
+                    assert_ne!(vm.gc.phase, GcPhase::Pause);
+                    let before = (
+                        heap_identity(&vm),
+                        root_identity(&vm),
+                        vm.ledger_snapshot(),
+                        vm.gc_trace(),
+                        gc_identity(&vm),
+                    );
+                    let trace_before = vm.allocation_trace();
+                    vm.inject_failure_once(point);
+                    assert_eq!(
+                        vm.capi_join_lua_upvalues(target, 1, source, 1),
+                        Err(VmError::InjectedFailure(point)),
+                        "{profile:?} {mode:?} {point:?}"
+                    );
+                    if point == FailPoint::MarkReserve {
+                        assert_eq!(
+                            vm.allocation_trace().last_failure.unwrap().attempt.point,
+                            Some(point),
+                            "{profile:?} {mode:?} {point:?}"
+                        );
+                    }
+                    assert!(vm.allocation_trace().next_ordinal > trace_before.next_ordinal);
+                    assert_eq!(
+                        vm.with_closure(source, |c| (c.environment_cell(), c.environment())),
+                        Ok((None, Some(Value::Integer(22))))
+                    );
+                    assert_eq!(
+                        vm.with_closure(target, |c| (c.environment_cell(), c.environment())),
+                        Ok((None, Some(Value::Integer(11))))
+                    );
+                    assert_eq!(
+                        (
+                            heap_identity(&vm),
+                            root_identity(&vm),
+                            vm.ledger_snapshot(),
+                            vm.gc_trace(),
+                            gc_identity(&vm),
+                        ),
+                        before,
+                        "{profile:?} {mode:?} {point:?}"
+                    );
+                    assert_eq!(vm.capi_join_lua_upvalues(target, 1, source, 1), Ok(true));
+                    let cell = vm
+                        .with_closure(source, |c| c.environment_cell())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        vm.with_closure(target, |c| c.environment_cell()),
+                        Ok(Some(cell))
+                    );
+                    vm.remove_root(source_root).unwrap();
+                    vm.remove_root(target_root).unwrap();
+                    vm.collect().unwrap();
+                    assert_eq!(vm.ledger_snapshot().reserved, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_source_environment_join_defers_only_transaction_gc() {
+        for (profile, language) in [
+            (LuaProfile::Lua54, LanguageProfile::Lua54),
+            (LuaProfile::Lua55, LanguageProfile::Lua55),
+        ] {
+            for mode in [GcMode::Incremental, GcMode::Generational] {
+                let mut vm = Vm::new_with_profile(profile).unwrap();
+                vm.set_gc_mode(mode).unwrap();
+                let module = vm.allocate_module(environment_module(language)).unwrap();
+                let target = Closure::new(
+                    module,
+                    ProtoId(0),
+                    &[],
+                    Some(Value::Integer(11)),
+                    &vm.ledger,
+                )
+                .unwrap();
+                let target = vm.allocate_closure(target).unwrap();
+                let source = Closure::new(
+                    module,
+                    ProtoId(0),
+                    &[],
+                    Some(Value::Integer(22)),
+                    &vm.ledger,
+                )
+                .unwrap();
+                let source = vm.allocate_closure(source).unwrap();
+                let target_root = vm.add_root(RootKind::Host, target).unwrap();
+                let source_root = vm.add_root(RootKind::Host, source).unwrap();
+                vm.collect().unwrap();
+                vm.set_collect_every_allocation(true);
+                let before = vm.gc_trace();
+                assert_eq!(vm.capi_join_lua_upvalues(target, 1, source, 1), Ok(true));
+                let after = vm.gc_trace();
+                assert!(vm.automatic_gc_running());
+                assert_eq!(after.transition_count, before.transition_count);
+                assert!(after.debt_bytes > before.debt_bytes);
+                let cell = vm
+                    .with_closure(source, |c| c.environment_cell())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    vm.with_closure(target, |c| c.environment_cell()),
+                    Ok(Some(cell))
+                );
+                vm.allocate_table().unwrap();
+                assert!(vm.gc_trace().transition_count > after.transition_count);
+                assert_eq!(vm.object_kind(cell), Ok(super::ObjectKind::Upvalue));
+                vm.remove_root(source_root).unwrap();
+                vm.remove_root(target_root).unwrap();
+                vm.collect().unwrap();
+                assert_eq!(vm.object_kind(cell), Err(VmError::StaleObject));
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_environment_source_replaces_capture_after_barrier_retry() {
+        for (profile, language) in [
+            (LuaProfile::Lua54, LanguageProfile::Lua54),
+            (LuaProfile::Lua55, LanguageProfile::Lua55),
+        ] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            vm.set_gc_mode(GcMode::Generational).unwrap();
+            let target_module = compile_with_budget(
+                b"local x=11; return function() return x end",
+                b"=a43-capture-target",
+                language,
+                &CompileLimits::default(),
+                &IrLimits::default(),
+                &VerifyLimits::default(),
+                &mut Unlimited,
+            )
+            .unwrap();
+            let RunOutcome::Returned(values) = vm.load(target_module).unwrap().run().unwrap()
+            else {
+                panic!("capture closure fixture 須正常返回");
+            };
+            let [Value::Object(target)] = values.as_slice() else {
+                panic!("capture closure fixture 須返回單一 closure");
+            };
+            let target = *target;
+            let target_root = vm.add_root(RootKind::Host, target).unwrap();
+            vm.collect_major().unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.gc_age(target), Ok(GcAge::Old));
+            let prior_cell = vm.with_closure(target, |c| c.upvalue(0)).unwrap().unwrap();
+
+            let module = vm.allocate_module(environment_module(language)).unwrap();
+            let source = Closure::new(
+                module,
+                ProtoId(0),
+                &[],
+                Some(Value::Integer(22)),
+                &vm.ledger,
+            )
+            .unwrap();
+            let source = vm.allocate_closure(source).unwrap();
+            let source_root = vm.add_root(RootKind::Host, source).unwrap();
+            let before = (
+                heap_identity(&vm),
+                root_identity(&vm),
+                vm.ledger_snapshot(),
+                vm.gc_trace(),
+                gc_identity(&vm),
+            );
+            vm.inject_failure_once(FailPoint::RememberedReserve);
+            assert_eq!(
+                vm.capi_join_lua_upvalues(target, 1, source, 1),
+                Err(VmError::InjectedFailure(FailPoint::RememberedReserve))
+            );
+            assert_eq!(
+                vm.with_closure(target, |c| c.upvalue(0)),
+                Ok(Some(prior_cell))
+            );
+            assert_eq!(vm.with_closure(source, |c| c.environment_cell()), Ok(None));
+            assert_eq!(
+                (
+                    heap_identity(&vm),
+                    root_identity(&vm),
+                    vm.ledger_snapshot(),
+                    vm.gc_trace(),
+                    gc_identity(&vm),
+                ),
+                before
+            );
+            assert_eq!(vm.capi_join_lua_upvalues(target, 1, source, 1), Ok(true));
+            let cell = vm
+                .with_closure(source, |c| c.environment_cell())
+                .unwrap()
+                .unwrap();
+            assert_eq!(vm.with_closure(target, |c| c.upvalue(0)), Ok(Some(cell)));
+            assert_eq!(vm.capi_closed_upvalue(cell), Ok(Some(Value::Integer(22))));
+            vm.remove_root(source_root).unwrap();
+            vm.remove_root(target_root).unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(cell), Err(VmError::StaleObject));
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod p16_b3_host_coroutine_transaction_tests {
+    use std::any::Any;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use rivetlua_core::LuaProfile;
+
+    use super::{ObjectKind, Vm, VmError};
+
+    struct DropProbe(Rc<Cell<usize>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn transaction_rolls_back_and_attachment_drops_with_coroutine() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.set_gc_debt_threshold(usize::MAX);
+            let baseline = vm.ledger_snapshot();
+            let unpublished = Cell::new(None);
+            let failed = vm.prepare_unpublished_host_coroutine::<VmError, ()>(
+                |_, object| {
+                    unpublished.set(Some(object));
+                    Err(VmError::AllocationFailed)
+                },
+                |_, _, _| panic!("失敗交易不得發布 root"),
+            );
+            assert_eq!(failed, Err(VmError::AllocationFailed));
+            assert_eq!(
+                vm.object_kind(unpublished.get().unwrap()),
+                Err(VmError::StaleObject)
+            );
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            assert_eq!(vm.ledger_snapshot().lua_heap_bytes, baseline.lua_heap_bytes);
+
+            let dropped = Rc::new(Cell::new(0));
+            let mut root = None;
+            let object = vm
+                .prepare_unpublished_host_coroutine::<VmError, ()>(
+                    |_, _| {
+                        Ok((
+                            (),
+                            Some(Box::new(DropProbe(Rc::clone(&dropped))) as Box<dyn Any>),
+                        ))
+                    },
+                    |_, handle, _| root = Some(handle),
+                )
+                .unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(object), Ok(ObjectKind::Coroutine));
+            assert_eq!(
+                vm.with_coroutine_host_attachment::<DropProbe, _>(object, |value| value.is_some()),
+                Ok(true)
+            );
+            drop(root.take());
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(object), Err(VmError::StaleObject));
+            assert_eq!(dropped.get(), 1);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod p16_b10_debug_line_table_transaction_tests {
+    use rivetlua_core::{LuaProfile, Value};
+
+    use crate::{FailPoint, ObjectKind, RootKind};
+
+    use super::{Vm, VmError};
+
+    #[test]
+    fn table_insert_refusal_rolls_back_unpublished_line_table() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let before_ledger = vm.ledger_snapshot();
+            let before_gc = vm.gc_trace();
+            let before_roots = RootKind::ALL.map(|kind| vm.roots().count(kind));
+            vm.inject_failure_once(FailPoint::TableInsert);
+            let rejected = vm.prepare_unpublished_host_line_table(&[3, 7]);
+            assert!(matches!(
+                rejected,
+                Err(VmError::InjectedFailure(FailPoint::TableInsert))
+            ));
+            assert_eq!(vm.ledger_snapshot().committed, before_ledger.committed);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            assert_eq!(vm.gc_trace(), before_gc);
+            assert_eq!(
+                RootKind::ALL.map(|kind| vm.roots().count(kind)),
+                before_roots
+            );
+            let (table, root) = vm.prepare_unpublished_host_line_table(&[3, 7]).unwrap();
+            assert_eq!(
+                vm.raw_get(table, Value::Integer(3)),
+                Ok(Value::Boolean(true))
+            );
+            assert_eq!(
+                vm.raw_get(table, Value::Integer(7)),
+                Ok(Value::Boolean(true))
+            );
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(table), Ok(ObjectKind::Table));
+            drop(root);
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(table), Err(VmError::StaleObject));
+        }
+    }
+}
+
+#[cfg(test)]
+mod p16_a4a_file_metatable_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use rivetlua_core::{LuaProfile, Value};
+
+    use crate::{
+        FileOperation, FileReadFormat, FileSeekOrigin, GcPhase, HostCloseResult, HostFileLease,
+        HostResourceError, ResourceBudget, RootKind, RunOutcome, ValueOperation, Vm, VmError,
+    };
+
+    use super::{FilePayload, HeapPayload, ObjectKind};
+
+    struct LeaseProbe(Rc<Cell<usize>>);
+
+    impl Drop for LeaseProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    impl HostFileLease for LeaseProbe {
+        fn authorize(
+            &mut self,
+            _operation: FileOperation,
+            _budget: &mut ResourceBudget<'_>,
+        ) -> Result<(), HostResourceError> {
+            unreachable!("此測試不呼叫 IO 方法")
+        }
+
+        fn read(
+            &mut self,
+            _format: FileReadFormat,
+            _budget: &mut ResourceBudget<'_>,
+        ) -> Result<Option<Vec<u8>>, HostResourceError> {
+            unreachable!("此測試不呼叫 IO 方法")
+        }
+
+        fn write(
+            &mut self,
+            _bytes: &[u8],
+            _budget: &mut ResourceBudget<'_>,
+        ) -> Result<usize, HostResourceError> {
+            unreachable!("此測試不呼叫 IO 方法")
+        }
+
+        fn seek(
+            &mut self,
+            _origin: FileSeekOrigin,
+            _offset: i64,
+            _budget: &mut ResourceBudget<'_>,
+        ) -> Result<u64, HostResourceError> {
+            unreachable!("此測試不呼叫 IO 方法")
+        }
+
+        fn flush(&mut self, _budget: &mut ResourceBudget<'_>) -> Result<(), HostResourceError> {
+            unreachable!("此測試不呼叫 IO 方法")
+        }
+
+        fn close(
+            self: Box<Self>,
+            _budget: &mut ResourceBudget<'_>,
+        ) -> Result<HostCloseResult, HostResourceError> {
+            unreachable!("此測試不呼叫 IO 方法")
+        }
+    }
+
+    #[test]
+    fn file_metatable_get_set_and_table_events_a4a() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.set_gc_debt_threshold(usize::MAX);
+            let released = Rc::new(Cell::new(0));
+            let file = vm
+                .allocate_payload(HeapPayload::File(FilePayload {
+                    lease: Some(Box::new(LeaseProbe(released.clone()))),
+                    metatable: None,
+                    standard: false,
+                    charge: None,
+                }))
+                .unwrap();
+            let file_root = vm.add_root(RootKind::Host, file).unwrap();
+            let metatable = vm.allocate_table().unwrap();
+            let metatable_root = vm.add_root(RootKind::Host, metatable).unwrap();
+            let fallback = vm.allocate_table().unwrap();
+            let fallback_root = vm.add_root(RootKind::Host, fallback).unwrap();
+            let index = vm.allocate_byte_string(b"__index").unwrap();
+            vm.raw_set(metatable, Value::Object(index), Value::Object(fallback))
+                .unwrap();
+            let newindex = vm.allocate_byte_string(b"__newindex").unwrap();
+            vm.raw_set(metatable, Value::Object(newindex), Value::Object(fallback))
+                .unwrap();
+            let key = vm.allocate_byte_string(b"answer").unwrap();
+            vm.raw_set(fallback, Value::Object(key), Value::Integer(42))
+                .unwrap();
+            assert_eq!(vm.get_metatable_for_value(Value::Object(file)), Ok(None));
+            vm.set_metatable_for_value(Value::Object(file), Some(metatable))
+                .unwrap();
+            assert_eq!(
+                vm.get_metatable_for_value(Value::Object(file)),
+                Ok(Some(metatable))
+            );
+            vm.remove_root(metatable_root).unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(metatable), Ok(ObjectKind::Table));
+            assert_eq!(
+                vm.value_operation(
+                    ValueOperation::TableGet,
+                    &[Value::Object(file), Value::Object(key)],
+                )
+                .unwrap()
+                .run(),
+                Ok(RunOutcome::Returned(vec![Value::Integer(42)]))
+            );
+            let write_key = vm.allocate_byte_string(b"written").unwrap();
+            assert_eq!(
+                vm.value_operation(
+                    ValueOperation::TableSet,
+                    &[
+                        Value::Object(file),
+                        Value::Object(write_key),
+                        Value::Integer(7),
+                    ],
+                )
+                .unwrap()
+                .run(),
+                Ok(RunOutcome::Returned(Vec::new()))
+            );
+            assert_eq!(
+                vm.raw_get(fallback, Value::Object(write_key)),
+                Ok(Value::Integer(7))
+            );
+            vm.set_metatable_for_value(Value::Object(file), None)
+                .unwrap();
+            assert_eq!(vm.get_metatable_for_value(Value::Object(file)), Ok(None));
+            vm.remove_root(fallback_root).unwrap();
+            while vm.gc_trace().phase != GcPhase::Pause {
+                vm.incremental_step(1024).unwrap();
+            }
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(metatable), Err(VmError::StaleObject));
+            assert_eq!(released.get(), 0);
+            vm.remove_root(file_root).unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(file), Err(VmError::StaleObject));
+            assert_eq!(released.get(), 1);
         }
     }
 }

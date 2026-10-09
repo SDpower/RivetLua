@@ -230,6 +230,7 @@ pub(crate) struct Buffer {
     pub(crate) bytes: Vec<u8>,
     ledger: AllocationLedger,
     charge: usize,
+    owner: Option<crate::alloc::AllocationCharge>,
 }
 
 impl Buffer {
@@ -237,11 +238,12 @@ impl Buffer {
         let ledger = vm.allocation_ledger().clone();
         let mut bytes = Vec::new();
         let ticket = reserve_vec(&ledger, &mut bytes, length, FailPoint::WorkReserve)?;
-        ticket.commit()?;
+        let owner = ticket.commit_charge()?;
         Ok(Self {
             bytes,
             ledger,
             charge: length,
+            owner: Some(owner),
         })
     }
 
@@ -250,6 +252,7 @@ impl Buffer {
             bytes: Vec::new(),
             ledger: vm.allocation_ledger().clone(),
             charge: 0,
+            owner: None,
         }
     }
 
@@ -274,23 +277,15 @@ impl Buffer {
             .checked_mul(2)
             .unwrap_or(needed)
             .max(needed);
-        let extra = next
-            .checked_sub(self.charge)
-            .ok_or(VmError::ArithmeticOverflow)?;
-        let ticket = self.ledger.reserve(extra)?;
-        self.ledger.checkpoint(FailPoint::WorkReserve)?;
-        self.bytes
-            .try_reserve_exact(next - self.bytes.len())
-            .map_err(|_| VmError::AllocationFailed)?;
-        ticket.commit()?;
+        let mut replacement = Vec::new();
+        let ticket = reserve_vec(&self.ledger, &mut replacement, next, FailPoint::WorkReserve)?;
+        let owner = ticket.commit_charge()?;
+        replacement.extend_from_slice(&self.bytes);
+        let old = core::mem::replace(&mut self.bytes, replacement);
+        drop(old);
+        self.owner = Some(owner);
         self.charge = next;
         Ok(())
-    }
-}
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.charge);
     }
 }
 

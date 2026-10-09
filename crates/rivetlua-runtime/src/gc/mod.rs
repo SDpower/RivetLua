@@ -1,8 +1,9 @@
 pub(crate) mod trace;
 
-use rivetlua_core::ObjectRef;
+use rivetlua_core::{LuaProfile, ObjectRef};
 
 use crate::AllocationLedger;
+use crate::alloc::{AllocationCharge, AllocationCharges};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GcPhase {
@@ -31,6 +32,38 @@ pub enum GcAge {
 pub enum GcMode {
     Incremental,
     Generational,
+}
+
+/// 固定 Lua profile 的公開 GC 控制要求；不暴露 collector 內部狀態。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GcControl {
+    Stop,
+    Restart,
+    Collect,
+    Count,
+    CountBytes,
+    Step(usize),
+    SetPause(i32),
+    SetStepMultiplier(i32),
+    IsRunning,
+    Generational {
+        minor_mul: i32,
+        minor_major: i32,
+    },
+    Incremental {
+        pause: i32,
+        step_mul: i32,
+        step_size: i32,
+    },
+    Parameter {
+        index: i32,
+        value: i32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GcControlResult {
+    Integer(i32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +136,16 @@ pub(crate) struct GcState {
     pub(crate) automatic_running: bool,
     pub(crate) pause_code: u8,
     pub(crate) stepmul_code: u8,
+    pub(crate) stepsize_code: u8,
+    pub(crate) minor_mul_code: u8,
+    pub(crate) major_minor_code: u8,
+    pub(crate) minor_major_code: u8,
+    pub(crate) stepsize_exponent: u8,
+    pub(crate) major_followup: bool,
+    pub(crate) major_threshold_override: bool,
+    pub(crate) last_major_lua_heap_bytes: usize,
+    pub(crate) cycle_start_lua_heap_bytes: usize,
+    pub(crate) cycle_start_reclaimed: usize,
     pub(crate) debt_threshold_override: Option<usize>,
     pub phase: GcPhase,
     pub mode: GcMode,
@@ -121,6 +164,7 @@ pub(crate) struct GcState {
     pub promotion_survivals: u8,
     pub remembered: Vec<ObjectRef>,
     pub remembered_charge: usize,
+    pub remembered_charges: AllocationCharges,
     pub barrier_count: usize,
     pub reclaimed_bytes: usize,
     pub reclaimed_objects: usize,
@@ -132,15 +176,38 @@ pub(crate) struct GcState {
     pub weak_cleared_pairs: usize,
     pub atomic_finalizer_stage: AtomicFinalizerStage,
     pub charge: usize,
-    ledger: AllocationLedger,
+    pub cycle_charges: AllocationCharges,
+    pub growth_charges: Vec<(usize, AllocationCharge, AllocationCharge)>,
 }
 
 impl GcState {
-    pub fn new(ledger: AllocationLedger) -> Self {
+    pub fn new(profile: LuaProfile, _ledger: AllocationLedger) -> Self {
         Self {
             automatic_running: true,
-            pause_code: 0x54,
-            stepmul_code: 0x50,
+            pause_code: match profile {
+                LuaProfile::Lua54 => 200 / 4,
+                LuaProfile::Lua55 => Self::code_param(250),
+            },
+            stepmul_code: match profile {
+                LuaProfile::Lua54 => 100 / 4,
+                LuaProfile::Lua55 => Self::code_param(200),
+            },
+            stepsize_code: Self::code_param(9600),
+            minor_mul_code: match profile {
+                LuaProfile::Lua54 => 20,
+                LuaProfile::Lua55 => Self::code_param(20),
+            },
+            major_minor_code: Self::code_param(50),
+            minor_major_code: match profile {
+                LuaProfile::Lua54 => 100 / 4,
+                LuaProfile::Lua55 => Self::code_param(70),
+            },
+            stepsize_exponent: 13,
+            major_followup: false,
+            major_threshold_override: false,
+            last_major_lua_heap_bytes: 0,
+            cycle_start_lua_heap_bytes: 0,
+            cycle_start_reclaimed: 0,
             debt_threshold_override: None,
             phase: GcPhase::Pause,
             mode: GcMode::Generational,
@@ -159,6 +226,7 @@ impl GcState {
             promotion_survivals: 2,
             remembered: Vec::new(),
             remembered_charge: 0,
+            remembered_charges: AllocationCharges::new(),
             barrier_count: 0,
             reclaimed_bytes: 0,
             reclaimed_objects: 0,
@@ -170,7 +238,8 @@ impl GcState {
             weak_cleared_pairs: 0,
             atomic_finalizer_stage: AtomicFinalizerStage::BeforeWeakValues,
             charge: 0,
-            ledger,
+            cycle_charges: AllocationCharges::new(),
+            growth_charges: Vec::new(),
         }
     }
 
@@ -205,11 +274,12 @@ impl GcState {
     }
 
     pub fn clear_cycle(&mut self) -> Result<(), crate::VmError> {
-        self.ledger.refund(self.charge)?;
-        self.charge = 0;
         self.colors = Vec::new();
         self.work = Vec::new();
         self.roots = Vec::new();
+        self.cycle_charges = AllocationCharges::new();
+        self.growth_charges.clear();
+        self.charge = 0;
         self.root_cursor = 0;
         self.remembered_cursor = 0;
         self.sweep_cursor = 0;
@@ -224,21 +294,10 @@ impl GcState {
     }
 
     pub fn clear_remembered(&mut self) -> Result<(), crate::VmError> {
-        self.ledger.refund(self.remembered_charge)?;
-        self.remembered_charge = 0;
         self.remembered = Vec::new();
+        self.remembered_charges = AllocationCharges::new();
+        self.remembered_charge = 0;
         self.remembered_cursor = 0;
         Ok(())
-    }
-}
-
-impl Drop for GcState {
-    fn drop(&mut self) {
-        if self.charge != 0 {
-            self.ledger.refund_on_drop(self.charge);
-        }
-        if self.remembered_charge != 0 {
-            self.ledger.refund_on_drop(self.remembered_charge);
-        }
     }
 }

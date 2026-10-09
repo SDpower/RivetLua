@@ -518,6 +518,61 @@ fn temporary_root(
             .map(Some)
             .map_err(SdkError::RuntimeVm),
         Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Float(_) => Ok(None),
+        Value::LightUserdata(_) | Value::CFunction(_) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod temporary_root_tests {
+    use super::{Engine, LuaProfile, Value, temporary_root};
+    use rivetlua_core::HostFunctionId;
+
+    #[test]
+    fn sdk_temporary_root_keeps_non_collectable_values_unrooted_for_both_profiles() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let engine = Engine::new(profile);
+            let mut vm = engine.new_vm().unwrap();
+            let Value::Object(globals) = vm.globals().value(&vm).unwrap() else {
+                panic!("SDK globals 必須是 heap object");
+            };
+            let vm_id = globals.identity().unwrap().vm;
+            let c_function = Value::CFunction(HostFunctionId::new_unique(vm_id).unwrap());
+            let light_userdata = Value::LightUserdata(0x1234);
+            let values = [light_userdata, c_function];
+            let roots_before = vm.runtime.roots().total_count();
+
+            for value in values {
+                let retained_value = value;
+                assert!(temporary_root(&mut vm.runtime, value).unwrap().is_none());
+                assert_eq!(retained_value, value);
+                assert_eq!(vm.runtime.roots().total_count(), roots_before);
+            }
+
+            vm.set_global(b"host_light_userdata", light_userdata)
+                .unwrap();
+            vm.set_global(b"host_c_function", c_function).unwrap();
+            assert_eq!(
+                vm.get_global(b"host_light_userdata").unwrap(),
+                light_userdata
+            );
+            assert_eq!(vm.get_global(b"host_c_function").unwrap(), c_function);
+
+            let table = vm.new_table().unwrap();
+            let roots_with_table = vm.runtime.roots().total_count();
+            vm.table_raw_set(&table, light_userdata, c_function)
+                .unwrap();
+            vm.table_raw_set(&table, c_function, light_userdata)
+                .unwrap();
+            assert_eq!(
+                vm.table_raw_get(&table, light_userdata).unwrap(),
+                c_function
+            );
+            assert_eq!(
+                vm.table_raw_get(&table, c_function).unwrap(),
+                light_userdata
+            );
+            assert_eq!(vm.runtime.roots().total_count(), roots_with_table);
+        }
     }
 }
 

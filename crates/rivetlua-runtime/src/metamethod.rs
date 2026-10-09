@@ -87,10 +87,11 @@ impl MetamethodEvent {
 }
 
 impl Vm {
-    /// table 與受控 file payload 有獨立 metatable；完整 ObjectId 每次重新驗證。
+    /// table、full userdata 與受控 file payload 有獨立 metatable；完整 ObjectId 每次重新驗證。
     pub fn get_metatable(&self, object: ObjectRef) -> Result<Option<ObjectRef>, VmError> {
         match self.object_kind(object)? {
             ObjectKind::Table => self.with_table(object, |table| table.metatable()),
+            ObjectKind::Userdata => self.userdata_metatable(object),
             ObjectKind::File => self.with_file(object, |file| file.metatable),
             _ => Err(VmError::WrongObjectType),
         }
@@ -101,7 +102,11 @@ impl Vm {
         object: ObjectRef,
         metatable: Option<ObjectRef>,
     ) -> Result<(), VmError> {
-        if self.object_kind(object)? != ObjectKind::Table {
+        let kind = self.object_kind(object)?;
+        if !matches!(
+            kind,
+            ObjectKind::Table | ObjectKind::Userdata | ObjectKind::File
+        ) {
             return Err(VmError::WrongObjectType);
         }
         let register = if let Some(reference) = metatable {
@@ -118,10 +123,15 @@ impl Vm {
             }
             self.write_ref(object, crate::gc::trace::RefField::Metatable, reference)?;
         }
-        self.with_table_mut(object, |table, _ledger| {
-            table.set_metatable(metatable);
-            Ok(())
-        })?;
+        match kind {
+            ObjectKind::Table => self.with_table_mut(object, |table, _ledger| {
+                table.set_metatable(metatable);
+                Ok(())
+            })?,
+            ObjectKind::Userdata => self.set_userdata_metatable(object, metatable)?,
+            ObjectKind::File => self.with_file_mut(object, |file| file.metatable = metatable)?,
+            _ => unreachable!("target kind 已驗證"),
+        }
         if register {
             self.register_finalizer(object)?;
         }
@@ -134,17 +144,47 @@ impl Vm {
         object: ObjectRef,
         event: MetamethodEvent,
     ) -> Result<Value, VmError> {
-        let Some(metatable) = self.get_metatable(object)? else {
+        self.lookup_raw_metafield(object, event.name_bytes())
+    }
+
+    pub fn lookup_metamethod_value(
+        &mut self,
+        value: Value,
+        event: MetamethodEvent,
+    ) -> Result<Value, VmError> {
+        self.lookup_raw_metafield_value(value, event.name_bytes())
+    }
+
+    /// 在既有 metatable 上 raw 查詢指定欄位；供 C auxiliary API 的 `__tostring`／`__name` 共用。
+    pub fn lookup_raw_metafield(
+        &mut self,
+        object: ObjectRef,
+        name: &[u8],
+    ) -> Result<Value, VmError> {
+        self.lookup_raw_metafield_value(Value::Object(object), name)
+    }
+
+    pub fn lookup_raw_metafield_value(
+        &mut self,
+        value: Value,
+        name: &[u8],
+    ) -> Result<Value, VmError> {
+        let Some(metatable) = self.get_metatable_for_value(value)? else {
             return Ok(Value::Nil);
         };
-        let root = self.add_root(RootKind::Temporary, object)?;
+        let root = match value {
+            Value::Object(object) => Some(self.add_root(RootKind::Temporary, object)?),
+            _ => None,
+        };
         let result = (|| {
-            let key = self.allocate_byte_string(event.name_bytes())?;
+            let key = self.allocate_byte_string(name)?;
             let found = self.raw_get(metatable, Value::Object(key));
             self.reclaim(key)?;
             found
         })();
-        self.remove_root(root)?;
+        if let Some(root) = root {
+            self.remove_root(root)?;
+        }
         result
     }
 }

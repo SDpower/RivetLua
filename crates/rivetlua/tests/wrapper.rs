@@ -281,6 +281,11 @@ fn outcome_summary(outcome: &RunOutcome) -> String {
         ),
         RunOutcome::Aborted(reason) => format!("Aborted({reason:?})"),
         RunOutcome::PendingClose(snapshot) => format!("PendingClose({snapshot:?})"),
+        outcome @ (RunOutcome::External(_)
+        | RunOutcome::CloseBoundaryA5 { .. }
+        | RunOutcome::NestedReturned(_)
+        | RunOutcome::NestedErrored(_)
+        | RunOutcome::NestedFailed(_)) => format!("{outcome:?}"),
     }
 }
 

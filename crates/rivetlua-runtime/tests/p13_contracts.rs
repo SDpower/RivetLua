@@ -9645,6 +9645,26 @@ fn p13_a_stdlib_basic_raw_metatable_next_pairs_ipairs_follow_lua_values() {
 }
 
 #[test]
+fn p13_basic_next_deleted_current_key_b13() {
+    let (_, values) = run_with_basic(
+        b"local a={[1]=11,[2]=22}; local k,v=next(a); a[k]=nil; local n,w=next(a,k); \
+          local h={[false]=1,[true]=2}; local hk=next(h); local expected=next(h,hk); \
+          h[hk]=nil; local actual=next(h,hk); return k,v,n,w,actual==expected,next(a,2)==nil",
+    );
+    assert_eq!(
+        values,
+        vec![
+            Value::Integer(1),
+            Value::Integer(11),
+            Value::Integer(2),
+            Value::Integer(22),
+            Value::Boolean(true),
+            Value::Boolean(true),
+        ]
+    );
+}
+
+#[test]
 fn p13_a_stdlib_basic_pcall_xpcall_and_assert_preserve_error_boundary() {
     let (vm, values) = run_with_basic(
         b"local a,b=pcall(error,'boom'); local c,d=xpcall(function() error('bad') end,function(e) return 'handled' end); local e,f=pcall(assert,false,'no'); return a,b,c,d,e,f",

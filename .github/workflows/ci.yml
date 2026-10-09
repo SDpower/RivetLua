@@ -21,6 +21,11 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/rivetlua-p16-target
+      TMPDIR: ${{ runner.temp }}/rivetlua-p16-target/tmp
+      RIVETLUA_P16_EVIDENCE_DIR: ${{ runner.temp }}/rivetlua-p16-evidence
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,8 +39,112 @@ jobs:
           cargo --version
           rustc -vV | grep -F "host: ${{ matrix.target }}"
 
+      - name: Prepare shared phase cache
+        run: mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR" "$RIVETLUA_P16_EVIDENCE_DIR"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Prepare fixed Lua 5.5 worker for workspace tests
+        env:
+          RIVETLUA_P16_CI_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          umask 077
+          bootstrap_dir=$(mktemp -d "$RIVETLUA_P16_EVIDENCE_DIR/bootstrap-lua55.XXXXXXXX")
+          export RIVETLUA_P16_BOOTSTRAP_DIR="$bootstrap_dir"
+          printf '%s\n' 'cargo build --locked -p rivetlua-capi --bin rivetlua-native-worker --message-format=json-render-diagnostics' > "$bootstrap_dir/build-command.txt"
+          if cargo build --locked -p rivetlua-capi --bin rivetlua-native-worker --message-format=json-render-diagnostics > "$bootstrap_dir/build.jsonl" 2> "$bootstrap_dir/build.stderr.log"; then
+            printf '0\n' > "$bootstrap_dir/build-exit.txt"
+          else
+            build_exit=$?
+            printf '%s\n' "$build_exit" > "$bootstrap_dir/build-exit.txt"
+            exit "$build_exit"
+          fi
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          target = Path(os.environ["CARGO_TARGET_DIR"]).resolve(strict=True)
+          evidence = Path(os.environ["RIVETLUA_P16_EVIDENCE_DIR"]).resolve(strict=True)
+          work = Path(os.environ["RIVETLUA_P16_BOOTSTRAP_DIR"]).resolve(strict=True)
+          require(target.is_absolute() and evidence.is_absolute(), "快取路徑須為絕對路徑")
+          require(evidence.parent == target.parent and work.parent == evidence, "bootstrap 超出外接快取")
+          build_json = work / "build.jsonl"
+          artifacts = []
+          for line in build_json.read_text().splitlines():
+              event = json.loads(line)
+              if event.get("reason") != "compiler-artifact":
+                  continue
+              artifact_target = event.get("target", {})
+              if artifact_target.get("name") != "rivetlua-native-worker":
+                  continue
+              if "bin" not in artifact_target.get("kind", []):
+                  continue
+              require("rivetlua-capi" in event.get("package_id", ""), "worker package 身分不符")
+              executable = event.get("executable")
+              require(isinstance(executable, str) and executable, "worker executable 缺失")
+              artifacts.append(Path(executable))
+          require(len(artifacts) == 1, "worker compiler-artifact 必須唯一")
+          alias = artifacts[0].resolve(strict=True)
+          alias.relative_to(target)
+          require(alias.name == "rivetlua-native-worker" and alias.is_file(), "worker alias 名稱或型別不符")
+          require(os.access(alias, os.X_OK), "worker alias 不可執行")
+          alias_sha = sha256(alias)
+          snapshot = work / "rivetlua-native-worker"
+          require(not snapshot.exists(), "worker snapshot 不得覆寫")
+          shutil.copy2(alias, snapshot)
+          snapshot.chmod(0o500)
+          require(snapshot.resolve(strict=True) == snapshot, "worker snapshot 路徑不符")
+          require(os.access(snapshot, os.X_OK), "worker snapshot 不可執行")
+          require(stat.S_IMODE(snapshot.stat().st_mode) == 0o500, "worker snapshot 非唯讀 0500")
+          snapshot_sha = sha256(snapshot)
+          require(snapshot_sha == alias_sha, "worker alias/snapshot SHA 不符")
+          source = Path(os.environ["GITHUB_WORKSPACE"]) / "crates/rivetlua-capi/src/bin/rivetlua-native-worker.rs"
+          record = {
+              "profile": "lua55-i64f64",
+              "host_target": os.environ["RIVETLUA_P16_CI_TARGET"],
+              "github_sha": os.environ["GITHUB_SHA"],
+              "command": (work / "build-command.txt").read_text().strip(),
+              "build_env": {
+                  "CARGO_TARGET_DIR": os.environ["CARGO_TARGET_DIR"],
+                  "TMPDIR": os.environ["TMPDIR"],
+                  "RIVETLUA_P16_EVIDENCE_DIR": os.environ["RIVETLUA_P16_EVIDENCE_DIR"],
+                  "PYTHONDONTWRITEBYTECODE": os.environ["PYTHONDONTWRITEBYTECODE"],
+              },
+              "build_exit_code": int((work / "build-exit.txt").read_text().strip()),
+              "cargo_json_path": str(build_json),
+              "cargo_json_sha256": sha256(build_json),
+              "cargo_stderr_path": str(work / "build.stderr.log"),
+              "cargo_stderr_sha256": sha256(work / "build.stderr.log"),
+              "worker_source_path": str(source),
+              "worker_source_sha256": sha256(source),
+              "alias_path": str(alias),
+              "alias_sha256": alias_sha,
+              "snapshot_path": str(snapshot),
+              "snapshot_sha256": snapshot_sha,
+              "snapshot_mode": "0500",
+          }
+          (work / "worker-bootstrap.json").write_text(json.dumps(record, indent=2) + "\n")
+          require("\n" not in str(snapshot) and "\r" not in str(snapshot), "worker env 路徑含換行")
+          with Path(os.environ["GITHUB_ENV"]).open("a") as output:
+              output.write(f"RIVETLUA_P16_WORKER_BIN={snapshot}\n")
+          PY
 
       - name: Test workspace
         run: cargo test --locked --workspace
@@ -84,10 +193,30 @@ jobs:
       - name: Verify public SDK, container, and CLI
         run: cargo run --locked -p rivetlua-xtask -- gate P14
 
+      - name: Observe Lua 5.5.1 oracle infrastructure
+        run: cargo run --locked -p rivetlua-xtask -- official-tests --profile lua55-i64f64 --mode basic
+
+      - name: Observe Lua 5.4.9 oracle infrastructure
+        run: cargo run --locked -p rivetlua-xtask -- official-tests --profile lua54-i64f64 --mode basic
+
+      - name: Verify two-profile oracle observations
+        run: cargo run --locked -p rivetlua-xtask -- gate P15
+
+      - name: Collect P16 two-profile SDK and ABI evidence
+        run: |
+          phase_status=0
+          cargo run --locked -p rivetlua-xtask -- p16-acceptance --profile lua55-i64f64 || phase_status=1
+          cargo run --locked -p rivetlua-xtask -- p16-acceptance --profile lua54-i64f64 || phase_status=1
+          cargo run --locked -p rivetlua-xtask -- gate P16 || phase_status=1
+          exit "$phase_status"
+
       - name: Save gate reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rivetlua-gate-reports-${{ matrix.runner }}
-          path: target/rivetlua-reports/
+          path: |
+            target/rivetlua-reports/
+            ${{ runner.temp }}/rivetlua-p16-target/p16-acceptance/
+            ${{ runner.temp }}/rivetlua-p16-evidence/
           if-no-files-found: ignore

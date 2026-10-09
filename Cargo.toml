@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rivetlua-core", "crates/rivetlua-compiler", "crates/rivetlua-runtime", "crates/rivetlua", "crates/rivetlua-cli", "xtask"]
+members = ["crates/rivetlua-core", "crates/rivetlua-compiler", "crates/rivetlua-runtime", "crates/rivetlua", "crates/rivetlua-cli", "crates/rivetlua-capi", "xtask"]
 resolver = "3"
 
 [workspace.package]

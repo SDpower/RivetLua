@@ -1,6 +1,7 @@
 //! P00 階段驗證工具。
 
 mod p15;
+mod p16;
 
 use std::env;
 use std::fmt::Write as _;
@@ -813,6 +814,434 @@ fn abi_check(root: &Path) -> Result<(), String> {
     abi_evidence_check(root, "tests/abi/REPORT.md", "tests/abi/evidence.json")
 }
 
+fn p00_direct_opt_in(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("P00 direct opt-in 僅允許精確值 1".into()),
+    }
+}
+
+fn p00_full_test_count(output: &str) -> Result<usize, String> {
+    let summaries = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("test result:"))
+        .collect::<Vec<_>>();
+    if summaries.len() != 1
+        || output
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(str::trim)
+            != summaries.first().copied()
+    {
+        return Err("P00 direct 完整測試摘要缺失、重複或不是輸出結尾".into());
+    }
+    let parts = summaries[0].split(';').map(str::trim).collect::<Vec<_>>();
+    if parts.len() != 6 {
+        return Err("P00 direct 測試摘要欄位數不符".into());
+    }
+    let first = parts[0]
+        .strip_prefix("test result: ok. ")
+        .and_then(|text| text.strip_suffix(" passed"))
+        .and_then(|text| text.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .ok_or("P00 direct 測試通過數必須大於零")?;
+    for (field, expected) in
+        parts[1..5]
+            .iter()
+            .zip(["0 failed", "0 ignored", "0 measured", "0 filtered out"])
+    {
+        if *field != expected {
+            return Err(format!("P00 direct 測試摘要不是 {expected}：{field}"));
+        }
+    }
+    if !parts[5].starts_with("finished in ") {
+        return Err("P00 direct 測試摘要缺少完成時間".into());
+    }
+    let running = output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("running "))
+        .filter_map(|line| line.strip_suffix(" tests"))
+        .map(str::parse::<usize>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("P00 direct 測試啟動數無效：{error}"))?;
+    if running.as_slice() != [first] {
+        return Err("P00 direct 測試啟動數與完整 PASS 摘要不符".into());
+    }
+    Ok(first)
+}
+
+fn p00_direct_metadata_package(root: &Path, text: &str) -> Result<String, String> {
+    let parsed = StrictJsonParser::parse(text)?;
+    let packages = parsed
+        .get("packages")
+        .and_then(StrictJsonValue::as_array)
+        .ok_or("P00 Cargo metadata 缺 packages")?;
+    let selected = packages
+        .iter()
+        .filter(|package| {
+            package.get("name").and_then(StrictJsonValue::as_str) == Some("rivetlua-xtask")
+        })
+        .collect::<Vec<_>>();
+    if selected.len() != 1 {
+        return Err("P00 Cargo metadata xtask package 必須唯一".into());
+    }
+    let package = selected[0];
+    let manifest = root.join("xtask/Cargo.toml");
+    if package
+        .get("manifest_path")
+        .and_then(StrictJsonValue::as_str)
+        != Some(manifest.to_string_lossy().as_ref())
+        || package.get("edition").and_then(StrictJsonValue::as_str) != Some("2024")
+        || !matches!(package.get("features"), Some(StrictJsonValue::Object(entries)) if entries.is_empty())
+        || !matches!(package.get("dependencies"), Some(StrictJsonValue::Array(entries)) if entries.is_empty())
+    {
+        return Err(
+            "P00 Cargo metadata 的 xtask manifest、edition、feature 或 dependency 不符".into(),
+        );
+    }
+    let targets = package
+        .get("targets")
+        .and_then(StrictJsonValue::as_array)
+        .ok_or("P00 Cargo metadata 缺 xtask targets")?;
+    let mut bins = 0usize;
+    for target in targets {
+        let kind = target
+            .get("kind")
+            .and_then(StrictJsonValue::as_array)
+            .ok_or("P00 Cargo target 缺 kind")?;
+        let kind = match kind {
+            [StrictJsonValue::String(kind)] => kind.as_str(),
+            _ => return Err("P00 Cargo target kind 必須唯一".into()),
+        };
+        match kind {
+            "bin" => {
+                bins += 1;
+                if target.get("name").and_then(StrictJsonValue::as_str) != Some("rivetlua-xtask")
+                    || target.get("src_path").and_then(StrictJsonValue::as_str)
+                        != Some(root.join("xtask/src/main.rs").to_string_lossy().as_ref())
+                {
+                    return Err("P00 Cargo bin 必須是固定 xtask main".into());
+                }
+            }
+            "test" => {}
+            _ => return Err(format!("P00 Cargo target kind 不允許 {kind}")),
+        }
+    }
+    if bins != 1 {
+        return Err("P00 Cargo bin 必須唯一".into());
+    }
+    package
+        .get("id")
+        .and_then(StrictJsonValue::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or("P00 Cargo metadata 缺 xtask package id".into())
+}
+
+fn p00_direct_artifact(
+    root: &Path,
+    target_root: &Path,
+    package_id: &str,
+    text: &str,
+) -> Result<PathBuf, String> {
+    let mut artifact = None;
+    let mut finished = false;
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let parsed = StrictJsonParser::parse(line)?;
+        match parsed.get("reason").and_then(StrictJsonValue::as_str) {
+            Some("compiler-artifact") => {
+                if artifact.is_some()
+                    || parsed.get("package_id").and_then(StrictJsonValue::as_str)
+                        != Some(package_id)
+                {
+                    return Err("P00 Cargo artifact 非唯一或 package 不符".into());
+                }
+                let target = parsed.get("target").ok_or("P00 Cargo artifact 缺 target")?;
+                let source = root.join("xtask/src/main.rs");
+                if target.get("name").and_then(StrictJsonValue::as_str) != Some("rivetlua-xtask")
+                    || target.get("src_path").and_then(StrictJsonValue::as_str)
+                        != Some(source.to_string_lossy().as_ref())
+                    || target.get("edition").and_then(StrictJsonValue::as_str) != Some("2024")
+                    || !matches!(target.get("test"), Some(StrictJsonValue::Bool(true)))
+                    || !matches!(target.get("kind"), Some(StrictJsonValue::Array(kinds)) if matches!(kinds.as_slice(), [StrictJsonValue::String(kind)] if kind == "bin"))
+                    || !matches!(parsed.get("features"), Some(StrictJsonValue::Array(features)) if features.is_empty())
+                {
+                    return Err("P00 Cargo artifact target、source 或 feature 不符".into());
+                }
+                let profile = parsed
+                    .get("profile")
+                    .ok_or("P00 Cargo artifact 缺 profile")?;
+                if profile.get("opt_level").and_then(StrictJsonValue::as_str) != Some("0")
+                    || !matches!(
+                        profile.get("debug_assertions"),
+                        Some(StrictJsonValue::Bool(true))
+                    )
+                    || !matches!(
+                        profile.get("overflow_checks"),
+                        Some(StrictJsonValue::Bool(true))
+                    )
+                    || !matches!(profile.get("test"), Some(StrictJsonValue::Bool(true)))
+                {
+                    return Err("P00 Cargo artifact test profile 不符".into());
+                }
+                let executable = parsed
+                    .get("executable")
+                    .and_then(StrictJsonValue::as_str)
+                    .map(PathBuf::from)
+                    .ok_or("P00 Cargo artifact 缺 executable")?;
+                if !executable.is_absolute() || !executable.starts_with(target_root) {
+                    return Err("P00 Cargo artifact 不在共享 target".into());
+                }
+                artifact = Some(executable);
+            }
+            Some("build-finished") => {
+                if finished || !matches!(parsed.get("success"), Some(StrictJsonValue::Bool(true))) {
+                    return Err("P00 Cargo build-finished 非唯一或非 PASS".into());
+                }
+                finished = true;
+            }
+            Some("compiler-message") => {}
+            _ => return Err("P00 Cargo --no-run 回傳未知 JSON 訊息".into()),
+        }
+    }
+    if !finished {
+        return Err("P00 Cargo --no-run 缺 build-finished".into());
+    }
+    artifact.ok_or("P00 Cargo --no-run 缺 compiler-artifact".into())
+}
+
+fn p00_sha_file(path: &Path) -> Result<String, String> {
+    let (program, prefix) = sha256_tool(env::consts::OS)?;
+    let output = Command::new(program)
+        .args(prefix)
+        .arg(path)
+        .output()
+        .map_err(|error| format!("P00 SHA-256 啟動失敗：{error}"))?;
+    let sha = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    if !output.status.success()
+        || sha.len() != 64
+        || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!("P00 SHA-256 失敗：{}", path.display()));
+    }
+    Ok(sha)
+}
+
+fn p00_argv(program: &str, args: &[&str]) -> String {
+    format!(
+        "{} {}",
+        program,
+        args.iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+fn p00_record_output(
+    dir: &Path,
+    stem: &str,
+    output: &std::process::Output,
+) -> Result<(PathBuf, String, PathBuf, String), String> {
+    let stdout = dir.join(format!("{stem}.stdout.log"));
+    let stderr = dir.join(format!("{stem}.stderr.log"));
+    fs::write(&stdout, &output.stdout).map_err(|error| error.to_string())?;
+    fs::write(&stderr, &output.stderr).map_err(|error| error.to_string())?;
+    let stdout_sha = p00_sha_file(&stdout)?;
+    let stderr_sha = p00_sha_file(&stderr)?;
+    Ok((stdout, stdout_sha, stderr, stderr_sha))
+}
+
+fn p00_build_override_name(name: &str) -> bool {
+    matches!(
+        name,
+        "RUSTFLAGS"
+            | "CARGO_ENCODED_RUSTFLAGS"
+            | "RUSTC"
+            | "RUSTC_WRAPPER"
+            | "RUSTC_WORKSPACE_WRAPPER"
+            | "CARGO_BUILD_TARGET"
+            | "CARGO_BUILD_RUSTFLAGS"
+            | "CARGO_BUILD_RUSTC"
+            | "CARGO_BUILD_RUSTC_WRAPPER"
+            | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+    ) || name.starts_with("CARGO_PROFILE_TEST_")
+        || name.starts_with("CARGO_TARGET_") && name.ends_with("_RUSTFLAGS")
+}
+
+fn p00_direct_xtask_full_tests(root: &Path) -> Result<(String, String), (String, String)> {
+    let mut commands = Vec::new();
+    let outcome = (|| -> Result<String, String> {
+        for (name, value) in env::vars_os() {
+            let name = name.to_string_lossy();
+            if !value.is_empty() && p00_build_override_name(&name) {
+                return Err(format!("P00 direct 不接受 {name} 建置覆寫"));
+            }
+        }
+        if root.join("xtask/build.rs").exists() {
+            return Err("P00 direct 不接受 xtask build.rs".into());
+        }
+        let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+        let target = env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .ok_or("P00 direct 必須設定共享 CARGO_TARGET_DIR")?;
+        let temp = env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .ok_or("P00 direct 必須設定共享 TMPDIR")?;
+        if !target.is_absolute() || !temp.is_absolute() {
+            return Err("P00 direct target/tmp 必須為絕對路徑".into());
+        }
+        let target = fs::canonicalize(&target).map_err(|error| error.to_string())?;
+        let temp = fs::canonicalize(&temp).map_err(|error| error.to_string())?;
+        if target.starts_with(&root)
+            || temp != fs::canonicalize(target.join("tmp")).map_err(|error| error.to_string())?
+        {
+            return Err("P00 direct target/tmp 必須位於受控外接 cache".into());
+        }
+        let dir = temp.join(format!("p00-direct-full-{}", std::process::id()));
+        fs::create_dir(&dir)
+            .map_err(|error| format!("P00 direct 建立唯一執行目錄失敗：{error}"))?;
+        let digest = source_digest(&root)?;
+
+        let metadata_args = ["metadata", "--locked", "--no-deps", "--format-version", "1"];
+        commands.push(p00_argv("cargo", &metadata_args));
+        let metadata_output = Command::new("cargo")
+            .args(metadata_args)
+            .current_dir(&root)
+            .output()
+            .map_err(|error| format!("P00 Cargo metadata 啟動失敗：{error}"))?;
+        let (metadata_log, metadata_sha, metadata_stderr, metadata_stderr_sha) =
+            p00_record_output(&dir, "metadata", &metadata_output)?;
+        if !metadata_output.status.success() {
+            return Err("P00 Cargo metadata 非零退出".into());
+        }
+        let package_id = p00_direct_metadata_package(
+            &root,
+            std::str::from_utf8(&metadata_output.stdout).map_err(|error| error.to_string())?,
+        )?;
+
+        let no_run_args = [
+            "test",
+            "--locked",
+            "-p",
+            "rivetlua-xtask",
+            "--bin",
+            "rivetlua-xtask",
+            "--no-run",
+            "--message-format=json-render-diagnostics",
+        ];
+        commands.push(p00_argv("cargo", &no_run_args));
+        let no_run_output = Command::new("cargo")
+            .args(no_run_args)
+            .current_dir(&root)
+            .output()
+            .map_err(|error| format!("P00 Cargo --no-run 啟動失敗：{error}"))?;
+        let (no_run_log, no_run_sha, no_run_stderr, no_run_stderr_sha) =
+            p00_record_output(&dir, "cargo-no-run", &no_run_output)?;
+        if !no_run_output.status.success() {
+            return Err("P00 Cargo --no-run 非零退出".into());
+        }
+        let artifact = p00_direct_artifact(
+            &root,
+            &target,
+            &package_id,
+            std::str::from_utf8(&no_run_output.stdout).map_err(|error| error.to_string())?,
+        )?;
+        let artifact = fs::canonicalize(&artifact).map_err(|error| error.to_string())?;
+        if !artifact.is_file() || !artifact.starts_with(&target) {
+            return Err("P00 Cargo unit artifact 無效或不在共享 target".into());
+        }
+        let artifact_sha = p00_sha_file(&artifact)?;
+
+        let binary = dir.join("xtask-full-unit");
+        let binary_text = binary.to_string_lossy().into_owned();
+        let rustc_args = [
+            "--edition=2024",
+            "--crate-name",
+            "rivetlua_xtask",
+            "--test",
+            "-C",
+            "opt-level=0",
+            "-C",
+            "debug-assertions=yes",
+            "-C",
+            "overflow-checks=yes",
+            "-C",
+            "debuginfo=2",
+            "xtask/src/main.rs",
+            "-o",
+            binary_text.as_str(),
+        ];
+        commands.push(format!(
+            "CARGO_MANIFEST_DIR={} {}",
+            root.join("xtask").display(),
+            p00_argv("rustc", &rustc_args)
+        ));
+        let rustc_output = Command::new("rustc")
+            .args(rustc_args)
+            .env("CARGO_MANIFEST_DIR", root.join("xtask"))
+            .current_dir(&root)
+            .output()
+            .map_err(|error| format!("P00 direct rustc 啟動失敗：{error}"))?;
+        let (rustc_log, rustc_sha, rustc_stderr, rustc_stderr_sha) =
+            p00_record_output(&dir, "rustc", &rustc_output)?;
+        if !rustc_output.status.success() {
+            return Err("P00 direct rustc 非零退出".into());
+        }
+        let binary_sha = p00_sha_file(&binary)?;
+
+        commands.push(format!(
+            "CARGO_MANIFEST_DIR={} {}",
+            root.join("xtask").display(),
+            p00_argv(&binary_text, &["--nocapture"])
+        ));
+        let unit_output = Command::new(&binary)
+            .arg("--nocapture")
+            .env("CARGO_MANIFEST_DIR", root.join("xtask"))
+            .current_dir(&root)
+            .output()
+            .map_err(|error| format!("P00 direct full unit 啟動失敗：{error}"))?;
+        let (unit_log, unit_sha, unit_stderr, unit_stderr_sha) =
+            p00_record_output(&dir, "full-unit", &unit_output)?;
+        if !unit_output.status.success() {
+            return Err(format!(
+                "P00 direct full unit 非零退出：{:?}",
+                unit_output.status.code()
+            ));
+        }
+        let count = p00_full_test_count(
+            std::str::from_utf8(&unit_output.stdout).map_err(|error| error.to_string())?,
+        )?;
+        if source_digest(&root)? != digest {
+            return Err("P00 direct full unit 前後來源摘要不同".into());
+        }
+        Ok(format!(
+            "direct-full opt-in=1；matched={count} passed={count} failed=0 ignored=0 filtered=0；Cargo --no-run PASS artifact={} sha256={artifact_sha}；metadata={} sha256={metadata_sha}；metadata-stderr={} sha256={metadata_stderr_sha}；no-run={} sha256={no_run_sha}；no-run-stderr={} sha256={no_run_stderr_sha}；rustc={} sha256={rustc_sha}；rustc-stderr={} sha256={rustc_stderr_sha}；binary={} sha256={binary_sha}；unit={} sha256={unit_sha}；unit-stderr={} sha256={unit_stderr_sha}；source_digest={digest}",
+            artifact.display(),
+            metadata_log.display(),
+            metadata_stderr.display(),
+            no_run_log.display(),
+            no_run_stderr.display(),
+            rustc_log.display(),
+            rustc_stderr.display(),
+            binary.display(),
+            unit_log.display(),
+            unit_stderr.display(),
+        ))
+    })();
+    let command = commands.join(" && ");
+    outcome
+        .map(|diagnostic| (command.clone(), diagnostic))
+        .map_err(|error| (command, error))
+}
+
 fn gate() -> Result<(), String> {
     let root = root()?;
     let mut results = Vec::new();
@@ -921,35 +1350,57 @@ fn gate() -> Result<(), String> {
         diagnostic: "header、profile 與 status 有效".into(),
         report_path: "target/rivetlua-reports/gate-P00.json".into(),
     });
-    if let Err(error) = run(
-        "cargo",
-        &[
-            "test",
-            "--locked",
-            "-p",
-            "rivetlua-xtask",
-            "--bin",
-            "rivetlua-xtask",
-        ],
-        &root,
-    ) {
-        results.push(GateResult {
-            name: "xtask-tests".into(),
-            command: "cargo test --locked -p rivetlua-xtask --bin rivetlua-xtask".into(),
-            exit_code: 1,
-            status: "FAIL",
-            diagnostic: error.clone(),
-            report_path: "target/rivetlua-reports/gate-P00.json".into(),
-        });
-        write_gate_results(&root, &results);
-        return Err(error);
-    }
+    let (test_command, test_result) = match env::var("RIVETLUA_P00_DIRECT_XTASK_FULL") {
+        Err(env::VarError::NotPresent) => (
+            "cargo test --locked -p rivetlua-xtask --bin rivetlua-xtask".to_owned(),
+            run(
+                "cargo",
+                &[
+                    "test",
+                    "--locked",
+                    "-p",
+                    "rivetlua-xtask",
+                    "--bin",
+                    "rivetlua-xtask",
+                ],
+                &root,
+            )
+            .map(|_| "xtask binary 單元測試通過".to_owned()),
+        ),
+        Ok(value) => match p00_direct_opt_in(Some(&value)) {
+            Ok(true) => match p00_direct_xtask_full_tests(&root) {
+                Ok((command, diagnostic)) => (command, Ok(diagnostic)),
+                Err((command, error)) => (command, Err(error)),
+            },
+            Ok(false) => unreachable!(),
+            Err(error) => ("RIVETLUA_P00_DIRECT_XTASK_FULL".into(), Err(error)),
+        },
+        Err(env::VarError::NotUnicode(_)) => (
+            "RIVETLUA_P00_DIRECT_XTASK_FULL".into(),
+            Err("P00 direct opt-in 不是 UTF-8".into()),
+        ),
+    };
+    let test_diagnostic = match test_result {
+        Ok(diagnostic) => diagnostic,
+        Err(error) => {
+            results.push(GateResult {
+                name: "xtask-tests".into(),
+                command: test_command,
+                exit_code: 1,
+                status: "FAIL",
+                diagnostic: error.clone(),
+                report_path: "target/rivetlua-reports/gate-P00.json".into(),
+            });
+            write_gate_results(&root, &results);
+            return Err(error);
+        }
+    };
     results.push(GateResult {
         name: "xtask-tests".into(),
-        command: "cargo test --locked -p rivetlua-xtask --bin rivetlua-xtask".into(),
+        command: test_command,
         exit_code: 0,
         status: "PASS",
-        diagnostic: "xtask binary 單元測試通過".into(),
+        diagnostic: test_diagnostic,
         report_path: "target/rivetlua-reports/gate-P00.json".into(),
     });
     let (sha_program, sha_prefix) = sha256_tool(env::consts::OS)?;
@@ -12018,6 +12469,7 @@ fn p14_gate() -> Result<(), String> {
         "cli_debug_gethook_is_allowed_for_both_profiles",
         "cli_debug_policy_rejects_unimplemented_ops_and_restricts_table_metatable_write",
         "cli_debug_table_metatable_write_starts_lua55_tracegc_fixture_when_explicitly_enabled",
+        "cli_unit_tests::cli_rejects_nested_returned_values_with_a_nonzero_diagnostic",
     ] {
         cli_filter_args.extend(["--skip", skipped]);
     }
@@ -12387,6 +12839,7 @@ fn main() -> ExitCode {
         }
         Some("reference") => reference(&arguments[1..]),
         Some("official-tests") => p15::official_tests(&arguments[1..]),
+        Some("p16-acceptance") => p16::acceptance(&arguments[1..]),
         Some("runner") => runner(&arguments[1..]),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P00") && arguments.len() == 2 => {
             GATE_REPORT_WRITTEN.store(false, Ordering::Relaxed);
@@ -12407,8 +12860,9 @@ fn main() -> ExitCode {
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P13") && arguments.len() == 2 => p13_gate(),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P14") && arguments.len() == 2 => p14_gate(),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P15") && arguments.len() == 2 => p15::gate(),
+        Some("gate") if arguments.get(1).map(String::as_str) == Some("P16") && arguments.len() == 2 => p16::gate(),
         _ => Err(
-            "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | official-tests --profile lua55-i64f64|lua54-i64f64 --mode basic | gate P00|P01|P02|P03|P04|P05|P06|P07|P08|P09|P10|P11|P12|P13|P14|P15".into(),
+            "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | official-tests --profile lua55-i64f64|lua54-i64f64 --mode basic | p16-acceptance --profile lua55-i64f64|lua54-i64f64 | gate P00|P01|P02|P03|P04|P05|P06|P07|P08|P09|P10|P11|P12|P13|P14|P15|P16".into(),
         ),
     };
     match result {
@@ -15084,5 +15538,108 @@ newline"}"#,
             Some(digest.as_str())
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn p00_direct_opt_in_and_full_summary_fail_closed() {
+        assert_eq!(super::p00_direct_opt_in(None).unwrap(), false);
+        assert_eq!(super::p00_direct_opt_in(Some("1")).unwrap(), true);
+        for invalid in ["", "0", "true", "/tmp/runner"] {
+            assert!(super::p00_direct_opt_in(Some(invalid)).is_err());
+        }
+        for name in [
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_TARGET",
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_PROFILE_TEST_PANIC",
+            "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS",
+        ] {
+            assert!(super::p00_build_override_name(name));
+        }
+        assert!(!super::p00_build_override_name("CARGO_TARGET_DIR"));
+        let valid = "running 101 tests\ntest result: ok. 101 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.76s\n";
+        assert_eq!(super::p00_full_test_count(valid).unwrap(), 101);
+        for invalid in [
+            "",
+            "test result: ok. 101 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.76s\n",
+            &valid.replace("running 101 tests", "running 100 tests"),
+            "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+            &valid.replace("0 failed", "1 failed"),
+            &valid.replace("0 ignored", "1 ignored"),
+            &valid.replace("0 filtered out", "1 filtered out"),
+            &valid.replace("test result: ok.", "test result: FAILED."),
+            &format!("{valid}{valid}"),
+        ] {
+            assert!(super::p00_full_test_count(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn p00_direct_metadata_requires_std_only_fixed_main_target() {
+        let root = std::path::Path::new("/fixed/workspace");
+        let valid = format!(
+            "{{\"packages\":[{{\"name\":\"rivetlua-xtask\",\"id\":\"fixed-package\",\"manifest_path\":\"{}/xtask/Cargo.toml\",\"edition\":\"2024\",\"features\":{{}},\"dependencies\":[],\"targets\":[{{\"name\":\"rivetlua-xtask\",\"kind\":[\"bin\"],\"src_path\":\"{}/xtask/src/main.rs\"}},{{\"name\":\"cli\",\"kind\":[\"test\"],\"src_path\":\"{}/xtask/tests/cli.rs\"}}]}}]}}",
+            root.display(),
+            root.display(),
+            root.display()
+        );
+        assert_eq!(
+            super::p00_direct_metadata_package(root, &valid).unwrap(),
+            "fixed-package"
+        );
+        for invalid in [
+            valid.replace("\"features\":{}", "\"features\":{\"extra\":[]}"),
+            valid.replace("\"dependencies\":[]", "\"dependencies\":[{}]"),
+            valid.replace("\"edition\":\"2024\"", "\"edition\":\"2021\""),
+            valid.replace(
+                "\"name\":\"rivetlua-xtask\",\"kind\":[\"bin\"]",
+                "\"name\":\"wrong\",\"kind\":[\"bin\"]",
+            ),
+            valid.replace("xtask/src/main.rs", "xtask/src/other.rs"),
+            valid.replace("xtask/Cargo.toml", "other/Cargo.toml"),
+            valid.replace("\"kind\":[\"test\"]", "\"kind\":[\"custom-build\"]"),
+            valid.replacen(
+                "\"packages\":[",
+                "\"packages\":[{\"name\":\"rivetlua-xtask\"},",
+                1,
+            ),
+        ] {
+            assert!(super::p00_direct_metadata_package(root, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn p00_direct_artifact_requires_exact_test_profile_and_source() {
+        let root = std::path::Path::new("/fixed/workspace");
+        let cache = std::path::Path::new("/fixed/cache");
+        let artifact = format!(
+            "{{\"reason\":\"compiler-artifact\",\"package_id\":\"fixed-package\",\"target\":{{\"name\":\"rivetlua-xtask\",\"kind\":[\"bin\"],\"src_path\":\"{}/xtask/src/main.rs\",\"edition\":\"2024\",\"test\":true}},\"profile\":{{\"opt_level\":\"0\",\"debug_assertions\":true,\"overflow_checks\":true,\"test\":true}},\"features\":[],\"executable\":\"{}/debug/deps/rivetlua_xtask-fixed\"}}",
+            root.display(),
+            cache.display()
+        );
+        let finish = "{\"reason\":\"build-finished\",\"success\":true}";
+        let valid = format!("{artifact}\n{finish}\n");
+        assert_eq!(
+            super::p00_direct_artifact(root, cache, "fixed-package", &valid).unwrap(),
+            cache.join("debug/deps/rivetlua_xtask-fixed")
+        );
+        for invalid in [
+            artifact.clone(),
+            valid.replace("\"opt_level\":\"0\"", "\"opt_level\":\"1\""),
+            valid.replace("\"debug_assertions\":true", "\"debug_assertions\":false"),
+            valid.replace("\"overflow_checks\":true", "\"overflow_checks\":false"),
+            valid.replace("\"test\":true", "\"test\":false"),
+            valid.replace("fixed-package", "wrong-package"),
+            valid.replace("xtask/src/main.rs", "xtask/src/other.rs"),
+            valid.replace("/fixed/cache/debug", "/fixed/other/debug"),
+            valid.replace("\"success\":true", "\"success\":false"),
+            format!("{artifact}\n{artifact}\n{finish}\n"),
+        ] {
+            assert!(super::p00_direct_artifact(root, cache, "fixed-package", &invalid).is_err());
+        }
     }
 }

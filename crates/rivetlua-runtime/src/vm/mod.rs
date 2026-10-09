@@ -7,22 +7,26 @@ use rivetlua_core::bytecode::native_debug::NativeSemanticUpvalue;
 use rivetlua_core::bytecode::official_export::{OfficialExportErrorKind, emit_official_chunk};
 use rivetlua_core::{
     BinaryOperation, BytecodeConstant, BytecodePrototype, BytecodeUpvalueSource, CoreError,
-    CoreErrorKind, EnvironmentSource, InputErrorKind, InputFormat, Instruction, InstructionOffset,
-    LuaProfile, NativePrototypeDebug, ObjectRef, OfficialChunkErrorKind, OfficialChunkLimits,
-    OfficialPlanBuiltin, OfficialPlanRootSource, OfficialRvluPc, OfficialTranslationErrorKind,
-    OfficialWorkBudget, Opcode, RVLU_V2, Register, ResultMode, TransportLimits, UnaryOperation,
-    UpvalueId, Value, VerifiedModule, VmId, classify_input, decode_input_module,
-    decode_official_chunk, input_scan_admission, preflight_input_module, preflight_official_chunk,
-    translate_official_chunk_with_work, verified_module_measurement_work,
+    CoreErrorKind, EnvironmentSource, HostFunctionId, InputErrorKind, InputFormat, Instruction,
+    InstructionOffset, LuaProfile, NativePrototypeDebug, ObjectRef, OfficialChunkErrorKind,
+    OfficialChunkLimits, OfficialPlanBuiltin, OfficialPlanRootSource, OfficialRvluPc,
+    OfficialTranslationErrorKind, OfficialWorkBudget, Opcode, RVLU_V2, Register, ResultMode,
+    TransportLimits, UnaryOperation, UpvalueId, Value, VerifiedModule, VmId, classify_input,
+    decode_input_module, decode_official_chunk, input_scan_admission, preflight_input_module,
+    preflight_official_chunk, translate_official_chunk_with_work, verified_module_measurement_work,
 };
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-use crate::alloc::{AllocationLedger, FailPoint, Reservation, checked_bytes, reserve_vec};
+use crate::alloc::{
+    AllocationCharge, AllocationCharges, AllocationLedger, FailPoint, Reservation, checked_bytes,
+    reserve_vec,
+};
 use crate::call::{CallFrame, OfficialFrameRegisters, PendingCloseSnapshot, VarargPayloads};
 use crate::callback::{CallbackContext, CallbackResult};
 use crate::closure::Closure;
 use crate::coroutine::{CoroutineState, ParkedLocalSlot, ThreadContext, YieldSite, root_coroutine};
 use crate::errors::{Builtin, ProtectedBoundary, ProtectedStage, explicit_error};
-use crate::gc::trace::{ActiveRootKind, trace_native};
+use crate::gc::trace::{ActiveRootKind, RefField, trace_native};
 use crate::heap::module_allocation_bytes;
 use crate::host::DebugPermission;
 use crate::host::{
@@ -172,8 +176,13 @@ fn debug_native_call_name<'a>(
     target: Value,
     call_pc: usize,
 ) -> Option<(&'a [u8], &'static [u8])> {
-    let (Instruction::Call { base, .. } | Instruction::TailCall { base, .. }) =
-        prototype.instructions.get(call_pc)?.instruction
+    let call = prototype.instructions.get(call_pc)?;
+    let (Instruction::Call {
+        base, arg_count, ..
+    }
+    | Instruction::TailCall {
+        base, arg_count, ..
+    }) = call.instruction
     else {
         return None;
     };
@@ -202,8 +211,8 @@ fn debug_native_call_name<'a>(
         return Some((&local.name, b"local"));
     }
     let get_pc = debug_last_definition(prototype, src, move_pc)?;
-    let Instruction::GetTable { dest, key, .. } = prototype.instructions.get(get_pc)?.instruction
-    else {
+    let get = prototype.instructions.get(get_pc)?;
+    let Instruction::GetTable { dest, table, key } = get.instruction else {
         return None;
     };
     if dest != src || debug_branch_enters_between(prototype, get_pc, call_pc) {
@@ -217,8 +226,30 @@ fn debug_native_call_name<'a>(
     if dest != key || debug_branch_enters_between(prototype, key_pc, call_pc) {
         return None;
     }
+    // native 編譯器將 method 的取欄位與 self 搬移標成整個呼叫的 span；
+    // 一般欄位呼叫的取欄位 span 較窄，來源不明時維持 field。
+    let method = arg_count > 0
+        && get.span == call.span
+        && (|| {
+            let self_register = Register(base.0.checked_add(1)?);
+            let self_pc = debug_last_definition(prototype, self_register, call_pc)?;
+            let self_move = prototype.instructions.get(self_pc)?;
+            let Instruction::Move { dest, src } = self_move.instruction else {
+                return None;
+            };
+            (dest == self_register
+                && src == table
+                && self_pc > get_pc
+                && self_move.span == call.span
+                && debug_last_definition(prototype, table, self_pc)
+                    == debug_last_definition(prototype, table, get_pc))
+            .then_some(())
+        })()
+        .is_some();
     match prototype.constants.get(constant.0 as usize)? {
-        BytecodeConstant::Name(name) | BytecodeConstant::String(name) => Some((name, b"field")),
+        BytecodeConstant::Name(name) | BytecodeConstant::String(name) => {
+            Some((name, if method { b"method" } else { b"field" }))
+        }
         _ => None,
     }
 }
@@ -286,7 +317,7 @@ fn debug_official_call_name<'a>(
         if definition >= before {
             return None;
         }
-        pc_map.rvlu_to_official().get(definition)?.source_pc()?;
+        let source_pc = pc_map.rvlu_to_official().get(definition)?.source_pc()?;
         match prototype.instructions.get(definition)?.instruction {
             Instruction::Move { dest, src } if dest == register => {
                 if caller.read(src).ok()? != target {
@@ -314,9 +345,11 @@ fn debug_official_call_name<'a>(
                 if key_dest != key {
                     return None;
                 }
+                // 兩版 official opcode 20 是 SELF；其展開的 GetTable 保留來源 PC。
+                let method = guest.code.get(source_pc as usize)? & 0x7f == 20;
                 return match prototype.constants.get(constant.0 as usize)? {
                     BytecodeConstant::Name(name) | BytecodeConstant::String(name) => {
-                        Some((name, b"field"))
+                        Some((name, if method { b"method" } else { b"field" }))
                     }
                     _ => None,
                 };
@@ -622,6 +655,194 @@ pub enum RunOutcome {
     LuaError(crate::LuaError),
     Aborted(AbortReason),
     PendingClose(PendingCloseSnapshot),
+    External(ExternalToken),
+    /// A5 reset 的 close walker 已抵達上一層 C callback，須先關閉該層 overlay。
+    CloseBoundaryA5 {
+        token: ExternalToken,
+        error: Option<Value>,
+    },
+    NestedReturned(Vec<Value>),
+    /// 巢狀公開 C call 失敗後，原 parked core 仍由同一 token 續接。
+    NestedErrored(crate::LuaError),
+    /// 巢狀呼叫的非 Lua 失敗仍保留外層 parked core 與錯誤類別。
+    NestedFailed(RuntimeError),
+}
+
+/// 單一 VM parked execution 的不可偽造續接身分。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalToken {
+    vm: VmId,
+    generation: u64,
+    depth: usize,
+}
+
+/// 公開 C resume 對既存 callback frame 的 token 換代；持有映射的配置額度。
+pub struct ExternalResumeA5 {
+    mappings: Vec<(ExternalToken, ExternalToken)>,
+    _charge: AllocationCharge,
+}
+
+impl ExternalResumeA5 {
+    pub fn mappings(&self) -> &[(ExternalToken, ExternalToken)] {
+        &self.mappings
+    }
+
+    pub fn top_token(&self) -> Option<ExternalToken> {
+        self.mappings.last().map(|(_, token)| *token)
+    }
+}
+
+/// 借用 VM 讀取已停放事件；值與 roots 的唯一擁有者仍是 parked core。
+#[derive(Debug, PartialEq)]
+pub struct ExternalEventView<'vm> {
+    pub token: ExternalToken,
+    pub function: HostFunctionId,
+    pub closure: Option<ObjectRef>,
+    pub args: &'vm [Value],
+    pub captures: &'vm [Value],
+}
+
+/// C API 專用的邏輯 frame 身分；不持有 frame 或暫存器的借用。
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DebugFrameHandle {
+    context: DebugFrameContext,
+    level: usize,
+    hook_target: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DebugFrameContext {
+    External {
+        token: ExternalToken,
+        revision: u64,
+    },
+    Coroutine {
+        vm: VmId,
+        object: ObjectRef,
+        revision: u64,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DebugFrameKind {
+    C,
+    Lua,
+    Main,
+    Tail,
+}
+
+/// 所有字串與 active lines 都由 host ledger 計費，Drop 時自動退帳。
+#[doc(hidden)]
+pub struct DebugFrameInfo {
+    pub function: Value,
+    pub kind: DebugFrameKind,
+    pub source: Vec<u8>,
+    pub short_source: Vec<u8>,
+    pub currentline: i64,
+    pub linedefined: i64,
+    pub lastlinedefined: i64,
+    pub nups: i64,
+    pub nparams: i64,
+    pub isvararg: bool,
+    pub extraargs: i64,
+    pub istailcall: bool,
+    pub ftransfer: i64,
+    pub ntransfer: i64,
+    pub name: Vec<u8>,
+    pub namewhat: Vec<u8>,
+    pub active_lines: Vec<u32>,
+    _source_charge: Option<AllocationCharge>,
+    _short_charge: Option<AllocationCharge>,
+    _name_charge: Option<AllocationCharge>,
+    _namewhat_charge: Option<AllocationCharge>,
+    _lines_charge: Option<AllocationCharge>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DebugLocalKind {
+    Lua,
+    Temporary,
+    Vararg,
+    VarargTable,
+    CTemporary,
+}
+
+#[doc(hidden)]
+pub struct DebugLocal {
+    pub name: Vec<u8>,
+    pub value: Value,
+    pub kind: DebugLocalKind,
+    _name_charge: Option<AllocationCharge>,
+}
+
+/// `lua_getlocal(L, NULL, n)` 的純名稱結果，不讀取 frame 值。
+#[doc(hidden)]
+pub struct DebugParameterName {
+    pub name: Vec<u8>,
+    _name_charge: Option<AllocationCharge>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DebugHookConfig {
+    pub function: ObjectRef,
+    pub call: bool,
+    pub ret: bool,
+    pub line: bool,
+    pub count: usize,
+}
+
+/// 宿主向同一 parked execution 提交的同步動作。
+pub enum ExternalCommand {
+    Return(Vec<Value>),
+    /// C finalizer 的錯誤值在同一 protected finalizer boundary 內續接。
+    Error(Value),
+    NestedCall {
+        target: Value,
+        args: Vec<Value>,
+        results: ResultMode,
+    },
+    NestedOperation {
+        operation: ValueOperation,
+        args: Vec<Value>,
+    },
+}
+
+/// C API 單次數值、比較、長度、串接或表操作；語意與 bytecode 共用執行路徑。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueOperation {
+    Unary(UnaryOperation),
+    Binary(BinaryOperation),
+    Concat,
+    TableGet,
+    TableSet,
+}
+
+impl ValueOperation {
+    fn validate(self, count: usize) -> Result<(), RuntimeError> {
+        let valid = match self {
+            Self::Unary(_) => count == 1,
+            Self::Binary(_) => count == 2,
+            Self::Concat => true,
+            Self::TableGet => count == 2,
+            Self::TableSet => count == 3,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(RuntimeError::new(RuntimeErrorKind::BasicArgument))
+        }
+    }
+
+    const fn result_mode(self) -> ResultMode {
+        match self {
+            Self::TableSet => ResultMode::Fixed(0),
+            _ => ResultMode::Fixed(1),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -632,6 +853,7 @@ enum ExecutionState {
     Failed,
     Aborted,
     PendingClose,
+    Parked,
 }
 
 enum DispatchResult {
@@ -639,6 +861,11 @@ enum DispatchResult {
     Returned(Vec<Value>, Option<Reservation>),
     Yielded(Vec<Value>, Option<Reservation>),
     PendingClose(PendingCloseSnapshot),
+    External(ExternalToken),
+    CloseBoundaryA5 {
+        token: ExternalToken,
+        error: Option<Value>,
+    },
     Aborted,
 }
 
@@ -659,7 +886,7 @@ enum RegularTableAction {
     Wrote,
     Invoke {
         current: Value,
-        event: ObjectRef,
+        event: Value,
         chain_steps: usize,
     },
     Aborted,
@@ -746,7 +973,7 @@ struct ResumeCaller {
     owner: Option<ObjectRef>,
     owner_root: Option<RootId>,
     child: ObjectRef,
-    child_root: RootId,
+    child_root: Option<RootId>,
     destination: Register,
     result_mode: ResultMode,
     resume_pc: usize,
@@ -773,7 +1000,41 @@ struct NativeBodyContinuation {
 struct ResumeChain {
     items: Vec<NativeCompletion>,
     charge: usize,
+    charges: AllocationCharges,
     ledger: AllocationLedger,
+}
+
+struct ExternalPending {
+    function: HostFunctionId,
+    closure: Option<ObjectRef>,
+    function_root: Option<RootId>,
+    arguments: PrintArguments,
+    captures: PrintArguments,
+    destination: Register,
+    mode: ResultMode,
+    tail_return: bool,
+    call_extraargs: u8,
+    next: usize,
+}
+
+struct ExternalNested {
+    token: ExternalToken,
+    outer_pending: ExternalPending,
+    previous_host_call_bootstrap: bool,
+    previous_operation_bootstrap: Option<ValueOperation>,
+    caller_depth: usize,
+    results: ResultMode,
+}
+
+impl ExternalPending {
+    fn clear_roots(&mut self, vm: &mut Vm) -> Result<(), RuntimeError> {
+        self.captures.clear_roots(vm)?;
+        self.arguments.clear_roots(vm)?;
+        if let Some(root) = self.function_root.take() {
+            vm.remove_root(root)?;
+        }
+        Ok(())
+    }
 }
 
 impl ResumeChain {
@@ -781,6 +1042,7 @@ impl ResumeChain {
         Self {
             items: Vec::new(),
             charge: 0,
+            charges: AllocationCharges::new(),
             ledger: ledger.clone(),
         }
     }
@@ -792,7 +1054,8 @@ impl ResumeChain {
                 .checked_add(core::mem::size_of::<NativeCompletion>())
                 .ok_or(VmError::ArithmeticOverflow)?;
             let ticket = reserve_vec(&self.ledger, &mut self.items, 1, FailPoint::WorkReserve)?;
-            ticket.commit()?;
+            self.charges.try_reserve(1)?;
+            self.charges.push_prepared(ticket.commit_charge()?);
             self.charge = next;
         }
         self.items.push(continuation);
@@ -801,12 +1064,6 @@ impl ResumeChain {
 
     fn last(&self) -> Option<NativeCompletion> {
         self.items.last().copied()
-    }
-}
-
-impl Drop for ResumeChain {
-    fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.charge);
     }
 }
 
@@ -867,12 +1124,15 @@ pub struct Execution<'vm> {
     frame: CallFrame,
     callers: Vec<CallFrame>,
     callers_charge: usize,
+    callers_charges: AllocationCharges,
     peak_frame_count: usize,
     pending_ops: PendingStack,
     protected: Vec<ProtectedBoundary>,
     protected_charge: usize,
+    protected_charges: AllocationCharges,
     error_root: Option<RootId>,
     close_unwind: Option<CloseUnwind>,
+    external_close_boundary_a5: bool,
     finalizer_saved_close: Option<CloseUnwind>,
     finalizer_saved_error_root: Option<RootId>,
     yield_site: Option<YieldSite>,
@@ -880,6 +1140,7 @@ pub struct Execution<'vm> {
     active_coroutine_root: Option<RootId>,
     resume_stack: Vec<ResumeCaller>,
     resume_charge: usize,
+    resume_charges: AllocationCharges,
     fuel: u64,
     finalizer_steps: u64,
     debug_hook_skip_once: bool,
@@ -887,12 +1148,2067 @@ pub struct Execution<'vm> {
     debug_builtin_capture: bool,
     debug_builtin_result: Option<DebugBuiltinReturn>,
     host_call_bootstrap: bool,
+    operation_bootstrap: Option<ValueOperation>,
     deferred_roots: Vec<RootId>,
     deferred_charge: usize,
+    deferred_owner: Option<AllocationCharge>,
+    external_pending: Option<ExternalPending>,
+    external_nested: Vec<ExternalNested>,
+    external_nested_charges: AllocationCharges,
+    external_nested_result: Option<PrintArguments>,
+    nested_origin: Option<ExternalToken>,
+    gc_finalizer_parent: bool,
+    nested_repark_token: Option<ExternalToken>,
     state: ExecutionState,
 }
 
+/// 不含 `&mut Vm` 的完整執行狀態；停在外部 C 邊界時由 Vm arena 持有。
+pub(crate) struct ExecutionCore {
+    vm_id: VmId,
+    module: Option<VerifiedModule>,
+    module_root: Option<RootId>,
+    frame: CallFrame,
+    callers: Vec<CallFrame>,
+    callers_charge: usize,
+    callers_charges: AllocationCharges,
+    peak_frame_count: usize,
+    pending_ops: PendingStack,
+    protected: Vec<ProtectedBoundary>,
+    protected_charge: usize,
+    protected_charges: AllocationCharges,
+    error_root: Option<RootId>,
+    close_unwind: Option<CloseUnwind>,
+    external_close_boundary_a5: bool,
+    finalizer_saved_close: Option<CloseUnwind>,
+    finalizer_saved_error_root: Option<RootId>,
+    yield_site: Option<YieldSite>,
+    active_coroutine: Option<ObjectRef>,
+    active_coroutine_root: Option<RootId>,
+    resume_stack: Vec<ResumeCaller>,
+    resume_charge: usize,
+    resume_charges: AllocationCharges,
+    fuel: u64,
+    finalizer_steps: u64,
+    debug_hook_skip_once: bool,
+    debug_hook_c_call_pending: Option<(ObjectRef, RootId)>,
+    debug_builtin_capture: bool,
+    debug_builtin_result: Option<DebugBuiltinReturn>,
+    host_call_bootstrap: bool,
+    operation_bootstrap: Option<ValueOperation>,
+    deferred_roots: Vec<RootId>,
+    deferred_charge: usize,
+    deferred_owner: Option<AllocationCharge>,
+    external_pending: Option<ExternalPending>,
+    external_nested: Vec<ExternalNested>,
+    external_nested_charges: AllocationCharges,
+    external_nested_result: Option<PrintArguments>,
+    nested_origin: Option<ExternalToken>,
+    gc_finalizer_parent: bool,
+    nested_repark_token: Option<ExternalToken>,
+    state: ExecutionState,
+}
+
+pub(crate) struct ParkedExecution {
+    token: ExternalToken,
+    debug_revision: u64,
+    core: Option<ExecutionCore>,
+    prepared_reset_target: Option<ObjectRef>,
+}
+
+/// 單一 C child 暫停時獨占其外部 callback marker；底層 VM LIFO 只保存活躍呼叫。
+pub(crate) struct ExternalSuspended {
+    markers: Vec<ParkedExecution>,
+    _marker_charge: Option<AllocationCharge>,
+    module_object: Option<ObjectRef>,
+    error_object: Option<ObjectRef>,
+    finalizer_error_object: Option<ObjectRef>,
+}
+
+impl ExternalSuspended {
+    pub(crate) fn trace_children(
+        &self,
+        mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
+    ) -> Result<(), VmError> {
+        if let Some(object) = self.module_object {
+            visit(object)?;
+        }
+        if let Some(object) = self.error_object {
+            visit(object)?;
+        }
+        if let Some(object) = self.finalizer_error_object {
+            visit(object)?;
+        }
+        for marker in &self.markers {
+            if let Some(core) = &marker.core {
+                core.trace_children(&mut visit)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_roots(&mut self, vm: &mut Vm) -> Result<(), RuntimeError> {
+        let core = self
+            .markers
+            .last_mut()
+            .and_then(|marker| marker.core.as_mut())
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        let restored = core.restore_suspended_roots(
+            vm,
+            self.module_object,
+            self.error_object,
+            self.finalizer_error_object,
+        );
+        if restored.is_err() {
+            let _ = core.park_suspended_roots(vm);
+        }
+        restored
+    }
+}
+
+impl ExecutionCore {
+    fn park_suspended_roots(
+        &mut self,
+        vm: &mut Vm,
+    ) -> Result<(Option<ObjectRef>, Option<ObjectRef>, Option<ObjectRef>), RuntimeError> {
+        let module = self
+            .module_root
+            .and_then(|root| vm.roots().active_object(root));
+        let error = self
+            .error_root
+            .and_then(|root| vm.roots().active_object(root));
+        let finalizer_error = self
+            .finalizer_saved_error_root
+            .and_then(|root| vm.roots().active_object(root));
+        if !self.deferred_roots.is_empty() || self.debug_hook_c_call_pending.is_some() {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineYield));
+        }
+        self.frame.park_roots(vm)?;
+        for frame in &mut self.callers {
+            frame.park_roots(vm)?;
+        }
+        self.pending_ops.park_roots(vm)?;
+        for boundary in &mut self.protected {
+            boundary.clear(vm)?;
+        }
+        if let Some(root) = self.module_root.take() {
+            vm.remove_root(root)?;
+        }
+        if let Some(root) = self.error_root.take() {
+            vm.remove_root(root)?;
+        }
+        if let Some(root) = self.finalizer_saved_error_root.take() {
+            vm.remove_root(root)?;
+        }
+        if let Some(root) = self.active_coroutine_root.take() {
+            vm.remove_root(root)?;
+        }
+        if let Some(pending) = &mut self.external_pending {
+            pending.clear_roots(vm)?;
+        }
+        for nested in &mut self.external_nested {
+            nested.outer_pending.clear_roots(vm)?;
+        }
+        if let Some(result) = &mut self.external_nested_result {
+            result.clear_roots(vm)?;
+        }
+        if let Some(result) = &mut self.debug_builtin_result {
+            result.values.clear_roots(vm)?;
+        }
+        for caller in &mut self.resume_stack {
+            caller.context.park_roots(vm)?;
+            if let Some(root) = caller.child_root.take() {
+                vm.remove_root(root)?;
+            }
+            if let Some(root) = caller.owner_root.take() {
+                vm.remove_root(root)?;
+            }
+            if let Some(root) = caller.handler_root.take() {
+                vm.remove_root(root)?;
+            }
+            if let Some(body) = &mut caller.native_body {
+                if let Some(root) = body.parent_root.take() {
+                    vm.remove_root(root)?;
+                }
+            }
+            for native in caller
+                .native
+                .iter_mut()
+                .chain(caller.outer_resumes.items.iter_mut())
+            {
+                if let NativeCompletion::Resume { parent_root, .. } = native {
+                    if let Some(root) = parent_root.take() {
+                        vm.remove_root(root)?;
+                    }
+                }
+            }
+        }
+        Ok((module, error, finalizer_error))
+    }
+
+    fn restore_suspended_roots(
+        &mut self,
+        vm: &mut Vm,
+        module: Option<ObjectRef>,
+        error: Option<ObjectRef>,
+        finalizer_error: Option<ObjectRef>,
+    ) -> Result<(), RuntimeError> {
+        self.module_root = module
+            .map(|object| vm.add_root(RootKind::Temporary, object))
+            .transpose()?;
+        self.frame.restore_roots(vm)?;
+        for frame in &mut self.callers {
+            frame.restore_roots(vm)?;
+        }
+        self.pending_ops.restore_roots(vm)?;
+        for boundary in &mut self.protected {
+            boundary.restore_root(vm)?;
+        }
+        self.error_root = error
+            .map(|object| vm.add_root(RootKind::Temporary, object))
+            .transpose()?;
+        self.finalizer_saved_error_root = finalizer_error
+            .map(|object| vm.add_root(RootKind::Temporary, object))
+            .transpose()?;
+        self.active_coroutine_root = self
+            .active_coroutine
+            .map(|object| vm.add_root(RootKind::Coroutine, object))
+            .transpose()?;
+        if let Some(pending) = &mut self.external_pending {
+            if let Some(object) = pending.closure {
+                pending.function_root = Some(vm.add_root(RootKind::Temporary, object)?);
+            }
+            pending.arguments.restore_roots(vm)?;
+            pending.captures.restore_roots(vm)?;
+        }
+        for nested in &mut self.external_nested {
+            let pending = &mut nested.outer_pending;
+            if let Some(object) = pending.closure {
+                pending.function_root = Some(vm.add_root(RootKind::Temporary, object)?);
+            }
+            pending.arguments.restore_roots(vm)?;
+            pending.captures.restore_roots(vm)?;
+        }
+        if let Some(result) = &mut self.external_nested_result {
+            result.restore_roots(vm)?;
+        }
+        if let Some(result) = &mut self.debug_builtin_result {
+            result.values.restore_roots(vm)?;
+        }
+        for caller in &mut self.resume_stack {
+            caller.context.restore_roots(vm)?;
+            caller.child_root = Some(vm.add_root(RootKind::Coroutine, caller.child)?);
+            caller.owner_root = caller
+                .owner
+                .map(|object| vm.add_root(RootKind::Coroutine, object))
+                .transpose()?;
+            let handler = match caller.native {
+                Some(
+                    NativeCompletion::XPCallBody { handler, .. }
+                    | NativeCompletion::XPCallHandler { handler, .. },
+                ) => handler,
+                _ => Value::Nil,
+            };
+            if let Value::Object(object) = handler {
+                caller.handler_root = Some(vm.add_root(RootKind::Temporary, object)?);
+            }
+            if let Some(body) = &mut caller.native_body {
+                body.parent_root = body
+                    .parent
+                    .map(|object| vm.add_root(RootKind::Coroutine, object))
+                    .transpose()?;
+            }
+            for native in caller
+                .native
+                .iter_mut()
+                .chain(caller.outer_resumes.items.iter_mut())
+            {
+                if let NativeCompletion::Resume {
+                    parent,
+                    parent_root,
+                    ..
+                } = native
+                {
+                    *parent_root = parent
+                        .map(|object| vm.add_root(RootKind::Coroutine, object))
+                        .transpose()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn trace_children(
+        &self,
+        mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
+    ) -> Result<(), VmError> {
+        self.frame.trace_children(&mut visit)?;
+        for frame in &self.callers {
+            frame.trace_children(&mut visit)?;
+        }
+        self.pending_ops.trace_children(&mut visit)?;
+        for boundary in &self.protected {
+            if let Some(Value::Object(object)) = boundary.handler {
+                visit(object)?;
+            }
+            if let Some(object) = boundary.finalizer {
+                visit(object)?;
+            }
+        }
+        for unwind in [self.close_unwind, self.finalizer_saved_close]
+            .into_iter()
+            .flatten()
+        {
+            if let Value::Object(object) = unwind.error.value {
+                visit(object)?;
+            }
+        }
+        if let Some(object) = self.active_coroutine {
+            visit(object)?;
+        }
+        if let Some((object, _)) = self.debug_hook_c_call_pending {
+            visit(object)?;
+        }
+        if let Some(result) = &self.debug_builtin_result {
+            result.values.trace_children(&mut visit)?;
+        }
+        if let Some(pending) = &self.external_pending {
+            if let Some(object) = pending.closure {
+                visit(object)?;
+            }
+            pending.arguments.trace_children(&mut visit)?;
+            pending.captures.trace_children(&mut visit)?;
+        }
+        for nested in &self.external_nested {
+            let pending = &nested.outer_pending;
+            if let Some(object) = pending.closure {
+                visit(object)?;
+            }
+            pending.arguments.trace_children(&mut visit)?;
+            pending.captures.trace_children(&mut visit)?;
+        }
+        if let Some(result) = &self.external_nested_result {
+            result.trace_children(&mut visit)?;
+        }
+        for caller in &self.resume_stack {
+            caller.context.trace_children(&mut visit)?;
+            if let Some(object) = caller.owner {
+                visit(object)?;
+            }
+            visit(caller.child)?;
+            if let Some(body) = caller.native_body {
+                visit(body.outer)?;
+                if let Some(parent) = body.parent {
+                    visit(parent)?;
+                }
+            }
+            if let Some(native) = caller.native {
+                trace_native(native, &mut visit)?;
+            }
+            for native in &caller.outer_resumes.items {
+                trace_native(*native, &mut visit)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// C writer 執行期間獨立持有已計費 bytes，不借用 VM、module 或 GC heap。
+#[doc(hidden)]
+pub struct CapiDumpBytes {
+    bytes: Vec<u8>,
+    _charge: AllocationCharges,
+}
+
+impl CapiDumpBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl Vm {
+    fn debug_handle_current_pc(&self, handle: DebugFrameHandle) -> Result<bool, RuntimeError> {
+        if !handle.hook_target {
+            return Ok(false);
+        }
+        let DebugFrameContext::External { token, revision } = handle.context else {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        };
+        let core = self.debug_external_core_for_handle(token, revision)?;
+        Ok(core.pending_ops.last().is_some_and(|entry| {
+            matches!(
+                entry.basic,
+                Some(BasicPending::DebugHook {
+                    local_current_pc: true,
+                    ..
+                })
+            )
+        }))
+    }
+
+    /// 只在借用同一 VM 時讀取最上層 parked event；token 消耗後 view 不能存活。
+    pub fn external_event(
+        &self,
+        token: ExternalToken,
+    ) -> Result<ExternalEventView<'_>, RuntimeError> {
+        if token.vm != self.id() || token.depth != self.parked_executions.len() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let top = self
+            .parked_executions
+            .last()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        if top.token != token {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let pending = top
+            .core
+            .as_ref()
+            .and_then(|core| core.external_pending.as_ref())
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        Ok(ExternalEventView {
+            token,
+            function: pending.function,
+            closure: pending.closure,
+            args: pending.arguments.values(),
+            captures: pending.captures.values(),
+        })
+    }
+
+    /// 讀取最上層 C closure callback 的即時 cell 值，不使用呼叫建立時的捕獲快照。
+    pub fn external_capture(
+        &self,
+        token: ExternalToken,
+        index: usize,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Some(cell) = self.external_capture_cell(token, index)? else {
+            return Ok(None);
+        };
+        self.capi_closed_upvalue(cell).map_err(Into::into)
+    }
+
+    /// C callback 的最內層 token 唯一決定 closure；缺席的 light C 函式沒有 cell。
+    pub fn external_capture_cell(
+        &self,
+        token: ExternalToken,
+        index: usize,
+    ) -> Result<Option<ObjectRef>, RuntimeError> {
+        let Some(closure) = self.external_event(token)?.closure else {
+            return Ok(None);
+        };
+        let index = index
+            .checked_add(1)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?;
+        self.capi_c_upvalue_cell(closure, index).map_err(Into::into)
+    }
+
+    /// C API 存取 Lua open upvalue 時，以 cell 身分尋找停放的 frame，避免重用 slot 誤指別的局部變數。
+    pub fn capi_read_upvalue(&self, cell: ObjectRef) -> Result<Value, RuntimeError> {
+        let (coroutine, slot) = match self.upvalue_state(cell)? {
+            UpvalueState::Closed(value) => return Ok(value),
+            UpvalueState::Open {
+                thread,
+                coroutine,
+                slot,
+            } if thread == self.id() => (coroutine, slot),
+            UpvalueState::Open { .. } => return Err(VmError::WrongVm.into()),
+        };
+        if self.execution_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        for parked in self.parked_executions.iter().rev() {
+            let Some(core) = &parked.core else { continue };
+            let frames = core::iter::once(&core.frame)
+                .chain(core.callers.iter())
+                .chain(core.resume_stack.iter().flat_map(|resume| {
+                    core::iter::once(&resume.context.frame).chain(resume.context.callers.iter())
+                }));
+            for frame in frames {
+                if frame
+                    .open_upvalues
+                    .iter()
+                    .any(|entry| entry.object == cell && entry.slot == slot)
+                {
+                    let index = slot
+                        .checked_sub(frame.stack_base)
+                        .filter(|index| *index < frame.register_limit)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?;
+                    return Ok(frame.registers[index]);
+                }
+            }
+        }
+        if let Some(owner) = coroutine {
+            return self
+                .with_coroutine(owner, |co| {
+                    if co.state != CoroutineState::Suspended {
+                        return None;
+                    }
+                    let external = co.external_suspended.as_ref().and_then(|suspended| {
+                        suspended
+                            .markers
+                            .last()
+                            .and_then(|marker| marker.core.as_ref())
+                    });
+                    let parked = external.and_then(|core| {
+                        core::iter::once(&core.frame)
+                            .chain(&core.callers)
+                            .chain(core.resume_stack.iter().flat_map(|resume| {
+                                core::iter::once(&resume.context.frame)
+                                    .chain(&resume.context.callers)
+                            }))
+                            .find(|frame| {
+                                frame
+                                    .open_upvalues
+                                    .iter()
+                                    .any(|entry| entry.object == cell && entry.slot == slot)
+                            })
+                    });
+                    parked
+                        .or_else(|| {
+                            co.context.as_ref().and_then(|context| {
+                                core::iter::once(&context.frame)
+                                    .chain(&context.callers)
+                                    .find(|frame| {
+                                        frame
+                                            .open_upvalues
+                                            .iter()
+                                            .any(|entry| entry.object == cell && entry.slot == slot)
+                                    })
+                            })
+                        })
+                        .and_then(|frame| {
+                            slot.checked_sub(frame.stack_base)
+                                .filter(|index| *index < frame.register_limit)
+                                .map(|index| frame.registers[index])
+                        })
+                })?
+                .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds));
+        }
+        Err(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))
+    }
+
+    /// 寫入 open cell 的實際暫存器；frame 寫入維持 stack root，暫停協程維持 GC barrier。
+    pub fn capi_set_upvalue(&mut self, cell: ObjectRef, value: Value) -> Result<(), RuntimeError> {
+        let (coroutine, slot) = match self.upvalue_state(cell)? {
+            UpvalueState::Closed(_) => {
+                return self
+                    .capi_set_closed_upvalue(cell, value)
+                    .map(|_| ())
+                    .map_err(Into::into);
+            }
+            UpvalueState::Open {
+                thread,
+                coroutine,
+                slot,
+            } if thread == self.id() => (coroutine, slot),
+            UpvalueState::Open { .. } => return Err(VmError::WrongVm.into()),
+        };
+        if let Value::CFunction(id) = value {
+            if id.vm() != self.id() {
+                return Err(VmError::WrongVm.into());
+            }
+        }
+        if self.execution_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        for parked_index in (0..self.parked_executions.len()).rev() {
+            let Some(mut core) = self.parked_executions[parked_index].core.take() else {
+                continue;
+            };
+            let result = {
+                let frames = core::iter::once(&mut core.frame)
+                    .chain(core.callers.iter_mut())
+                    .chain(core.resume_stack.iter_mut().flat_map(|resume| {
+                        core::iter::once(&mut resume.context.frame)
+                            .chain(resume.context.callers.iter_mut())
+                    }));
+                let mut found = None;
+                for frame in frames {
+                    if frame
+                        .open_upvalues
+                        .iter()
+                        .any(|entry| entry.object == cell && entry.slot == slot)
+                    {
+                        found = Some(frame);
+                        break;
+                    }
+                }
+                if let Some(frame) = found {
+                    Some(
+                        slot.checked_sub(frame.stack_base)
+                            .filter(|index| *index < frame.register_limit)
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))
+                            .and_then(|index| {
+                                let register =
+                                    u16::try_from(index).map(Register).map_err(|_| {
+                                        RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds)
+                                    })?;
+                                frame.write(self, register, value)
+                            }),
+                    )
+                } else {
+                    None
+                }
+            };
+            self.parked_executions[parked_index].core = Some(core);
+            if let Some(result) = result {
+                return result;
+            }
+        }
+        if let Some(owner) = coroutine {
+            let external_present = self.with_coroutine(owner, |co| {
+                co.state == CoroutineState::Suspended
+                    && co.external_suspended.as_ref().is_some_and(|suspended| {
+                        suspended
+                            .markers
+                            .last()
+                            .and_then(|marker| marker.core.as_ref())
+                            .is_some_and(|core| {
+                                core::iter::once(&core.frame)
+                                    .chain(&core.callers)
+                                    .chain(core.resume_stack.iter().flat_map(|resume| {
+                                        core::iter::once(&resume.context.frame)
+                                            .chain(&resume.context.callers)
+                                    }))
+                                    .any(|frame| {
+                                        frame
+                                            .open_upvalues
+                                            .iter()
+                                            .any(|entry| entry.object == cell && entry.slot == slot)
+                                    })
+                            })
+                    })
+            })?;
+            if external_present {
+                if let Value::Object(child) = value {
+                    self.write_ref(owner, RefField::Coroutine, child)?;
+                }
+                let written = self.with_coroutine_mut(owner, &[], |co| {
+                    let Some(core) = co
+                        .external_suspended
+                        .as_mut()
+                        .and_then(|suspended| suspended.markers.last_mut())
+                        .and_then(|marker| marker.core.as_mut())
+                    else {
+                        return false;
+                    };
+                    let frames = core::iter::once(&mut core.frame)
+                        .chain(&mut core.callers)
+                        .chain(core.resume_stack.iter_mut().flat_map(|resume| {
+                            core::iter::once(&mut resume.context.frame)
+                                .chain(&mut resume.context.callers)
+                        }));
+                    for frame in frames {
+                        if !frame
+                            .open_upvalues
+                            .iter()
+                            .any(|entry| entry.object == cell && entry.slot == slot)
+                        {
+                            continue;
+                        }
+                        let Some(index) = slot
+                            .checked_sub(frame.stack_base)
+                            .filter(|index| *index < frame.register_limit)
+                        else {
+                            return false;
+                        };
+                        if frame.roots[index].is_some() {
+                            return false;
+                        }
+                        frame.registers[index] = value;
+                        return true;
+                    }
+                    false
+                })?;
+                return if written {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))
+                };
+            }
+            let present = self.with_coroutine(owner, |co| {
+                co.state == CoroutineState::Suspended
+                    && co.context.as_ref().is_some_and(|context| {
+                        core::iter::once(&context.frame)
+                            .chain(&context.callers)
+                            .any(|frame| {
+                                frame
+                                    .open_upvalues
+                                    .iter()
+                                    .any(|entry| entry.object == cell && entry.slot == slot)
+                            })
+                    })
+            })?;
+            if present && self.coroutine_stack_write(owner, slot, value)? {
+                return Ok(());
+            }
+        }
+        Err(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))
+    }
+
+    /// 完成已停放的外部呼叫；只有同 VM、同世代且最上層 token 可續接。
+    pub fn continue_external(
+        &mut self,
+        token: ExternalToken,
+        command: ExternalCommand,
+    ) -> Result<RunOutcome, RuntimeError> {
+        if self.execution_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        match command {
+            ExternalCommand::Return(values) => {
+                let core = self.take_top_external_core(token)?;
+                let mut execution = Execution::from_core(self, core);
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    execution.clear_external_nested_result()?;
+                    execution.complete_external_return(values)
+                }));
+                match outcome {
+                    Ok(Ok(value)) => {
+                        if matches!(
+                            value,
+                            RunOutcome::NestedReturned(_)
+                                | RunOutcome::NestedErrored(_)
+                                | RunOutcome::NestedFailed(_)
+                        ) {
+                            if let Some(parent) = execution.nested_repark_token.take() {
+                                let core = execution.take_core();
+                                execution.vm.restore_external_core(parent, core)?;
+                            }
+                        }
+                        Ok(value)
+                    }
+                    Ok(Err(error)) => {
+                        if !execution.external_nested.is_empty() {
+                            if let Ok(outcome) = execution.finish_external_nested_failure(error) {
+                                let parent = execution.nested_repark_token.take().ok_or(
+                                    RuntimeError::new(RuntimeErrorKind::TerminalExecution),
+                                )?;
+                                let core = execution.take_core();
+                                execution.vm.restore_external_core(parent, core)?;
+                                return Ok(outcome);
+                            }
+                        }
+                        execution.state = ExecutionState::Failed;
+                        let cleanup = execution.finish_owned_external_abort();
+                        execution.state = ExecutionState::Parked;
+                        execution.vm.discard_empty_external_markers();
+                        cleanup?;
+                        Err(error)
+                    }
+                    Err(payload) => {
+                        execution.state = ExecutionState::Failed;
+                        let cleanup = execution.finish_owned_external_abort();
+                        debug_assert!(cleanup.is_ok());
+                        execution.state = ExecutionState::Parked;
+                        execution.vm.discard_empty_external_markers();
+                        resume_unwind(payload);
+                    }
+                }
+            }
+            ExternalCommand::Error(value) => {
+                let core = self.take_top_external_core(token)?;
+                let mut execution = Execution::from_core(self, core);
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    execution.clear_external_nested_result()?;
+                    execution.complete_external_error(value)
+                }));
+                match outcome {
+                    Ok(Ok(value)) => {
+                        if matches!(
+                            value,
+                            RunOutcome::NestedReturned(_)
+                                | RunOutcome::NestedErrored(_)
+                                | RunOutcome::NestedFailed(_)
+                        ) {
+                            if let Some(parent) = execution.nested_repark_token.take() {
+                                let core = execution.take_core();
+                                execution.vm.restore_external_core(parent, core)?;
+                            }
+                        }
+                        Ok(value)
+                    }
+                    Ok(Err(error)) => {
+                        if !execution.external_nested.is_empty() {
+                            if let Ok(outcome) = execution.finish_external_nested_failure(error) {
+                                let parent = execution.nested_repark_token.take().ok_or(
+                                    RuntimeError::new(RuntimeErrorKind::TerminalExecution),
+                                )?;
+                                let core = execution.take_core();
+                                execution.vm.restore_external_core(parent, core)?;
+                                return Ok(outcome);
+                            }
+                        }
+                        execution.state = ExecutionState::Failed;
+                        let cleanup = execution.finish_owned_external_abort();
+                        execution.state = ExecutionState::Parked;
+                        execution.vm.discard_empty_external_markers();
+                        cleanup?;
+                        Err(error)
+                    }
+                    Err(payload) => {
+                        execution.state = ExecutionState::Failed;
+                        let cleanup = execution.finish_owned_external_abort();
+                        debug_assert!(cleanup.is_ok());
+                        execution.state = ExecutionState::Parked;
+                        execution.vm.discard_empty_external_markers();
+                        resume_unwind(payload);
+                    }
+                }
+            }
+            ExternalCommand::NestedCall {
+                target,
+                args,
+                results,
+            } => {
+                let core = self.borrow_top_external_core(token)?;
+                let mut execution = Execution::from_core(self, core);
+                let start = catch_unwind(AssertUnwindSafe(|| {
+                    execution.start_external_nested(token, target, &args, results, None)
+                }));
+                match start {
+                    Ok(Err(error)) => {
+                        let core = execution.take_core();
+                        execution.vm.restore_external_core(token, core)?;
+                        return Err(error);
+                    }
+                    Err(payload) => {
+                        execution.state = ExecutionState::Failed;
+                        let cleanup = execution.finish_owned_external_abort();
+                        debug_assert!(cleanup.is_ok());
+                        execution.state = ExecutionState::Parked;
+                        execution.vm.discard_empty_external_markers();
+                        resume_unwind(payload);
+                    }
+                    Ok(Ok(())) => {}
+                }
+                execution.run()
+            }
+            ExternalCommand::NestedOperation { operation, args } => {
+                ValueOperation::validate(operation, args.len())?;
+                let core = self.borrow_top_external_core(token)?;
+                let mut execution = Execution::from_core(self, core);
+                let start = catch_unwind(AssertUnwindSafe(|| {
+                    execution.start_external_nested(
+                        token,
+                        Value::Nil,
+                        &args,
+                        operation.result_mode(),
+                        Some(operation),
+                    )
+                }));
+                match start {
+                    Ok(Err(error)) => {
+                        let core = execution.take_core();
+                        execution.vm.restore_external_core(token, core)?;
+                        return Err(error);
+                    }
+                    Err(payload) => {
+                        execution.state = ExecutionState::Failed;
+                        let cleanup = execution.finish_owned_external_abort();
+                        debug_assert!(cleanup.is_ok());
+                        execution.state = ExecutionState::Parked;
+                        execution.vm.discard_empty_external_markers();
+                        resume_unwind(payload);
+                    }
+                    Ok(Ok(())) => {}
+                }
+                execution.run()
+            }
+        }
+    }
+
+    /// Lua 5.5 的執行中 thread 自行關閉：停止目前 C callback，沿既有 close unwind
+    /// 清理 coroutine frame，再將結果交還啟動它的 resume 呼叫。
+    pub fn self_close_external(
+        &mut self,
+        token: ExternalToken,
+    ) -> Result<RunOutcome, RuntimeError> {
+        self.self_close_external_with_error(token, None)
+    }
+
+    /// 驗證停放中的 callback 是否屬於目前執行、可自行關閉的 Lua 5.5 thread。
+    pub fn self_close_external_ready(&self, token: ExternalToken, object: ObjectRef) -> bool {
+        self.language_profile() == LuaProfile::Lua55
+            && !self.execution_running()
+            && self
+                .parked_executions
+                .last()
+                .filter(|entry| entry.token == token)
+                .and_then(|entry| entry.core.as_ref())
+                .is_some_and(|core| {
+                    core.active_coroutine == Some(object)
+                        && core.resume_stack.last().map(|caller| caller.child) == Some(object)
+                        && core.close_unwind.is_none()
+                        && core.external_pending.is_some()
+                })
+    }
+
+    /// overlay 錯誤優先作為自行關閉時的原始 close error。
+    pub fn self_close_external_with_error(
+        &mut self,
+        token: ExternalToken,
+        error: Option<Value>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        if self.language_profile() != LuaProfile::Lua55 {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
+        }
+        self.close_external_with_error_a5(token, error, false)
+    }
+
+    /// 已停放 C callback 的 reset/close 復用既有 Lua close walker，包含巢狀 frame 的 `__close`。
+    pub fn close_suspended_external_a5(
+        &mut self,
+        child: ObjectRef,
+        error: Option<Value>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let restored = self.resume_external_a5(child)?;
+        let token = restored
+            .top_token()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        self.close_external_with_error_a5(token, error, true)
+    }
+
+    fn close_external_with_error_a5(
+        &mut self,
+        token: ExternalToken,
+        error: Option<Value>,
+        boundaries: bool,
+    ) -> Result<RunOutcome, RuntimeError> {
+        if self.execution_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
+        }
+        let eligible = self
+            .parked_executions
+            .last()
+            .filter(|entry| entry.token == token)
+            .and_then(|entry| entry.core.as_ref())
+            .is_some_and(|core| {
+                core.active_coroutine.is_some()
+                    && core.resume_stack.last().map(|caller| caller.child) == core.active_coroutine
+                    && core.close_unwind.is_none()
+            });
+        if !eligible {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
+        }
+        let core = self.take_top_external_core(token)?;
+        let mut execution = Execution::from_core(self, core);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            execution.complete_external_self_close(error, boundaries)
+        }));
+        match outcome {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                execution.state = ExecutionState::Failed;
+                let cleanup = execution.finish_owned_external_abort();
+                execution.state = ExecutionState::Parked;
+                execution.vm.discard_empty_external_markers();
+                cleanup?;
+                Err(error)
+            }
+            Err(payload) => {
+                execution.state = ExecutionState::Failed;
+                let cleanup = execution.finish_owned_external_abort();
+                debug_assert!(cleanup.is_ok());
+                execution.state = ExecutionState::Parked;
+                execution.vm.discard_empty_external_markers();
+                resume_unwind(payload);
+            }
+        }
+    }
+
+    /// 完成上一層 C overlay 後，以最終錯誤續接同一 Lua close walker。
+    pub fn continue_external_close_boundary_a5(
+        &mut self,
+        token: ExternalToken,
+        error: Option<Value>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let eligible = self
+            .parked_executions
+            .last()
+            .filter(|entry| entry.token == token)
+            .and_then(|entry| entry.core.as_ref())
+            .is_some_and(|core| core.external_close_boundary_a5 && core.close_unwind.is_some());
+        if self.execution_running() || !eligible {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
+        }
+        let core = self.take_top_external_core(token)?;
+        let mut execution = Execution::from_core(self, core);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            if let Some(value) = error {
+                let previous = execution
+                    .close_unwind
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::CoroutineClose))?;
+                if !previous.failed || previous.error.value != value {
+                    let mut replacement = explicit_error(value, execution.frame.pc);
+                    execution.prepare_close_error_value(&mut replacement)?;
+                    let unwind = execution
+                        .close_unwind
+                        .as_mut()
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::CoroutineClose))?;
+                    unwind.error = replacement;
+                    unwind.failed = true;
+                }
+            }
+            execution.state = ExecutionState::Ready;
+            execution.run()
+        }));
+        match outcome {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                execution.state = ExecutionState::Failed;
+                execution.finish_owned_external_abort()?;
+                Err(error)
+            }
+            Err(payload) => {
+                execution.state = ExecutionState::Failed;
+                let cleanup = execution.finish_owned_external_abort();
+                debug_assert!(cleanup.is_ok());
+                resume_unwind(payload)
+            }
+        }
+    }
+
+    /// 顯式放棄最上層外部呼叫；清理 frame、open upvalue 與所有 VM roots。
+    pub fn abort_external(&mut self, token: ExternalToken) -> Result<(), RuntimeError> {
+        if self.execution_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let core = self.take_top_external_core(token)?;
+        let mut execution = Execution::from_core(self, core);
+        execution.state = ExecutionState::Aborted;
+        let result = execution.finish_owned_external_abort();
+        execution.state = ExecutionState::Parked;
+        execution.vm.discard_empty_external_markers();
+        result
+    }
+
+    /// C callback 錯誤只撤銷這次 nested call；外層仍停放，供較低的 close mark 續用。
+    pub fn abort_external_nested_callback(
+        &mut self,
+        token: ExternalToken,
+    ) -> Result<(), RuntimeError> {
+        if self.execution_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let nested = self
+            .parked_executions
+            .last()
+            .and_then(|entry| entry.core.as_ref())
+            .and_then(|core| core.external_nested.last())
+            .is_some_and(|entry| entry.token != token);
+        if !nested {
+            return self.abort_external(token);
+        }
+        let core = self.take_top_external_core(token)?;
+        let mut execution = Execution::from_core(self, core);
+        match execution.abort_current_nested_callback() {
+            Ok(parent) => {
+                let core = execution.take_core();
+                execution.vm.restore_external_core(parent, core)
+            }
+            Err(error) => {
+                execution.state = ExecutionState::Failed;
+                let cleanup = execution.finish_owned_external_abort();
+                execution.state = ExecutionState::Parked;
+                execution.vm.discard_empty_external_markers();
+                cleanup?;
+                Err(error)
+            }
+        }
+    }
+
+    fn reserve_external_token(&mut self) -> Result<ExternalToken, VmError> {
+        let depth = self
+            .parked_executions
+            .len()
+            .checked_add(1)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let next_generation = self
+            .parked_next_generation
+            .checked_add(1)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        if self.parked_executions.len() == self.parked_executions.capacity() {
+            let ledger = self.allocation_ledger().clone();
+            let bytes = self
+                .parked_charge
+                .checked_add(core::mem::size_of::<ParkedExecution>())
+                .ok_or(VmError::ArithmeticOverflow)?;
+            self.parked_charge_owners.try_reserve(1)?;
+            let ticket = reserve_vec(
+                &ledger,
+                &mut self.parked_executions,
+                1,
+                FailPoint::WorkReserve,
+            )?;
+            self.parked_charge_owners
+                .push_prepared(ticket.commit_charge()?);
+            self.parked_charge = bytes;
+        }
+        let token = ExternalToken {
+            vm: self.id(),
+            generation: self.parked_next_generation,
+            depth,
+        };
+        self.parked_next_generation = next_generation;
+        Ok(token)
+    }
+
+    fn park_external_core(&mut self, token: ExternalToken, core: ExecutionCore) {
+        self.parked_executions.push(ParkedExecution {
+            token,
+            debug_revision: 0,
+            core: Some(core),
+            prepared_reset_target: None,
+        });
+    }
+
+    fn borrow_top_external_core(
+        &mut self,
+        token: ExternalToken,
+    ) -> Result<ExecutionCore, RuntimeError> {
+        if token.vm != self.id() || token.depth != self.parked_executions.len() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let top = self
+            .parked_executions
+            .last_mut()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        if top.token != token {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        top.core
+            .take()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))
+    }
+
+    fn restore_external_core(
+        &mut self,
+        token: ExternalToken,
+        core: ExecutionCore,
+    ) -> Result<(), RuntimeError> {
+        let top = self
+            .parked_executions
+            .last_mut()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        if top.token != token || top.core.is_some() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        top.debug_revision = top.debug_revision.saturating_add(1);
+        top.core = Some(core);
+        Ok(())
+    }
+
+    fn discard_empty_external_markers(&mut self) {
+        while self
+            .parked_executions
+            .last()
+            .is_some_and(|entry| entry.core.is_none())
+        {
+            self.parked_executions.pop();
+        }
+        if self.parked_executions.is_empty() {
+            self.parked_executions = Vec::new();
+            self.parked_charge_owners = AllocationCharges::new();
+            self.parked_charge = 0;
+        }
+    }
+
+    fn take_top_external_core(
+        &mut self,
+        token: ExternalToken,
+    ) -> Result<ExecutionCore, RuntimeError> {
+        if token.vm != self.id() || token.depth != self.parked_executions.len() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let Some(top) = self.parked_executions.last() else {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        };
+        if top.token != token {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let Some(core) = self.parked_executions.pop().and_then(|entry| entry.core) else {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        };
+        if self.parked_executions.is_empty() {
+            self.parked_executions = Vec::new();
+            self.parked_charge_owners = AllocationCharges::new();
+            self.parked_charge = 0;
+        }
+        Ok(core)
+    }
+
+    /// 把目前 C child 的整段外部 marker 與執行核心轉交 coroutine payload。
+    /// 預留與 write barrier 全在移轉之前，成功後不留下全域 LIFO 的 child suffix。
+    pub fn external_suspend_depth_a5(
+        &self,
+        token: ExternalToken,
+        child: ObjectRef,
+    ) -> Result<usize, RuntimeError> {
+        let top = self
+            .parked_executions
+            .last()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        if top.token != token || token.vm != self.id() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let core = top
+            .core
+            .as_ref()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        if core.active_coroutine != Some(child) {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineYield));
+        }
+        core.external_nested
+            .len()
+            .checked_add(1)
+            .ok_or(VmError::ArithmeticOverflow.into())
+    }
+
+    pub fn suspend_external_a5(
+        &mut self,
+        token: ExternalToken,
+        child: ObjectRef,
+    ) -> Result<usize, RuntimeError> {
+        if self.execution_running() || self.finalizer_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineYield));
+        }
+        if self.coroutine_state(child)? != CoroutineState::Running
+            || self.with_coroutine(child, |co| co.external_suspended.is_some())?
+        {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineYield));
+        }
+        let top = self
+            .parked_executions
+            .last()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::CoroutineYield))?;
+        if top.token != token {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let core = top
+            .core
+            .as_ref()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        if core.active_coroutine != Some(child) {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineYield));
+        }
+        let count = core
+            .external_nested
+            .len()
+            .checked_add(1)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let start = self
+            .parked_executions
+            .len()
+            .checked_sub(count)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        for (marker, nested) in self.parked_executions[start..]
+            .iter()
+            .zip(&core.external_nested)
+        {
+            if marker.token != nested.token || marker.core.is_some() {
+                return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+            }
+        }
+        let parent = core.resume_stack.last().and_then(|caller| caller.owner);
+        let mut markers = Vec::new();
+        let ticket = reserve_vec(
+            self.allocation_ledger(),
+            &mut markers,
+            count,
+            FailPoint::WorkReserve,
+        )?;
+        let marker_charge = ticket.commit_charge()?;
+        let core = self
+            .parked_executions
+            .last_mut()
+            .and_then(|entry| entry.core.take())
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        let prepared =
+            core.trace_children(|object| self.write_ref(child, RefField::Coroutine, object));
+        self.parked_executions
+            .last_mut()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?
+            .core = Some(core);
+        prepared?;
+        let mut core = self
+            .parked_executions
+            .last_mut()
+            .and_then(|entry| entry.core.take())
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        let (module_object, error_object, finalizer_error_object) =
+            core.park_suspended_roots(self)?;
+        self.parked_executions
+            .last_mut()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?
+            .core = Some(core);
+        markers.extend(self.parked_executions.drain(start..));
+        let mut suspended = Some(ExternalSuspended {
+            markers,
+            _marker_charge: Some(marker_charge),
+            module_object,
+            error_object,
+            finalizer_error_object,
+        });
+        let assigned = self.with_coroutine_mut(child, &[], |co| {
+            co.external_suspended = suspended.take();
+            co.state = CoroutineState::Suspended;
+        });
+        if let Err(error) = assigned {
+            if let Some(mut suspended) = suspended {
+                let restore = suspended.restore_roots(self);
+                self.parked_executions.extend(suspended.markers.drain(..));
+                restore?;
+            }
+            return Err(error.into());
+        }
+        if let Some(parent) = parent {
+            self.with_coroutine_mut(parent, &[], |co| co.state = CoroutineState::Running)?;
+        }
+        if self.parked_executions.is_empty() {
+            self.parked_executions = Vec::new();
+            self.parked_charge_owners = AllocationCharges::new();
+            self.parked_charge = 0;
+        }
+        Ok(count)
+    }
+
+    /// 還原 child 所有 callback marker 並換代 token，避免 sibling 暫停互相佔用 LIFO。
+    pub fn resume_external_a5(
+        &mut self,
+        child: ObjectRef,
+    ) -> Result<ExternalResumeA5, RuntimeError> {
+        if self.execution_running() || self.finalizer_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let (count, parent) = self
+            .with_coroutine(child, |co| {
+                if co.state != CoroutineState::Suspended {
+                    return None;
+                }
+                co.external_suspended.as_ref().and_then(|suspended| {
+                    suspended.markers.last().and_then(|marker| {
+                        marker.core.as_ref().map(|core| {
+                            (
+                                suspended.markers.len(),
+                                core.resume_stack.last().and_then(|caller| caller.owner),
+                            )
+                        })
+                    })
+                })
+            })?
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        let count64 = u64::try_from(count).map_err(|_| VmError::ArithmeticOverflow)?;
+        let next = self
+            .parked_next_generation
+            .checked_add(count64)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let depth = self.parked_executions.len();
+        depth
+            .checked_add(count)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let mut mappings = Vec::new();
+        let mapping_ticket = reserve_vec(
+            self.allocation_ledger(),
+            &mut mappings,
+            count,
+            FailPoint::WorkReserve,
+        )?;
+        self.with_coroutine(child, |co| -> Result<(), RuntimeError> {
+            let suspended = co
+                .external_suspended
+                .as_ref()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+            for (index, marker) in suspended.markers.iter().enumerate() {
+                mappings.push((
+                    marker.token,
+                    ExternalToken {
+                        vm: self.id(),
+                        generation: self.parked_next_generation + index as u64,
+                        depth: depth + index + 1,
+                    },
+                ));
+            }
+            Ok(())
+        })??;
+        let mapping_charge = mapping_ticket.commit_charge()?;
+        if self.parked_executions.capacity() - depth < count {
+            let bytes = count
+                .checked_mul(core::mem::size_of::<ParkedExecution>())
+                .and_then(|bytes| self.parked_charge.checked_add(bytes))
+                .ok_or(VmError::ArithmeticOverflow)?;
+            self.parked_charge_owners.try_reserve(1)?;
+            let ledger = self.allocation_ledger().clone();
+            let ticket = reserve_vec(
+                &ledger,
+                &mut self.parked_executions,
+                count,
+                FailPoint::WorkReserve,
+            )?;
+            self.parked_charge_owners
+                .push_prepared(ticket.commit_charge()?);
+            self.parked_charge = bytes;
+        }
+        let child_root = self.add_root(RootKind::Temporary, child)?;
+        let mut suspended = self
+            .with_coroutine_mut(child, &[], |co| co.external_suspended.take())?
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        if let Err(error) = suspended.restore_roots(self) {
+            self.with_coroutine_mut(child, &[], |co| co.external_suspended = Some(suspended))?;
+            self.remove_root(child_root)?;
+            return Err(error);
+        }
+        let core = suspended
+            .markers
+            .last_mut()
+            .and_then(|marker| marker.core.as_mut())
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        for nested in &mut core.external_nested {
+            if let Some((_, replacement)) = mappings.iter().find(|(old, _)| *old == nested.token) {
+                nested.token = *replacement;
+            }
+        }
+        for token in [&mut core.nested_origin, &mut core.nested_repark_token] {
+            if let Some(current) = *token {
+                if let Some((_, replacement)) = mappings.iter().find(|(old, _)| *old == current) {
+                    *token = Some(*replacement);
+                }
+            }
+        }
+        for (marker, (_, replacement)) in suspended.markers.iter_mut().zip(&mappings) {
+            marker.token = *replacement;
+            marker.debug_revision = marker.debug_revision.saturating_add(1);
+        }
+        self.parked_executions.extend(suspended.markers.drain(..));
+        self.parked_next_generation = next;
+        self.with_coroutine_mut(child, &[], |co| co.state = CoroutineState::Running)?;
+        if let Some(parent) = parent {
+            self.with_coroutine_mut(parent, &[], |co| co.state = CoroutineState::Normal)?;
+        }
+        self.remove_root(child_root)?;
+        Ok(ExternalResumeA5 {
+            mappings,
+            _charge: mapping_charge,
+        })
+    }
+
+    /// reset/close 放棄已返回 C resume checkpoint 的 child 執行，關閉 open upvalue 並釋放 roots。
+    pub fn abort_suspended_external_a5(&mut self, child: ObjectRef) -> Result<(), RuntimeError> {
+        if self.execution_running() || self.finalizer_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let mut suspended = self
+            .with_coroutine_mut(child, &[], |co| co.external_suspended.take())?
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        if let Err(error) = suspended.restore_roots(self) {
+            self.with_coroutine_mut(child, &[], |co| co.external_suspended = Some(suspended))?;
+            return Err(error);
+        }
+        let core = suspended
+            .markers
+            .last_mut()
+            .and_then(|marker| marker.core.take())
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        let mut execution = Execution::from_core(self, core);
+        execution.finish_owned_external_abort()?;
+        Ok(())
+    }
+
+    /// reset 進入 close 階段後若無法續接，舊 execution 只能終止。
+    /// 尚在 child payload 的 core 與已回到 VM parked LIFO 的 core 使用同一清理路徑。
+    pub fn abort_closing_external_a5(&mut self, child: ObjectRef) -> Result<(), RuntimeError> {
+        if self.execution_running() || self.finalizer_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        if self.with_coroutine(child, |co| co.external_suspended.is_some())? {
+            self.abort_suspended_external_a5(child)?;
+        } else if let Some(parked) = self.parked_executions.last() {
+            if parked
+                .core
+                .as_ref()
+                .is_some_and(|core| core.active_coroutine == Some(child))
+            {
+                self.abort_external(parked.token)?;
+            }
+        }
+        if self.coroutine_state(child)? != CoroutineState::Dead {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_parked_on_drop(&mut self) {
+        while let Some(entry) = self.parked_executions.pop() {
+            if let Some(core) = entry.core {
+                let mut execution = Execution::from_core(self, core);
+                let cleanup = execution.finish_owned_external_abort();
+                debug_assert!(cleanup.is_ok());
+            }
+        }
+    }
+}
+
+impl<'vm> Execution<'vm> {
+    fn complete_external_self_close(
+        &mut self,
+        original: Option<Value>,
+        boundaries: bool,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let mut error = explicit_error(original.unwrap_or(Value::Nil), self.frame.pc);
+        self.prepare_close_error_value(&mut error)?;
+        let mut pending = self
+            .external_pending
+            .take()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        pending.clear_roots(self.vm)?;
+        self.state = ExecutionState::Ready;
+        self.external_close_boundary_a5 = boundaries;
+        self.close_unwind = Some(CloseUnwind {
+            error,
+            caller_depth: 0,
+            include_root: true,
+            finish: CloseFinish::Coroutine { wrap: false },
+            failed: original.is_some(),
+            waiting_depth: None,
+        });
+        self.run()
+    }
+
+    fn clear_external_nested_result(&mut self) -> Result<(), RuntimeError> {
+        if let Some(mut result) = self.external_nested_result.take() {
+            result.clear_roots(self.vm)?;
+        }
+        Ok(())
+    }
+
+    fn complete_external_error(&mut self, value: Value) -> Result<RunOutcome, RuntimeError> {
+        if self.external_pending.is_none() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        if self.close_unwind.is_some() {
+            let mut held = PrintArguments::new(self.vm, &[value])?;
+            let mut pending = self
+                .external_pending
+                .take()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+            self.state = ExecutionState::Ready;
+            let mut error = RuntimeError::new(RuntimeErrorKind::Thrown);
+            error.value = value;
+            let prepared = self.prepare_close_error_value(&mut error);
+            let pending_cleanup = pending.clear_roots(self.vm);
+            let held_cleanup = held.clear_roots(self.vm);
+            prepared?;
+            pending_cleanup?;
+            held_cleanup?;
+            let unwind = self
+                .close_unwind
+                .as_mut()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+            unwind.error = error;
+            unwind.failed = true;
+            unwind.waiting_depth = None;
+            return self.run();
+        }
+        let mut held = PrintArguments::new(self.vm, &[value])?;
+        let mut pending = self
+            .external_pending
+            .take()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        self.state = ExecutionState::Ready;
+        let error = explicit_error(value, self.frame.pc);
+        let result = (|| -> Result<RunOutcome, RuntimeError> {
+            if self.begin_close_unwind(error)? {
+                return self.run();
+            }
+            match self.handle_protected_error(error)? {
+                ProtectedErrorResult::Caught(DispatchResult::Continue) => self.run(),
+                ProtectedErrorResult::Caught(DispatchResult::Returned(values, ticket)) => {
+                    drop(ticket);
+                    if self
+                        .external_nested
+                        .last()
+                        .is_some_and(|nested| self.callers.len() == nested.caller_depth + 1)
+                    {
+                        self.complete_external_nested_result(values)
+                    } else {
+                        self.state = ExecutionState::Returned;
+                        self.finish()?;
+                        Ok(RunOutcome::Returned(values))
+                    }
+                }
+                ProtectedErrorResult::Uncaught(error) if !self.external_nested.is_empty() => {
+                    self.finish_external_nested_error(error)
+                }
+                ProtectedErrorResult::Uncaught(error) => {
+                    let preserved = crate::LuaError::from_runtime(
+                        self.vm,
+                        error,
+                        self.frame.prototype,
+                        self.frame.depth,
+                        self.frame.pc,
+                    )?;
+                    self.state = ExecutionState::LuaError;
+                    self.finish()?;
+                    Ok(RunOutcome::LuaError(preserved))
+                }
+                _ => Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution)),
+            }
+        })();
+        let pending_cleanup = pending.clear_roots(self.vm);
+        let held_cleanup = held.clear_roots(self.vm);
+        pending_cleanup?;
+        held_cleanup?;
+        result
+    }
+
+    fn start_external_nested(
+        &mut self,
+        token: ExternalToken,
+        target: Value,
+        args: &[Value],
+        results: ResultMode,
+        operation: Option<ValueOperation>,
+    ) -> Result<(), RuntimeError> {
+        if self.state != ExecutionState::Parked || self.external_pending.is_none() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        self.clear_external_nested_result()?;
+        let target_root = match target {
+            Value::Object(object) => Some(self.vm.add_root(RootKind::Temporary, object)?),
+            _ => None,
+        };
+        let mut arguments = match PrintArguments::new(self.vm, args) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                if let Some(root) = target_root {
+                    self.vm.remove_root(root)?;
+                }
+                return Err(error.into());
+            }
+        };
+        let prepared = (|| {
+            let mut frame = self.new_basic_coroutine_frame(target, args)?;
+            let reserve = (|| {
+                if self.callers.len() == self.callers.capacity() {
+                    let next_charge = self
+                        .callers_charge
+                        .checked_add(core::mem::size_of::<CallFrame>())
+                        .ok_or(VmError::ArithmeticOverflow)?;
+                    let ticket = reserve_vec(
+                        self.vm.allocation_ledger(),
+                        &mut self.callers,
+                        1,
+                        FailPoint::CallFrameReserve,
+                    )?;
+                    self.callers_charges.try_reserve(1)?;
+                    self.callers_charges.push_prepared(ticket.commit_charge()?);
+                    self.callers_charge = next_charge;
+                }
+                if self.external_nested.len() == self.external_nested.capacity() {
+                    let ticket = reserve_vec(
+                        self.vm.allocation_ledger(),
+                        &mut self.external_nested,
+                        1,
+                        FailPoint::WorkReserve,
+                    )?;
+                    self.external_nested_charges.try_reserve(1)?;
+                    self.external_nested_charges
+                        .push_prepared(ticket.commit_charge()?);
+                }
+                Ok::<(), RuntimeError>(())
+            })();
+            if let Err(error) = reserve {
+                frame.clear_roots(self.vm)?;
+                return Err(error);
+            }
+            Ok::<CallFrame, RuntimeError>(frame)
+        })();
+        arguments.clear_roots(self.vm)?;
+        if let Some(root) = target_root {
+            self.vm.remove_root(root)?;
+        }
+        let frame = prepared?;
+        let outer_pending = self
+            .external_pending
+            .take()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        self.external_nested.push(ExternalNested {
+            token,
+            outer_pending,
+            previous_host_call_bootstrap: self.host_call_bootstrap,
+            previous_operation_bootstrap: self.operation_bootstrap,
+            caller_depth: self.callers.len(),
+            results,
+        });
+        let outer = core::mem::replace(&mut self.frame, frame);
+        self.callers.push(outer);
+        self.peak_frame_count = self.peak_frame_count.max(self.callers.len() + 1);
+        self.host_call_bootstrap = operation.is_none();
+        self.operation_bootstrap = operation;
+        self.nested_origin = Some(token);
+        self.state = ExecutionState::Ready;
+        Ok(())
+    }
+
+    fn complete_external_return(&mut self, values: Vec<Value>) -> Result<RunOutcome, RuntimeError> {
+        if self.external_pending.is_none() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let mut returned = PrintArguments::new(self.vm, &values)?;
+        let mut pending = self
+            .external_pending
+            .take()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        self.state = ExecutionState::Ready;
+        let action = self.complete_builtin_values(
+            pending.destination,
+            pending.mode,
+            pending.tail_return,
+            pending.next,
+            values,
+            None,
+        );
+        let return_cleanup = returned.clear_roots(self.vm);
+        let pending_cleanup = pending.clear_roots(self.vm);
+        return_cleanup?;
+        pending_cleanup?;
+        match action? {
+            RegularCallAction::Entered | RegularCallAction::Completed(DispatchResult::Continue) => {
+                if self.protected.last().is_some_and(|boundary| {
+                    boundary.finalizer.is_some()
+                        && boundary.inline_target
+                        && boundary.caller_depth == self.callers.len()
+                }) {
+                    let _ = self.propagate_tail_result(Vec::new(), None)?;
+                }
+                self.run()
+            }
+            RegularCallAction::Completed(DispatchResult::Returned(values, ticket)) => {
+                if self.external_nested.last().is_some_and(|nested| {
+                    self.callers.len() == nested.caller_depth + 1
+                        && self.frame.module.is_none()
+                        && self.frame.closure.is_none()
+                }) {
+                    drop(ticket);
+                    return self.complete_external_nested_result(values);
+                }
+                self.state = ExecutionState::Returned;
+                self.finish()?;
+                drop(ticket);
+                Ok(RunOutcome::Returned(values))
+            }
+            RegularCallAction::Aborted | RegularCallAction::Completed(DispatchResult::Aborted) => {
+                self.state = ExecutionState::Aborted;
+                self.finish()?;
+                Ok(RunOutcome::Aborted(AbortReason::FuelExhausted))
+            }
+            RegularCallAction::Completed(_) => {
+                Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution))
+            }
+        }
+    }
+
+    fn complete_external_nested_result(
+        &mut self,
+        mut values: Vec<Value>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let nested = self
+            .external_nested
+            .last()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        if self.callers.len() != nested.caller_depth + 1
+            || self.frame.module.is_some()
+            || self.frame.closure.is_some()
+        {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        if let ResultMode::Fixed(count) = nested.results {
+            let count = usize::from(count);
+            if values.len() < count {
+                let additional = count - values.len();
+                let ticket = match reserve_vec(
+                    self.vm.allocation_ledger(),
+                    &mut values,
+                    additional,
+                    FailPoint::ReturnReserve,
+                ) {
+                    Ok(ticket) => ticket,
+                    Err(error) => return self.finish_external_nested_failure(error.into()),
+                };
+                values.resize(count, Value::Nil);
+                drop(ticket);
+            } else {
+                values.truncate(count);
+            }
+        }
+        // 零回傳的同步 setter 已可能提交表寫入；此後不能再為空 result
+        // 製造配置失敗，否則會對外回報錯誤但寫入已生效。
+        let mut result = if matches!(nested.results, ResultMode::Fixed(0)) {
+            PrintArguments::empty()
+        } else {
+            match PrintArguments::new(self.vm, &values) {
+                Ok(result) => result,
+                Err(error) => return self.finish_external_nested_failure(error.into()),
+            }
+        };
+        let mut finished = core::mem::replace(
+            &mut self.frame,
+            self.callers
+                .pop()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?,
+        );
+        let cleanup = finished
+            .close_open(self.vm)
+            .and_then(|()| finished.clear_roots(self.vm));
+        finished.release_storage();
+        if let Err(error) = cleanup {
+            result.clear_roots(self.vm)?;
+            return Err(error);
+        }
+        let nested = self
+            .external_nested
+            .pop()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        self.external_pending = Some(nested.outer_pending);
+        self.host_call_bootstrap = nested.previous_host_call_bootstrap;
+        self.operation_bootstrap = nested.previous_operation_bootstrap;
+        self.nested_repark_token = Some(nested.token);
+        self.nested_origin = self.external_nested.last().map(|entry| entry.token);
+        self.external_nested_result = Some(result);
+        self.state = ExecutionState::Parked;
+        if self.external_nested.is_empty() {
+            self.external_nested = Vec::new();
+            self.external_nested_charges = AllocationCharges::new();
+        }
+        Ok(RunOutcome::NestedReturned(values))
+    }
+
+    fn finish_external_nested_error(
+        &mut self,
+        error: RuntimeError,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let preserved = crate::LuaError::from_runtime(
+            self.vm,
+            error,
+            self.frame.prototype,
+            self.frame.depth,
+            self.frame.pc,
+        );
+        let parent = self.abort_current_nested_callback()?;
+        if let Some(root) = self.error_root.take() {
+            self.vm.remove_root(root)?;
+        }
+        self.nested_repark_token = Some(parent);
+        Ok(match preserved {
+            Ok(error) => RunOutcome::NestedErrored(error),
+            Err(failure) => RunOutcome::NestedFailed(failure.into()),
+        })
+    }
+
+    fn finish_external_nested_failure(
+        &mut self,
+        error: RuntimeError,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let parent = self.abort_current_nested_callback()?;
+        if let Some(root) = self.error_root.take() {
+            self.vm.remove_root(root)?;
+        }
+        self.nested_repark_token = Some(parent);
+        Ok(RunOutcome::NestedFailed(error))
+    }
+
+    fn abort_current_nested_callback(&mut self) -> Result<ExternalToken, RuntimeError> {
+        let nested = self
+            .external_nested
+            .last()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        let parent = nested.token;
+        let caller_depth = nested.caller_depth;
+        if let Some(mut pending) = self.external_pending.take() {
+            pending.clear_roots(self.vm)?;
+        }
+        self.unwind_to_protected(caller_depth + 1)?;
+        while self
+            .protected
+            .last()
+            .is_some_and(|boundary| boundary.caller_depth > caller_depth)
+        {
+            let mut boundary = self
+                .protected
+                .pop()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+            boundary.clear(self.vm)?;
+        }
+        if self.callers.len() != caller_depth + 1 {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let outer = self
+            .callers
+            .pop()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+        let mut finished = core::mem::replace(&mut self.frame, outer);
+        finished.close_open(self.vm)?;
+        finished.clear_roots(self.vm)?;
+        finished.release_storage();
+        let nested = self
+            .external_nested
+            .pop()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        self.external_pending = Some(nested.outer_pending);
+        self.host_call_bootstrap = nested.previous_host_call_bootstrap;
+        self.operation_bootstrap = nested.previous_operation_bootstrap;
+        self.nested_origin = self.external_nested.last().map(|entry| entry.token);
+        self.nested_repark_token = None;
+        self.state = ExecutionState::Parked;
+        if self.external_nested.is_empty() {
+            self.external_nested = Vec::new();
+            self.external_nested_charges = AllocationCharges::new();
+        }
+        Ok(parent)
+    }
+
+    fn from_core(vm: &'vm mut Vm, core: ExecutionCore) -> Self {
+        Self {
+            vm,
+            vm_id: core.vm_id,
+            module: core.module,
+            module_root: core.module_root,
+            frame: core.frame,
+            callers: core.callers,
+            callers_charge: core.callers_charge,
+            callers_charges: core.callers_charges,
+            peak_frame_count: core.peak_frame_count,
+            pending_ops: core.pending_ops,
+            protected: core.protected,
+            protected_charge: core.protected_charge,
+            protected_charges: core.protected_charges,
+            error_root: core.error_root,
+            close_unwind: core.close_unwind,
+            external_close_boundary_a5: core.external_close_boundary_a5,
+            finalizer_saved_close: core.finalizer_saved_close,
+            finalizer_saved_error_root: core.finalizer_saved_error_root,
+            yield_site: core.yield_site,
+            active_coroutine: core.active_coroutine,
+            active_coroutine_root: core.active_coroutine_root,
+            resume_stack: core.resume_stack,
+            resume_charge: core.resume_charge,
+            resume_charges: core.resume_charges,
+            fuel: core.fuel,
+            finalizer_steps: core.finalizer_steps,
+            debug_hook_skip_once: core.debug_hook_skip_once,
+            debug_hook_c_call_pending: core.debug_hook_c_call_pending,
+            debug_builtin_capture: core.debug_builtin_capture,
+            debug_builtin_result: core.debug_builtin_result,
+            host_call_bootstrap: core.host_call_bootstrap,
+            operation_bootstrap: core.operation_bootstrap,
+            deferred_roots: core.deferred_roots,
+            deferred_charge: core.deferred_charge,
+            deferred_owner: core.deferred_owner,
+            external_pending: core.external_pending,
+            external_nested: core.external_nested,
+            external_nested_charges: core.external_nested_charges,
+            external_nested_result: core.external_nested_result,
+            nested_origin: core.nested_origin,
+            gc_finalizer_parent: core.gc_finalizer_parent,
+            nested_repark_token: core.nested_repark_token,
+            state: core.state,
+        }
+    }
+
+    fn take_core(&mut self) -> ExecutionCore {
+        let ledger = self.vm.allocation_ledger().clone();
+        ExecutionCore {
+            vm_id: self.vm_id,
+            module: self.module.take(),
+            module_root: self.module_root.take(),
+            frame: core::mem::replace(&mut self.frame, CallFrame::parked_placeholder(&ledger)),
+            callers: core::mem::take(&mut self.callers),
+            callers_charge: core::mem::replace(&mut self.callers_charge, 0),
+            callers_charges: core::mem::replace(
+                &mut self.callers_charges,
+                AllocationCharges::new(),
+            ),
+            peak_frame_count: core::mem::replace(&mut self.peak_frame_count, 0),
+            pending_ops: core::mem::replace(&mut self.pending_ops, PendingStack::new(ledger)),
+            protected: core::mem::take(&mut self.protected),
+            protected_charge: core::mem::replace(&mut self.protected_charge, 0),
+            protected_charges: core::mem::replace(
+                &mut self.protected_charges,
+                AllocationCharges::new(),
+            ),
+            error_root: self.error_root.take(),
+            close_unwind: self.close_unwind.take(),
+            external_close_boundary_a5: self.external_close_boundary_a5,
+            finalizer_saved_close: self.finalizer_saved_close.take(),
+            finalizer_saved_error_root: self.finalizer_saved_error_root.take(),
+            yield_site: self.yield_site.take(),
+            active_coroutine: self.active_coroutine.take(),
+            active_coroutine_root: self.active_coroutine_root.take(),
+            resume_stack: core::mem::take(&mut self.resume_stack),
+            resume_charge: core::mem::replace(&mut self.resume_charge, 0),
+            resume_charges: core::mem::replace(&mut self.resume_charges, AllocationCharges::new()),
+            fuel: core::mem::replace(&mut self.fuel, 0),
+            finalizer_steps: core::mem::replace(&mut self.finalizer_steps, 0),
+            debug_hook_skip_once: core::mem::replace(&mut self.debug_hook_skip_once, false),
+            debug_hook_c_call_pending: self.debug_hook_c_call_pending.take(),
+            debug_builtin_capture: core::mem::replace(&mut self.debug_builtin_capture, false),
+            debug_builtin_result: self.debug_builtin_result.take(),
+            host_call_bootstrap: core::mem::replace(&mut self.host_call_bootstrap, false),
+            operation_bootstrap: self.operation_bootstrap.take(),
+            deferred_roots: core::mem::take(&mut self.deferred_roots),
+            deferred_charge: core::mem::replace(&mut self.deferred_charge, 0),
+            deferred_owner: self.deferred_owner.take(),
+            external_pending: self.external_pending.take(),
+            external_nested: core::mem::take(&mut self.external_nested),
+            external_nested_charges: core::mem::replace(
+                &mut self.external_nested_charges,
+                AllocationCharges::new(),
+            ),
+            external_nested_result: self.external_nested_result.take(),
+            nested_origin: self.nested_origin.take(),
+            gc_finalizer_parent: self.gc_finalizer_parent,
+            nested_repark_token: self.nested_repark_token.take(),
+            state: core::mem::replace(&mut self.state, ExecutionState::Parked),
+        }
+    }
+}
+
+impl Vm {
+    /// 以獨立的 protected execution 清空 `lua_gc` 留下的 finalizer 佇列。
+    /// `parent` 僅授權最上層完整停放的 C callback，不借走其 core。
+    pub fn gc_finalizer_execution(
+        &mut self,
+        parent: Option<ExternalToken>,
+    ) -> Result<Execution<'_>, RuntimeError> {
+        if self.execution_running() || self.finalizer_running() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        match (self.parked_executions.last(), parent) {
+            (None, None) => {}
+            (Some(top), None) if top.prepared_reset_target.is_some() && top.core.is_some() => {}
+            (Some(top), Some(token)) if top.token == token && top.core.is_some() => {}
+            _ => return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution)),
+        }
+        let mut execution = Execution::for_native_finalizer(self)?;
+        execution.nested_origin = parent;
+        execution.gc_finalizer_parent = parent.is_some();
+        Ok(execution)
+    }
+
+    /// 以同一 VM 的原生 frame 執行一次 P10 運算；外部 metamethod 會停在 B4 token。
+    pub fn value_operation(
+        &mut self,
+        operation: ValueOperation,
+        args: &[Value],
+    ) -> Result<Execution<'_>, RuntimeError> {
+        operation.validate(args.len())?;
+        let mut execution = Execution::for_native_finalizer(self)?;
+        let frame = execution.new_basic_coroutine_frame(Value::Nil, args)?;
+        let mut empty = core::mem::replace(&mut execution.frame, frame);
+        empty.clear_roots(execution.vm)?;
+        execution.operation_bootstrap = Some(operation);
+        Ok(execution)
+    }
+
     /// 在同一 VM 的執行器中呼叫 Lua 值；參數及目標在執行期間由 frame 持有。
     pub fn call(&mut self, function: Value, args: &[Value]) -> Result<Execution<'_>, RuntimeError> {
         let mut execution = Execution::for_native_finalizer(self)?;
@@ -969,6 +3285,223 @@ impl Vm {
         Ok(execution)
     }
 
+    /// 以既有 `coroutine.close` unwind 路徑驅動宿主 thread reset。
+    /// 呼叫者須在結果的錯誤值發布至宿主 stack 後呼叫 `finalize_thread_reset`。
+    pub fn reset_thread_execution(
+        &mut self,
+        coroutine: Value,
+    ) -> Result<Execution<'_>, RuntimeError> {
+        self.reset_thread_execution_with_error(coroutine, None)
+    }
+
+    /// C facade 在呼叫任何 overlay `__close` 前預備 runtime reset frame。
+    pub fn prepare_thread_reset_b11(&mut self, thread: ObjectRef) -> Result<(), RuntimeError> {
+        if self
+            .parked_executions
+            .iter()
+            .any(|parked| parked.prepared_reset_target.is_some())
+        {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let core = {
+            let mut execution = self.reset_thread_execution(Value::Object(thread))?;
+            execution.take_core()
+        };
+        let token = match self.reserve_external_token() {
+            Ok(token) => token,
+            Err(error) => {
+                let mut execution = Execution::from_core(self, core);
+                execution.finish()?;
+                return Err(error.into());
+            }
+        };
+        self.parked_executions.push(ParkedExecution {
+            token,
+            debug_revision: 0,
+            core: Some(core),
+            prepared_reset_target: Some(thread),
+        });
+        Ok(())
+    }
+
+    /// 預備完成後才接受 C overlay 的原始錯誤並啟動既有 close walker。
+    pub fn run_prepared_thread_reset_b11(
+        &mut self,
+        thread: ObjectRef,
+        original: Option<Value>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let parked = self
+            .parked_executions
+            .last()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        if parked.prepared_reset_target != Some(thread) {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
+        }
+        let core = self.take_top_external_core(parked.token)?;
+        let mut execution = Execution::from_core(self, core);
+        if let Some(value) = original {
+            let reference = match value {
+                Value::Object(reference) => Some(reference),
+                _ => None,
+            };
+            execution
+                .vm
+                .with_coroutine_mut(thread, reference.as_slice(), |co| co.error = Some(value))?;
+        }
+        execution.run()
+    }
+
+    /// checkpoint 建立失敗等未執行路徑只撤銷預備 frame，不觸發 Lua close callback。
+    pub fn cancel_prepared_thread_reset_b11(&mut self) -> Result<(), RuntimeError> {
+        let Some(parked) = self.parked_executions.last() else {
+            return Ok(());
+        };
+        if parked.prepared_reset_target.is_none() {
+            return if self
+                .parked_executions
+                .iter()
+                .any(|parked| parked.prepared_reset_target.is_some())
+            {
+                Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution))
+            } else {
+                Ok(())
+            };
+        }
+        let core = self.take_top_external_core(parked.token)?;
+        let mut execution = Execution::from_core(self, core);
+        execution.finish()?;
+        Ok(())
+    }
+
+    /// overlay 已發布的錯誤可覆蓋既有 thread error，供跨層 close 再次替換。
+    pub fn reset_thread_execution_with_error(
+        &mut self,
+        coroutine: Value,
+        error: Option<Value>,
+    ) -> Result<Execution<'_>, RuntimeError> {
+        let Value::Object(object) = coroutine else {
+            return Err(VmError::WrongObjectType.into());
+        };
+        if matches!(
+            self.coroutine_state(object)?,
+            CoroutineState::Running | CoroutineState::Normal
+        ) {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
+        }
+        let held = crate::HostHandle::<Value>::new(self, object)?;
+        let mut execution = Execution::for_native_finalizer(self)?;
+        let target = execution
+            .vm
+            .allocate_callback_action_builtin(Builtin::CoroutineClose)?;
+        let target_handle = match crate::HostHandle::<Value>::new(execution.vm, target) {
+            Ok(handle) => handle,
+            Err(error) => {
+                execution.vm.reclaim(target)?;
+                return Err(error.into());
+            }
+        };
+        let frame = execution.new_basic_coroutine_frame(Value::Object(target), &[coroutine])?;
+        let mut empty = core::mem::replace(&mut execution.frame, frame);
+        empty.clear_roots(execution.vm)?;
+        execution.host_call_bootstrap = true;
+        if let Some(value) = error {
+            let reference = match value {
+                Value::Object(reference) => Some(reference),
+                _ => None,
+            };
+            execution
+                .vm
+                .with_coroutine_mut(object, reference.as_slice(), |co| co.error = Some(value))?;
+        }
+        drop(target_handle);
+        drop(held);
+        Ok(execution)
+    }
+
+    /// 宿主完成結果發布後，清除單次執行狀態並保留 thread 設定與身分。
+    pub fn finalize_thread_reset(&mut self, coroutine: Value) -> Result<(), RuntimeError> {
+        let Value::Object(object) = coroutine else {
+            return Err(VmError::WrongObjectType.into());
+        };
+        let ready = self.with_coroutine(object, |co| {
+            co.state == CoroutineState::Dead && co.context.is_none() && co.unwind_context.is_none()
+        })?;
+        if !ready {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
+        }
+        self.with_coroutine_mut(object, &[], |co| {
+            co.state = CoroutineState::Suspended;
+            co.entry = Value::Nil;
+            co.replace_context(None);
+            co.unwind_context = None;
+            co.error = None;
+            co.native_yielded = false;
+            co.native = None;
+            co.native_bridge = None;
+        })?;
+        Ok(())
+    }
+
+    /// B11 固定 C fixture：在 idle host thread 建立單一待關閉的 runtime frame。
+    #[doc(hidden)]
+    pub fn install_host_thread_close_fixture_b11(
+        &mut self,
+        thread: ObjectRef,
+        value: Value,
+    ) -> Result<(), RuntimeError> {
+        let ready = self.with_coroutine(thread, |co| {
+            co.state == CoroutineState::Suspended
+                && co.context.is_none()
+                && co.unwind_context.is_none()
+        })?;
+        if !ready {
+            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
+        }
+        let held = match value {
+            Value::Object(object) => Some(crate::HostHandle::<Value>::new(self, object)?),
+            _ => None,
+        };
+        let mut frame = CallFrame::new_native_finalizer(self.allocation_ledger())?;
+        let prepared = (|| -> Result<(), RuntimeError> {
+            frame.grow_for_open_results(1)?;
+            frame.write(self, Register(0), value)?;
+            frame.add_close(
+                self,
+                rivetlua_core::BytecodeBindingId {
+                    function: 0,
+                    ordinal: 0,
+                },
+                Register(0),
+                value,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            frame.clear_roots(self)?;
+            frame.release_storage();
+            return Err(error);
+        }
+        let mut context = ThreadContext::new(frame, self.allocation_ledger());
+        if let Err(error) = self.prepare_coroutine_context_write(thread, &context) {
+            context.finish(self)?;
+            return Err(error.into());
+        }
+        if let Err(error) = context.park_roots(self) {
+            context.finish(self)?;
+            return Err(error);
+        }
+        let mut owned = Some(context);
+        let result = self.with_coroutine_mut(thread, &[], |co| co.replace_context(owned.take()));
+        if let Err(error) = result {
+            if let Some(mut context) = owned {
+                context.finish(self)?;
+            }
+            return Err(error.into());
+        }
+        drop(held);
+        Ok(())
+    }
+
     fn resolve_finalizer_closure(
         &mut self,
         callback: Value,
@@ -983,7 +3516,7 @@ impl Vm {
                 return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
             };
             match self.object_kind(object)? {
-                ObjectKind::Closure | ObjectKind::Builtin => {
+                ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin => {
                     let mut arguments = Vec::new();
                     let ticket = reserve_vec(
                         self.allocation_ledger(),
@@ -995,7 +3528,7 @@ impl Vm {
                     arguments.push(Value::Object(target));
                     return Ok((object, arguments, ticket));
                 }
-                ObjectKind::Table if count < MAX_TAG_LOOP => {
+                ObjectKind::Table | ObjectKind::Userdata if count < MAX_TAG_LOOP => {
                     let next = self.lookup_metamethod(object, MetamethodEvent::Call)?;
                     if next == Value::Nil {
                         return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
@@ -1004,7 +3537,7 @@ impl Vm {
                     count += 1;
                     current = next;
                 }
-                ObjectKind::Table => {
+                ObjectKind::Table | ObjectKind::Userdata => {
                     return Err(RuntimeError::new(RuntimeErrorKind::MetatableChainLimit));
                 }
                 _ => return Err(RuntimeError::new(RuntimeErrorKind::NotCallable)),
@@ -1027,7 +3560,10 @@ impl Vm {
                 let native = match self.resolve_finalizer_closure(callback, object) {
                     Ok((callee, _, ticket)) => {
                         drop(ticket);
-                        self.object_kind(callee)? == ObjectKind::Builtin
+                        matches!(
+                            self.object_kind(callee)?,
+                            ObjectKind::Builtin | ObjectKind::CClosure
+                        )
                     }
                     Err(RuntimeError {
                         kind: RuntimeErrorKind::NotCallable,
@@ -1050,6 +3586,13 @@ impl Vm {
                     drop(execution);
                     match outcome {
                         Ok(RunOutcome::Returned(_)) => {}
+                        Ok(RunOutcome::External(token)) => {
+                            self.abort_external(token)
+                                .map_err(|error| match error.kind {
+                                    RuntimeErrorKind::Heap(error) => error,
+                                    _ => VmError::LedgerInvariant,
+                                })?;
+                        }
                         Err(RuntimeError {
                             kind: RuntimeErrorKind::Heap(error),
                             ..
@@ -1358,8 +3901,7 @@ impl Vm {
             }
         }
         let has_official_plan = module.official_execution().is_some();
-        let has_native_debug =
-            module.profile() == LuaProfile::Lua55 && module.native_debug().is_some();
+        let has_native_debug = module.native_debug().is_some();
         let parameter_count = usize::from(data.prototypes[entry_index].parameter_count);
         let is_variadic = data.prototypes[entry_index].is_variadic;
         let needs_module_payload = has_official_plan
@@ -1386,7 +3928,7 @@ impl Vm {
             .filter(|value| matches!(value, Value::Object(_)))
             .count();
         let mut argument_roots = Vec::new();
-        let argument_charge = checked_bytes(argument_objects, core::mem::size_of::<RootId>())?;
+        let mut argument_owner = None;
         if argument_objects != 0 {
             let ticket = reserve_vec(
                 self.allocation_ledger(),
@@ -1394,8 +3936,9 @@ impl Vm {
                 argument_objects,
                 FailPoint::WorkReserve,
             )?;
-            ticket.commit()?;
+            argument_owner = Some(ticket.commit_charge()?);
         }
+        let gc = self.defer_automatic_gc();
         let frame_result = (|| {
             let environment_guard = match environment {
                 Some(table) => Some(self.add_root(RootKind::Temporary, table)?),
@@ -1540,12 +4083,11 @@ impl Vm {
             }
             result
         })();
+        self.finish_deferred_automatic_gc(gc, frame_result.is_ok());
         for root in argument_roots.into_iter().rev() {
             self.remove_root(root)?;
         }
-        if argument_charge != 0 {
-            self.allocation_ledger().refund(argument_charge)?;
-        }
+        drop(argument_owner);
         let (frame, owned_module, module_root) = frame_result?;
         let pending_ops = PendingStack::new(self.allocation_ledger().clone());
         Ok(Execution {
@@ -1556,12 +4098,15 @@ impl Vm {
             frame,
             callers: Vec::new(),
             callers_charge: 0,
+            callers_charges: AllocationCharges::new(),
             peak_frame_count: 1,
             pending_ops,
             protected: Vec::new(),
             protected_charge: 0,
+            protected_charges: AllocationCharges::new(),
             error_root: None,
             close_unwind: None,
+            external_close_boundary_a5: false,
             finalizer_saved_close: None,
             finalizer_saved_error_root: None,
             yield_site: None,
@@ -1569,6 +4114,7 @@ impl Vm {
             active_coroutine_root: None,
             resume_stack: Vec::new(),
             resume_charge: 0,
+            resume_charges: AllocationCharges::new(),
             fuel: 1_000_000,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
@@ -1576,18 +4122,25 @@ impl Vm {
             debug_builtin_capture: false,
             debug_builtin_result: None,
             host_call_bootstrap: false,
+            operation_bootstrap: None,
             deferred_roots: Vec::new(),
             deferred_charge: 0,
+            deferred_owner: None,
+            external_pending: None,
+            external_nested: Vec::new(),
+            external_nested_charges: AllocationCharges::new(),
+            external_nested_result: None,
+            nested_origin: None,
+            gc_finalizer_parent: false,
+            nested_repark_token: None,
             state: ExecutionState::Ready,
         })
     }
 
-    fn loaded_chunk_closure(
-        &mut self,
-        module: VerifiedModule,
-        environment: Value,
-        mut charge: ModuleCharge,
-    ) -> Result<(ObjectRef, RootId), RuntimeError> {
+    fn loaded_chunk_entry(
+        &self,
+        module: &VerifiedModule,
+    ) -> Result<(rivetlua_core::ProtoId, bool), RuntimeError> {
         if module.format_version() != RVLU_V2 || module.profile() != self.language_profile() {
             return Err(RuntimeError::new(RuntimeErrorKind::UnsupportedFormat));
         }
@@ -1611,8 +4164,113 @@ impl Vm {
         {
             return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
         }
-        let entry = *entry;
-        let has_official_plan = module.official_execution().is_some();
+        Ok((*entry, module.official_execution().is_some()))
+    }
+
+    /// 已驗證模組的 C stack 入口沿原 VM 帳本持有巢狀容量，成功時交出暫時 root。
+    pub fn capi_loaded_chunk_closure(
+        &mut self,
+        module: VerifiedModule,
+        environment: Value,
+    ) -> Result<(ObjectRef, RootId), RuntimeError> {
+        self.loaded_chunk_entry(&module)?;
+        let retained = module_allocation_bytes(&module)?;
+        if retained > self.load_limits().max_module_allocation_bytes {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
+        }
+        let ticket = self.allocation_ledger().reserve(retained)?;
+        let mut charges = AllocationCharges::new();
+        charges.try_reserve(1)?;
+        charges.push_prepared(ticket.commit_charge()?);
+        self.loaded_chunk_closure(module, environment, ModuleCharge::from_charges(charges))
+    }
+
+    /// C loader 將 compiler 或 binary admission 已預付的 retained charges
+    /// 精確轉交 module；不足即拒絕，不再次 reserve 同一份模組容量。
+    #[doc(hidden)]
+    pub fn capi_loaded_chunk_closure_charged(
+        &mut self,
+        module: VerifiedModule,
+        environment: Value,
+        mut charges: AllocationCharges,
+    ) -> Result<(ObjectRef, RootId), RuntimeError> {
+        self.loaded_chunk_entry(&module)?;
+        let actual = module_allocation_bytes(&module)?;
+        if actual > self.load_limits().max_module_allocation_bytes
+            || actual > charges.total_bytes()?
+        {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
+        }
+        let normalized = charges.normalize(actual)?;
+        self.loaded_chunk_closure(module, environment, ModuleCharge::from_charges(normalized))
+    }
+
+    /// 只輸出固定 profile 的官方 prototype bytes；結果離開 VM 借用後仍由
+    /// ledger charge 保活，供純 C writer callback 使用。
+    #[doc(hidden)]
+    pub fn capi_dump_closure(
+        &self,
+        closure: ObjectRef,
+        strip: bool,
+    ) -> Result<CapiDumpBytes, RuntimeError> {
+        let limits = self.capi_dump_limits();
+        let work_limit = u64::try_from(limits.max_work_units)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostDumpBudget))?;
+        let mut work = OfficialWorkBudget::new(work_limit);
+        let ticket = self
+            .allocation_ledger()
+            .reserve(limits.max_temporary_bytes)?;
+        let (module_ref, selected) =
+            self.with_closure(closure, |payload| (payload.module(), payload.prototype()))?;
+        let mut chunk_limits = OfficialChunkLimits::default();
+        chunk_limits.max_bytes = chunk_limits.max_bytes.min(limits.max_encoded_bytes);
+        chunk_limits.max_allocated_bytes = chunk_limits
+            .max_allocated_bytes
+            .min(limits.max_temporary_bytes);
+        let bytes = emit_official_chunk(
+            self.module(module_ref)?,
+            selected,
+            self.language_profile(),
+            strip,
+            &chunk_limits,
+            &mut work,
+        )
+        .map_err(|error| {
+            let kind = match error.kind {
+                OfficialExportErrorKind::WorkExhausted | OfficialExportErrorKind::LimitExceeded => {
+                    RuntimeErrorKind::HostDumpBudget
+                }
+                OfficialExportErrorKind::AllocationFailed => {
+                    RuntimeErrorKind::Heap(VmError::AllocationFailed)
+                }
+                OfficialExportErrorKind::Unsupported => RuntimeErrorKind::HostUnsupported,
+                OfficialExportErrorKind::ProfileMismatch
+                | OfficialExportErrorKind::InvalidPrototype
+                | OfficialExportErrorKind::Codec => RuntimeErrorKind::StringArgument,
+            };
+            RuntimeError::new(kind)
+        })?;
+        work.charge(bytes.len(), selected, 0)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostDumpBudget))?;
+        if bytes.capacity() > limits.max_temporary_bytes {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostDumpBudget));
+        }
+        let mut charges = AllocationCharges::new();
+        charges.try_reserve(1)?;
+        charges.push_prepared(ticket.commit_charge()?);
+        Ok(CapiDumpBytes {
+            _charge: charges.normalize(bytes.capacity())?,
+            bytes,
+        })
+    }
+
+    fn loaded_chunk_closure(
+        &mut self,
+        module: VerifiedModule,
+        environment: Value,
+        mut charge: ModuleCharge,
+    ) -> Result<(ObjectRef, RootId), RuntimeError> {
+        let (entry, has_official_plan) = self.loaded_chunk_entry(&module)?;
         let environment_root = match environment {
             Value::Object(object) => Some(self.add_root(RootKind::Temporary, object)?),
             _ => None,
@@ -1721,11 +4379,14 @@ impl Execution<'_> {
             frame,
             callers: Vec::new(),
             callers_charge: 0,
+            callers_charges: AllocationCharges::new(),
             peak_frame_count: 1,
             protected: Vec::new(),
             protected_charge: 0,
+            protected_charges: AllocationCharges::new(),
             error_root: None,
             close_unwind: None,
+            external_close_boundary_a5: false,
             finalizer_saved_close: None,
             finalizer_saved_error_root: None,
             yield_site: None,
@@ -1733,6 +4394,7 @@ impl Execution<'_> {
             active_coroutine_root: None,
             resume_stack: Vec::new(),
             resume_charge: 0,
+            resume_charges: AllocationCharges::new(),
             fuel: 1_000_000,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
@@ -1740,27 +4402,64 @@ impl Execution<'_> {
             debug_builtin_capture: false,
             debug_builtin_result: None,
             host_call_bootstrap: false,
+            operation_bootstrap: None,
             deferred_roots: Vec::new(),
             deferred_charge: 0,
+            deferred_owner: None,
+            external_pending: None,
+            external_nested: Vec::new(),
+            external_nested_charges: AllocationCharges::new(),
+            external_nested_result: None,
+            nested_origin: None,
+            gc_finalizer_parent: false,
+            nested_repark_token: None,
             state: ExecutionState::Ready,
         })
     }
 
-    fn start_pending_finalizer(&mut self) -> Result<bool, RuntimeError> {
+    fn start_pending_finalizer(&mut self) -> Result<Option<DispatchResult>, RuntimeError> {
         if self.vm.finalizer_running() {
-            return Ok(false);
+            return Ok(None);
         }
         let Some((object, callback)) = self.vm.pending_finalizer()? else {
-            return Ok(false);
+            return Ok(None);
         };
         self.vm.start_finalizer(object)?;
         if callback == Value::Nil {
             self.vm.finish_finalizer(object)?;
-            return Ok(true);
+            return Ok(Some(DispatchResult::Continue));
         }
-        let resolved = self.resolve_callable_event(callback, &[Value::Object(object)]);
+        let external = match callback {
+            Value::CFunction(_) => true,
+            Value::Object(closure) => match self.vm.object_kind(closure) {
+                Ok(kind) => kind == ObjectKind::CClosure,
+                Err(error) => {
+                    self.vm.pause_finalizer_start(object)?;
+                    return Err(error.into());
+                }
+            },
+            _ => false,
+        };
+        let resolved = (|| -> Result<Option<(Value, Vec<Value>, Reservation)>, RuntimeError> {
+            if external {
+                let mut args = Vec::new();
+                let ticket = reserve_vec(
+                    self.vm.allocation_ledger(),
+                    &mut args,
+                    1,
+                    FailPoint::WorkReserve,
+                )?;
+                args.push(Value::Object(object));
+                Ok(Some((callback, args, ticket)))
+            } else {
+                self.resolve_callable_event(callback, &[Value::Object(object)])
+                    .map(|candidate| {
+                        candidate.map(|(callee, args, ticket, _)| (callee, args, ticket))
+                    })
+            }
+        })();
         let (callee, args, ticket) = match resolved {
-            Ok(Some((callee, args, ticket, _))) => (callee, args, ticket),
+            Ok(Some((callee, args, ticket))) => (callee, args, ticket),
             Ok(_)
             | Err(RuntimeError {
                 kind: RuntimeErrorKind::NotCallable,
@@ -1768,16 +4467,31 @@ impl Execution<'_> {
             }) => {
                 self.vm.record_finalizer_warning();
                 self.vm.finish_finalizer(object)?;
-                return Ok(true);
+                return Ok(Some(DispatchResult::Continue));
             }
             Err(error) if error.kind.is_lua_error() => {
                 self.vm.record_finalizer_warning();
                 self.vm.finish_finalizer(object)?;
-                return Ok(true);
+                return Ok(Some(DispatchResult::Continue));
             }
             Err(error) => {
                 self.vm.pause_finalizer_start(object)?;
                 return Err(error);
+            }
+        };
+        let native = if external {
+            true
+        } else {
+            let Value::Object(callee) = callee else {
+                self.vm.pause_finalizer_start(object)?;
+                return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
+            };
+            match self.vm.object_kind(callee) {
+                Ok(kind) => kind == ObjectKind::Builtin,
+                Err(error) => {
+                    self.vm.pause_finalizer_start(object)?;
+                    return Err(error.into());
+                }
             }
         };
         let resume_pc = self.frame.pc;
@@ -1791,7 +4505,6 @@ impl Execution<'_> {
             .last_mut()
             .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?
             .finalizer = Some(object);
-        let native = self.vm.object_kind(callee)? == ObjectKind::Builtin;
         if native {
             self.protected
                 .last_mut()
@@ -1801,14 +4514,11 @@ impl Execution<'_> {
         self.finalizer_saved_close = self.close_unwind.take();
         self.finalizer_saved_error_root = self.error_root.take();
         let entered = if native {
-            self.enter_callable_values(
-                Value::Object(callee),
-                &args,
-                Register(0),
-                ResultMode::Fixed(0),
-                resume_pc,
-            )
+            self.enter_callable_values(callee, &args, Register(0), ResultMode::Fixed(0), resume_pc)
         } else {
+            let Value::Object(callee) = callee else {
+                return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
+            };
             self.enter_metamethod_call(
                 callee,
                 &args,
@@ -1825,7 +4535,7 @@ impl Execution<'_> {
         let entered = match entered {
             Ok(action) => action,
             Err(error) => {
-                if !native
+                if (!native || external)
                     && matches!(
                         error.kind,
                         RuntimeErrorKind::Heap(
@@ -1853,14 +4563,16 @@ impl Execution<'_> {
                             {
                                 let _ = self.propagate_tail_result(Vec::new(), None)?;
                             }
-                            return Ok(true);
+                            return Ok(Some(DispatchResult::Continue));
                         }
-                        Ok(ProtectedErrorResult::Caught(_)) => return Ok(true),
+                        Ok(ProtectedErrorResult::Caught(_)) => {
+                            return Ok(Some(DispatchResult::Continue));
+                        }
                         Ok(ProtectedErrorResult::Uncaught(_)) | Err(_) => {}
                     }
                 }
                 self.abort_finalizer_callback()?;
-                return Ok(true);
+                return Ok(Some(DispatchResult::Continue));
             }
         };
         match entered {
@@ -1869,9 +4581,12 @@ impl Execution<'_> {
             RegularCallAction::Completed(DispatchResult::Continue) => {
                 let _ = self.propagate_tail_result(Vec::new(), None)?;
             }
+            RegularCallAction::Completed(DispatchResult::External(token)) => {
+                return Ok(Some(DispatchResult::External(token)));
+            }
             RegularCallAction::Completed(_) => self.abort_finalizer_callback()?,
         }
-        Ok(true)
+        Ok(Some(DispatchResult::Continue))
     }
 
     fn finish_finalizer_callback(
@@ -1970,11 +4685,14 @@ impl Execution<'_> {
             frame,
             callers: Vec::new(),
             callers_charge: 0,
+            callers_charges: AllocationCharges::new(),
             peak_frame_count: 1,
             protected: Vec::new(),
             protected_charge: 0,
+            protected_charges: AllocationCharges::new(),
             error_root: None,
             close_unwind: None,
+            external_close_boundary_a5: false,
             finalizer_saved_close: None,
             finalizer_saved_error_root: None,
             yield_site: None,
@@ -1982,6 +4700,7 @@ impl Execution<'_> {
             active_coroutine_root: None,
             resume_stack: Vec::new(),
             resume_charge: 0,
+            resume_charges: AllocationCharges::new(),
             fuel: 1_000_000,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
@@ -1989,8 +4708,17 @@ impl Execution<'_> {
             debug_builtin_capture: false,
             debug_builtin_result: None,
             host_call_bootstrap: false,
+            operation_bootstrap: None,
             deferred_roots: Vec::new(),
             deferred_charge: 0,
+            deferred_owner: None,
+            external_pending: None,
+            external_nested: Vec::new(),
+            external_nested_charges: AllocationCharges::new(),
+            external_nested_result: None,
+            nested_origin: None,
+            gc_finalizer_parent: false,
+            nested_repark_token: None,
             state: ExecutionState::Ready,
         })
     }
@@ -2104,21 +4832,7 @@ impl Execution<'_> {
     }
 
     fn rollback_new_open(&mut self, original: usize) -> Result<(), RuntimeError> {
-        while self.frame.open_upvalues.len() > original {
-            let entry = self
-                .frame
-                .open_upvalues
-                .pop()
-                .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?;
-            if let Some(root) = entry.root {
-                self.vm.remove_root(root)?;
-            }
-            self.vm.reclaim(entry.object)?;
-            let bytes = core::mem::size_of::<crate::call::OpenUpvalue>();
-            self.vm.allocation_ledger().refund(bytes)?;
-            self.frame.open_charge -= bytes;
-        }
-        Ok(())
+        self.frame.rollback_open_prefix(self.vm, original)
     }
 
     fn capture_upvalues(
@@ -2170,7 +4884,7 @@ impl Execution<'_> {
                                 slot,
                             ))?;
                             if let Err(error) = self.frame.add_open(self.vm, slot, object) {
-                                self.vm.reclaim(object)?;
+                                self.vm.reclaim_unpublished_object(object)?;
                                 return Err(error);
                             }
                             object
@@ -2326,39 +5040,35 @@ impl Execution<'_> {
         };
         let mut current = target;
         for step in 0..MAX_TAG_LOOP {
-            let Value::Object(object) = current else {
-                return Err(VmError::WrongObjectType.into());
+            let table = match current {
+                Value::Object(object) if self.vm.object_kind(object)? == ObjectKind::Table => {
+                    Some(object)
+                }
+                _ => None,
             };
-            let object_kind = self.vm.object_kind(object)?;
-            let raw = match object_kind {
-                ObjectKind::Table => self.vm.raw_get(object, key)?,
-                ObjectKind::ByteString | ObjectKind::File if value.is_none() => Value::Nil,
-                ObjectKind::File => Value::Nil,
-                _ => return Err(VmError::WrongObjectType.into()),
+            let raw = match table {
+                Some(table) => self.vm.raw_get(table, key)?,
+                None => Value::Nil,
             };
             if raw != Value::Nil {
                 if let Some(value) = value {
-                    self.vm.raw_set(object, key, value)?;
+                    self.vm
+                        .raw_set(table.ok_or(VmError::WrongObjectType)?, key, value)?;
                     return Ok(RegularTableAction::Wrote);
                 }
                 return Ok(RegularTableAction::Read(raw));
             }
-            let event = if object_kind == ObjectKind::ByteString {
-                self.vm
-                    .string_index_event()?
-                    .ok_or(VmError::WrongObjectType)?
-            } else {
-                self.vm.lookup_metamethod(object, event_kind)?
-            };
+            let event = self.vm.lookup_metamethod_value(current, event_kind)?;
             if event == Value::Nil {
                 if let Some(value) = value {
-                    if object_kind == ObjectKind::File {
-                        return Err(VmError::WrongObjectType.into());
-                    }
-                    self.vm.raw_set(object, key, value)?;
+                    let table = table.ok_or(VmError::WrongObjectType)?;
+                    self.vm.raw_set(table, key, value)?;
                     return Ok(RegularTableAction::Wrote);
                 }
-                return Ok(RegularTableAction::Read(Value::Nil));
+                return match table {
+                    Some(_) => Ok(RegularTableAction::Read(Value::Nil)),
+                    None => Err(VmError::WrongObjectType.into()),
+                };
             }
             if self.vm.finalizer_running() {
                 if self.finalizer_steps >= 1_000_000 {
@@ -2371,17 +5081,20 @@ impl Execution<'_> {
                 }
                 self.fuel -= 1;
             }
-            if let Value::Object(event_object) = event {
-                if matches!(
+            let callable = match event {
+                Value::CFunction(_) => true,
+                Value::Object(event_object) => matches!(
                     self.vm.object_kind(event_object)?,
-                    ObjectKind::Closure | ObjectKind::Builtin
-                ) {
-                    return Ok(RegularTableAction::Invoke {
-                        current,
-                        event: event_object,
-                        chain_steps: step + 1,
-                    });
-                }
+                    ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin
+                ),
+                _ => false,
+            };
+            if callable {
+                return Ok(RegularTableAction::Invoke {
+                    current,
+                    event,
+                    chain_steps: step + 1,
+                });
             }
             current = event;
         }
@@ -2395,7 +5108,7 @@ impl Execution<'_> {
         current: Value,
         key: Value,
         value: Value,
-        event: ObjectRef,
+        event: Value,
         destination: Register,
         next: usize,
         chain_steps: usize,
@@ -2407,7 +5120,7 @@ impl Execution<'_> {
         };
         self.invoke_event(
             PendingKind::Table(kind),
-            [original, current, key, value, Value::Object(event)],
+            [original, current, key, value, event],
             event,
             &args[..arg_count],
             destination,
@@ -2423,7 +5136,7 @@ impl Execution<'_> {
         &mut self,
         kind: PendingKind,
         values: [Value; 5],
-        event: ObjectRef,
+        event: Value,
         args: &[Value],
         destination: Register,
         result_mode: ResultMode,
@@ -2453,14 +5166,21 @@ impl Execution<'_> {
                 return Err(error.into());
             }
         };
-        let event_kind = match self.vm.object_kind(event) {
-            Ok(kind) => kind,
-            Err(error) => {
+        let event_kind = match event {
+            Value::CFunction(_) => None,
+            Value::Object(object) => match self.vm.object_kind(object) {
+                Ok(kind) => Some(kind),
+                Err(error) => {
+                    pending.clear(self.vm)?;
+                    return Err(error.into());
+                }
+            },
+            _ => {
                 pending.clear(self.vm)?;
-                return Err(error.into());
+                return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
             }
         };
-        if event_kind == ObjectKind::Closure {
+        if event_kind == Some(ObjectKind::Closure) {
             let call_extraargs = match kind {
                 PendingKind::Call => chain_steps,
                 PendingKind::Value | PendingKind::Boolean { .. } | PendingKind::Close => {
@@ -2469,7 +5189,10 @@ impl Execution<'_> {
                 PendingKind::Table(_) | PendingKind::Basic => 0,
             };
             if let Err(error) = self.enter_metamethod_call(
-                event,
+                match event {
+                    Value::Object(object) => object,
+                    _ => unreachable!(),
+                },
                 args,
                 destination,
                 result_mode,
@@ -2484,17 +5207,51 @@ impl Execution<'_> {
             self.pending_ops.push_prepared(prepared, pending);
             return Ok(RegularCallAction::Entered);
         }
-        if event_kind != ObjectKind::Builtin {
+        if event_kind != Some(ObjectKind::Builtin)
+            && event_kind != Some(ObjectKind::CClosure)
+            && !matches!(event, Value::CFunction(_))
+        {
             pending.clear(self.vm)?;
             return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
         }
         self.pending_ops.push_prepared(prepared, pending);
-        let action =
-            self.invoke_builtin_event(event, args, destination, result_mode, next, tail_return);
+        let action = if event_kind == Some(ObjectKind::Builtin) {
+            self.invoke_builtin_event(
+                match event {
+                    Value::Object(object) => object,
+                    _ => unreachable!(),
+                },
+                args,
+                destination,
+                result_mode,
+                next,
+                tail_return,
+            )
+        } else {
+            let call_extraargs = match kind {
+                PendingKind::Call => chain_steps,
+                PendingKind::Value | PendingKind::Boolean { .. } | PendingKind::Close => {
+                    chain_steps.saturating_sub(1)
+                }
+                PendingKind::Table(_) | PendingKind::Basic => 0,
+            };
+            self.external_call(
+                event,
+                args,
+                destination,
+                result_mode,
+                tail_return,
+                next,
+                call_extraargs,
+            )
+        };
         match action {
             Ok(RegularCallAction::Entered) => Ok(RegularCallAction::Entered),
             Ok(RegularCallAction::Completed(DispatchResult::Yielded(values, ticket))) => Ok(
                 RegularCallAction::Completed(DispatchResult::Yielded(values, ticket)),
+            ),
+            Ok(RegularCallAction::Completed(DispatchResult::External(token))) => Ok(
+                RegularCallAction::Completed(DispatchResult::External(token)),
             ),
             Ok(action) => {
                 self.complete_immediate_event()?;
@@ -2823,12 +5580,14 @@ impl Execution<'_> {
             }
         }
         if !reuse_tail_frame && self.callers.len() == self.callers.capacity() {
-            let ticket = match reserve_vec(
-                self.vm.allocation_ledger(),
-                &mut self.callers,
-                1,
-                FailPoint::CallFrameReserve,
-            ) {
+            let ticket = match self.callers_charges.try_reserve(1).and_then(|()| {
+                reserve_vec(
+                    self.vm.allocation_ledger(),
+                    &mut self.callers,
+                    1,
+                    FailPoint::CallFrameReserve,
+                )
+            }) {
                 Ok(ticket) => ticket,
                 Err(error) => {
                     callee.clear_roots(self.vm)?;
@@ -2836,11 +5595,15 @@ impl Execution<'_> {
                     return Err(error.into());
                 }
             };
-            if let Err(error) = ticket.commit() {
-                callee.clear_roots(self.vm)?;
-                named_payload.reclaim(self.vm)?;
-                return Err(error.into());
-            }
+            let charge = match ticket.commit_charge() {
+                Ok(charge) => charge,
+                Err(error) => {
+                    callee.clear_roots(self.vm)?;
+                    named_payload.reclaim(self.vm)?;
+                    return Err(error.into());
+                }
+            };
+            self.callers_charges.push_prepared(charge);
             self.callers_charge = next_charge;
         }
         if reuse_tail_frame {
@@ -2869,17 +5632,32 @@ impl Execution<'_> {
         &mut self,
         target: Value,
         args: &[Value],
-    ) -> Result<Option<(ObjectRef, Vec<Value>, Reservation, usize)>, RuntimeError> {
+    ) -> Result<Option<(Value, Vec<Value>, Reservation, usize)>, RuntimeError> {
         const MAX_TAG_LOOP: usize = 2000;
         let mut chain = [Value::Nil; MAX_TAG_LOOP];
         let mut count: usize = 0;
         let mut current = target;
         loop {
+            if matches!(current, Value::CFunction(_)) {
+                let total = count
+                    .checked_add(args.len())
+                    .ok_or(VmError::ArithmeticOverflow)?;
+                let mut final_args = Vec::new();
+                let ticket = reserve_vec(
+                    self.vm.allocation_ledger(),
+                    &mut final_args,
+                    total,
+                    FailPoint::WorkReserve,
+                )?;
+                final_args.extend(chain[..count].iter().rev().copied());
+                final_args.extend_from_slice(args);
+                return Ok(Some((current, final_args, ticket, count)));
+            }
             let Value::Object(object) = current else {
                 return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
             };
             match self.vm.object_kind(object)? {
-                ObjectKind::Closure | ObjectKind::Builtin => {
+                ObjectKind::Closure | ObjectKind::Builtin | ObjectKind::CClosure => {
                     let total = count
                         .checked_add(args.len())
                         .ok_or(VmError::ArithmeticOverflow)?;
@@ -2892,9 +5670,9 @@ impl Execution<'_> {
                     )?;
                     final_args.extend(chain[..count].iter().rev().copied());
                     final_args.extend_from_slice(args);
-                    return Ok(Some((object, final_args, ticket, count)));
+                    return Ok(Some((current, final_args, ticket, count)));
                 }
-                ObjectKind::Table => {
+                ObjectKind::Table | ObjectKind::Userdata => {
                     if count == MAX_TAG_LOOP
                         || (self.vm.language_profile() == LuaProfile::Lua55 && count == 15)
                     {
@@ -2934,7 +5712,7 @@ impl Execution<'_> {
         };
         if !matches!(
             self.vm.object_kind(object)?,
-            ObjectKind::Table | ObjectKind::File
+            ObjectKind::Table | ObjectKind::File | ObjectKind::Userdata
         ) {
             return Ok(Value::Nil);
         }
@@ -2978,13 +5756,7 @@ impl Execution<'_> {
         };
         let result = self.invoke_event(
             kind,
-            [
-                original[0],
-                original[1],
-                event_value,
-                Value::Nil,
-                Value::Object(event),
-            ],
+            [original[0], original[1], event_value, Value::Nil, event],
             event,
             &args,
             destination,
@@ -3091,12 +5863,14 @@ impl Execution<'_> {
             None
         };
         if let Some(next_charge) = next_charge {
-            let ticket = reserve_vec(
-                self.vm.allocation_ledger(),
-                &mut self.protected,
-                1,
-                FailPoint::WorkReserve,
-            );
+            let ticket = self.protected_charges.try_reserve(1).and_then(|()| {
+                reserve_vec(
+                    self.vm.allocation_ledger(),
+                    &mut self.protected,
+                    1,
+                    FailPoint::WorkReserve,
+                )
+            });
             let ticket = match ticket {
                 Ok(ticket) => ticket,
                 Err(error) => {
@@ -3106,12 +5880,16 @@ impl Execution<'_> {
                     return Err(error.into());
                 }
             };
-            if let Err(error) = ticket.commit() {
-                if let Some(root) = handler_root {
-                    self.vm.remove_root(root)?;
+            let charge = match ticket.commit_charge() {
+                Ok(charge) => charge,
+                Err(error) => {
+                    if let Some(root) = handler_root {
+                        self.vm.remove_root(root)?;
+                    }
+                    return Err(error.into());
                 }
-                return Err(error.into());
-            }
+            };
+            self.protected_charges.push_prepared(charge);
             self.protected_charge = next_charge;
         }
         self.protected.push(ProtectedBoundary {
@@ -3148,10 +5926,44 @@ impl Execution<'_> {
             let inputs = carried
                 .as_ref()
                 .map_or(args, |(values, _, skip)| &values[*skip..]);
+            let external = match target {
+                Value::CFunction(_) => true,
+                Value::Object(object) => self.vm.object_kind(object)? == ObjectKind::CClosure,
+                _ => false,
+            };
+            if external {
+                return self.external_call(
+                    target,
+                    inputs,
+                    destination,
+                    current_mode,
+                    false,
+                    next,
+                    0,
+                );
+            }
             let Some((callee, arguments, ticket, call_extraargs)) =
                 self.resolve_callable_event(target, inputs)?
             else {
                 return Ok(RegularCallAction::Aborted);
+            };
+            if matches!(callee, Value::CFunction(_))
+                || matches!(callee, Value::Object(object) if self.vm.object_kind(object)? == ObjectKind::CClosure)
+            {
+                let action = self.external_call(
+                    callee,
+                    &arguments,
+                    destination,
+                    current_mode,
+                    false,
+                    next,
+                    call_extraargs,
+                );
+                drop(ticket);
+                return action;
+            }
+            let Value::Object(callee) = callee else {
+                return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
             };
             match self.vm.object_kind(callee)? {
                 ObjectKind::Builtin => match self.vm.builtin(callee)? {
@@ -3586,6 +6398,31 @@ impl Execution<'_> {
             // 末引數先求值，再於任何 callee 或 builtin 執行前關閉 caller upvalue。
             self.frame.close_open(self.vm)?;
         }
+        let external = match target {
+            Value::CFunction(_) => true,
+            Value::Object(object) => self.vm.object_kind(object)? == ObjectKind::CClosure,
+            _ => false,
+        };
+        if external {
+            let next = if tail_return {
+                self.frame.pc.checked_add(1).ok_or(RuntimeError::new(
+                    RuntimeErrorKind::ProgramCounterOutOfBounds,
+                ))?
+            } else {
+                self.next_pc()?
+            };
+            let mut args = Vec::new();
+            let ticket = reserve_vec(
+                self.vm.allocation_ledger(),
+                &mut args,
+                end - start,
+                FailPoint::WorkReserve,
+            )?;
+            args.extend_from_slice(&self.frame.registers[start..end]);
+            let action = self.external_call(target, &args, base, result_mode, tail_return, next, 0);
+            drop(ticket);
+            return action;
+        }
         if let Value::Object(object) = target {
             match self.vm.object_kind(object)? {
                 ObjectKind::Closure => {
@@ -3700,11 +6537,14 @@ impl Execution<'_> {
         };
         if tail_return
             && self.frame.pending_close.is_none()
-            && self.vm.object_kind(event)? == ObjectKind::Closure
+            && matches!(event, Value::Object(object) if self.vm.object_kind(object)? == ObjectKind::Closure)
         {
             // 尾呼叫沒有本 frame 的回填目的；參數在替換 frame 前取得新 roots。
             self.enter_metamethod_call(
-                event,
+                match event {
+                    Value::Object(object) => object,
+                    _ => unreachable!(),
+                },
                 &args,
                 base,
                 result_mode,
@@ -3719,13 +6559,7 @@ impl Execution<'_> {
         }
         let action = self.invoke_event(
             PendingKind::Call,
-            [
-                target,
-                Value::Nil,
-                Value::Nil,
-                Value::Nil,
-                Value::Object(event),
-            ],
+            [target, Value::Nil, Value::Nil, Value::Nil, event],
             event,
             &args,
             base,
@@ -3896,12 +6730,14 @@ impl Execution<'_> {
         }
         debug_assert_eq!(arguments_end, arguments_start + actual_arg_count);
         if !reuse_tail_frame && self.callers.len() == self.callers.capacity() {
-            let ticket = match reserve_vec(
-                self.vm.allocation_ledger(),
-                &mut self.callers,
-                1,
-                FailPoint::CallFrameReserve,
-            ) {
+            let ticket = match self.callers_charges.try_reserve(1).and_then(|()| {
+                reserve_vec(
+                    self.vm.allocation_ledger(),
+                    &mut self.callers,
+                    1,
+                    FailPoint::CallFrameReserve,
+                )
+            }) {
                 Ok(ticket) => ticket,
                 Err(error) => {
                     callee.clear_roots(self.vm)?;
@@ -3909,11 +6745,15 @@ impl Execution<'_> {
                     return Err(error.into());
                 }
             };
-            if let Err(error) = ticket.commit() {
-                callee.clear_roots(self.vm)?;
-                named_payload.reclaim(self.vm)?;
-                return Err(error.into());
-            }
+            let charge = match ticket.commit_charge() {
+                Ok(charge) => charge,
+                Err(error) => {
+                    callee.clear_roots(self.vm)?;
+                    named_payload.reclaim(self.vm)?;
+                    return Err(error.into());
+                }
+            };
+            self.callers_charges.push_prepared(charge);
             self.callers_charge = next_charge;
         }
         if reuse_tail_frame {
@@ -4103,9 +6943,11 @@ impl Execution<'_> {
         core::mem::swap(&mut self.frame, &mut context.frame);
         core::mem::swap(&mut self.callers, &mut context.callers);
         core::mem::swap(&mut self.callers_charge, &mut context.callers_charge);
+        core::mem::swap(&mut self.callers_charges, &mut context.callers_charges);
         core::mem::swap(&mut self.pending_ops, &mut context.pending_ops);
         core::mem::swap(&mut self.protected, &mut context.protected);
         core::mem::swap(&mut self.protected_charge, &mut context.protected_charge);
+        core::mem::swap(&mut self.protected_charges, &mut context.protected_charges);
         core::mem::swap(&mut self.error_root, &mut context.error_root);
         core::mem::swap(&mut self.close_unwind, &mut context.close_unwind);
         core::mem::swap(&mut self.yield_site, &mut context.yield_site);
@@ -4236,17 +7078,19 @@ impl Execution<'_> {
 
     fn ensure_resume_capacity(&mut self) -> Result<(), RuntimeError> {
         if self.resume_stack.len() == self.resume_stack.capacity() {
+            let next = self
+                .resume_charge
+                .checked_add(core::mem::size_of::<ResumeCaller>())
+                .ok_or(VmError::ArithmeticOverflow)?;
+            self.resume_charges.try_reserve(1)?;
             let ticket = reserve_vec(
                 self.vm.allocation_ledger(),
                 &mut self.resume_stack,
                 1,
                 FailPoint::WorkReserve,
             )?;
-            ticket.commit()?;
-            self.resume_charge = self
-                .resume_charge
-                .checked_add(core::mem::size_of::<ResumeCaller>())
-                .ok_or(VmError::ArithmeticOverflow)?;
+            self.resume_charges.push_prepared(ticket.commit_charge()?);
+            self.resume_charge = next;
         }
         Ok(())
     }
@@ -4293,7 +7137,7 @@ impl Execution<'_> {
             owner: self.active_coroutine,
             owner_root: self.active_coroutine_root.take(),
             child: object,
-            child_root,
+            child_root: Some(child_root),
             destination,
             result_mode: mode,
             resume_pc: next,
@@ -5710,6 +8554,98 @@ impl Execution<'_> {
         }
     }
 
+    fn external_call(
+        &mut self,
+        target: Value,
+        args: &[Value],
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+        extraargs: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        if self.external_pending.is_some() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let (function, closure) = match target {
+            Value::CFunction(id) if id.vm() == self.vm.id() => (id, None),
+            Value::Object(object) if self.vm.object_kind(object)? == ObjectKind::CClosure => {
+                (self.vm.capi_c_closure_function(object)?, Some(object))
+            }
+            _ => return Err(RuntimeError::new(RuntimeErrorKind::NotCallable)),
+        };
+        let call_extraargs = if self.vm.language_profile() == LuaProfile::Lua55 {
+            u8::try_from(extraargs)
+                .ok()
+                .filter(|count| *count <= 15)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::MetatableChainLimit))?
+        } else {
+            0
+        };
+        let mut capture_values = [Value::Nil; 255];
+        let mut capture_count = 0;
+        if let Some(object) = closure {
+            for index in 1..=capture_values.len() {
+                let Some(cell) = self.vm.capi_upvalue_cell(Value::Object(object), index)? else {
+                    break;
+                };
+                let value = self
+                    .vm
+                    .capi_closed_upvalue(cell)?
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::NotCallable))?;
+                capture_values[capture_count] = value;
+                capture_count += 1;
+            }
+        }
+        let captures = &capture_values[..capture_count];
+        let function_root = closure
+            .map(|object| self.vm.add_root(RootKind::Temporary, object))
+            .transpose()?;
+        let arguments = match PrintArguments::new(self.vm, args) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                if let Some(root) = function_root {
+                    self.vm.remove_root(root)?;
+                }
+                return Err(error.into());
+            }
+        };
+        let captures_guard = match PrintArguments::new(self.vm, captures) {
+            Ok(captures_guard) => captures_guard,
+            Err(error) => {
+                let mut arguments = arguments;
+                arguments.clear_roots(self.vm)?;
+                if let Some(root) = function_root {
+                    self.vm.remove_root(root)?;
+                }
+                return Err(error.into());
+            }
+        };
+        let mut pending = ExternalPending {
+            function,
+            closure,
+            function_root,
+            arguments,
+            captures: captures_guard,
+            destination,
+            mode,
+            tail_return,
+            call_extraargs,
+            next,
+        };
+        let token = match self.vm.reserve_external_token() {
+            Ok(token) => token,
+            Err(error) => {
+                pending.clear_roots(self.vm)?;
+                return Err(error.into());
+            }
+        };
+        self.external_pending = Some(pending);
+        Ok(RegularCallAction::Completed(DispatchResult::External(
+            token,
+        )))
+    }
+
     fn host_callback(
         &mut self,
         id: usize,
@@ -6272,168 +9208,164 @@ impl Execution<'_> {
         next: usize,
     ) -> Result<RegularCallAction, RuntimeError> {
         let mut state_slot = Some(state);
-        let progress = (|| {
-            loop {
-                let state = state_slot
-                    .as_mut()
-                    .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
-                if let Some(value) = answer.take() {
-                    let cost = state.answer_len(self.vm, value)?;
-                    if !self.charge_native_work(cost)? {
-                        return Ok(RegularCallAction::Aborted);
-                    }
-                    state.append_answer(self.vm, value)?;
-                }
-                if state.count >= state.maximum || state.cursor > state.source.bytes.len() {
-                    if state.changed {
-                        let remaining = state.source.bytes.len().saturating_sub(state.cursor);
-                        if !self.charge_native_work(remaining)? {
-                            return Ok(RegularCallAction::Aborted);
-                        }
-                    }
-                    let (values, ticket) = state.finish(self.vm)?;
-                    return self.complete_basic_continuation_values(
-                        destination,
-                        mode,
-                        tail_return,
-                        next,
-                        values,
-                        ticket,
-                    );
-                }
-                let available = if self.vm.finalizer_running() {
-                    1_000_000_u64.saturating_sub(self.finalizer_steps)
-                } else {
-                    self.fuel
-                };
-                let mut matcher =
-                    Matcher::new(&state.source.bytes, &state.pattern.bytes, available);
-                let found = matcher.at(state.cursor, state.anchored);
-                let cost = matcher.steps();
-                let found = match found {
-                    Ok(found) => found,
-                    Err(PatternError::Exhausted) => {
-                        let _ = self.charge_native_work(
-                            usize::try_from(available.saturating_add(1)).unwrap_or(usize::MAX),
-                        )?;
-                        return Ok(RegularCallAction::Aborted);
-                    }
-                    Err(PatternError::Malformed | PatternError::TooComplex) => {
-                        if !self.charge_native_work(usize::try_from(cost).unwrap_or(usize::MAX))? {
-                            return Ok(RegularCallAction::Aborted);
-                        }
-                        return Err(RuntimeError::new(RuntimeErrorKind::StringPattern));
-                    }
-                };
-                if !self.charge_native_work(usize::try_from(cost).unwrap_or(usize::MAX))? {
+        let progress = (|| loop {
+            let state = state_slot
+                .as_mut()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+            if let Some(value) = answer.take() {
+                let cost = state.answer_len(self.vm, value)?;
+                if !self.charge_native_work(cost)? {
                     return Ok(RegularCallAction::Aborted);
                 }
-                if let Some(found) = found.filter(|found| Some(found.end) != state.last) {
-                    state.count = state
-                        .count
-                        .checked_add(1)
-                        .ok_or(VmError::ArithmeticOverflow)?;
-                    state.cursor = found.end;
-                    state.last = Some(found.end);
-                    if state.anchored {
-                        state.maximum = state.count;
-                    }
-                    match &state.replacement {
-                        Replacement::Text(_) => {
-                            let cost = state.text_cost(self.vm, found)?;
-                            if !self.charge_native_work(cost)? {
-                                return Ok(RegularCallAction::Aborted);
-                            }
-                            state.append_text(self.vm, found)?;
-                            continue;
-                        }
-                        Replacement::Function(function) | Replacement::Table(function) => {
-                            let function = *function;
-                            let cost = string_lib::pattern_output_units(Some(found), false);
-                            if !self.charge_native_work(cost)? {
-                                return Ok(RegularCallAction::Aborted);
-                            }
-                            state.callback_arguments =
-                                Some(string_lib::pattern_callback_arguments(
-                                    self.vm,
-                                    &state.source.bytes,
-                                    found,
-                                )?);
-                            state.awaiting = Some((found.start, found.end));
-                            let callback_values = state
-                                .callback_arguments
-                                .as_ref()
-                                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?
-                                .values();
-                            let mut stack_args = [Value::Nil; 32];
-                            let count = callback_values.len();
-                            stack_args[..count].copy_from_slice(callback_values);
-                            if matches!(state.replacement, Replacement::Table(_)) {
-                                let key = stack_args[0];
-                                match self.regular_table_access(function, key, None)? {
-                                    RegularTableAction::Read(value) => {
-                                        answer = Some(value);
-                                        continue;
-                                    }
-                                    RegularTableAction::Aborted => {
-                                        return Ok(RegularCallAction::Aborted);
-                                    }
-                                    RegularTableAction::Invoke { current, event, .. } => {
-                                        let state = state_slot.take().ok_or(RuntimeError::new(
-                                            RuntimeErrorKind::MissingEntryPoint,
-                                        ))?;
-                                        return self.start_basic_callback(
-                                            Value::Object(event),
-                                            &[current, key],
-                                            function,
-                                            BasicPending::StringGSub {
-                                                state,
-                                                outer_mode: mode,
-                                                tail_return,
-                                            },
-                                            destination,
-                                            next,
-                                        );
-                                    }
-                                    RegularTableAction::Wrote => {
-                                        return Err(RuntimeError::new(
-                                            RuntimeErrorKind::MissingEntryPoint,
-                                        ));
-                                    }
-                                }
-                            }
-                            let state = state_slot
-                                .take()
-                                .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
-                            return self.start_basic_callback(
-                                function,
-                                &stack_args[..count],
-                                function,
-                                BasicPending::StringGSub {
-                                    state,
-                                    outer_mode: mode,
-                                    tail_return,
-                                },
-                                destination,
-                                next,
-                            );
-                        }
-                    }
-                }
-                if state.cursor < state.source.bytes.len() {
-                    if !self.charge_native_work(1)? {
+                state.append_answer(self.vm, value)?;
+            }
+            if state.count >= state.maximum || state.cursor > state.source.bytes.len() {
+                if state.changed {
+                    let remaining = state.source.bytes.len().saturating_sub(state.cursor);
+                    if !self.charge_native_work(remaining)? {
                         return Ok(RegularCallAction::Aborted);
                     }
-                    let cursor = state.cursor;
-                    let byte = state.source.bytes[cursor];
-                    state.append(self.vm, &[byte])?;
-                    state.cursor += 1;
-                    if state.anchored {
-                        state.maximum = state.count;
+                }
+                let (values, ticket) = state.finish(self.vm)?;
+                return self.complete_basic_continuation_values(
+                    destination,
+                    mode,
+                    tail_return,
+                    next,
+                    values,
+                    ticket,
+                );
+            }
+            let available = if self.vm.finalizer_running() {
+                1_000_000_u64.saturating_sub(self.finalizer_steps)
+            } else {
+                self.fuel
+            };
+            let mut matcher = Matcher::new(&state.source.bytes, &state.pattern.bytes, available);
+            let found = matcher.at(state.cursor, state.anchored);
+            let cost = matcher.steps();
+            let found = match found {
+                Ok(found) => found,
+                Err(PatternError::Exhausted) => {
+                    let _ = self.charge_native_work(
+                        usize::try_from(available.saturating_add(1)).unwrap_or(usize::MAX),
+                    )?;
+                    return Ok(RegularCallAction::Aborted);
+                }
+                Err(PatternError::Malformed | PatternError::TooComplex) => {
+                    if !self.charge_native_work(usize::try_from(cost).unwrap_or(usize::MAX))? {
+                        return Ok(RegularCallAction::Aborted);
                     }
-                } else {
+                    return Err(RuntimeError::new(RuntimeErrorKind::StringPattern));
+                }
+            };
+            if !self.charge_native_work(usize::try_from(cost).unwrap_or(usize::MAX))? {
+                return Ok(RegularCallAction::Aborted);
+            }
+            if let Some(found) = found.filter(|found| Some(found.end) != state.last) {
+                state.count = state
+                    .count
+                    .checked_add(1)
+                    .ok_or(VmError::ArithmeticOverflow)?;
+                state.cursor = found.end;
+                state.last = Some(found.end);
+                if state.anchored {
                     state.maximum = state.count;
                 }
+                match &state.replacement {
+                    Replacement::Text(_) => {
+                        let cost = state.text_cost(self.vm, found)?;
+                        if !self.charge_native_work(cost)? {
+                            return Ok(RegularCallAction::Aborted);
+                        }
+                        state.append_text(self.vm, found)?;
+                        continue;
+                    }
+                    Replacement::Function(function) | Replacement::Table(function) => {
+                        let function = *function;
+                        let cost = string_lib::pattern_output_units(Some(found), false);
+                        if !self.charge_native_work(cost)? {
+                            return Ok(RegularCallAction::Aborted);
+                        }
+                        state.callback_arguments = Some(string_lib::pattern_callback_arguments(
+                            self.vm,
+                            &state.source.bytes,
+                            found,
+                        )?);
+                        state.awaiting = Some((found.start, found.end));
+                        let callback_values = state
+                            .callback_arguments
+                            .as_ref()
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?
+                            .values();
+                        let mut stack_args = [Value::Nil; 32];
+                        let count = callback_values.len();
+                        stack_args[..count].copy_from_slice(callback_values);
+                        if matches!(state.replacement, Replacement::Table(_)) {
+                            let key = stack_args[0];
+                            match self.regular_table_access(function, key, None)? {
+                                RegularTableAction::Read(value) => {
+                                    answer = Some(value);
+                                    continue;
+                                }
+                                RegularTableAction::Aborted => {
+                                    return Ok(RegularCallAction::Aborted);
+                                }
+                                RegularTableAction::Invoke { current, event, .. } => {
+                                    let state = state_slot.take().ok_or(RuntimeError::new(
+                                        RuntimeErrorKind::MissingEntryPoint,
+                                    ))?;
+                                    return self.start_basic_callback(
+                                        event,
+                                        &[current, key],
+                                        function,
+                                        BasicPending::StringGSub {
+                                            state,
+                                            outer_mode: mode,
+                                            tail_return,
+                                        },
+                                        destination,
+                                        next,
+                                    );
+                                }
+                                RegularTableAction::Wrote => {
+                                    return Err(RuntimeError::new(
+                                        RuntimeErrorKind::MissingEntryPoint,
+                                    ));
+                                }
+                            }
+                        }
+                        let state = state_slot
+                            .take()
+                            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+                        return self.start_basic_callback(
+                            function,
+                            &stack_args[..count],
+                            function,
+                            BasicPending::StringGSub {
+                                state,
+                                outer_mode: mode,
+                                tail_return,
+                            },
+                            destination,
+                            next,
+                        );
+                    }
+                }
+            }
+            if state.cursor < state.source.bytes.len() {
+                if !self.charge_native_work(1)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+                let cursor = state.cursor;
+                let byte = state.source.bytes[cursor];
+                state.append(self.vm, &[byte])?;
+                state.cursor += 1;
+                if state.anchored {
+                    state.maximum = state.count;
+                }
+            } else {
+                state.maximum = state.count;
             }
         })();
         if let Some(mut state) = state_slot {
@@ -7131,7 +10063,7 @@ impl Execution<'_> {
             RegularTableAction::Wrote => Ok(TableRequestResult::Immediate(Value::Nil)),
             RegularTableAction::Aborted => Ok(TableRequestResult::Aborted),
             RegularTableAction::Invoke { current, event, .. } => Ok(TableRequestResult::Callback {
-                event: Value::Object(event),
+                event,
                 args: [current, key, value.unwrap_or(Value::Nil)],
                 count: if value.is_some() { 3 } else { 2 },
             }),
@@ -9532,13 +12464,19 @@ impl Execution<'_> {
                 _ => None,
             };
             if kind == DebugBuiltin::SetUserValue {
-                if !matches!(target, Some((_, ObjectKind::File))) || args.get(1).is_none() {
+                if !matches!(target, Some((_, ObjectKind::Userdata | ObjectKind::File)))
+                    || args.get(1).is_none()
+                {
                     return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
                 }
             }
-            let _index = index;
-            // File 沒有 uservalue slot；讀取和合法設定皆回傳一個 nil。
-            let slot: Option<Value> = None;
+            let slot = match (target, index) {
+                (Some((object, ObjectKind::Userdata)), Some(index)) => {
+                    self.vm.get_uservalue(object, index)?
+                }
+                // File 是 userdata，但沒有可讀寫的 uservalue slot。
+                _ => None,
+            };
             let mut output = [Value::Nil; 2];
             let mut count = 1;
             if kind == DebugBuiltin::GetUserValue {
@@ -9552,6 +12490,15 @@ impl Execution<'_> {
                 }
             }
             let (values, ticket) = math_lib::values(self.vm, &output[..count])?;
+            if kind == DebugBuiltin::SetUserValue {
+                if let (Some((object, ObjectKind::Userdata)), Some(index), Some(value)) =
+                    (target, index, args.get(1).copied())
+                {
+                    if slot.is_some() && !self.vm.set_uservalue(object, index, value)? {
+                        return Err(VmError::LedgerInvariant.into());
+                    }
+                }
+            }
             return self.complete_builtin_values(
                 destination,
                 mode,
@@ -9959,7 +12906,9 @@ impl Execution<'_> {
                     return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                 };
                 let metatable = match self.vm.object_kind(object)? {
-                    ObjectKind::Table | ObjectKind::File => self.vm.get_metatable(object)?,
+                    ObjectKind::Table | ObjectKind::File | ObjectKind::Userdata => {
+                        self.vm.get_metatable(object)?
+                    }
                     ObjectKind::ByteString => self.vm.string_metatable(),
                     _ => return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug)),
                 };
@@ -9973,7 +12922,10 @@ impl Execution<'_> {
                 else {
                     return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
                 };
-                if !matches!(self.vm.object_kind(table)?, ObjectKind::Table) {
+                if !matches!(
+                    self.vm.object_kind(table)?,
+                    ObjectKind::Table | ObjectKind::Userdata
+                ) {
                     return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                 }
                 let metatable = match args.get(1).copied() {
@@ -10713,6 +13665,7 @@ impl Execution<'_> {
             ],
             original,
             BasicPending::DebugHook {
+                hook_function: function,
                 original,
                 dynamic_top,
                 resume_instruction,
@@ -11607,7 +14560,7 @@ impl Execution<'_> {
                             .take()
                             .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
                         return self.start_basic_callback(
-                            Value::Object(event),
+                            event,
                             &[current, Value::Object(key)],
                             Value::Object(table),
                             BasicPending::OsCalendarTime {
@@ -11681,7 +14634,7 @@ impl Execution<'_> {
                             .take()
                             .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
                         return self.start_basic_callback(
-                            Value::Object(event),
+                            event,
                             &[current, Value::Object(key), value],
                             Value::Object(table),
                             BasicPending::OsCalendarTime {
@@ -13233,8 +16186,7 @@ impl Execution<'_> {
             .take_module_charge()
             .ok_or(RuntimeError::new(RuntimeErrorKind::HostLoadBudget))?;
         drop(budget);
-        module_charge.transfer(actual)?;
-        let charge = ModuleCharge::new(self.vm, actual);
+        let charge = ModuleCharge::from_charges(module_charge.transfer(actual)?);
         let loaded = self.vm.loaded_chunk_closure(module, environment, charge);
         drop(temporary_charge);
         let (value, root) = loaded?;
@@ -13298,9 +16250,12 @@ impl Execution<'_> {
         if actual > admission.retained_bytes {
             return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
         }
-        ticket.commit()?;
-        self.vm.allocation_ledger().refund(admitted - actual)?;
-        let charge = ModuleCharge::new(self.vm, actual);
+        let mut charges = crate::alloc::AllocationCharges::new();
+        if let Err((error, charge)) = charges.try_push(ticket.commit_charge()?) {
+            drop(charge);
+            return Err(error.into());
+        }
+        let charge = ModuleCharge::from_charges(charges.normalize(actual)?);
         let (value, root) = self.vm.loaded_chunk_closure(module, environment, charge)?;
         Ok(Some(LoadCreated {
             value,
@@ -13436,11 +16391,12 @@ impl Execution<'_> {
             return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
         }
         drop(decoded);
-        admission.commit()?;
-        self.vm
-            .allocation_ledger()
-            .refund(admission_bytes - actual)?;
-        let charge = ModuleCharge::new(self.vm, actual);
+        let mut charges = crate::alloc::AllocationCharges::new();
+        if let Err((error, charge)) = charges.try_push(admission.commit_charge()?) {
+            drop(charge);
+            return Err(error.into());
+        }
+        let charge = ModuleCharge::from_charges(charges.normalize(actual)?);
         let (value, root) = self.vm.loaded_chunk_closure(module, environment, charge)?;
         Ok(Some(LoadCreated {
             value,
@@ -13602,7 +16558,7 @@ impl Execution<'_> {
                 self.finish_preload_searcher(state, loader, destination, mode, tail_return, next)
             }
             Ok(RegularTableAction::Invoke { current, event, .. }) => self.start_basic_callback(
-                Value::Object(event),
+                event,
                 &[current, Value::Object(key)],
                 Value::Object(preload),
                 BasicPending::Preload {
@@ -13772,7 +16728,7 @@ impl Execution<'_> {
                 self.finish_package_path_searcher(state, path, destination, mode, tail_return, next)
             }
             Ok(RegularTableAction::Invoke { current, event, .. }) => self.start_basic_callback(
-                Value::Object(event),
+                event,
                 &[current, Value::Object(path_key)],
                 Value::Object(package),
                 BasicPending::PackagePath {
@@ -14179,8 +17135,7 @@ impl Execution<'_> {
             .take_module_charge()
             .ok_or(RuntimeError::new(RuntimeErrorKind::HostLoadBudget))?;
         drop(budget);
-        module_charge.transfer(actual)?;
-        let charge = ModuleCharge::new(self.vm, actual);
+        let charge = ModuleCharge::from_charges(module_charge.transfer(actual)?);
         let (loader, loader_root) =
             self.vm
                 .loaded_chunk_closure(found.module, Value::Object(environment), charge)?;
@@ -14346,7 +17301,7 @@ impl Execution<'_> {
                 let args = [current, key, write.unwrap_or(Value::Nil)];
                 let count = if write.is_some() { 3 } else { 2 };
                 self.start_basic_callback(
-                    Value::Object(event),
+                    event,
                     &args[..count],
                     state.get(RequireRef::Name),
                     BasicPending::Require {
@@ -15217,7 +18172,7 @@ impl Execution<'_> {
                             }
                             RegularTableAction::Invoke { current, event, .. } => {
                                 return self.start_basic_callback(
-                                    Value::Object(event),
+                                    event,
                                     &[current, key],
                                     Value::Object(*table),
                                     BasicPending::IPairsAux {
@@ -15263,7 +18218,7 @@ impl Execution<'_> {
             return Ok(None);
         };
         let metatable = match self.vm.object_kind(object)? {
-            ObjectKind::Table => self.vm.get_metatable(object)?,
+            ObjectKind::Table | ObjectKind::Userdata => self.vm.get_metatable(object)?,
             ObjectKind::ByteString => self.vm.string_metatable(),
             _ => None,
         };
@@ -16284,7 +19239,7 @@ impl Execution<'_> {
         let root = root_coroutine(self.vm, object)?;
         let original = self.vm.with_coroutine(object, |co| co.error)?;
         let prior = self.vm.with_coroutine_mut(object, &[], |co| {
-            co.context.take().or_else(|| co.unwind_context.take())
+            co.take_context().or_else(|| co.unwind_context.take())
         })?;
         let Some(mut context) = prior else {
             self.vm.with_coroutine_mut(object, &[], |co| {
@@ -16325,14 +19280,14 @@ impl Execution<'_> {
         if let Err(error) = self.ensure_resume_capacity() {
             self.vm.prepare_coroutine_context_write(object, &context)?;
             self.vm
-                .with_coroutine_mut(object, &[], |co| co.context = Some(context))?;
+                .with_coroutine_mut(object, &[], |co| co.replace_context(Some(context)))?;
             self.vm.remove_root(root)?;
             return Err(error);
         }
         if let Err(error) = context.restore_roots(self.vm) {
             self.vm.prepare_coroutine_context_write(object, &context)?;
             self.vm
-                .with_coroutine_mut(object, &[], |co| co.context = Some(context))?;
+                .with_coroutine_mut(object, &[], |co| co.replace_context(Some(context)))?;
             self.vm.remove_root(root)?;
             return Err(error);
         }
@@ -16342,7 +19297,7 @@ impl Execution<'_> {
             owner: self.active_coroutine,
             owner_root: self.active_coroutine_root.take(),
             child: object,
-            child_root: root,
+            child_root: Some(root),
             destination,
             result_mode: mode,
             resume_pc: next,
@@ -16404,12 +19359,16 @@ impl Execution<'_> {
         self.vm
             .with_coroutine_mut(caller.child, error_ref.as_slice(), |co| {
                 co.state = CoroutineState::Dead;
-                co.context = extra;
+                co.replace_context(extra);
                 co.entry = Value::Nil;
                 co.native = None;
                 co.native_bridge = None;
                 co.error = error_value;
             })?;
+        // 由 suspended external core 還原的目前 child 可能有獨立 root；切回 caller 前釋放。
+        if let Some(root) = self.active_coroutine_root.take() {
+            self.vm.remove_root(root)?;
+        }
         self.active_coroutine = caller.owner;
         self.active_coroutine_root = caller.owner_root;
         if let Some(parent) = self.active_coroutine {
@@ -16425,7 +19384,9 @@ impl Execution<'_> {
                 caller.resume_pc,
                 wrap,
             );
-            self.vm.remove_root(caller.child_root)?;
+            if let Some(root) = caller.child_root {
+                self.vm.remove_root(root)?;
+            }
             return match next? {
                 RegularCallAction::Entered => {
                     if let Some(continuation) = caller.native_body {
@@ -16496,7 +19457,9 @@ impl Execution<'_> {
                 Ok(DispatchResult::Continue)
             }
         })();
-        self.vm.remove_root(caller.child_root)?;
+        if let Some(root) = caller.child_root {
+            self.vm.remove_root(root)?;
+        }
         result
     }
 
@@ -16551,17 +19514,19 @@ impl Execution<'_> {
         resume_values.extend_from_slice(args.get(1..).unwrap_or(&[]));
         let bytes = core::mem::size_of::<ResumeCaller>();
         if self.resume_stack.len() == self.resume_stack.capacity() {
+            let next = self
+                .resume_charge
+                .checked_add(bytes)
+                .ok_or(VmError::ArithmeticOverflow)?;
+            self.resume_charges.try_reserve(1)?;
             let ticket = reserve_vec(
                 self.vm.allocation_ledger(),
                 &mut self.resume_stack,
                 1,
                 FailPoint::WorkReserve,
             )?;
-            ticket.commit()?;
-            self.resume_charge = self
-                .resume_charge
-                .checked_add(bytes)
-                .ok_or(VmError::ArithmeticOverflow)?;
+            self.resume_charges.push_prepared(ticket.commit_charge()?);
+            self.resume_charge = next;
         }
         let child_root = root_coroutine(self.vm, object)?;
         let prior = self.vm.take_coroutine_context(object)?;
@@ -16604,7 +19569,7 @@ impl Execution<'_> {
             if let Err(error) = context.restore_roots(self.vm) {
                 self.vm.prepare_coroutine_context_write(object, &context)?;
                 self.vm
-                    .with_coroutine_mut(object, &[], |co| co.context = Some(context))?;
+                    .with_coroutine_mut(object, &[], |co| co.replace_context(Some(context)))?;
                 self.vm.remove_root(child_root)?;
                 return Err(error);
             }
@@ -16657,7 +19622,7 @@ impl Execution<'_> {
                 self.vm.prepare_coroutine_context_write(object, &context)?;
                 self.vm.with_coroutine_mut(object, &[], |co| {
                     co.state = CoroutineState::Dead;
-                    co.context = Some(context);
+                    co.replace_context(Some(context));
                 })?;
                 self.vm.remove_root(child_root)?;
                 return Err(error);
@@ -16667,20 +19632,11 @@ impl Execution<'_> {
             let entry = self.vm.with_coroutine(object, |co| co.entry)?;
             let basic_entry = match entry {
                 Value::Object(callable)
-                    if self.vm.object_kind(callable)? == ObjectKind::Builtin =>
+                    if self.vm.object_kind(callable)? == ObjectKind::Closure =>
                 {
-                    matches!(
-                        self.vm.builtin(callable)?,
-                        Builtin::Basic(_)
-                            | Builtin::Table(_)
-                            | Builtin::Math(_)
-                            | Builtin::Utf8(_)
-                            | Builtin::Load(_)
-                            | Builtin::String(_)
-                            | Builtin::StringIterator { .. }
-                    )
+                    false
                 }
-                _ => false,
+                _ => true,
             };
             let frame = match if basic_entry {
                 self.new_basic_coroutine_frame(entry, &resume_values)
@@ -16715,7 +19671,7 @@ impl Execution<'_> {
                 context.park_roots(self.vm)?;
                 self.vm.prepare_coroutine_context_write(object, &context)?;
                 self.vm
-                    .with_coroutine_mut(object, &[], |co| co.context = Some(context))?;
+                    .with_coroutine_mut(object, &[], |co| co.replace_context(Some(context)))?;
                 self.vm.remove_root(child_root)?;
                 return Err(error.into());
             }
@@ -16726,7 +19682,7 @@ impl Execution<'_> {
             owner: self.active_coroutine,
             owner_root: self.active_coroutine_root.take(),
             child: object,
-            child_root,
+            child_root: Some(child_root),
             destination,
             result_mode: mode,
             resume_pc: next,
@@ -16827,7 +19783,7 @@ impl Execution<'_> {
                 }
                 self.vm.with_coroutine_mut(caller.child, &[], |co| {
                     co.state = CoroutineState::Suspended;
-                    co.context = Some(child_context);
+                    co.replace_context(Some(child_context));
                     co.native = native;
                 })?;
             }
@@ -16835,7 +19791,7 @@ impl Execution<'_> {
                 child_context.finish(self.vm)?;
                 self.vm.with_coroutine_mut(caller.child, &[], |co| {
                     co.state = CoroutineState::Dead;
-                    co.context = None;
+                    co.replace_context(None);
                     co.entry = Value::Nil;
                     co.native = None;
                 })?;
@@ -16853,12 +19809,16 @@ impl Execution<'_> {
                     .with_coroutine_mut(caller.child, error_ref.as_slice(), |co| {
                         co.state = CoroutineState::Dead;
                         co.error = Some(error);
-                        co.context = Some(child_context);
+                        co.replace_context(Some(child_context));
                         co.native = None;
                     })?;
             }
         }
         if let Some(root) = caller.handler_root {
+            self.vm.remove_root(root)?;
+        }
+        // 外部暫停還原時 active child 與 resume caller 可各自持有 root；切回 caller 前都須釋放。
+        if let Some(root) = self.active_coroutine_root.take() {
             self.vm.remove_root(root)?;
         }
         self.active_coroutine = caller.owner;
@@ -16910,7 +19870,9 @@ impl Execution<'_> {
                 caller.resume_pc,
                 true,
             );
-            self.vm.remove_root(caller.child_root)?;
+            if let Some(root) = caller.child_root {
+                self.vm.remove_root(root)?;
+            }
             if let Some(continuation) = caller.native_body {
                 return match action {
                     Ok(RegularCallAction::Entered) => {
@@ -16958,7 +19920,9 @@ impl Execution<'_> {
                 RegularCallAction::Completed(action) => Ok(action),
             };
         }
-        self.vm.remove_root(caller.child_root)?;
+        if let Some(root) = caller.child_root {
+            self.vm.remove_root(root)?;
+        }
         let native_status = match (exit, caller.native) {
             (CoroutineExit::Yield, Some(NativeCompletion::Resume { protected, .. })) => {
                 let extra = match protected {
@@ -17079,6 +20043,15 @@ impl Execution<'_> {
     ) -> Result<DispatchResult, RuntimeError> {
         loop {
             action = match action {
+                DispatchResult::Returned(_, _)
+                    if self.external_nested.last().is_some_and(|nested| {
+                        self.callers.len() == nested.caller_depth + 1
+                            && self.frame.module.is_none()
+                            && self.frame.closure.is_none()
+                    }) =>
+                {
+                    return Ok(action);
+                }
                 DispatchResult::Returned(values, ticket) if !self.resume_stack.is_empty() => {
                     self.complete_coroutine(values, ticket, CoroutineExit::Return)?
                 }
@@ -17200,9 +20173,10 @@ impl Execution<'_> {
             for root in self.deferred_roots.drain(..) {
                 self.vm.remove_root(root)?;
             }
+            self.deferred_roots = Vec::new();
             return Err(error);
         }
-        ticket.commit()?;
+        self.deferred_owner = Some(ticket.commit_charge()?);
         self.deferred_charge = charge;
         Ok(())
     }
@@ -17212,10 +20186,8 @@ impl Execution<'_> {
             self.vm.remove_root(root)?;
         }
         self.deferred_roots = Vec::new();
-        if self.deferred_charge != 0 {
-            self.vm.allocation_ledger().refund(self.deferred_charge)?;
-            self.deferred_charge = 0;
-        }
+        self.deferred_owner = None;
+        self.deferred_charge = 0;
         Ok(())
     }
 
@@ -17263,6 +20235,10 @@ impl Execution<'_> {
             && self.frame.closure.is_none()
             && !self.vm.finalizer_running()
             && self.active_coroutine.is_some()
+            && !self
+                .external_nested
+                .last()
+                .is_some_and(|nested| self.callers.len() == nested.caller_depth + 1)
             && self
                 .resume_stack
                 .last()
@@ -17270,11 +20246,428 @@ impl Execution<'_> {
     }
 
     fn host_call_bootstrap_active(&self) -> bool {
-        self.host_call_bootstrap
+        self.operation_bootstrap.is_none()
+            && ((self.external_nested.last().is_some_and(|nested| {
+                self.callers.len() == nested.caller_depth + 1
+                    && self.frame.module.is_none()
+                    && self.frame.closure.is_none()
+            })) || (self.host_call_bootstrap
+                && self.frame.module.is_none()
+                && self.frame.closure.is_none()
+                && self.active_coroutine.is_none()
+                && !self.vm.finalizer_running()))
+    }
+
+    fn operation_bootstrap_active(&self) -> bool {
+        self.operation_bootstrap.is_some()
             && self.frame.module.is_none()
             && self.frame.closure.is_none()
-            && self.active_coroutine.is_none()
-            && !self.vm.finalizer_running()
+            && (self.active_coroutine.is_none()
+                || self
+                    .external_nested
+                    .last()
+                    .is_some_and(|nested| self.callers.len() == nested.caller_depth + 1))
+    }
+
+    fn execute_unary_operation(
+        &mut self,
+        dest: Register,
+        op: UnaryOperation,
+        src: Register,
+        next: usize,
+    ) -> Result<DispatchResult, RuntimeError> {
+        let value = self.frame.read(src)?;
+        self.frame.index(dest)?;
+        let event = match op {
+            UnaryOperation::Not => None,
+            UnaryOperation::Length => {
+                if let Value::Object(object) = value {
+                    if matches!(
+                        self.vm.object_kind(object)?,
+                        ObjectKind::Table | ObjectKind::Userdata
+                    ) {
+                        let event = self.lookup_value_event(value, MetamethodEvent::Len)?;
+                        if event != Value::Nil {
+                            Some(event)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            UnaryOperation::Negate if !matches!(value, Value::Integer(_) | Value::Float(_)) => {
+                Some(self.lookup_value_event(value, MetamethodEvent::Unm)?)
+            }
+            UnaryOperation::BitNot if !matches!(value, Value::Integer(_) | Value::Float(_)) => {
+                Some(self.lookup_value_event(value, MetamethodEvent::Bnot)?)
+            }
+            _ => None,
+        };
+        if let Some(event) = event {
+            let args = [value, value];
+            let action =
+                self.invoke_value_event(event, &args, [value, Value::Nil], dest, next, None)?;
+            if let Some(action) = Self::operation_dispatch_action(action) {
+                return Ok(action);
+            }
+        } else {
+            let result = if op == UnaryOperation::Length {
+                ops::length(self.vm, value)?
+            } else {
+                ops::unary(op, value)?
+            };
+            self.frame.write(self.vm, dest, result)?;
+            self.frame.pc = next;
+        }
+        Ok(DispatchResult::Continue)
+    }
+
+    fn execute_binary_operation(
+        &mut self,
+        dest: Register,
+        op: BinaryOperation,
+        left: Register,
+        right: Register,
+        next: usize,
+    ) -> Result<DispatchResult, RuntimeError> {
+        let left = self.frame.read(left)?;
+        let right = self.frame.read(right)?;
+        self.frame.index(dest)?;
+        use BinaryOperation as B;
+        let mut event_request = None;
+        let raw = match op {
+            B::Equal | B::NotEqual => {
+                let equal = ops::raw_equal(self.vm, left, right)?;
+                let same_metatable_kind = match (left, right) {
+                    (Value::Object(a), Value::Object(b)) if a != b => {
+                        let kind = self.vm.object_kind(a)?;
+                        matches!(kind, ObjectKind::Table | ObjectKind::Userdata)
+                            && self.vm.object_kind(b)? == kind
+                    }
+                    _ => false,
+                };
+                if !equal && same_metatable_kind {
+                    event_request = Some((MetamethodEvent::Eq, left, right, op == B::NotEqual));
+                    None
+                } else {
+                    Some(Value::Boolean(if op == B::NotEqual {
+                        !equal
+                    } else {
+                        equal
+                    }))
+                }
+            }
+            B::Less | B::LessEqual | B::Greater | B::GreaterEqual => {
+                let raw = ops::raw_order(self.vm, op, left, right)?;
+                if raw.is_none() {
+                    let (event, a, b) = match op {
+                        B::Less => (MetamethodEvent::Lt, left, right),
+                        B::LessEqual => (MetamethodEvent::Le, left, right),
+                        B::Greater => (MetamethodEvent::Lt, right, left),
+                        B::GreaterEqual => (MetamethodEvent::Le, right, left),
+                        _ => unreachable!(),
+                    };
+                    event_request = Some((event, a, b, false));
+                }
+                raw
+            }
+            B::Or | B::And => Some(ops::binary(op, left, right)?),
+            B::Concat => {
+                let profile = if self.operation_bootstrap_active() {
+                    self.vm.language_profile()
+                } else {
+                    self.current_module()?.profile()
+                };
+                let raw = ops::raw_concat(self.vm, profile, left, right)?;
+                if raw.is_none() {
+                    event_request = Some((MetamethodEvent::Concat, left, right, false));
+                }
+                raw
+            }
+            _ => {
+                let raw = ops::raw_arithmetic(op, left, right)?;
+                if raw.is_none() {
+                    event_request = arithmetic_event(op).map(|event| (event, left, right, false));
+                }
+                raw
+            }
+        };
+        if let Some(result) = raw {
+            if let Err(error) = self.frame.write(self.vm, dest, result) {
+                if op == B::Concat {
+                    if let Value::Object(object) = result {
+                        self.vm.reclaim(object)?;
+                    }
+                }
+                return Err(error);
+            }
+            self.frame.pc = next;
+        } else {
+            let (event, a, b, mut invert) =
+                event_request.ok_or(RuntimeError::new(RuntimeErrorKind::MetamethodAbsent))?;
+            let mut found = self.lookup_binary_event(a, b, event)?;
+            let mut call_args = [a, b];
+            if found == Value::Nil
+                && event == MetamethodEvent::Le
+                && (if self.operation_bootstrap_active() {
+                    self.vm.language_profile()
+                } else {
+                    self.current_module()?.profile()
+                }) == LuaProfile::Lua54
+            {
+                found = self.lookup_binary_event(b, a, MetamethodEvent::Lt)?;
+                if found != Value::Nil {
+                    invert = true;
+                    call_args = [b, a];
+                }
+            }
+            if found == Value::Nil && event == MetamethodEvent::Eq {
+                self.frame
+                    .write(self.vm, dest, Value::Boolean(op == B::NotEqual))?;
+                self.frame.pc = next;
+            } else {
+                if found == Value::Nil && arithmetic_event(op).is_some() && op != B::Concat {
+                    let _ = ops::binary(op, left, right)?;
+                }
+                if matches!(
+                    op,
+                    B::Equal | B::NotEqual | B::Less | B::LessEqual | B::Greater | B::GreaterEqual
+                ) {
+                    let action = self.invoke_value_event(
+                        found,
+                        &call_args,
+                        [left, right],
+                        dest,
+                        next,
+                        Some(invert),
+                    )?;
+                    if let Some(action) = Self::operation_dispatch_action(action) {
+                        return Ok(action);
+                    }
+                } else {
+                    let action = self.invoke_value_event(
+                        found,
+                        &call_args,
+                        [left, right],
+                        dest,
+                        next,
+                        None,
+                    )?;
+                    if let Some(action) = Self::operation_dispatch_action(action) {
+                        return Ok(action);
+                    }
+                }
+            }
+        }
+        Ok(DispatchResult::Continue)
+    }
+
+    fn operation_dispatch_action(action: RegularCallAction) -> Option<DispatchResult> {
+        match action {
+            RegularCallAction::Entered | RegularCallAction::Completed(DispatchResult::Continue) => {
+                None
+            }
+            RegularCallAction::Aborted => Some(DispatchResult::Aborted),
+            RegularCallAction::Completed(action) => Some(action),
+        }
+    }
+
+    fn dispatch_operation_bootstrap(&mut self) -> Result<DispatchResult, RuntimeError> {
+        let operation = self
+            .operation_bootstrap
+            .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+        let count = self
+            .frame
+            .dynamic_top
+            .checked_sub(1)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?;
+        let pc = self.frame.pc;
+        let (result_register, action) =
+            match operation {
+                ValueOperation::Unary(op) => {
+                    if pc == 0 {
+                        (
+                            Register(0),
+                            self.execute_unary_operation(Register(0), op, Register(1), 1)?,
+                        )
+                    } else if pc == 1 {
+                        (Register(0), DispatchResult::Continue)
+                    } else {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorKind::ProgramCounterOutOfBounds,
+                        ));
+                    }
+                }
+                ValueOperation::Binary(op) => {
+                    if pc == 0 {
+                        (
+                            Register(0),
+                            self.execute_binary_operation(
+                                Register(0),
+                                op,
+                                Register(1),
+                                Register(2),
+                                1,
+                            )?,
+                        )
+                    } else if pc == 1 {
+                        (Register(0), DispatchResult::Continue)
+                    } else {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorKind::ProgramCounterOutOfBounds,
+                        ));
+                    }
+                }
+                ValueOperation::TableGet => {
+                    if pc == 0 {
+                        let target = self.frame.read(Register(1))?;
+                        let key = self.frame.read(Register(2))?;
+                        let action = match self.regular_table_access(target, key, None)? {
+                            RegularTableAction::Read(value) => {
+                                self.frame.write(self.vm, Register(0), value)?;
+                                self.frame.pc = 1;
+                                DispatchResult::Continue
+                            }
+                            RegularTableAction::Invoke {
+                                current,
+                                event,
+                                chain_steps,
+                            } => match self.invoke_table_event(
+                                PendingTableKind::Get,
+                                target,
+                                current,
+                                key,
+                                Value::Nil,
+                                event,
+                                Register(0),
+                                1,
+                                chain_steps,
+                            )? {
+                                RegularCallAction::Entered => DispatchResult::Continue,
+                                RegularCallAction::Aborted => DispatchResult::Aborted,
+                                RegularCallAction::Completed(result) => result,
+                            },
+                            RegularTableAction::Aborted => DispatchResult::Aborted,
+                            RegularTableAction::Wrote => {
+                                return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
+                            }
+                        };
+                        (Register(0), action)
+                    } else if pc == 1 {
+                        (Register(0), DispatchResult::Continue)
+                    } else {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorKind::ProgramCounterOutOfBounds,
+                        ));
+                    }
+                }
+                ValueOperation::TableSet => {
+                    if pc == 1 {
+                        // 寫入已提交；返回零值不再配置，避免 stack 發布失敗後出現半套 set。
+                        return Ok(DispatchResult::Returned(Vec::new(), None));
+                    }
+                    if pc != 0 {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorKind::ProgramCounterOutOfBounds,
+                        ));
+                    }
+                    let target = self.frame.read(Register(1))?;
+                    let key = self.frame.read(Register(2))?;
+                    let value = self.frame.read(Register(3))?;
+                    let action = match self.regular_table_access(target, key, Some(value))? {
+                        RegularTableAction::Wrote => {
+                            self.frame.pc = 1;
+                            DispatchResult::Continue
+                        }
+                        RegularTableAction::Invoke {
+                            current,
+                            event,
+                            chain_steps,
+                        } => match self.invoke_table_event(
+                            PendingTableKind::Set,
+                            target,
+                            current,
+                            key,
+                            value,
+                            event,
+                            Register(0),
+                            1,
+                            chain_steps,
+                        )? {
+                            RegularCallAction::Entered => DispatchResult::Continue,
+                            RegularCallAction::Aborted => DispatchResult::Aborted,
+                            RegularCallAction::Completed(result) => result,
+                        },
+                        RegularTableAction::Aborted => DispatchResult::Aborted,
+                        RegularTableAction::Read(_) => {
+                            return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
+                        }
+                    };
+                    (Register(0), action)
+                }
+                ValueOperation::Concat => {
+                    if count == 0 && pc == 0 {
+                        let value = Value::Object(self.vm.allocate_byte_string(b"")?);
+                        if let Err(error) = self.frame.write(self.vm, Register(0), value) {
+                            if let Value::Object(object) = value {
+                                self.vm.reclaim(object)?;
+                            }
+                            return Err(error);
+                        }
+                        self.frame.pc = 1;
+                        (Register(0), DispatchResult::Continue)
+                    } else if count == 1 && pc == 0 {
+                        self.frame.pc = 1;
+                        (Register(1), DispatchResult::Continue)
+                    } else if count >= 2 && pc < count - 1 {
+                        let left = Register(u16::try_from(count - pc - 1).map_err(|_| {
+                            RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds)
+                        })?);
+                        let right = Register(u16::try_from(count - pc).map_err(|_| {
+                            RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds)
+                        })?);
+                        (
+                            Register(1),
+                            self.execute_binary_operation(
+                                left,
+                                BinaryOperation::Concat,
+                                left,
+                                right,
+                                pc + 1,
+                            )?,
+                        )
+                    } else if pc == count.saturating_sub(1).max(1) {
+                        (
+                            if count == 0 { Register(0) } else { Register(1) },
+                            DispatchResult::Continue,
+                        )
+                    } else {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorKind::ProgramCounterOutOfBounds,
+                        ));
+                    }
+                }
+            };
+        if self.operation_bootstrap_active()
+            && pc == self.frame.pc
+            && matches!(action, DispatchResult::Continue)
+        {
+            let value = self.frame.read(result_register)?;
+            let mut values = Vec::new();
+            let ticket = reserve_vec(
+                self.vm.allocation_ledger(),
+                &mut values,
+                1,
+                FailPoint::ReturnReserve,
+            )?;
+            values.push(value);
+            return Ok(DispatchResult::Returned(values, Some(ticket)));
+        }
+        Ok(action)
     }
 
     fn dispatch_host_call_bootstrap(&mut self) -> Result<DispatchResult, RuntimeError> {
@@ -17324,10 +20717,7 @@ impl Execution<'_> {
     fn dispatch_basic_bootstrap(&mut self) -> Result<DispatchResult, RuntimeError> {
         match self.frame.pc {
             0 => {
-                let Value::Object(callable) = self.frame.read(Register(0))? else {
-                    return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
-                };
-                let builtin = self.vm.builtin(callable)?;
+                let target = self.frame.read(Register(0))?;
                 let count = self
                     .frame
                     .dynamic_top
@@ -17341,39 +20731,52 @@ impl Execution<'_> {
                     FailPoint::WorkReserve,
                 )?;
                 args.extend_from_slice(&self.frame.registers[1..self.frame.dynamic_top]);
+                let builtin = match target {
+                    Value::Object(callable)
+                        if self.vm.object_kind(callable)? == ObjectKind::Builtin =>
+                    {
+                        Some((callable, self.vm.builtin(callable)?))
+                    }
+                    _ => None,
+                };
                 let action = match builtin {
-                    Builtin::HostCallback(id) => {
+                    None => {
+                        self.enter_callable_values(target, &args, Register(0), ResultMode::All, 1)
+                    }
+                    Some((_, Builtin::HostCallback(id))) => {
                         self.host_callback(id, &args, Register(0), ResultMode::All, false, 1)
                     }
-                    Builtin::Basic(kind) => {
+                    Some((_, Builtin::Basic(kind))) => {
                         self.basic_builtin(kind, &args, Register(0), ResultMode::All, false, 1)
                     }
-                    Builtin::Table(kind) => {
+                    Some((_, Builtin::Table(kind))) => {
                         self.table_builtin(kind, &args, Register(0), ResultMode::All, false, 1)
                     }
-                    Builtin::Math(kind) => {
+                    Some((_, Builtin::Math(kind))) => {
                         self.math_builtin(kind, &args, Register(0), ResultMode::All, false, 1)
                     }
-                    Builtin::Utf8(kind) => {
+                    Some((_, Builtin::Utf8(kind))) => {
                         self.utf8_builtin(kind, &args, Register(0), ResultMode::All, false, 1)
                     }
-                    Builtin::Load(kind) => {
+                    Some((_, Builtin::Load(kind))) => {
                         self.load_builtin(kind, &args, Register(0), ResultMode::All, false, 1)
                     }
-                    builtin @ (Builtin::Io(_) | Builtin::Os(_) | Builtin::Debug(_)) => self
-                        .resource_builtin(builtin, &args, Register(0), ResultMode::All, false, 1),
-                    Builtin::String(kind) => {
+                    Some((_, builtin @ (Builtin::Io(_) | Builtin::Os(_) | Builtin::Debug(_)))) => {
+                        self.resource_builtin(
+                            builtin,
+                            &args,
+                            Register(0),
+                            ResultMode::All,
+                            false,
+                            1,
+                        )
+                    }
+                    Some((_, Builtin::String(kind))) => {
                         self.string_builtin(kind, &args, Register(0), ResultMode::All, false, 1)
                     }
-                    builtin @ Builtin::StringIterator { .. } => self.string_iterator(
-                        callable,
-                        builtin,
-                        Register(0),
-                        ResultMode::All,
-                        false,
-                        1,
-                    ),
-                    _ => Err(RuntimeError::new(RuntimeErrorKind::NotCallable)),
+                    Some((callable, builtin @ Builtin::StringIterator { .. })) => self
+                        .string_iterator(callable, builtin, Register(0), ResultMode::All, false, 1),
+                    Some(_) => Err(RuntimeError::new(RuntimeErrorKind::NotCallable)),
                 };
                 drop(ticket);
                 match action? {
@@ -17406,9 +20809,71 @@ impl Execution<'_> {
         if self.vm.execution_running() {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
         }
+        let parked_authorized = match (self.vm.parked_executions.last(), self.nested_origin) {
+            (None, None) => true,
+            (Some(top), None) => {
+                (top.prepared_reset_target.is_some() && top.core.is_some())
+                    || top.core.as_ref().is_some_and(|core| {
+                        core.external_close_boundary_a5 && core.close_unwind.is_some()
+                    })
+            }
+            (Some(top), Some(origin)) => top.token == origin && top.core.is_none(),
+            _ => false,
+        } || (self.gc_finalizer_parent
+            && self.nested_origin.is_some_and(|origin| {
+                self.vm
+                    .parked_executions
+                    .last()
+                    .is_some_and(|top| top.token == origin && top.core.is_some())
+            }));
+        if !parked_authorized {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
         self.vm.set_execution_running(true);
-        let outcome = self.run_inner();
+        let outcome = catch_unwind(AssertUnwindSafe(|| self.run_inner()));
         self.vm.set_execution_running(false);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(payload) => {
+                self.state = ExecutionState::Failed;
+                let cleanup = self.finish_owned_external_abort();
+                debug_assert!(cleanup.is_ok());
+                self.state = ExecutionState::Parked;
+                self.vm.discard_empty_external_markers();
+                resume_unwind(payload);
+            }
+        };
+        match &outcome {
+            Ok(RunOutcome::External(token)) => {
+                let core = self.take_core();
+                self.vm.park_external_core(*token, core);
+            }
+            Ok(RunOutcome::CloseBoundaryA5 { token, .. }) => {
+                let core = self.take_core();
+                self.vm
+                    .restore_external_core(*token, core)
+                    .expect("A5 close 邊界須回填既存 C marker");
+            }
+            Ok(
+                RunOutcome::NestedReturned(_)
+                | RunOutcome::NestedErrored(_)
+                | RunOutcome::NestedFailed(_),
+            ) => {
+                let token = self
+                    .nested_repark_token
+                    .take()
+                    .expect("nested result 必須有既存外部 token");
+                let core = self.take_core();
+                self.vm
+                    .restore_external_core(token, core)
+                    .expect("nested result 必須回填最上層 marker");
+            }
+            _ => {
+                if self.nested_origin.is_some() {
+                    self.vm.discard_empty_external_markers();
+                }
+            }
+        }
         outcome
     }
 
@@ -17417,6 +20882,28 @@ impl Execution<'_> {
             self.vm.restore_table_sort_trace(trace);
         }
         self.vm.end_table_sort(stop);
+    }
+
+    fn finish_owned_external_abort(&mut self) -> Result<(), RuntimeError> {
+        let sort_trace = self.pending_ops.outermost_sort_trace();
+        let finalizer = self
+            .protected
+            .iter()
+            .rev()
+            .find_map(|boundary| boundary.finalizer);
+        let finalizer_result = if self.vm.finalizer_running() {
+            finalizer.map_or(Ok(()), |object| {
+                self.finish_finalizer_callback(object, true)
+            })
+        } else {
+            Ok(())
+        };
+        if let Some(trace) = sort_trace {
+            self.vm.restore_table_sort_trace(trace);
+            self.vm.end_table_sort(TableSortStop::Aborted);
+        }
+        let cleanup = self.finish();
+        finalizer_result.and(cleanup)
     }
 
     fn run_inner(&mut self) -> Result<RunOutcome, RuntimeError> {
@@ -17428,14 +20915,22 @@ impl Execution<'_> {
             let resume_deferred = deferred.is_some()
                 && !self.vm.finalizer_running()
                 && self.vm.pending_finalizer()?.is_none();
-            if !resume_deferred && !self.vm.finalizer_running() && self.start_pending_finalizer()? {
-                continue;
+            if !resume_deferred && !self.vm.finalizer_running() {
+                match self.start_pending_finalizer()? {
+                    Some(DispatchResult::External(token)) => {
+                        self.state = ExecutionState::Parked;
+                        return Ok(RunOutcome::External(token));
+                    }
+                    Some(_) => continue,
+                    None => {}
+                }
             }
             if self.module.is_none()
                 && self.frame.module.is_none()
                 && self.frame.closure.is_none()
                 && !self.basic_bootstrap_active()
                 && !self.host_call_bootstrap_active()
+                && !self.operation_bootstrap_active()
                 && !self.vm.finalizer_running()
                 && self.vm.pending_finalizer()?.is_none()
                 && deferred.is_none()
@@ -17468,6 +20963,7 @@ impl Execution<'_> {
             if !resume_deferred
                 && !self.basic_bootstrap_active()
                 && !self.host_call_bootstrap_active()
+                && !self.operation_bootstrap_active()
                 && !basic_ready_at_boundary
                 && !callback_invoke_at_boundary
                 && self.frame.pc >= self.prototype().instructions.len()
@@ -17524,6 +21020,9 @@ impl Execution<'_> {
                         None if self.host_call_bootstrap_active() => {
                             self.dispatch_host_call_bootstrap()
                         }
+                        None if self.operation_bootstrap_active() => {
+                            self.dispatch_operation_bootstrap()
+                        }
                         None if self.basic_bootstrap_active() => self.dispatch_basic_bootstrap(),
                         None => self.dispatch_with_debug_hook(),
                     })
@@ -17545,6 +21044,14 @@ impl Execution<'_> {
             }
             match dispatch {
                 Ok(DispatchResult::Returned(values, ticket)) => {
+                    if self.external_nested.last().is_some_and(|nested| {
+                        self.callers.len() == nested.caller_depth + 1
+                            && self.frame.module.is_none()
+                            && self.frame.closure.is_none()
+                    }) {
+                        drop(ticket);
+                        return self.complete_external_nested_result(values);
+                    }
                     self.state = ExecutionState::Returned;
                     self.finish()?;
                     // 結果 Vec 在此移交宿主持有；VM 僅檢查並暫留配置額度。
@@ -17560,6 +21067,14 @@ impl Execution<'_> {
                 Ok(DispatchResult::PendingClose(snapshot)) => {
                     self.state = ExecutionState::PendingClose;
                     return Ok(RunOutcome::PendingClose(snapshot));
+                }
+                Ok(DispatchResult::External(token)) => {
+                    self.state = ExecutionState::Parked;
+                    return Ok(RunOutcome::External(token));
+                }
+                Ok(DispatchResult::CloseBoundaryA5 { token, error }) => {
+                    self.state = ExecutionState::Parked;
+                    return Ok(RunOutcome::CloseBoundaryA5 { token, error });
                 }
                 Ok(DispatchResult::Aborted) => {
                     self.finish_active_table_sort(TableSortStop::Aborted);
@@ -17682,6 +21197,9 @@ impl Execution<'_> {
                                 }
                             }
                         }
+                        if !self.external_nested.is_empty() {
+                            return self.finish_external_nested_error(error);
+                        }
                         let host_error = match crate::LuaError::from_runtime(
                             self.vm,
                             error,
@@ -17702,6 +21220,9 @@ impl Execution<'_> {
                         return Ok(RunOutcome::LuaError(host_error));
                     }
                     self.finish_active_table_sort(table_sort_error_stop(error.kind));
+                    if !self.external_nested.is_empty() {
+                        return self.finish_external_nested_failure(error);
+                    }
                     self.state = ExecutionState::Failed;
                     self.finish()?;
                     return Err(error);
@@ -17775,6 +21296,29 @@ impl Execution<'_> {
             {
                 break;
             }
+            if self.external_close_boundary_a5
+                && self
+                    .external_nested
+                    .last()
+                    .is_some_and(|nested| self.callers.len() == nested.caller_depth)
+            {
+                let mut nested = self
+                    .external_nested
+                    .pop()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+                nested.outer_pending.clear_roots(self.vm)?;
+                self.host_call_bootstrap = nested.previous_host_call_bootstrap;
+                self.operation_bootstrap = nested.previous_operation_bootstrap;
+                self.nested_origin = self.external_nested.last().map(|entry| entry.token);
+                if self.external_nested.is_empty() {
+                    self.external_nested = Vec::new();
+                    self.external_nested_charges = AllocationCharges::new();
+                }
+                let error = unwind.failed.then_some(unwind.error.value);
+                let token = nested.token;
+                self.close_unwind = Some(unwind);
+                return Ok(DispatchResult::CloseBoundaryA5 { token, error });
+            }
             if let Some(entry) = self.frame.close_entries.last().copied() {
                 let value = entry.value;
                 if value == Value::Nil || value == Value::Boolean(false) {
@@ -17798,13 +21342,7 @@ impl Execution<'_> {
                     ))?;
                     let result = self.invoke_event(
                         PendingKind::Close,
-                        [
-                            value,
-                            unwind.error.value,
-                            event_value,
-                            Value::Nil,
-                            Value::Object(event),
-                        ],
+                        [value, unwind.error.value, event_value, Value::Nil, event],
                         event,
                         &args,
                         entry.register,
@@ -18207,6 +21745,15 @@ impl Execution<'_> {
     }
 
     fn finish(&mut self) -> Result<(), RuntimeError> {
+        self.clear_external_nested_result()?;
+        if let Some(mut pending) = self.external_pending.take() {
+            pending.clear_roots(self.vm)?;
+        }
+        while let Some(mut nested) = self.external_nested.pop() {
+            nested.outer_pending.clear_roots(self.vm)?;
+        }
+        self.external_nested = Vec::new();
+        self.external_nested_charges = AllocationCharges::new();
         if let Some(mut result) = self.debug_builtin_result.take() {
             result.values.clear_roots(self.vm)?;
         }
@@ -18227,11 +21774,9 @@ impl Execution<'_> {
         while let Some(mut boundary) = self.protected.pop() {
             boundary.clear(self.vm)?;
         }
-        if self.protected_charge != 0 {
-            self.protected = Vec::new();
-            self.vm.allocation_ledger().refund(self.protected_charge)?;
-            self.protected_charge = 0;
-        }
+        self.protected = Vec::new();
+        self.protected_charges = AllocationCharges::new();
+        self.protected_charge = 0;
         self.pending_ops.clear(self.vm)?;
         self.frame.close_open(self.vm)?;
         self.frame.clear_roots(self.vm)?;
@@ -18242,10 +21787,8 @@ impl Execution<'_> {
             caller.release_storage();
         }
         self.callers = Vec::new();
-        if self.callers_charge != 0 {
-            self.vm.allocation_ledger().refund(self.callers_charge)?;
-            self.callers_charge = 0;
-        }
+        self.callers_charges = AllocationCharges::new();
+        self.callers_charge = 0;
         if let Some(active) = self.active_coroutine.take() {
             self.vm
                 .with_coroutine_mut(active, &[], |co| co.state = CoroutineState::Dead)?;
@@ -18286,15 +21829,16 @@ impl Execution<'_> {
                     self.vm.remove_root(root)?;
                 }
             }
-            self.vm.remove_root(caller.child_root)?;
+            if let Some(root) = caller.child_root {
+                self.vm.remove_root(root)?;
+            }
             if let Some(root) = caller.owner_root {
                 self.vm.remove_root(root)?;
             }
         }
-        if self.resume_charge != 0 {
-            self.vm.allocation_ledger().refund(self.resume_charge)?;
-            self.resume_charge = 0;
-        }
+        self.resume_stack = Vec::new();
+        self.resume_charges = AllocationCharges::new();
+        self.resume_charge = 0;
         if let Some(root) = self.module_root.take() {
             self.vm.remove_root(root)?;
         }
@@ -18522,7 +22066,7 @@ impl Execution<'_> {
                     }
                     let object = self.vm.allocate_closure(closure)?;
                     if let Err(error) = self.frame.write(self.vm, dest, Value::Object(object)) {
-                        self.vm.reclaim(object)?;
+                        self.vm.reclaim_unpublished_object(object)?;
                         return Err(error);
                     }
                     Ok(())
@@ -18608,13 +22152,7 @@ impl Execution<'_> {
                         };
                         let result = self.invoke_event(
                             PendingKind::Close,
-                            [
-                                value,
-                                event_value,
-                                Value::Nil,
-                                Value::Nil,
-                                Value::Object(event),
-                            ],
+                            [value, event_value, Value::Nil, Value::Nil, event],
                             event,
                             &args,
                             snapshot.next_register,
@@ -18665,62 +22203,10 @@ impl Execution<'_> {
                 }
             }
             Instruction::UnaryOp { dest, op, src } => {
-                let value = self.frame.read(src)?;
-                self.frame.index(dest)?;
                 let next = self.next_pc()?;
-                let event = match op {
-                    UnaryOperation::Not => None,
-                    UnaryOperation::Length => {
-                        if let Value::Object(object) = value {
-                            if matches!(self.vm.object_kind(object)?, ObjectKind::Table) {
-                                let event = self.lookup_value_event(value, MetamethodEvent::Len)?;
-                                if event != Value::Nil {
-                                    Some(event)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    UnaryOperation::Negate
-                        if !matches!(value, Value::Integer(_) | Value::Float(_)) =>
-                    {
-                        Some(self.lookup_value_event(value, MetamethodEvent::Unm)?)
-                    }
-                    UnaryOperation::BitNot
-                        if !matches!(value, Value::Integer(_) | Value::Float(_)) =>
-                    {
-                        Some(self.lookup_value_event(value, MetamethodEvent::Bnot)?)
-                    }
-                    _ => None,
-                };
-                if let Some(event) = event {
-                    let args = [value, value];
-                    if matches!(
-                        self.invoke_value_event(
-                            event,
-                            &args,
-                            [value, Value::Nil],
-                            dest,
-                            next,
-                            None
-                        )?,
-                        RegularCallAction::Aborted
-                    ) {
-                        return Ok(DispatchResult::Aborted);
-                    }
-                } else {
-                    let result = if op == UnaryOperation::Length {
-                        ops::length(self.vm, value)?
-                    } else {
-                        ops::unary(op, value)?
-                    };
-                    self.frame.write(self.vm, dest, result)?;
-                    self.frame.pc = next;
+                let action = self.execute_unary_operation(dest, op, src, next)?;
+                if !matches!(action, DispatchResult::Continue) {
+                    return Ok(action);
                 }
             }
             Instruction::BinaryOp {
@@ -18729,134 +22215,10 @@ impl Execution<'_> {
                 left,
                 right,
             } => {
-                let left = self.frame.read(left)?;
-                let right = self.frame.read(right)?;
-                self.frame.index(dest)?;
                 let next = self.next_pc()?;
-                use BinaryOperation as B;
-                let mut event_request = None;
-                let raw = match op {
-                    B::Equal | B::NotEqual => {
-                        let equal = ops::raw_equal(self.vm, left, right)?;
-                        let same_metatable_kind = match (left, right) {
-                            (Value::Object(a), Value::Object(b)) if a != b => {
-                                let kind = self.vm.object_kind(a)?;
-                                matches!(kind, ObjectKind::Table) && self.vm.object_kind(b)? == kind
-                            }
-                            _ => false,
-                        };
-                        if !equal && same_metatable_kind {
-                            event_request =
-                                Some((MetamethodEvent::Eq, left, right, op == B::NotEqual));
-                            None
-                        } else {
-                            Some(Value::Boolean(if op == B::NotEqual {
-                                !equal
-                            } else {
-                                equal
-                            }))
-                        }
-                    }
-                    B::Less | B::LessEqual | B::Greater | B::GreaterEqual => {
-                        let raw = ops::raw_order(self.vm, op, left, right)?;
-                        if raw.is_none() {
-                            let (event, a, b) = match op {
-                                B::Less => (MetamethodEvent::Lt, left, right),
-                                B::LessEqual => (MetamethodEvent::Le, left, right),
-                                B::Greater => (MetamethodEvent::Lt, right, left),
-                                B::GreaterEqual => (MetamethodEvent::Le, right, left),
-                                _ => unreachable!(),
-                            };
-                            event_request = Some((event, a, b, false));
-                        }
-                        raw
-                    }
-                    B::Or | B::And => Some(ops::binary(op, left, right)?),
-                    B::Concat => {
-                        let profile = self.current_module()?.profile();
-                        let raw = ops::raw_concat(self.vm, profile, left, right)?;
-                        if raw.is_none() {
-                            event_request = Some((MetamethodEvent::Concat, left, right, false));
-                        }
-                        raw
-                    }
-                    _ => {
-                        let raw = ops::raw_arithmetic(op, left, right)?;
-                        if raw.is_none() {
-                            event_request =
-                                arithmetic_event(op).map(|event| (event, left, right, false));
-                        }
-                        raw
-                    }
-                };
-                if let Some(result) = raw {
-                    if let Err(error) = self.frame.write(self.vm, dest, result) {
-                        if op == B::Concat {
-                            if let Value::Object(object) = result {
-                                self.vm.reclaim(object)?;
-                            }
-                        }
-                        return Err(error);
-                    }
-                    self.frame.pc = next;
-                } else {
-                    let (event, a, b, mut invert) = event_request
-                        .ok_or(RuntimeError::new(RuntimeErrorKind::MetamethodAbsent))?;
-                    let mut found = self.lookup_binary_event(a, b, event)?;
-                    let mut call_args = [a, b];
-                    if found == Value::Nil
-                        && event == MetamethodEvent::Le
-                        && self.current_module()?.profile() == LuaProfile::Lua54
-                    {
-                        found = self.lookup_binary_event(b, a, MetamethodEvent::Lt)?;
-                        if found != Value::Nil {
-                            invert = true;
-                            call_args = [b, a];
-                        }
-                    }
-                    if found == Value::Nil && event == MetamethodEvent::Eq {
-                        self.frame
-                            .write(self.vm, dest, Value::Boolean(op == B::NotEqual))?;
-                        self.frame.pc = next;
-                    } else {
-                        if found == Value::Nil && arithmetic_event(op).is_some() && op != B::Concat
-                        {
-                            let _ = ops::binary(op, left, right)?;
-                        }
-                        if matches!(
-                            op,
-                            B::Equal
-                                | B::NotEqual
-                                | B::Less
-                                | B::LessEqual
-                                | B::Greater
-                                | B::GreaterEqual
-                        ) {
-                            let action = self.invoke_value_event(
-                                found,
-                                &call_args,
-                                [left, right],
-                                dest,
-                                next,
-                                Some(invert),
-                            )?;
-                            if matches!(action, RegularCallAction::Aborted) {
-                                return Ok(DispatchResult::Aborted);
-                            }
-                        } else {
-                            let action = self.invoke_value_event(
-                                found,
-                                &call_args,
-                                [left, right],
-                                dest,
-                                next,
-                                None,
-                            )?;
-                            if matches!(action, RegularCallAction::Aborted) {
-                                return Ok(DispatchResult::Aborted);
-                            }
-                        }
-                    }
+                let action = self.execute_binary_operation(dest, op, left, right, next)?;
+                if !matches!(action, DispatchResult::Continue) {
+                    return Ok(action);
                 }
             }
             Instruction::Jump { target } => {
@@ -18937,7 +22299,7 @@ impl Execution<'_> {
                 let available = if let Some(table) = named_table {
                     let key = self.vm.allocate_byte_string(b"n")?;
                     let field = self.vm.raw_get(table, Value::Object(key));
-                    self.vm.reclaim(key)?;
+                    self.vm.reclaim_unpublished_object(key)?;
                     let count = match field? {
                         Value::Integer(count) if (0..=i64::from(i32::MAX / 2)).contains(&count) => {
                             count
@@ -19195,7 +22557,7 @@ impl Execution<'_> {
                         };
                         let valid = awaiting
                             && pending.chain_steps > 0
-                            && matches!(pending.values[4], Value::Object(_))
+                            && matches!(pending.values[4], Value::Object(_) | Value::CFunction(_))
                             && pending.result_mode == expected_mode
                             && self.callers.len() == pending.caller_depth
                             && self.frame.pc == pending.resume_pc
@@ -19232,9 +22594,1167 @@ impl Execution<'_> {
 
 impl Drop for Execution<'_> {
     fn drop(&mut self) {
+        if self.state == ExecutionState::Parked {
+            return;
+        }
         // RootId 由各 frame 唯一持有；P06 remove_root 不配置也不觸發 GC。
-        let cleanup = self.finish();
+        let cleanup = if self.external_pending.is_some() || !self.external_nested.is_empty() {
+            self.finish_owned_external_abort()
+        } else {
+            self.finish()
+        };
         debug_assert!(cleanup.is_ok());
+    }
+}
+
+enum DebugFrameRef<'a> {
+    C(&'a ExternalPending),
+    Lua(&'a CallFrame),
+    HookTarget(ObjectRef),
+}
+
+#[derive(Clone, Copy)]
+enum DebugLocalSlot {
+    Register(Register),
+    Vararg(usize),
+    VarargTable,
+    OfficialRaw { table: ObjectRef, key: i64 },
+}
+
+struct DebugSelectedLocal {
+    local: DebugLocal,
+    slot: DebugLocalSlot,
+}
+
+fn debug_copy_bytes(
+    ledger: &AllocationLedger,
+    bytes: &[u8],
+) -> Result<(Vec<u8>, Option<AllocationCharge>), RuntimeError> {
+    let mut owned = Vec::new();
+    if bytes.is_empty() {
+        return Ok((owned, None));
+    }
+    let ticket = reserve_vec(ledger, &mut owned, bytes.len(), FailPoint::WorkReserve)?;
+    owned.extend_from_slice(bytes);
+    Ok((owned, Some(ticket.commit_charge()?)))
+}
+
+fn debug_copy_lines(
+    ledger: &AllocationLedger,
+    lines: &[u32],
+) -> Result<(Vec<u32>, Option<AllocationCharge>), RuntimeError> {
+    let mut owned = Vec::new();
+    if lines.is_empty() {
+        return Ok((owned, None));
+    }
+    let ticket = reserve_vec(ledger, &mut owned, lines.len(), FailPoint::WorkReserve)?;
+    owned.extend_from_slice(lines);
+    Ok((owned, Some(ticket.commit_charge()?)))
+}
+
+fn debug_visible_pc(
+    frame: &CallFrame,
+    prototype: &BytecodePrototype,
+    hook_current_pc: bool,
+) -> usize {
+    if hook_current_pc
+        || matches!(
+            prototype
+                .instructions
+                .get(frame.pc)
+                .map(|entry| &entry.instruction),
+            Some(Instruction::Call { .. } | Instruction::TailCall { .. })
+        )
+    {
+        frame.pc
+    } else {
+        frame.pc.saturating_sub(1)
+    }
+}
+
+impl Vm {
+    fn debug_infer_name_from_caller(
+        &self,
+        caller: &CallFrame,
+        target: Value,
+    ) -> Result<
+        Option<(
+            Vec<u8>,
+            Option<AllocationCharge>,
+            Vec<u8>,
+            Option<AllocationCharge>,
+        )>,
+        RuntimeError,
+    > {
+        let Some(module) = caller.module else {
+            return Ok(None);
+        };
+        let verified = self.module(module)?;
+        let Some(proto) = verified.module().prototypes.get(caller.prototype) else {
+            return Ok(None);
+        };
+        let call_pc = if matches!(
+            proto
+                .instructions
+                .get(caller.pc)
+                .map(|entry| &entry.instruction),
+            Some(Instruction::Call { .. } | Instruction::TailCall { .. })
+        ) {
+            caller.pc
+        } else if let Some(previous) = caller.pc.checked_sub(1) {
+            previous
+        } else {
+            return Ok(None);
+        };
+        let inferred = if let Some(debug) = verified
+            .native_debug()
+            .and_then(|debug| debug.prototype(proto.id))
+        {
+            debug_native_call_name(proto, debug, caller, target, call_pc)
+        } else {
+            debug_official_call_name(verified, proto, caller, target, call_pc)
+        };
+        let Some((name, kind)) = inferred else {
+            return Ok(None);
+        };
+        let (name, name_charge) = debug_copy_bytes(self.allocation_ledger(), name)?;
+        let (kind, kind_charge) = debug_copy_bytes(self.allocation_ledger(), kind)?;
+        Ok(Some((name, name_charge, kind, kind_charge)))
+    }
+
+    fn debug_named_local(
+        &self,
+        name: &[u8],
+        value: Value,
+        kind: DebugLocalKind,
+        slot: DebugLocalSlot,
+    ) -> Result<DebugSelectedLocal, RuntimeError> {
+        let (name, charge) = debug_copy_bytes(self.allocation_ledger(), name)?;
+        Ok(DebugSelectedLocal {
+            local: DebugLocal {
+                name,
+                value,
+                kind,
+                _name_charge: charge,
+            },
+            slot,
+        })
+    }
+
+    fn debug_select_lua_local(
+        &self,
+        handle: DebugFrameHandle,
+        frame: &CallFrame,
+        index: i64,
+        hook_current_pc: bool,
+    ) -> Result<Option<DebugSelectedLocal>, RuntimeError> {
+        if index == 0 {
+            return Ok(None);
+        }
+        if index < 0 {
+            let position = index
+                .checked_neg()
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+            if let Some(register) = frame.official_raw_varargs {
+                if position >= frame.official_raw_vararg_count {
+                    return Ok(None);
+                }
+                let Value::Object(table) = frame.read(register)? else {
+                    return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+                };
+                let key = i64::try_from(position + 1)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                let value = self.raw_get(table, Value::Integer(key))?;
+                return self
+                    .debug_named_local(
+                        b"(vararg)",
+                        value,
+                        DebugLocalKind::Vararg,
+                        DebugLocalSlot::OfficialRaw { table, key },
+                    )
+                    .map(Some);
+            }
+            let Some(value) = frame.varargs.get(position).copied() else {
+                return Ok(None);
+            };
+            return self
+                .debug_named_local(
+                    b"(vararg)",
+                    value,
+                    DebugLocalKind::Vararg,
+                    DebugLocalSlot::Vararg(position),
+                )
+                .map(Some);
+        }
+        let ordinal = usize::try_from(index)
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+        let module = frame
+            .module
+            .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+        let verified = self.module(module)?;
+        let proto = verified
+            .module()
+            .prototypes
+            .get(frame.prototype)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        let (visible_pc, temporary_limit) =
+            self.debug_local_pc_and_limit(handle, frame, proto, hook_current_pc)?;
+        if let Some(artifact) = verified.official_artifact() {
+            let guest = artifact
+                .prototype(proto.id)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+            let mapping = verified
+                .official_execution()
+                .and_then(|plan| plan.upvalue_map(proto.id))
+                .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+            let guest_start = usize::from(mapping.guest_start.0);
+            let guest_end = guest_start.saturating_add(usize::from(mapping.guest_register_count));
+            let register_index = guest_start.saturating_add(ordinal.saturating_sub(1));
+            if register_index >= guest_end {
+                return Ok(None);
+            }
+            let register = Register(
+                u16::try_from(register_index)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds))?,
+            );
+            let source_pc = artifact
+                .pc_map(proto.id)
+                .and_then(|map| map.rvlu_to_official().get(visible_pc))
+                .and_then(|origin| origin.source_pc());
+            let named = guest.debug.locals.iter().filter(|local| {
+                local.start_pc <= source_pc.unwrap_or(0) && source_pc.unwrap_or(0) < local.end_pc
+            });
+            let name = named
+                .into_iter()
+                .nth(ordinal - 1)
+                .and_then(|local| local.name.as_deref());
+            let kind = if name.is_some() {
+                DebugLocalKind::Lua
+            } else if temporary_limit
+                .or_else(|| source_pc.is_none().then_some(guest_end))
+                .is_some_and(|limit| register_index < limit)
+            {
+                DebugLocalKind::Temporary
+            } else {
+                return Ok(None);
+            };
+            let name = name.unwrap_or(b"(temporary)");
+            let value = frame.read(register)?;
+            return self
+                .debug_named_local(name, value, kind, DebugLocalSlot::Register(register))
+                .map(Some);
+        }
+        let debug = verified
+            .native_debug()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        let locals = debug
+            .prototype(proto.id)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        let storage = debug
+            .storage_for(proto.id)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        let synthetic = self.language_profile() == LuaProfile::Lua55
+            && proto.id.0 != 0
+            && proto.is_variadic
+            && proto.named_vararg.is_none();
+        let synthetic_ordinal = usize::from(proto.parameter_count) + 1;
+        if synthetic && ordinal == synthetic_ordinal {
+            return self
+                .debug_named_local(
+                    b"(vararg table)",
+                    frame.debug_vararg_table,
+                    DebugLocalKind::VarargTable,
+                    DebugLocalSlot::VarargTable,
+                )
+                .map(Some);
+        }
+        let adjusted = if synthetic && ordinal > synthetic_ordinal {
+            ordinal - 1
+        } else {
+            ordinal
+        };
+        let Some(slot) = adjusted
+            .checked_sub(1)
+            .and_then(|index| u8::try_from(index).ok())
+        else {
+            return Ok(None);
+        };
+        if let Some((local, storage)) =
+            locals.locals.iter().zip(storage).find(|(local, storage)| {
+                local.slot == slot
+                    && local.start_pc as usize <= visible_pc
+                    && visible_pc < local.end_pc as usize
+                    && storage.start_pc as usize <= visible_pc
+                    && visible_pc < storage.end_pc as usize
+                    && local.register == storage.register
+                    && local.binding == storage.binding
+            })
+        {
+            let register = storage.register;
+            let value = frame.read(register)?;
+            return self
+                .debug_named_local(
+                    &local.name,
+                    value,
+                    DebugLocalKind::Lua,
+                    DebugLocalSlot::Register(register),
+                )
+                .map(Some);
+        }
+        let active = locals
+            .locals
+            .iter()
+            .zip(storage)
+            .filter(|(local, storage)| {
+                local.start_pc as usize <= visible_pc
+                    && visible_pc < local.end_pc as usize
+                    && storage.start_pc as usize <= visible_pc
+                    && visible_pc < storage.end_pc as usize
+            })
+            .count();
+        if let Some(temporary) = debug
+            .temporaries_at(proto.id, InstructionOffset(visible_pc as u32))
+            .and_then(|entries| {
+                adjusted.checked_sub(active).and_then(|position| {
+                    entries
+                        .iter()
+                        .find(|entry| usize::from(entry.ordinal) == position)
+                })
+            })
+        {
+            if temporary_limit.is_none_or(|limit| usize::from(temporary.register.0) < limit) {
+                let value = frame.read(temporary.register)?;
+                return self
+                    .debug_named_local(
+                        b"(temporary)",
+                        value,
+                        DebugLocalKind::Temporary,
+                        DebugLocalSlot::Register(temporary.register),
+                    )
+                    .map(Some);
+            }
+        }
+        if let Some(initializer) = debug
+            .initializer_temporaries_for(proto.id)
+            .and_then(|entries| {
+                entries.iter().find(|entry| {
+                    entry.slot == slot
+                        && entry.start_pc as usize <= visible_pc
+                        && visible_pc < entry.end_pc as usize
+                })
+            })
+            .filter(|entry| {
+                temporary_limit.is_none_or(|limit| usize::from(entry.register.0) < limit)
+            })
+        {
+            let value = frame.read(initializer.register)?;
+            return self
+                .debug_named_local(
+                    b"(temporary)",
+                    value,
+                    DebugLocalKind::Temporary,
+                    DebugLocalSlot::Register(initializer.register),
+                )
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    fn debug_local_pc_and_limit(
+        &self,
+        handle: DebugFrameHandle,
+        frame: &CallFrame,
+        proto: &BytecodePrototype,
+        hook_current_pc: bool,
+    ) -> Result<(usize, Option<usize>), RuntimeError> {
+        let mut pc = debug_visible_pc(frame, proto, hook_current_pc);
+        let mut limit = match proto.instructions.get(pc).map(|entry| &entry.instruction) {
+            Some(Instruction::Call { base, .. } | Instruction::TailCall { base, .. })
+            | Some(Instruction::Return { base, .. }) => Some(usize::from(base.0)),
+            _ => None,
+        };
+        if let DebugFrameContext::Coroutine { object, .. } = handle.context {
+            if handle.level == 0 {
+                if let Some(site) = self.with_coroutine(object, |coroutine| {
+                    coroutine
+                        .context
+                        .as_ref()
+                        .and_then(|context| context.yield_site)
+                })? {
+                    if !site.tail_return {
+                        pc = site.resume_pc.saturating_sub(1);
+                        limit = Some(usize::from(site.destination.0));
+                    }
+                }
+            }
+        }
+        Ok((pc, limit))
+    }
+    fn debug_external_core(&self, token: ExternalToken) -> Result<&ExecutionCore, RuntimeError> {
+        self.external_event(token)?;
+        self.parked_executions
+            .last()
+            .and_then(|parked| parked.core.as_ref())
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))
+    }
+
+    fn debug_external_revision(&self, token: ExternalToken) -> Result<u64, RuntimeError> {
+        self.debug_external_core(token)?;
+        let revision = self
+            .parked_executions
+            .last()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?
+            .debug_revision;
+        if revision == u64::MAX {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        Ok(revision)
+    }
+
+    fn debug_external_core_for_handle(
+        &self,
+        token: ExternalToken,
+        revision: u64,
+    ) -> Result<&ExecutionCore, RuntimeError> {
+        if self.debug_external_revision(token)? != revision {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        self.debug_external_core(token)
+    }
+
+    fn debug_is_current_hook(core: &ExecutionCore) -> bool {
+        let Some(pending) = core.external_pending.as_ref() else {
+            return false;
+        };
+        core.pending_ops.last().is_some_and(|entry| {
+            matches!(
+                entry.basic.as_ref(),
+                Some(BasicPending::DebugHook { hook_function, .. })
+                    if pending.closure == Some(*hook_function)
+            )
+        })
+    }
+
+    fn debug_external_frame_at<'a>(
+        &self,
+        core: &'a ExecutionCore,
+        level: usize,
+    ) -> Option<DebugFrameRef<'a>> {
+        let hook = core.pending_ops.last().and_then(|pending| {
+            if let Some(BasicPending::DebugHook {
+                hook_function,
+                target,
+                ..
+            }) = pending.basic.as_ref()
+            {
+                Some((*hook_function, *target))
+            } else {
+                None
+            }
+        });
+        let is_hook = |pending: &ExternalPending| {
+            hook.is_some_and(|(function, _)| pending.closure == Some(function))
+        };
+        let mut cursor = 0;
+        let current = core.external_pending.as_ref()?;
+        if is_hook(current) {
+            if let Some(target) = hook.and_then(|(_, target)| target) {
+                if level == cursor {
+                    return Some(DebugFrameRef::HookTarget(target));
+                }
+                cursor += 1;
+            }
+        } else {
+            if level == cursor {
+                return Some(DebugFrameRef::C(current));
+            }
+            cursor += 1;
+        }
+        if core.frame.module.is_some() {
+            if level == cursor {
+                return Some(DebugFrameRef::Lua(&core.frame));
+            }
+            cursor += 1;
+        }
+        for index in (0..core.callers.len()).rev() {
+            for nested in core
+                .external_nested
+                .iter()
+                .rev()
+                .filter(|nested| nested.caller_depth == index)
+            {
+                if is_hook(&nested.outer_pending) {
+                    if let Some(target) = hook.and_then(|(_, target)| target) {
+                        if level == cursor {
+                            return Some(DebugFrameRef::HookTarget(target));
+                        }
+                        cursor += 1;
+                    }
+                } else {
+                    if level == cursor {
+                        return Some(DebugFrameRef::C(&nested.outer_pending));
+                    }
+                    cursor += 1;
+                }
+            }
+            let frame = &core.callers[index];
+            if frame.module.is_some() {
+                if level == cursor {
+                    return Some(DebugFrameRef::Lua(frame));
+                }
+                cursor += 1;
+            }
+        }
+        None
+    }
+
+    fn with_debug_frame<R>(
+        &self,
+        handle: DebugFrameHandle,
+        read: impl FnOnce(DebugFrameRef<'_>) -> Result<R, RuntimeError>,
+    ) -> Result<R, RuntimeError> {
+        match handle.context {
+            DebugFrameContext::External { token, revision } => {
+                let core = self.debug_external_core_for_handle(token, revision)?;
+                if handle.hook_target
+                    && !core.pending_ops.last().is_some_and(|pending| {
+                        matches!(pending.basic, Some(BasicPending::DebugHook { .. }))
+                    })
+                {
+                    return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+                }
+                let frame = self
+                    .debug_external_frame_at(core, handle.level)
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                read(frame)
+            }
+            DebugFrameContext::Coroutine {
+                vm,
+                object,
+                revision,
+            } => {
+                if vm != self.id() || handle.hook_target {
+                    return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+                }
+                self.with_coroutine(object, |coroutine| {
+                    if coroutine.state != CoroutineState::Suspended
+                        || coroutine.debug_revision == u64::MAX
+                        || coroutine.debug_revision != revision
+                    {
+                        return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+                    }
+                    let frame = coroutine
+                        .context
+                        .as_ref()
+                        .and_then(|context| {
+                            handle
+                                .level
+                                .checked_add(1)
+                                .and_then(|level| context.debug_frame(level))
+                        })
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                    read(DebugFrameRef::Lua(frame))
+                })?
+            }
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn debug_frame_external(
+        &self,
+        token: ExternalToken,
+        level: usize,
+    ) -> Result<Option<DebugFrameHandle>, RuntimeError> {
+        let core = self.debug_external_core(token)?;
+        let revision = self.debug_external_revision(token)?;
+        Ok(self
+            .debug_external_frame_at(core, level)
+            .map(|_| DebugFrameHandle {
+                context: DebugFrameContext::External { token, revision },
+                level,
+                hook_target: level == 0 && Self::debug_is_current_hook(core),
+            }))
+    }
+
+    #[doc(hidden)]
+    pub fn debug_hook_frame(
+        &self,
+        token: ExternalToken,
+    ) -> Result<Option<DebugFrameHandle>, RuntimeError> {
+        let core = self.debug_external_core(token)?;
+        if !Self::debug_is_current_hook(core) {
+            return Ok(None);
+        }
+        let revision = self.debug_external_revision(token)?;
+        Ok(self
+            .debug_external_frame_at(core, 0)
+            .map(|_| DebugFrameHandle {
+                context: DebugFrameContext::External { token, revision },
+                level: 0,
+                hook_target: true,
+            }))
+    }
+
+    #[doc(hidden)]
+    pub fn debug_frame_coroutine(
+        &self,
+        object: ObjectRef,
+        level: usize,
+    ) -> Result<Option<DebugFrameHandle>, RuntimeError> {
+        self.with_coroutine(object, |coroutine| {
+            // 世代耗盡後拒絕新 handle，避免飽和計數器重用舊身分。
+            if coroutine.state != CoroutineState::Suspended || coroutine.debug_revision == u64::MAX
+            {
+                return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+            }
+            let Some(context) = coroutine.context.as_ref() else {
+                return Ok(None);
+            };
+            Ok(level
+                .checked_add(1)
+                .and_then(|level| context.debug_frame(level))
+                .map(|_| DebugFrameHandle {
+                    context: DebugFrameContext::Coroutine {
+                        vm: self.id(),
+                        object,
+                        revision: coroutine.debug_revision,
+                    },
+                    level,
+                    hook_target: false,
+                }))
+        })?
+    }
+
+    #[doc(hidden)]
+    pub fn debug_set_hook(
+        &mut self,
+        thread: Option<ObjectRef>,
+        config: Option<DebugHookConfig>,
+    ) -> Result<(), RuntimeError> {
+        let hook = if let Some(config) = config {
+            if !matches!(
+                self.object_kind(config.function)?,
+                ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin
+            ) {
+                return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+            }
+            let mut hook = DebugHook::with_line(config.function, config.count, config.line);
+            hook.call = config.call;
+            hook.ret = config.ret;
+            Some(hook)
+        } else {
+            None
+        };
+        self.set_debug_hook(thread, hook)?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn debug_get_hook(
+        &self,
+        thread: Option<ObjectRef>,
+    ) -> Result<Option<DebugHookConfig>, RuntimeError> {
+        Ok(self.debug_hook_for(thread)?.map(|hook| DebugHookConfig {
+            function: hook.function,
+            call: hook.call,
+            ret: hook.ret,
+            line: hook.line,
+            count: hook.count,
+        }))
+    }
+
+    fn debug_snapshot(
+        &self,
+        function: Value,
+        frame: Option<&CallFrame>,
+        c_nups: usize,
+        hook_current_pc: bool,
+        transfer: Option<DebugTransfer>,
+    ) -> Result<DebugFrameInfo, RuntimeError> {
+        let mut info = DebugFrameInfo {
+            function,
+            kind: DebugFrameKind::C,
+            source: Vec::new(),
+            short_source: Vec::new(),
+            currentline: -1,
+            linedefined: -1,
+            lastlinedefined: -1,
+            nups: i64::try_from(c_nups)
+                .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?,
+            nparams: 0,
+            isvararg: true,
+            extraargs: 0,
+            istailcall: false,
+            ftransfer: 0,
+            ntransfer: 0,
+            name: Vec::new(),
+            namewhat: Vec::new(),
+            active_lines: Vec::new(),
+            _source_charge: None,
+            _short_charge: None,
+            _name_charge: None,
+            _namewhat_charge: None,
+            _lines_charge: None,
+        };
+        if let Some(transfer) = transfer
+            .filter(|transfer| self.language_profile() != LuaProfile::Lua54 || transfer.count > 0)
+        {
+            info.ftransfer = i64::try_from(transfer.first)
+                .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+            info.ntransfer = i64::try_from(transfer.count)
+                .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+        }
+        let closure = match function {
+            Value::Object(object) if self.object_kind(object)? == ObjectKind::Closure => {
+                Some(object)
+            }
+            Value::Object(object) if self.object_kind(object)? == ObjectKind::CClosure => {
+                info.nups = i64::try_from(self.debug_c_closure_upvalue_count(object)?)
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                None
+            }
+            Value::Object(object) if self.object_kind(object)? == ObjectKind::Builtin => None,
+            Value::CFunction(_) => None,
+            _ => return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument)),
+        };
+        if let Some(closure) = closure {
+            let (module, proto_id) =
+                self.with_closure(closure, |closure| (closure.module(), closure.prototype()))?;
+            let verified = self.module(module)?;
+            let proto = verified
+                .module()
+                .prototypes
+                .iter()
+                .find(|proto| proto.id == proto_id)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+            let visible_pc = frame.map(|frame| debug_visible_pc(frame, proto, hook_current_pc));
+            let main = proto.id.0 == 0
+                && verified.official_artifact().is_none_or(|artifact| {
+                    artifact
+                        .prototype(proto.id)
+                        .is_some_and(|guest| guest.line_defined == 0)
+                });
+            info.kind = if main {
+                DebugFrameKind::Main
+            } else {
+                DebugFrameKind::Lua
+            };
+            info.nparams = i64::from(proto.parameter_count);
+            info.isvararg = proto.is_variadic;
+            info.istailcall = frame.is_some_and(|frame| frame.tail_called);
+            info.extraargs = frame.map_or(0, |frame| i64::from(frame.call_extraargs));
+            info.nups = if let Some(artifact) = verified.official_artifact() {
+                let plan = verified
+                    .official_execution()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                let _ = artifact;
+                i64::from(
+                    plan.upvalue_map(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?
+                        .guest_count,
+                )
+            } else if let Some(debug) = verified.native_debug() {
+                i64::try_from(
+                    debug
+                        .semantic_upvalue_count(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?,
+                )
+                .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?
+            } else {
+                i64::try_from(proto.upvalues.len())
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::DebugArgument))?
+            };
+            let (source, defined, last, current, active_lines, lines_charge) =
+                if let Some(artifact) = verified.official_artifact() {
+                    let guest = artifact
+                        .prototype(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                    let map = artifact
+                        .pc_map(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                    let mut lines = Vec::new();
+                    let ticket = reserve_vec(
+                        self.allocation_ledger(),
+                        &mut lines,
+                        map.rvlu_to_official().len(),
+                        FailPoint::WorkReserve,
+                    )?;
+                    for pc in 0..map.rvlu_to_official().len() {
+                        lines.push(
+                            u32::try_from(pc)
+                                .ok()
+                                .and_then(|pc| map.line_at_rvlu(InstructionOffset(pc)))
+                                .unwrap_or(0),
+                        );
+                    }
+                    let current = visible_pc
+                        .and_then(|pc| u32::try_from(pc).ok())
+                        .and_then(|pc| map.line_at_rvlu(InstructionOffset(pc)))
+                        .map(i64::from)
+                        .unwrap_or(-1);
+                    (
+                        artifact.effective_source(proto.id).unwrap_or(b"=?"),
+                        i64::from(guest.line_defined),
+                        i64::from(guest.last_line_defined),
+                        current,
+                        lines,
+                        Some(ticket.commit_charge()?),
+                    )
+                } else if let Some(debug) = verified.native_debug() {
+                    let metadata = debug
+                        .prototype(proto.id)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+                    let (lines, charge) =
+                        debug_copy_lines(self.allocation_ledger(), &metadata.lines)?;
+                    let current = visible_pc
+                        .and_then(|pc| metadata.lines.get(pc))
+                        .copied()
+                        .filter(|line| *line > 0)
+                        .map(i64::from)
+                        .unwrap_or(-1);
+                    (
+                        debug.source_name(),
+                        i64::from(metadata.line_defined),
+                        i64::from(metadata.last_line_defined),
+                        current,
+                        lines,
+                        charge,
+                    )
+                } else {
+                    (b"=?".as_slice(), 0, 0, -1, Vec::new(), None)
+                };
+            (info.source, info._source_charge) =
+                debug_copy_bytes(self.allocation_ledger(), source)?;
+            let (short, size) = official_short_source(source);
+            (info.short_source, info._short_charge) =
+                debug_copy_bytes(self.allocation_ledger(), &short[..size])?;
+            info.currentline = current;
+            info.linedefined = defined;
+            info.lastlinedefined = last;
+            info.active_lines = active_lines;
+            info._lines_charge = lines_charge;
+        } else {
+            (info.source, info._source_charge) =
+                debug_copy_bytes(self.allocation_ledger(), b"=[C]")?;
+            (info.short_source, info._short_charge) =
+                debug_copy_bytes(self.allocation_ledger(), b"[C]")?;
+        }
+        Ok(info)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_frame_info(
+        &self,
+        handle: DebugFrameHandle,
+    ) -> Result<DebugFrameInfo, RuntimeError> {
+        let hook_current_pc = self.debug_handle_current_pc(handle)?;
+        let transfer = if handle.hook_target {
+            if let DebugFrameContext::External { token, revision } = handle.context {
+                self.debug_external_core_for_handle(token, revision)?
+                    .pending_ops
+                    .last()
+                    .and_then(|entry| match entry.basic.as_ref() {
+                        Some(BasicPending::DebugHook { transfer, .. }) => *transfer,
+                        _ => None,
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut info = self.with_debug_frame(handle, |frame| match frame {
+            DebugFrameRef::C(pending) => {
+                let mut info = self.debug_snapshot(
+                    pending
+                        .closure
+                        .map(Value::Object)
+                        .unwrap_or(Value::CFunction(pending.function)),
+                    None,
+                    pending.captures.values().len(),
+                    hook_current_pc,
+                    transfer,
+                )?;
+                // TailCall 轉入公開 C callback 時，以同一 pending 標記呈現 debug frame。
+                info.istailcall = pending.tail_return;
+                info.extraargs = i64::from(pending.call_extraargs);
+                Ok(info)
+            }
+            DebugFrameRef::Lua(frame) => self.debug_snapshot(
+                frame.closure.map(Value::Object).unwrap_or(Value::Nil),
+                Some(frame),
+                0,
+                hook_current_pc,
+                transfer,
+            ),
+            DebugFrameRef::HookTarget(target) => {
+                self.debug_snapshot(Value::Object(target), None, 0, hook_current_pc, transfer)
+            }
+        })?;
+        let caller = match handle.context {
+            DebugFrameContext::External { token, .. } => {
+                self.debug_frame_external(token, handle.level.saturating_add(1))?
+            }
+            DebugFrameContext::Coroutine { object, .. } => {
+                self.debug_frame_coroutine(object, handle.level.saturating_add(1))?
+            }
+        };
+        if let Some(caller) = caller {
+            let name = self.with_debug_frame(caller, |frame| match frame {
+                DebugFrameRef::Lua(frame) => {
+                    self.debug_infer_name_from_caller(frame, info.function)
+                }
+                _ => Ok(None),
+            })?;
+            if let Some((name, name_charge, kind, kind_charge)) = name {
+                info.name = name;
+                info._name_charge = name_charge;
+                info.namewhat = kind;
+                info._namewhat_charge = kind_charge;
+            }
+        }
+        Ok(info)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_function_info(&self, function: Value) -> Result<DebugFrameInfo, RuntimeError> {
+        self.debug_snapshot(function, None, 0, false, None)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_function_parameter_name(
+        &self,
+        function: Value,
+        index: i64,
+    ) -> Result<Option<DebugParameterName>, RuntimeError> {
+        let Some(slot) = index
+            .checked_sub(1)
+            .and_then(|slot| u8::try_from(slot).ok())
+        else {
+            return Ok(None);
+        };
+        let Value::Object(object) = function else {
+            return Ok(None);
+        };
+        if self.object_kind(object)? != ObjectKind::Closure {
+            return Ok(None);
+        }
+        let (module, prototype) =
+            self.with_closure(object, |closure| (closure.module(), closure.prototype()))?;
+        let verified = self.module(module)?;
+        let prototype = verified
+            .module()
+            .prototypes
+            .iter()
+            .find(|entry| entry.id == prototype)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug))?;
+        if usize::from(slot) >= usize::from(prototype.parameter_count) {
+            return Ok(None);
+        }
+        let name = if let Some(artifact) = verified.official_artifact() {
+            artifact
+                .prototype(prototype.id)
+                .and_then(|guest| {
+                    guest
+                        .debug
+                        .locals
+                        .iter()
+                        .filter(|local| local.start_pc == 0 && local.end_pc > 0)
+                        .nth(usize::from(slot))
+                })
+                .and_then(|local| local.name.as_deref())
+        } else {
+            verified
+                .native_debug()
+                .and_then(|debug| debug.prototype(prototype.id))
+                .and_then(|metadata| {
+                    metadata
+                        .locals
+                        .iter()
+                        .find(|local| local.slot == slot && local.start_pc == 0 && local.end_pc > 0)
+                })
+                .map(|local| local.name.as_slice())
+        };
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        let (name, charge) = debug_copy_bytes(self.allocation_ledger(), name)?;
+        Ok(Some(DebugParameterName {
+            name,
+            _name_charge: charge,
+        }))
+    }
+
+    #[doc(hidden)]
+    pub fn debug_local_read(
+        &self,
+        handle: DebugFrameHandle,
+        index: i64,
+    ) -> Result<Option<DebugLocal>, RuntimeError> {
+        let current_pc = self.debug_handle_current_pc(handle)?;
+        self.with_debug_frame(handle, |frame| match frame {
+            DebugFrameRef::Lua(frame) => Ok(self
+                .debug_select_lua_local(handle, frame, index, current_pc)?
+                .map(|selected| selected.local)),
+            DebugFrameRef::C(_) | DebugFrameRef::HookTarget(_) => Ok(None),
+        })
+    }
+
+    fn debug_external_lua_rank(
+        &self,
+        core: &ExecutionCore,
+        level: usize,
+    ) -> Result<usize, RuntimeError> {
+        let mut rank = 0;
+        for cursor in 0..=level {
+            match self.debug_external_frame_at(core, cursor) {
+                Some(DebugFrameRef::Lua(_)) if cursor == level => return Ok(rank),
+                Some(DebugFrameRef::Lua(_)) => rank += 1,
+                Some(_) => {}
+                None => return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution)),
+            }
+        }
+        Err(RuntimeError::new(RuntimeErrorKind::DebugArgument))
+    }
+
+    fn debug_external_mut_lua_frame(
+        core: &mut ExecutionCore,
+        mut rank: usize,
+    ) -> Option<&mut CallFrame> {
+        if core.frame.module.is_some() {
+            if rank == 0 {
+                return Some(&mut core.frame);
+            }
+            rank -= 1;
+        }
+        core.callers
+            .iter_mut()
+            .rev()
+            .filter(|frame| frame.module.is_some())
+            .nth(rank)
+    }
+
+    fn debug_write_external_slot(
+        &mut self,
+        token: ExternalToken,
+        level: usize,
+        slot: DebugLocalSlot,
+        value: Value,
+    ) -> Result<(), RuntimeError> {
+        let core = self.debug_external_core(token)?;
+        let rank = self.debug_external_lua_rank(core, level)?;
+        let mut core = self
+            .parked_executions
+            .last_mut()
+            .and_then(|parked| parked.core.take())
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        let written = catch_unwind(AssertUnwindSafe(|| {
+            let frame = Self::debug_external_mut_lua_frame(&mut core, rank)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+            match slot {
+                DebugLocalSlot::Register(register) => frame.write(self, register, value),
+                DebugLocalSlot::Vararg(index) => frame
+                    .begin_debug_vararg_write(self, index, value)?
+                    .commit(self),
+                DebugLocalSlot::VarargTable => frame
+                    .begin_debug_vararg_table_write(self, value)?
+                    .commit(self),
+                DebugLocalSlot::OfficialRaw { .. } => {
+                    Err(RuntimeError::new(RuntimeErrorKind::DebugArgument))
+                }
+            }
+        }));
+        let top = self
+            .parked_executions
+            .last_mut()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        top.core = Some(core);
+        match written {
+            Ok(result) => result,
+            Err(panic) => resume_unwind(panic),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn debug_local_write(
+        &mut self,
+        handle: DebugFrameHandle,
+        index: i64,
+        value: Value,
+    ) -> Result<Option<DebugLocal>, RuntimeError> {
+        let current_pc = self.debug_handle_current_pc(handle)?;
+        let Some(mut selected) = self.with_debug_frame(handle, |frame| match frame {
+            DebugFrameRef::Lua(frame) => {
+                self.debug_select_lua_local(handle, frame, index, current_pc)
+            }
+            DebugFrameRef::C(_) | DebugFrameRef::HookTarget(_) => Ok(None),
+        })?
+        else {
+            return Ok(None);
+        };
+        match selected.slot {
+            DebugLocalSlot::OfficialRaw { table, key } => {
+                let root = if let Value::Object(object) = value {
+                    Some(self.add_root(RootKind::Temporary, object)?)
+                } else {
+                    None
+                };
+                let result = self.raw_set(table, Value::Integer(key), value);
+                if let Some(root) = root {
+                    self.remove_root(root)?;
+                }
+                result?;
+            }
+            slot => match handle.context {
+                DebugFrameContext::External { token, .. } => {
+                    self.debug_write_external_slot(token, handle.level, slot, value)?;
+                }
+                DebugFrameContext::Coroutine {
+                    vm,
+                    object,
+                    revision,
+                } => {
+                    if vm != self.id()
+                        || self.with_coroutine(object, |co| {
+                            co.state != CoroutineState::Suspended
+                                || co.debug_revision == u64::MAX
+                                || co.debug_revision != revision
+                        })?
+                    {
+                        return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+                    }
+                    let parked_slot = match slot {
+                        DebugLocalSlot::Register(register) => ParkedLocalSlot::Register(register),
+                        DebugLocalSlot::Vararg(index) => ParkedLocalSlot::Vararg(index),
+                        DebugLocalSlot::VarargTable => ParkedLocalSlot::VarargTable,
+                        DebugLocalSlot::OfficialRaw { .. } => {
+                            return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+                        }
+                    };
+                    let root = if let Value::Object(object) = value {
+                        Some(self.add_root(RootKind::Temporary, object)?)
+                    } else {
+                        None
+                    };
+                    let level = handle
+                        .level
+                        .checked_add(1)
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                    let result =
+                        self.coroutine_debug_local_write(object, level, parked_slot, value);
+                    if let Some(root) = root {
+                        self.remove_root(root)?;
+                    }
+                    if !result? {
+                        return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+                    }
+                }
+            },
+        }
+        selected.local.value = value;
+        Ok(Some(selected.local))
     }
 }
 
@@ -19249,6 +23769,267 @@ mod tests {
         RVLU_NUMERIC_I64_F64, RVLU_V2, Register, ResultMode, UpvalueId, Value, VerifyLimits,
         verify_module,
     };
+
+    mod full_userdata_a27_correction_tests {
+        use super::*;
+        use crate::{DebugCapability, DebugPermission, FinalizerState, GcAge, GcMode};
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+
+        fn compile(profile: LuaProfile, source: &[u8]) -> VerifiedModule {
+            let language = match profile {
+                LuaProfile::Lua54 => LanguageProfile::Lua54,
+                LuaProfile::Lua55 => LanguageProfile::Lua55,
+            };
+            let limits = CompileLimits::default();
+            let tokens = lex(source, language, &limits).unwrap();
+            let parsed = parse(&tokens, language, &limits).unwrap();
+            let resolved = resolve(&parsed, &tokens, language, &limits).unwrap();
+            let ir = lower(&resolved, &IrLimits::default()).unwrap();
+            emit(&ir, &VerifyLimits::default())
+                .unwrap()
+                .verified()
+                .clone()
+        }
+
+        fn closure(vm: &mut Vm, profile: LuaProfile, source: &[u8]) -> ObjectRef {
+            let mut execution = vm.load(compile(profile, source)).unwrap();
+            let RunOutcome::Returned(values) = execution.run().unwrap() else {
+                panic!("測試 closure 須正常返回")
+            };
+            let Value::Object(object) = values[0] else {
+                panic!("測試 closure 須為物件")
+            };
+            object
+        }
+
+        #[test]
+        fn userdata_dispatch_call_len_eq_basic_and_finalizer() {
+            for profile in [LuaProfile::Lua55, LuaProfile::Lua54] {
+                let mut vm = Vm::new_with_profile(profile).unwrap();
+                vm.set_gc_debt_threshold(usize::MAX);
+                let env = vm.allocate_table().unwrap();
+                let env_root = vm.add_root(RootKind::Host, env).unwrap();
+                vm.install_basic_builtins(env).unwrap();
+                let u = vm.allocate_userdata(0, 0).unwrap();
+                let v = vm.allocate_userdata(0, 0).unwrap();
+                let t = vm.allocate_table().unwrap();
+                for (name, object) in [(b"u".as_slice(), u), (b"v", v), (b"t", t)] {
+                    vm.set_string_field(env, name, Value::Object(object))
+                        .unwrap();
+                }
+                let mt = vm.allocate_table().unwrap();
+                let number_event = closure(&mut vm, profile, b"return function(...) return 41 end");
+                let text_event = closure(&mut vm, profile, b"return function(...) return 'ud' end");
+                for name in [b"__call".as_slice(), b"__len", b"__eq"] {
+                    vm.raw_set_byte_string_key(mt, name, Value::Object(number_event))
+                        .unwrap();
+                }
+                vm.raw_set_byte_string_key(mt, b"__tostring", Value::Object(text_event))
+                    .unwrap();
+                vm.raw_set_byte_string_key(mt, b"__metatable", Value::Integer(123))
+                    .unwrap();
+                for object in [u, v, t] {
+                    vm.set_metatable(object, Some(mt)).unwrap();
+                }
+                let mut execution = vm
+                    .load_with_environment(
+                        compile(profile, b"return u(7), #u, u==v, u~=v, u==t, u~=t, tostring(u), getmetatable(u)"),
+                        Value::Object(env),
+                    )
+                    .unwrap();
+                let RunOutcome::Returned(values) = execution.run().unwrap() else {
+                    panic!("userdata dispatch 須返回")
+                };
+                assert_eq!(values.len(), 8);
+                assert_eq!(
+                    &values[..6],
+                    &[
+                        Value::Integer(41),
+                        Value::Integer(41),
+                        Value::Boolean(true),
+                        Value::Boolean(false),
+                        Value::Boolean(false),
+                        Value::Boolean(true)
+                    ]
+                );
+                let Value::Object(text) = values[6] else {
+                    panic!("__tostring 須返回字串")
+                };
+                assert_eq!(
+                    execution
+                        .vm
+                        .with_byte_string(text, |s| s.as_bytes().to_vec()),
+                    Ok(b"ud".to_vec())
+                );
+                assert_eq!(values[7], Value::Integer(123));
+                drop(execution);
+                vm.raw_set_byte_string_key(mt, b"__len", Value::Nil)
+                    .unwrap();
+                let mut missing = vm
+                    .load_with_environment(compile(profile, b"return #u"), Value::Object(env))
+                    .unwrap();
+                assert_eq!(
+                    missing.run().err().map(|e| e.kind),
+                    Some(RuntimeErrorKind::UnsupportedUnaryOperation(
+                        rivetlua_core::UnaryOperation::Length
+                    ))
+                );
+                drop(missing);
+
+                let callback = vm.allocate_userdata(0, 0).unwrap();
+                let callback_mt = vm.allocate_table().unwrap();
+                let mut make_finalizer = vm
+                    .load_with_environment(
+                        compile(profile, b"return function(...) finalized = true end"),
+                        Value::Object(env),
+                    )
+                    .unwrap();
+                let RunOutcome::Returned(finalizer) = make_finalizer.run().unwrap() else {
+                    panic!("finalizer callback 須建立")
+                };
+                let Value::Object(finalizer) = finalizer[0] else {
+                    panic!("finalizer callback 須為 closure")
+                };
+                drop(make_finalizer);
+                vm.raw_set_byte_string_key(callback_mt, b"__call", Value::Object(finalizer))
+                    .unwrap();
+                vm.set_metatable(callback, Some(callback_mt)).unwrap();
+                let target = vm.allocate_userdata(0, 0).unwrap();
+                let finalizer_mt = vm.allocate_table().unwrap();
+                vm.raw_set_byte_string_key(finalizer_mt, b"__gc", Value::Object(callback))
+                    .unwrap();
+                vm.set_metatable(target, Some(finalizer_mt)).unwrap();
+                vm.set_execution_running(true);
+                vm.collect().unwrap();
+                vm.set_execution_running(false);
+                assert_eq!(vm.finalizer_state(target), Ok(FinalizerState::Pending));
+                assert_eq!(
+                    vm.pending_finalizer(),
+                    Ok(Some((target, Value::Object(callback))))
+                );
+                vm.start_finalizer(target).unwrap();
+                assert_eq!(vm.finalizer_state(target), Ok(FinalizerState::Running));
+                vm.pause_finalizer_start(target).unwrap();
+                assert_eq!(vm.finalizer_state(target), Ok(FinalizerState::Pending));
+                vm.run_pending_finalizers().unwrap();
+                assert_eq!(vm.finalizer_state(target), Ok(FinalizerState::Finalized));
+                assert_eq!(vm.gc_trace().finalizer_warnings, 0);
+                let finalized = vm.allocate_byte_string(b"finalized").unwrap();
+                assert_eq!(
+                    vm.raw_get(env, Value::Object(finalized)),
+                    Ok(Value::Boolean(true))
+                );
+                vm.collect().unwrap();
+                assert_eq!(vm.object_kind(target), Err(VmError::StaleObject));
+                vm.remove_root(env_root).unwrap();
+            }
+        }
+
+        #[test]
+        fn userdata_debug_metatable_and_uservalue_contract() {
+            for profile in [LuaProfile::Lua55, LuaProfile::Lua54] {
+                let services = HostServices::deny_all().and_debug(
+                    DebugCapability::deny_all()
+                        .allow(DebugPermission::MetatableRead)
+                        .allow(DebugPermission::TableMetatableWrite)
+                        .allow(DebugPermission::UserValueRead)
+                        .allow(DebugPermission::UserValueWrite),
+                );
+                let mut vm = Vm::new_with_services(profile, services).unwrap();
+                vm.set_gc_debt_threshold(usize::MAX);
+                let env = vm.allocate_table().unwrap();
+                let env_root = vm.add_root(RootKind::Host, env).unwrap();
+                vm.install_basic_builtins(env).unwrap();
+                vm.install_debug_builtins(env).unwrap();
+                let u = vm.allocate_userdata(0, 2).unwrap();
+                let mt = vm.allocate_table().unwrap();
+                vm.set_string_field(env, b"u", Value::Object(u)).unwrap();
+                vm.set_string_field(env, b"m", Value::Object(mt)).unwrap();
+                for (source, expected) in [
+                    (b"return debug.setmetatable(u,m)==u, debug.getmetatable(u)==m, getmetatable(u)==m".as_slice(), vec![Value::Boolean(true); 3]),
+                    (b"return debug.setuservalue(u,99,2)==u, debug.getuservalue(u,2), select('#',debug.getuservalue(u,0)), debug.setuservalue(u,7,0)==nil", vec![Value::Boolean(true), Value::Integer(99), Value::Integer(1), Value::Boolean(true)]),
+                    (b"return debug.getuservalue(u)".as_slice(), vec![Value::Nil, Value::Boolean(true)]),
+                    (b"return debug.setuservalue(u,7,nil)==u, debug.getuservalue(u,nil)".as_slice(), vec![Value::Boolean(true), Value::Integer(7), Value::Boolean(true)]),
+                    (b"return debug.getuservalue(u,2)".as_slice(), vec![Value::Integer(99), Value::Boolean(true)]),
+                    (b"return debug.getuservalue(u,3)".as_slice(), vec![Value::Nil]),
+                    (b"return debug.getuservalue(m)".as_slice(), vec![Value::Nil]),
+                ] {
+                    let mut execution = vm.load_with_environment(compile(profile, source), Value::Object(env)).unwrap();
+                    assert_eq!(execution.run(), Ok(RunOutcome::Returned(expected)), "{profile:?} {source:?}");
+                }
+                let mut errors = vm.load(compile(profile, b"return nil")).unwrap();
+                for args in [
+                    vec![],
+                    vec![Value::Object(u)],
+                    vec![Value::Object(mt), Value::Nil],
+                ] {
+                    assert_eq!(
+                        errors
+                            .debug_builtin(
+                                DebugBuiltin::SetUserValue,
+                                &args,
+                                Register(0),
+                                ResultMode::Fixed(1),
+                                false,
+                                errors.frame.pc,
+                            )
+                            .err()
+                            .map(|error| error.kind),
+                        Some(RuntimeErrorKind::DebugArgument),
+                        "{profile:?} args={args:?}"
+                    );
+                }
+                drop(errors);
+                assert_eq!(vm.get_uservalue(u, 2), Ok(Some(Value::Integer(99))));
+                vm.set_gc_mode(GcMode::Generational).unwrap();
+                vm.set_gc_promotion_survivals(1).unwrap();
+                vm.collect_minor().unwrap();
+                assert_eq!(vm.gc_age(u), Ok(GcAge::Old));
+                let child = vm.allocate_table().unwrap();
+                let mut write = vm.load(compile(profile, b"return nil")).unwrap();
+                let before = write.vm.gc_trace();
+                write.vm.inject_failure_once(FailPoint::RememberedReserve);
+                assert_eq!(
+                    write
+                        .debug_builtin(
+                            DebugBuiltin::SetUserValue,
+                            &[Value::Object(u), Value::Object(child), Value::Integer(1)],
+                            Register(0),
+                            ResultMode::Fixed(1),
+                            false,
+                            write.frame.pc,
+                        )
+                        .err()
+                        .map(|error| error.kind),
+                    Some(RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                        FailPoint::RememberedReserve
+                    )))
+                );
+                assert_eq!(write.vm.get_uservalue(u, 1), Ok(Some(Value::Integer(7))));
+                assert_eq!(write.vm.gc_trace(), before);
+                assert_eq!(write.vm.ledger_snapshot().reserved, 0);
+                assert!(matches!(
+                    write.debug_builtin(
+                        DebugBuiltin::SetUserValue,
+                        &[Value::Object(u), Value::Object(child), Value::Integer(1)],
+                        Register(0),
+                        ResultMode::Fixed(1),
+                        false,
+                        write.frame.pc,
+                    ),
+                    Ok(RegularCallAction::Completed(DispatchResult::Continue))
+                ));
+                assert_eq!(write.vm.get_uservalue(u, 1), Ok(Some(Value::Object(child))));
+                assert_eq!(write.vm.gc_trace().remembered_len, 1);
+                drop(write);
+                vm.collect_minor().unwrap();
+                assert_eq!(vm.object_kind(child), Ok(ObjectKind::Table));
+                vm.remove_root(env_root).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn p13_h_official_count_eligibility_uses_pc_origin_and_rejects_missing_pc() {
@@ -21079,7 +25860,7 @@ mod tests {
         let Err(error) = execution.invoke_event(
             PendingKind::Value,
             values,
-            event,
+            Value::Object(event),
             &args,
             Register(0),
             ResultMode::Fixed(1),
@@ -21097,7 +25878,7 @@ mod tests {
         let Err(error) = execution.invoke_event(
             PendingKind::Value,
             values,
-            event,
+            Value::Object(event),
             &args,
             Register(0),
             ResultMode::Fixed(1),
@@ -23326,6 +28107,117 @@ mod tests {
     }
 
     #[test]
+    fn p16_b9_official_dual_vararg_second_failure_restores_whole_gc_transaction() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+
+        let source = b"local f=function(...va) return ... end; return f(1,2)";
+        let limits = CompileLimits::default();
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let verified = emit(&ir, &VerifyLimits::default())
+            .unwrap()
+            .verified()
+            .clone();
+        let prototype = verified
+            .module()
+            .prototypes
+            .iter()
+            .find(|prototype| prototype.named_vararg.is_some())
+            .unwrap();
+        let prepare = || {
+            let mut vm = Vm::new().unwrap();
+            for _ in 0..8 {
+                vm.allocate(Value::Nil).unwrap();
+            }
+            vm.collect().unwrap();
+            let frame = CallFrame::new(prototype, 0, None, vm.allocation_ledger()).unwrap();
+            vm.set_gc_debt_threshold(1);
+            (vm, frame)
+        };
+        let (mut probe, mut probe_frame) = prepare();
+        let guest = probe_frame.named_vararg.unwrap();
+        let raw = if guest == Register(1) {
+            Register(2)
+        } else {
+            Register(1)
+        };
+        assert!(probe_frame.index(raw).is_ok());
+        let values = [Value::Integer(1), Value::Integer(2)];
+        let first_ordinal = probe.allocation_trace().next_ordinal;
+        probe_frame
+            .initialize_variadic_inputs(
+                &mut probe,
+                &values,
+                Some(OfficialFrameRegisters {
+                    raw: Some(raw),
+                    guest_named: None,
+                    active: None,
+                }),
+            )
+            .unwrap();
+        let second_ordinal = probe.allocation_trace().next_ordinal;
+        assert!(second_ordinal > first_ordinal);
+
+        let (mut vm, mut frame) = prepare();
+        assert_eq!(vm.allocation_trace().next_ordinal, first_ordinal);
+        let before_gc = vm.gc_trace();
+        let before_ledger = vm.ledger_snapshot();
+        let before_roots = vm.roots().total_count();
+        let official = OfficialFrameRegisters {
+            raw: Some(raw),
+            guest_named: Some(guest),
+            active: None,
+        };
+        vm.inject_allocation_failure_at(second_ordinal);
+        let error = frame
+            .initialize_variadic_inputs(&mut vm, &values, Some(official))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error.kind,
+            RuntimeErrorKind::Heap(VmError::InjectedAllocation(attempt))
+                if attempt.ordinal == second_ordinal
+                    && attempt.point == Some(FailPoint::TableArrayReserve)
+        ));
+        assert_eq!(
+            vm.allocation_trace().last_failure.unwrap().attempt.ordinal,
+            second_ordinal
+        );
+        assert_eq!(frame.read(raw), Ok(Value::Nil));
+        assert_eq!(frame.read(guest), Ok(Value::Nil));
+        assert_eq!(vm.roots().total_count(), before_roots);
+        assert_eq!(vm.ledger_snapshot(), before_ledger);
+        assert!(vm.automatic_gc_running());
+        assert_eq!(vm.gc_trace(), before_gc);
+
+        frame
+            .initialize_variadic_inputs(&mut vm, &values, Some(official))
+            .unwrap();
+        let Value::Object(raw_table) = frame.read(raw).unwrap() else {
+            panic!("原始 vararg 須發布 table")
+        };
+        let Value::Object(guest_table) = frame.read(guest).unwrap() else {
+            panic!("具名 vararg 須發布 table")
+        };
+        assert_ne!(raw_table, guest_table);
+        assert!(vm.automatic_gc_running());
+        assert_eq!(vm.gc_trace().transition_count, before_gc.transition_count);
+        assert!(vm.gc_trace().debt_bytes > before_gc.debt_bytes);
+        vm.allocate(Value::Nil).unwrap();
+        assert!(vm.gc_trace().transition_count > before_gc.transition_count);
+        assert_eq!(vm.object_kind(raw_table), Ok(crate::ObjectKind::Table));
+        assert_eq!(vm.object_kind(guest_table), Ok(crate::ObjectKind::Table));
+        frame.clear_roots(&mut vm).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.roots().total_count(), 0);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+
+    #[test]
     fn p09_4_named_vararg_enter_call_failure_keeps_caller() {
         use rivetlua_compiler::{
             CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
@@ -24106,6 +28998,197 @@ mod tests {
             }],
         };
         verify_module(candidate, LuaProfile::Lua55, &VerifyLimits::default()).unwrap()
+    }
+
+    #[test]
+    fn capi_load_configuration_rejects_parked_execution_without_changing_limits() {
+        let mut vm = Vm::new().unwrap();
+        let original = crate::LoadLimits::default();
+        let raised = crate::LoadLimits {
+            max_work_units: 2_000_000,
+            ..original
+        };
+        let id = vm.id();
+        vm.parked_executions.push(ParkedExecution {
+            token: ExternalToken {
+                vm: id,
+                generation: 1,
+                depth: 1,
+            },
+            debug_revision: 0,
+            core: None,
+            prepared_reset_target: None,
+        });
+        assert_eq!(
+            vm.capi_configure_load_limits(raised),
+            Err(crate::VmError::HostConfigurationBusy)
+        );
+        assert_eq!(vm.capi_load_limits(), original);
+        vm.parked_executions.pop();
+    }
+
+    #[test]
+    fn capi_loaded_chunk_retains_module_capacity_until_gc_and_rejects_wrong_profile() {
+        let verified = module(
+            vec![Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            }],
+            vec![BytecodeConstant::String(b"retained module bytes".to_vec())],
+        );
+        let retained = module_allocation_bytes(&verified).unwrap();
+        assert!(retained > 0);
+
+        let mut wrong_profile = Vm::new_with_profile(LuaProfile::Lua54).unwrap();
+        let before_wrong = wrong_profile.ledger_snapshot();
+        assert!(matches!(
+            wrong_profile.capi_loaded_chunk_closure(verified.clone(), Value::Nil),
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::UnsupportedFormat,
+                ..
+            })
+        ));
+        assert_eq!(wrong_profile.ledger_snapshot(), before_wrong);
+
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        let before = vm.ledger_snapshot();
+        let ordinal = vm.allocation_trace().next_ordinal;
+        vm.inject_allocation_failure_at(ordinal);
+        assert!(
+            vm.capi_loaded_chunk_closure(verified.clone(), Value::Nil)
+                .is_err()
+        );
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        assert_eq!(vm.roots().total_count(), 0);
+
+        let (closure, root) = vm.capi_loaded_chunk_closure(verified, Value::Nil).unwrap();
+        assert_eq!(vm.object_kind(closure).unwrap(), ObjectKind::Closure);
+        let held = vm.ledger_snapshot();
+        assert!(
+            held.host_allocation_bytes >= before.host_allocation_bytes + retained,
+            "retained={retained} before={before:?} held={held:?}"
+        );
+        assert_eq!(held.reserved, 0);
+        vm.remove_root(root).unwrap();
+        vm.collect().unwrap();
+        let released = vm.ledger_snapshot();
+        assert!(
+            held.host_allocation_bytes >= released.host_allocation_bytes + retained,
+            "retained={retained} held={held:?} released={released:?}"
+        );
+        assert_eq!(released.reserved, 0);
+        assert_eq!(vm.roots().total_count(), 0);
+    }
+
+    #[test]
+    fn capi_charged_chunk_transfers_exact_retained_charge_and_refunds_on_failure() {
+        let verified = module(
+            vec![Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            }],
+            vec![BytecodeConstant::String(b"charged module bytes".to_vec())],
+        );
+        let retained = module_allocation_bytes(&verified).unwrap();
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        let before = vm.ledger_snapshot();
+
+        let make_charges = |vm: &Vm, bytes| {
+            let mut charges = AllocationCharges::new();
+            charges.try_reserve(1).unwrap();
+            charges.push_prepared(
+                vm.allocation_ledger()
+                    .reserve(bytes)
+                    .unwrap()
+                    .commit_charge()
+                    .unwrap(),
+            );
+            charges
+        };
+        assert!(matches!(
+            vm.capi_loaded_chunk_closure_charged(
+                verified.clone(),
+                Value::Nil,
+                make_charges(&vm, retained - 1),
+            ),
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::HostLoadBudget,
+                ..
+            })
+        ));
+        assert_eq!(vm.ledger_snapshot(), before);
+
+        let charges = make_charges(&vm, retained + 32);
+        let ordinal = vm.allocation_trace().next_ordinal;
+        vm.inject_allocation_failure_at(ordinal);
+        assert!(
+            vm.capi_loaded_chunk_closure_charged(verified.clone(), Value::Nil, charges)
+                .is_err()
+        );
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        assert_eq!(vm.roots().total_count(), 0);
+
+        let charges = make_charges(&vm, retained + 32);
+        let (closure, root) = vm
+            .capi_loaded_chunk_closure_charged(verified, Value::Nil, charges)
+            .unwrap();
+        assert_eq!(vm.object_kind(closure), Ok(ObjectKind::Closure));
+        assert!(
+            vm.ledger_snapshot().host_allocation_bytes >= before.host_allocation_bytes + retained
+        );
+        vm.remove_root(root).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        assert_eq!(
+            vm.ledger_snapshot().host_allocation_bytes,
+            before.host_allocation_bytes
+        );
+    }
+
+    #[test]
+    fn capi_dump_bytes_survive_vm_borrow_and_refund_after_writer_scope() {
+        use rivetlua_compiler::{
+            CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+        };
+
+        for (profile, language) in [
+            (LuaProfile::Lua54, LanguageProfile::Lua54),
+            (LuaProfile::Lua55, LanguageProfile::Lua55),
+        ] {
+            let source = b"return function() return 9 end";
+            let limits = CompileLimits::default();
+            let tokens = lex(source, language, &limits).unwrap();
+            let parsed = parse(&tokens, language, &limits).unwrap();
+            let resolved = resolve(&parsed, &tokens, language, &limits).unwrap();
+            let ir = lower(&resolved, &IrLimits::default()).unwrap();
+            let verified = emit(&ir, &VerifyLimits::default())
+                .unwrap()
+                .verified()
+                .clone();
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let mut execution = vm.load(verified).unwrap();
+            let RunOutcome::Returned(values) = execution.run().unwrap() else {
+                panic!("chunk 須返回 Lua closure")
+            };
+            let [Value::Object(closure)] = values.as_slice() else {
+                panic!("chunk 須返回單一 Lua closure")
+            };
+            let closure = *closure;
+            drop(execution);
+            let before = vm.ledger_snapshot();
+            let dumped = vm.capi_dump_closure(closure, true).unwrap();
+            assert!(dumped.as_bytes().starts_with(b"\x1bLua"));
+            assert_eq!(
+                dumped.as_bytes()[4],
+                match profile {
+                    LuaProfile::Lua54 => 0x54,
+                    LuaProfile::Lua55 => 0x55,
+                }
+            );
+            assert!(vm.ledger_snapshot().host_allocation_bytes > before.host_allocation_bytes);
+            drop(dumped);
+            assert_eq!(vm.ledger_snapshot(), before);
+        }
     }
 
     #[test]
@@ -25178,7 +30261,7 @@ mod tests {
         };
         let (mut dry, dry_seed_root) = setup();
         let start = dry.allocation_trace().next_ordinal;
-        let charge = ModuleCharge::new(&dry, 0);
+        let charge = ModuleCharge::empty();
         let (_, root) = dry
             .loaded_chunk_closure(verified.clone(), Value::Nil, charge)
             .unwrap();
@@ -25192,7 +30275,7 @@ mod tests {
             let (mut vm, seed_root) = setup();
             assert_eq!(vm.allocation_trace().next_ordinal, start);
             vm.inject_allocation_failure_at(start + offset);
-            let charge = ModuleCharge::new(&vm, 0);
+            let charge = ModuleCharge::empty();
             let result = vm.loaded_chunk_closure(verified.clone(), Value::Nil, charge);
             if let Ok((_, root)) = result {
                 vm.remove_root(root).unwrap();
@@ -25210,7 +30293,7 @@ mod tests {
                 "offset={offset}"
             );
             assert_eq!(vm.ledger_snapshot().reserved, 0, "offset={offset}");
-            let charge = ModuleCharge::new(&vm, 0);
+            let charge = ModuleCharge::empty();
             let (_, root) = vm
                 .loaded_chunk_closure(verified.clone(), Value::Nil, charge)
                 .unwrap();
@@ -25250,7 +30333,7 @@ mod tests {
         let (mut dry, dry_seed_root) = setup();
         let start = dry.allocation_trace().next_ordinal;
         let (_, closure_root) = dry
-            .loaded_chunk_closure(verified.clone(), Value::Nil, ModuleCharge::new(&dry, 0))
+            .loaded_chunk_closure(verified.clone(), Value::Nil, ModuleCharge::empty())
             .unwrap();
         dry.remove_root(closure_root).unwrap();
         dry.remove_root(dry_seed_root).unwrap();
@@ -25262,7 +30345,7 @@ mod tests {
             assert_eq!(vm.allocation_trace().next_ordinal, start);
             vm.inject_allocation_failure_at(start + offset);
             let result =
-                vm.loaded_chunk_closure(verified.clone(), Value::Nil, ModuleCharge::new(&vm, 0));
+                vm.loaded_chunk_closure(verified.clone(), Value::Nil, ModuleCharge::empty());
             assert!(result.is_err(), "offset={offset}");
             assert_eq!(vm.roots().total_count(), 1, "offset={offset}");
             vm.collect()
@@ -25274,7 +30357,7 @@ mod tests {
             );
             assert_eq!(vm.ledger_snapshot().reserved, 0, "offset={offset}");
             let (_, closure_root) = vm
-                .loaded_chunk_closure(verified.clone(), Value::Nil, ModuleCharge::new(&vm, 0))
+                .loaded_chunk_closure(verified.clone(), Value::Nil, ModuleCharge::empty())
                 .unwrap();
             vm.remove_root(closure_root).unwrap();
             vm.remove_root(seed_root).unwrap();

@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 static NEXT_OPAQUE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_VM_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_RUNTIME_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_HOST_FUNCTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 每個 VM 建立時取得的唯一身分。全域流水號只用於區分 VM，不能單獨識別物件。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -18,6 +19,29 @@ impl VmId {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .ok()?;
         NonZeroU64::new(id).map(Self)
+    }
+}
+
+/// 宿主 C 函式在單一 VM 內的不可解參照身分；指標只留在 C API registry。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct HostFunctionId {
+    vm: VmId,
+    token: NonZeroU64,
+}
+
+impl HostFunctionId {
+    pub fn new_unique(vm: VmId) -> Option<Self> {
+        let token = NEXT_HOST_FUNCTION_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .ok()?;
+        Some(Self {
+            vm,
+            token: NonZeroU64::new(token)?,
+        })
+    }
+
+    pub const fn vm(self) -> VmId {
+        self.vm
     }
 }
 
@@ -122,6 +146,15 @@ impl ObjectRef {
             ObjectRefKind::Heap { id, .. } => Some(id),
         }
     }
+
+    /// 僅供 runtime 在驗證 VM／slot／世代及完整參照後產生不可解參照的資訊指標。
+    #[doc(hidden)]
+    pub const fn runtime_token(self) -> Option<NonZeroU64> {
+        match self.0 {
+            ObjectRefKind::Heap { token, .. } => token,
+            ObjectRefKind::Opaque(_) => None,
+        }
+    }
 }
 
 /// P01 唯一的值分類。
@@ -131,6 +164,8 @@ pub enum Value {
     Boolean(bool),
     Integer(i64),
     Float(f64),
+    LightUserdata(usize),
+    CFunction(HostFunctionId),
     Object(ObjectRef),
 }
 
@@ -141,6 +176,8 @@ pub enum ValueKind {
     Boolean,
     Integer,
     Float,
+    LightUserdata,
+    CFunction,
     Object,
 }
 
@@ -152,6 +189,8 @@ impl Value {
             Self::Boolean(_) => ValueKind::Boolean,
             Self::Integer(_) => ValueKind::Integer,
             Self::Float(_) => ValueKind::Float,
+            Self::LightUserdata(_) => ValueKind::LightUserdata,
+            Self::CFunction(_) => ValueKind::CFunction,
             Self::Object(_) => ValueKind::Object,
         }
     }
@@ -174,7 +213,39 @@ pub const fn select_or(left: Value, right: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectRef, Value, ValueKind, select_and, select_or};
+    use super::{HostFunctionId, ObjectRef, Value, ValueKind, VmId, select_and, select_or};
+
+    #[test]
+    fn host_function_capability_is_vm_local_non_collectable_value() {
+        let first_vm = VmId::new_unique().unwrap();
+        let second_vm = VmId::new_unique().unwrap();
+        let first = HostFunctionId::new_unique(first_vm).unwrap();
+        let second = HostFunctionId::new_unique(first_vm).unwrap();
+        let foreign = HostFunctionId::new_unique(second_vm).unwrap();
+        assert_eq!(first.vm(), first_vm);
+        assert_ne!(first, second);
+        assert_ne!(first, foreign);
+        assert_eq!(Value::CFunction(first).kind(), ValueKind::CFunction);
+        assert!(Value::CFunction(first).is_truthy());
+        assert_eq!(Value::CFunction(first), Value::CFunction(first));
+        assert_ne!(Value::CFunction(first), Value::CFunction(second));
+    }
+
+    #[test]
+    fn runtime_token_only_on_runtime_ref_and_never_reused() {
+        let id = super::ObjectId::new(
+            super::VmId::new_unique().unwrap(),
+            super::SlotId::new(0),
+            super::Generation::new(0),
+        );
+        assert_eq!(ObjectRef::new_opaque().unwrap().runtime_token(), None);
+        assert_eq!(ObjectRef::from_id(id).runtime_token(), None);
+        let first = ObjectRef::new_runtime(id).unwrap().runtime_token().unwrap();
+        let next = ObjectRef::new_runtime(id).unwrap().runtime_token().unwrap();
+        assert_ne!(first, next);
+        assert_ne!(first.get(), 0);
+        assert_ne!(next.get(), 0);
+    }
 
     #[test]
     fn every_value_has_an_unambiguous_kind() {
@@ -216,5 +287,17 @@ mod tests {
         assert_eq!(select_or(object, Value::Integer(8)), object);
         assert_eq!(select_and(Value::Nil, Value::Integer(7)), Value::Nil);
         assert_eq!(select_or(Value::Nil, Value::Integer(8)), Value::Integer(8));
+    }
+
+    #[test]
+    fn lightuserdata_address_is_scalar_truthy_and_distinct() {
+        let null = Value::LightUserdata(0);
+        let first = Value::LightUserdata(0x1234);
+        assert_eq!(null.kind(), ValueKind::LightUserdata);
+        assert!(null.is_truthy());
+        assert_eq!(first, Value::LightUserdata(0x1234));
+        assert_ne!(first, Value::LightUserdata(0x1235));
+        assert_ne!(first, Value::Integer(0x1234));
+        assert_eq!(select_or(null, Value::Integer(1)), null);
     }
 }

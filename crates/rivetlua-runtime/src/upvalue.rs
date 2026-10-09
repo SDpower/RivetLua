@@ -19,6 +19,12 @@ pub struct Upvalue {
 }
 
 impl Upvalue {
+    pub(crate) const fn closed(value: Value) -> Self {
+        Self {
+            state: UpvalueState::Closed(value),
+            identity: None,
+        }
+    }
     pub(crate) const fn open(thread: VmId, coroutine: Option<ObjectRef>, slot: usize) -> Self {
         Self {
             state: UpvalueState::Open {

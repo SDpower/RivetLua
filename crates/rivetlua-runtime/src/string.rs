@@ -2,11 +2,53 @@
 
 use crate::VmError;
 use crate::alloc::{AllocationLedger, FailPoint, Reservation, reserve_vec};
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+
+/// 外部不可變 byte string 的安全擁有者。bytes 在 owner 存活期間須保持不變；
+/// 最後一個 owner 消失時由實作者釋放資源。
+pub trait ExternalStringStorage {
+    fn bytes(&self) -> &[u8];
+
+    /// 可選的原位 NUL 結尾視圖；未提供時 C API 會建立自有 NUL 結尾 view。
+    #[doc(hidden)]
+    fn nul_terminated_bytes(&self) -> Option<&[u8]> {
+        None
+    }
+}
+
+enum StringBacking {
+    Owned(Vec<u8>),
+    External(Rc<dyn ExternalStringStorage>),
+}
 
 /// Heap 內的不可變任意 bytes；相等與 hash 均涵蓋完整內容。
-#[derive(Debug, Eq, PartialEq, Hash)]
 pub struct ByteString {
-    bytes: Vec<u8>,
+    backing: StringBacking,
+}
+
+impl fmt::Debug for ByteString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ByteString")
+            .field(&self.as_bytes())
+            .finish()
+    }
+}
+
+impl PartialEq for ByteString {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for ByteString {}
+
+impl Hash for ByteString {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
 }
 
 impl ByteString {
@@ -22,19 +64,67 @@ impl ByteString {
             FailPoint::StringBytesReserve,
         )?;
         stored.extend_from_slice(bytes);
-        Ok((Self { bytes: stored }, ticket))
+        Ok((
+            Self {
+                backing: StringBacking::Owned(stored),
+            },
+            ticket,
+        ))
+    }
+
+    pub(crate) fn from_external(owner: Rc<dyn ExternalStringStorage>) -> Self {
+        Self {
+            backing: StringBacking::External(owner),
+        }
+    }
+
+    pub(crate) fn shared_external(&self) -> Option<Self> {
+        match &self.backing {
+            StringBacking::External(owner) => Some(Self::from_external(Rc::clone(owner))),
+            StringBacking::Owned(_) => None,
+        }
+    }
+
+    /// 宿主借讀 external 原指標；呼叫端必須以此字串物件的 root 保活它。
+    #[doc(hidden)]
+    pub fn external_pointer(&self) -> Option<(*const u8, usize)> {
+        match &self.backing {
+            StringBacking::External(owner) => {
+                let bytes = owner.bytes();
+                let terminated = owner.nul_terminated_bytes()?;
+                let required = bytes.len().checked_add(1)?;
+                if terminated.len() != required
+                    || terminated.as_ptr() != bytes.as_ptr()
+                    || terminated[bytes.len()] != 0
+                {
+                    return None;
+                }
+                Some((bytes.as_ptr(), bytes.len()))
+            }
+            StringBacking::Owned(_) => None,
+        }
+    }
+
+    pub(crate) fn managed_payload_len(&self) -> usize {
+        match &self.backing {
+            StringBacking::Owned(bytes) => bytes.len(),
+            StringBacking::External(_) => 0,
+        }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        match &self.backing {
+            StringBacking::Owned(bytes) => bytes,
+            StringBacking::External(owner) => owner.bytes(),
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.as_bytes().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.as_bytes().is_empty()
     }
 }
 

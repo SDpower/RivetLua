@@ -2,7 +2,7 @@
 
 [English](IMPLEMENTATION_STATUS.md) | 繁體中文 | [한국어](IMPLEMENTATION_STATUS.ko.md) | [日本語](IMPLEMENTATION_STATUS.ja.md)
 
-更新日期：2026-10-08。本頁列出專案中已實作與待實作的功能。勾選代表所述範圍已通過測試；未勾選代表尚未實作。規格文件或測試資料存在，不代表對應的執行功能已完成。
+更新日期：2026-10-10。本頁列出專案中已實作與待實作的功能。勾選代表所述範圍已通過測試；未勾選代表尚未完成階段驗收。規格文件或測試資料存在，不代表對應的執行功能已完成。
 
 ## 已實作並驗收
 
@@ -34,7 +34,7 @@
 
 - [ ] 完成 P15 官方 Lua Basic 相容性驗收；目前只完成官方測試執行與報告基礎設施，兩個 profile 的 Basic 相容性皆為 `FAIL`。
 - [ ] 通過官方 Lua Basic 測試套件相容性驗收。
-- [ ] 實作正式 C API／ABI 與原生模組支援。
+- [ ] 完成正式 C API／ABI 與原生模組的 P16 階段驗收；P16-1～P16-5 已實作，雙 profile collector 有封存的正式證據，但修補後的完整 workspace／doctests 與 `gate P16` 尚未執行。
 - [ ] 通過官方 Lua Complete 測試套件相容性驗收。
 - [ ] 驗證 LuaRocks、Moonrocks、LuaUnit 與 Busted 的使用流程。
 - [ ] 完成 Lua 5.5.1 與 5.4.9 的完整相容配置與回歸檢查。
@@ -49,6 +49,28 @@
 P14 已於提交 `048c0d942a2fc1a343b6c2d00c4eca88882eac60` 完成階段驗收。P15 採核准的 `scope=oracle-infrastructure`：固定 Lua 5.5.1／5.4.9 官方來源與測試包、雙 profile manifest、隔離測試樹、來源與 binary 雜湊、嚴格 child 啟動參數、原始 log、可解析報告，以及以前置 P00～P14 報告與雙 profile 觀察為條件的 P15 gate。P15 gate 通過只表示基礎設施及觀察有效，不表示官方 Basic 語意相容。
 
 正式 Basic 觀察中，`lua55-i64f64` 與 `lua54-i64f64` 的 runner 皆為 `PASS`，但官方 child 皆以非零狀態結束，`final OK !!!` 未出現；兩份報告的 `basic_compatibility_status` 皆為 `FAIL`。因此 BASIC-001／BASIC-002 與完整 Lua 相容性仍未驗收。完整 `_U` skip trace／coverage 與 production arithmetic injection 亦未納入本階段；後續須完成相容性修復與重新驗證。本節的基礎設施與 Basic 狀態以 P15 isolated stage 的 fresh 報告為最終證據；早期 P14 前置紀錄僅代表各自記載的程式狀態。
+
+## P16 C API／ABI 實作與證據狀態（2026-10-10）
+
+P16-1～P16-5 的核准實作已完成；**P16 階段驗收尚未完成**。本次文件整理前，修補後來源快照的摘要為 `4fb33798ee0b5aa25382f22e1b26b069ce851a19d6a1bc171531c6c72c967c87`（700 個路徑）；文件改動不回寫舊報告的來源摘要；本次未執行新的驗收。主代理逐檔核對：它與下述正式 collector 使用的 `2b27eda68e9113ad2004431e6561364792b8ab24edb5787d9082ca34cc4665f9` 只差一處 runtime 測試 fixture 修補；產品、header、P16 工具與 manifest 均未變。舊報告保留原來源摘要，不當成目前來源已完成的新 gate 報告。
+
+| 步驟 | 已實作範圍 |
+| --- | --- |
+| P16-1 | 固定 Lua 5.5／5.4 公開 header 與 ABI manifest；951 列中 538 個 `HEADER_ONLY`、413 個 `IMPLEMENTED`、0 個 `NOT_IMPLEMENTED`，逐列有型別化證據。 |
+| P16-2 | C API stack、reference、userdata、coroutine 與狀態生命週期，含 VM ownership、GC root 與配置帳本。 |
+| P16-3 | callback、錯誤與 C trampoline；`longjmp` 僅在合法 C checkpoint 發生，不越過持有資源的 Rust frame，並拒絕不允許的 panic／foreign unwind。 |
+| P16-4 | 經宿主授權的可信 native 載入，以及以版本化協定隔離未受信任套件的 worker。 |
+| P16-5 | 配置失敗與 load／dump 的受控驗證、有限資源預算、C module／SDK 實際載入及 C API／ABI 驗收工具。 |
+
+封存的 `2b27` 正式 `p16-acceptance` 報告在 macOS arm64 兩個 profile 各有 **15/15 cases PASS**；Lua 5.5 為 159/159 typed proofs、476/476 manifest rows，Lua 5.4 為 151/151 proofs、475/475 rows，兩版 `unmapped=0`。951 列皆有實際逐列證據，不只是映射。報告 SHA 分別為 `c67844e918a99e83d65499c094c96af923a09fef55d617aba2543d6d19c35930` 與 `1258316e3cdf683c8fa27a2c86071dbb7e6c52e0d3d6ba7f2e46c351715b20f6`；原始報告、library、proof、SDK 收據與原路徑對照封存於外接 `b4-history-2b27-dfl0nva1`，其 `archive-map.json` SHA 為 `cc67ddd553812d72e141109d4389c361a363e825c8b6bf9f318f1351b7ed33af`。
+
+同一 `2b27` 來源的 CAPI 測試，Lua 5.5 `abi`／`callback`／`worker` 各通過 10／29／7 項，完整 CAPI 255 passed、0 failed、1 ignored；Lua 5.4 各通過 10／28／7 項，完整 CAPI 246 passed、0 failed、1 ignored。被忽略的是 SDK module 測試，collector 已另以 `--ignored` 在兩版各實際通過 1/1，不能把完整 CAPI 的 ignored 當作通過。NEG003 與 NEG006 具名測試各 1/1；C STRESS 兩版以 seed `381747182` 執行 1024 輪，128 輪 warmup 後 896 個樣本的 active tokens 均穩定為 52，live bytes 分別穩定為 18229／18189；關閉後 tokens／bytes 為 0，兩版 issued／refunded 均為 218212。NEG006 本機 staticlib 稽核在 Lua 5.5 的 997 個、Lua 5.4 的 994 個 member 中各識別唯一 allocator shim，其餘 996／993 個與來源 archive 位元組相符。
+
+NEG006 在兩版各有 30 個已綁來源 SHA 的 LLVM bitcode member，受本機 `nm` 限制而無法解碼符號；收據明列限制，不宣稱已檢查這些符號。Linux 僅有 build-script mock 正負測試，尚無實機 staticlib 稽核。P15 官方 Basic 兩版的基礎設施觀察有效，但語意相容性仍為 `FAIL`；完整 Lua 相容性未獲證明。
+
+`2b27` 的完整 workspace 命令已產生 139 個 target 摘要：1197 passed、1 failed、48 ignored；唯一失敗是 `capi_temporary_byte_key` 的舊 ordinal 預期。現行 `4fb` fixture 已改為短 key 7 個／長 key 9 個失敗 ordinal，保留 named `TableKeyReserve`、rollback、root／GC 與同 VM retry 驗證；修補後該具名案例 1/1、整個 target 5/5 通過。**修補後完整 workspace、doctests 與 `gate P16` 均為 `NOT_RUN`**，不以定點測試或舊來源 collector 代替階段驗收；P16 尚未 push 或取得 CI 驗證。先前 `4fb` 的 P00～P06 gate PASS 僅作已停止流程的歷史紀錄，不列為本次 P16 文件整理的新增門檻。
+
+現有證據採共用外接 `CARGO_TARGET_DIR`、其下絕對 `TMPDIR` 與同 parent 的 `RIVETLUA_P16_EVIDENCE_DIR`；worker 測試使用從當輪 Cargo JSON 唯一 artifact 複製、驗證 SHA 且唯讀可執行的 profile 專屬快照，`RIVETLUA_P16_WORKER_BIN` 不指向可覆寫的 `target/debug` alias。預設 workspace 為 Lua 5.5 快照；Lua 5.4 CAPI 使用獨立快照。此次依使用者指示僅整理既有證據供提交，沒有重啟舊階段驗證。
 
 ## 重新執行驗證
 

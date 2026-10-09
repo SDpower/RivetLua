@@ -239,6 +239,13 @@ fn observed(root: &Path, profile: &str, current_digest: &str) -> Result<String, 
     Ok(compatibility.to_owned())
 }
 
+pub(super) fn validate_existing(root: &Path, current_digest: &str) -> Result<[String; 2], String> {
+    Ok([
+        observed(root, PROFILES[0], current_digest)?,
+        observed(root, PROFILES[1], current_digest)?,
+    ])
+}
+
 fn report_path(root: &Path) -> PathBuf {
     root.join("target/rivetlua-reports/gate-P15.json")
 }

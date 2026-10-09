@@ -1,0 +1,28 @@
+[package]
+name = "rivetlua-capi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RivetLua 固定 C SDK ABI 身分與清單。"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "rivetlua-native-worker"
+path = "src/bin/rivetlua-native-worker.rs"
+
+[features]
+default = ["lua55"]
+lua55 = []
+lua54 = []
+
+[dependencies]
+rivetlua-core = { path = "../rivetlua-core" }
+rivetlua-compiler = { path = "../rivetlua-compiler" }
+rivetlua-runtime = { path = "../rivetlua-runtime" }
+
+[build-dependencies]
+cc = "1"

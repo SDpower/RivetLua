@@ -5,7 +5,6 @@ use std::rc::Rc;
 
 use rivetlua_core::{ObjectRef, Register, ResultMode, Value};
 
-use crate::alloc::AllocationLedger;
 use crate::call::PendingCloseSnapshot;
 use crate::stdlib::basic::BasicBuiltin;
 use crate::stdlib::debug::DebugBuiltin;
@@ -65,14 +64,7 @@ pub struct LuaError {
 
 struct LuaErrorRoot {
     _handle: HostHandle<Value>,
-    ledger: AllocationLedger,
-    charge: usize,
-}
-
-impl Drop for LuaErrorRoot {
-    fn drop(&mut self) {
-        self.ledger.refund_on_drop(self.charge);
-    }
+    _charge: crate::alloc::AllocationCharge,
 }
 
 impl LuaError {
@@ -91,11 +83,10 @@ impl LuaError {
                 .and_then(|header| header.checked_add(size_of::<LuaErrorRoot>()))
                 .ok_or(VmError::ArithmeticOverflow)?;
             let ticket = ledger.reserve(charge)?;
-            ticket.commit()?;
+            let charge = ticket.commit_charge()?;
             Some(Rc::new(LuaErrorRoot {
                 _handle: handle,
-                ledger,
-                charge,
+                _charge: charge,
             }))
         } else {
             None

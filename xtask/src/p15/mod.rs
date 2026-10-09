@@ -4,12 +4,18 @@ mod parser;
 mod result;
 mod runner;
 
+use std::path::Path;
+
 pub(super) fn official_tests(args: &[String]) -> Result<(), String> {
     runner::official_tests(args)
 }
 
 pub(super) fn gate() -> Result<(), String> {
     gate::gate()
+}
+
+pub(super) fn validate_existing(root: &Path, digest: &str) -> Result<[String; 2], String> {
+    gate::validate_existing(root, digest)
 }
 
 #[cfg(test)]
