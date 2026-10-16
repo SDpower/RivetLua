@@ -14,7 +14,7 @@ use crate::{
 };
 use rivetlua_core::{
     BinaryOperation, ConstId, EnvironmentSource, FrameLayout, Instruction, InstructionOffset,
-    IrLimits, LuaProfile, Number, ProtoId, Register, ResultMode, UnaryOperation, UpvalueId,
+    IrLimits, Number, ProtoId, Register, ResultMode, UnaryOperation, UpvalueId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,10 +36,7 @@ impl core::fmt::Display for IrError {
 impl std::error::Error for IrError {}
 
 pub fn lower(module: &ResolvedModule, limits: &IrLimits) -> Result<IrModule, IrError> {
-    let profile = match module.profile {
-        LanguageProfile::Lua55 => LuaProfile::Lua55,
-        LanguageProfile::Lua54 => LuaProfile::Lua54,
-    };
+    let profile = module.profile;
     let mut bodies = Vec::new();
     collect_block_bodies(&module.root, &mut bodies);
     let mut functions = module.functions.clone();

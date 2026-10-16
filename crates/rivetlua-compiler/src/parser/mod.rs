@@ -866,7 +866,7 @@ impl<'a> Parser<'a> {
             if self.take_symbol(Symbol::Vararg) {
                 let span = self.previous().span;
                 let table_name = if self.current().kind == TokenKind::Name {
-                    if self.profile != LanguageProfile::Lua55 {
+                    if !self.profile.rules().named_vararg {
                         return Err(self.error("具名 vararg table 僅支援 lua55"));
                     }
                     let t = self.current().clone();

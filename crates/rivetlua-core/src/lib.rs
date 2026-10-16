@@ -3,9 +3,11 @@
 #![forbid(unsafe_code)]
 
 pub mod bytecode;
+mod compatibility;
 pub mod error;
 pub mod limits;
 pub mod number;
+pub mod profile;
 pub mod value;
 
 pub use bytecode::input::{
@@ -50,11 +52,13 @@ pub use bytecode::{
     Register, RegisterEffects, ResultMode, UnaryOperation, UpvalueId, VerifiedModule, VerifyLimits,
     decode_module, encode_module, verify_module,
 };
+pub use compatibility::{COMPATIBILITY_VERSION, CompatibilityEntry, compatibility_entries};
 pub use error::{CoreError, CoreErrorKind, Operation};
 pub use number::{
     Number, add, bit_and, bit_not, bit_or, bit_xor, compare, divide, equal, floor_divide, modulo,
     multiply, negate, number_from_value, power, shift_left, shift_right, subtract,
 };
+pub use profile::ProfileRules;
 pub use value::{
     Generation, HostFunctionId, ObjectId, ObjectRef, SlotId, Value, ValueKind, VmId, select_and,
     select_or,

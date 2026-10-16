@@ -1,0 +1,10 @@
+area,lua55_rule,lua54_rule,source,case_id,status
+keywords,global 為 Lua 5.5 關鍵字,global 為 Lua 5.4 一般識別字,https://www.lua.org/source/5.5/llex.c.html|https://www.lua.org/source/5.4/llex.c.html,PROF-001-KEYWORD-GLOBAL,implemented
+declarations,Lua 5.5 支援 global 全域宣告語句,Lua 5.4 沒有 global 全域宣告語句且 global 是一般識別字,https://www.lua.org/source/5.5/lparser.c.html|https://www.lua.org/source/5.4/lparser.c.html,PROF-002-DECL-GLOBAL,implemented
+vararg,參數列表允許 ...Name 命名可變參數,參數列表不支援命名可變參數,https://www.lua.org/source/5.5/lparser.c.html|https://www.lua.org/source/5.4/lparser.c.html,PROF-002-VARARG-NAMED,implemented
+loop,數值 for 控制變數與泛型 for 第一個控制變數唯讀；泛型 for 後續控制變數可寫,數值與泛型 for 控制變數皆為一般區域變數,https://www.lua.org/source/5.5/lparser.c.html|https://www.lua.org/source/5.4/lparser.c.html,PROF-002-LOOP-READONLY,implemented
+stdlib,提供 table.create,沒有 table.create,https://www.lua.org/source/5.5/ltablib.c.html|https://www.lua.org/source/5.4/ltablib.c.html,PROF-002-STDLIB-TABLECREATE,implemented
+c_api,宣告 luaL_openselectedlibs,沒有 luaL_openselectedlibs 宣告,https://www.lua.org/source/5.5/lualib.h.html|https://www.lua.org/source/5.4/lualib.h.html,PROF-002-CAPI-OPENSELECTEDLIBS,specified
+c_api,宣告 luaL_makeseed,沒有 luaL_makeseed 宣告,https://www.lua.org/source/5.5/lauxlib.h.html|https://www.lua.org/source/5.4/lauxlib.h.html,PROF-002-CAPI-MAKESEED,implemented
+chunk,原生 chunk header 版本須匹配 Lua 5.5,原生 chunk header 版本須匹配 Lua 5.4,https://www.lua.org/source/5.5/lundump.c.html|https://www.lua.org/source/5.4/lundump.c.html,PROF-006-CHUNK-PROFILE,implemented
+cli,顯示 Lua 5.5.1 release,顯示 Lua 5.4.9 release,https://www.lua.org/source/5.5/lua.h.html|https://www.lua.org/source/5.4/lua.h.html,PROF-006-CLI-PROFILE,implemented

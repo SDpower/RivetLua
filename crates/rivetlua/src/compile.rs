@@ -4,7 +4,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 use rivetlua_compiler::{
-    BudgetedCompileError, CompileBudgetSink, LanguageProfile, compile_with_budget,
+    BudgetedCompileError, CompileBudgetSink, compile_with_budget,
 };
 use rivetlua_core::{LuaProfile, VerifiedModule};
 use rivetlua_runtime::{
@@ -193,7 +193,7 @@ impl Engine {
         let verified = compile_with_budget(
             source,
             chunk_name,
-            language_profile(self.profile),
+            self.profile,
             &self.compile_limits,
             &self.ir_limits,
             &self.verify_limits,
@@ -279,7 +279,7 @@ impl HostLoadCompiler for Engine {
         match compile_with_budget(
             source,
             chunkname,
-            language_profile(profile),
+            profile,
             &self.compile_limits,
             &self.ir_limits,
             &self.verify_limits,
@@ -300,12 +300,5 @@ impl HostLoadCompiler for Engine {
                 | BudgetedCompileError::AdmissionUnderestimated,
             ) => Err(HostLoadError::new(HostLoadErrorKind::Budget, Vec::new())),
         }
-    }
-}
-
-pub(crate) const fn language_profile(profile: LuaProfile) -> LanguageProfile {
-    match profile {
-        LuaProfile::Lua54 => LanguageProfile::Lua54,
-        LuaProfile::Lua55 => LanguageProfile::Lua55,
     }
 }

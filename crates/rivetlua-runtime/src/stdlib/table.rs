@@ -12,6 +12,7 @@ use crate::{ObjectKind, RootId, RootKind, Vm, VmError};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TableBuiltin {
     Concat,
+    Create,
     Insert,
     Remove,
     Move,
@@ -460,6 +461,20 @@ pub(crate) fn integer_arg(args: &[Value], index: usize) -> Result<i64, RuntimeEr
         .ok_or_else(argument)
 }
 
+fn create_capacity(vm: &Vm, args: &[Value], index: usize) -> Result<usize, RuntimeError> {
+    let value = match args.get(index).copied() {
+        None | Some(Value::Nil) if index == 1 => return Ok(0),
+        Some(value) => value,
+        None => return Err(argument()),
+    };
+    let number = basic::number(vm, value, None)?;
+    let capacity = basic::lua_integer(number).ok_or_else(argument)?;
+    if !(0..=i64::from(i32::MAX)).contains(&capacity) {
+        return Err(argument());
+    }
+    usize::try_from(capacity).map_err(|_| VmError::ArithmeticOverflow.into())
+}
+
 pub(crate) fn optional_integer(
     args: &[Value],
     index: usize,
@@ -564,6 +579,11 @@ pub(crate) fn work_units(
     available: u64,
 ) -> Result<usize, RuntimeError> {
     let units = match kind {
+        TableBuiltin::Create => {
+            let array = create_capacity(vm, args, 0)?;
+            let hash = create_capacity(vm, args, 1)?;
+            array.saturating_add(hash).saturating_add(1)
+        }
         TableBuiltin::Pack => args.len().saturating_add(1),
         TableBuiltin::Unpack => {
             let table = table_arg(vm, args, 0)?;
@@ -657,6 +677,20 @@ pub(crate) fn execute(
     args: &[Value],
 ) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
     match kind {
+        TableBuiltin::Create => {
+            let array = create_capacity(vm, args, 0)?;
+            let hash = create_capacity(vm, args, 1)?;
+            let mut output = Vec::new();
+            let ticket = reserve_vec(
+                vm.allocation_ledger(),
+                &mut output,
+                1,
+                FailPoint::ReturnReserve,
+            )?;
+            let table = vm.allocate_table_with_capacity(array, hash)?;
+            output.push(Value::Object(table));
+            Ok((output, Some(ticket)))
+        }
         TableBuiltin::Pack => {
             let count = i64::try_from(args.len()).map_err(|_| VmError::ArithmeticOverflow)?;
             let table = vm.allocate_table_with_capacity(args.len(), 1)?;

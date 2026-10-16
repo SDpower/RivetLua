@@ -711,6 +711,7 @@ fn debug_official_call_name_metered<'a>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeErrorKind {
     UnsupportedFormat,
+    ProfileMismatch { vm: LuaProfile, module: LuaProfile },
     MissingEntryPoint,
     UnsupportedInstruction(Opcode),
     UnsupportedUnaryOperation(UnaryOperation),
@@ -939,6 +940,7 @@ impl RuntimeError {
     pub const fn new(kind: RuntimeErrorKind) -> Self {
         let diagnostic_id = match kind {
             RuntimeErrorKind::UnsupportedFormat => "E_VM_FORMAT",
+            RuntimeErrorKind::ProfileMismatch { .. } => "E_VM_PROFILE_MISMATCH",
             RuntimeErrorKind::MissingEntryPoint => "E_VM_ENTRY",
             RuntimeErrorKind::UnsupportedInstruction(_) => "E_VM_OPCODE_UNSUPPORTED",
             RuntimeErrorKind::UnsupportedUnaryOperation(_) => "E_VM_UNARY_UNSUPPORTED",
@@ -4580,10 +4582,13 @@ impl Vm {
         if module.format_version() != RVLU_V2 {
             return Err(RuntimeError::new(RuntimeErrorKind::UnsupportedFormat));
         }
-        let data = module.module();
-        if !matches!(module.profile(), LuaProfile::Lua54 | LuaProfile::Lua55) {
-            return Err(RuntimeError::new(RuntimeErrorKind::UnsupportedFormat));
+        if module.profile() != self.language_profile() {
+            return Err(RuntimeError::new(RuntimeErrorKind::ProfileMismatch {
+                vm: self.language_profile(),
+                module: module.profile(),
+            }));
         }
+        let data = module.module();
         let Some((_, entry_id)) = data
             .function_prototypes
             .iter()
@@ -10706,7 +10711,7 @@ impl Execution<'_> {
             }
             return result;
         }
-        if kind != TableBuiltin::Pack {
+        if !matches!(kind, TableBuiltin::Pack | TableBuiltin::Create) {
             let state = TableOpState::new(self.vm, kind, args)?;
             return self.advance_table_op(state, None, destination, mode, tail_return, next);
         }
@@ -10795,7 +10800,7 @@ impl Execution<'_> {
                         }
                         TableBuiltin::Insert | TableBuiltin::Remove => true,
                         TableBuiltin::Move => false,
-                        TableBuiltin::Pack | TableBuiltin::Sort => {
+                        TableBuiltin::Create | TableBuiltin::Pack | TableBuiltin::Sort => {
                             return Err(table_lib::argument());
                         }
                     };
@@ -10939,7 +10944,7 @@ impl Execution<'_> {
                             state.index = 0;
                             state.stage = S::MoveNext;
                         }
-                        TableBuiltin::Pack | TableBuiltin::Sort => {
+                        TableBuiltin::Create | TableBuiltin::Pack | TableBuiltin::Sort => {
                             return Err(table_lib::argument());
                         }
                     }

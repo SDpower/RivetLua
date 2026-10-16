@@ -6,11 +6,7 @@ mod scanner;
 use cursor::Cursor;
 
 /// 支援的 Lua 語言 profile。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LanguageProfile {
-    Lua55,
-    Lua54,
-}
+pub use rivetlua_core::LuaProfile as LanguageProfile;
 
 /// 不受信任編譯輸入的固定上限。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

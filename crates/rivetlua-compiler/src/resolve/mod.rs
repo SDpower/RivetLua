@@ -835,7 +835,7 @@ impl<'a> Resolver<'a> {
         declaration: &GlobalDeclaration,
         span: Span,
     ) -> Result<ResolvedStmt, Diagnostic> {
-        if self.profile != LanguageProfile::Lua55 {
+        if !self.profile.rules().global_declarations {
             return Err(self.resolve_error(span, "lua54 不支援 lua55 global declaration"));
         }
         match declaration {
@@ -928,7 +928,7 @@ impl<'a> Resolver<'a> {
             Expr::Name { name, span } => {
                 let resolution = match self.lookup(name, *span)? {
                     Some(ResolvedName::Global(binding))
-                        if self.profile == LanguageProfile::Lua55 =>
+                        if self.profile.rules().global_declarations =>
                     {
                         if let Some(env) = self.lexical_environment_shadow(*span)? {
                             Some(ResolvedName::EnvField {
@@ -1108,7 +1108,7 @@ impl<'a> Resolver<'a> {
             ResolvedName::Local(binding) => Some(*binding),
             ResolvedName::Upvalue(upvalue) => Some(self.upvalue_binding(*upvalue, span)?),
             ResolvedName::Global(binding) => Some(*binding),
-            ResolvedName::EnvField { name, .. } if self.profile == LanguageProfile::Lua55 => {
+            ResolvedName::EnvField { name, .. } if self.profile.rules().global_declarations => {
                 self.visible_named_global(name)
             }
             ResolvedName::EnvField { .. } => None,
@@ -1172,7 +1172,7 @@ impl<'a> Resolver<'a> {
                 name.span,
                 name.attribute.clone(),
                 BindingKind::NumericFor,
-                self.profile == LanguageProfile::Lua55,
+                self.profile.rules().readonly_for_control,
             )?;
             self.loops.push(target);
             let body = self.resolve_nested_block(body);
@@ -1221,13 +1221,13 @@ impl<'a> Resolver<'a> {
             resolved_names
                 .try_reserve(names.len())
                 .map_err(|_| self.limit(span, "generic-for name 配置超過編譯限制"))?;
-            for name in names {
+            for (index, name) in names.iter().enumerate() {
                 let binding = self.declare_binding(
                     name.name.clone(),
                     name.span,
                     name.attribute.clone(),
                     BindingKind::GenericFor,
-                    false,
+                    index == 0 && self.profile.rules().readonly_for_control,
                 )?;
                 resolved_names.push(ResolvedLocalName {
                     binding,
@@ -1343,7 +1343,7 @@ impl<'a> Resolver<'a> {
             });
         }
         let vararg = if let Some(vararg) = &body.vararg {
-            if self.profile != LanguageProfile::Lua55 && vararg.table_name.is_some() {
+            if !self.profile.rules().named_vararg && vararg.table_name.is_some() {
                 return Err(
                     child.resolve_error(vararg.span, "lua54 不支援 lua55 具名 vararg table")
                 );
@@ -1581,25 +1581,24 @@ impl<'a> Resolver<'a> {
         if name == b"_ENV" {
             return Ok(None);
         }
-        match self.profile {
-            LanguageProfile::Lua55 => {
-                let mode = self.effective_global_mode();
-                if matches!(mode, Some(GlobalMode::NamedOnly)) {
-                    Ok(None)
-                } else if let Some(env) = self.lexical_environment_shadow(span)? {
-                    Ok(Some(ResolvedName::EnvField {
-                        env,
-                        name: name.to_vec(),
-                    }))
-                } else {
-                    Ok(Some(ResolvedName::Global(self.declare_implicit_global(
-                        name,
-                        span,
-                        matches!(mode, Some(GlobalMode::Wildcard { readonly: true })),
-                    )?)))
-                }
+        if self.profile.rules().global_declarations {
+            let mode = self.effective_global_mode();
+            if matches!(mode, Some(GlobalMode::NamedOnly)) {
+                Ok(None)
+            } else if let Some(env) = self.lexical_environment_shadow(span)? {
+                Ok(Some(ResolvedName::EnvField {
+                    env,
+                    name: name.to_vec(),
+                }))
+            } else {
+                Ok(Some(ResolvedName::Global(self.declare_implicit_global(
+                    name,
+                    span,
+                    matches!(mode, Some(GlobalMode::Wildcard { readonly: true })),
+                )?)))
             }
-            LanguageProfile::Lua54 => match self.lookup(b"_ENV", span)? {
+        } else {
+            match self.lookup(b"_ENV", span)? {
                 Some(ResolvedName::Local(env)) => Ok(Some(ResolvedName::EnvField {
                     env,
                     name: name.to_vec(),
@@ -1609,7 +1608,7 @@ impl<'a> Resolver<'a> {
                     name: name.to_vec(),
                 })),
                 Some(ResolvedName::EnvField { .. } | ResolvedName::Global(_)) | None => Ok(None),
-            },
+            }
         }
     }
 

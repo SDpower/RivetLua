@@ -6680,6 +6680,13 @@ impl Vm {
                 ] {
                     self.install_one_builtin(table, name, Builtin::Table(builtin))?;
                 }
+                if self.language_profile().rules().table_create {
+                    self.install_one_builtin(
+                        table,
+                        b"create",
+                        Builtin::Table(TableBuiltin::Create),
+                    )?;
+                }
                 let key = self.allocate_byte_string(b"table")?;
                 let key_root = self.add_root(RootKind::Temporary, key)?;
                 let inserted = self.raw_set(environment, Value::Object(key), Value::Object(table));

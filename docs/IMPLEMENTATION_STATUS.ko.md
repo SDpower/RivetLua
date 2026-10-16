@@ -2,6 +2,8 @@
 
 [English](IMPLEMENTATION_STATUS.md) | [繁體中文](IMPLEMENTATION_STATUS.zh-TW.md) | 한국어 | [日本語](IMPLEMENTATION_STATUS.ja.md)
 
+> **目前狀態（2026-10-17）：P17 已交付（[commit](https://github.com/SDpower/RivetLua/commit/f84b0d74ac743e26dd02e7749b37d8298b1c5be1)）；P18 已交付（[commit](https://github.com/SDpower/RivetLua/commit/fba6e4bbe94ddcc3916ceed21a1ac58eb87ff233)）；P19 B01～B04 四批實作與整合複閱已完成，本階段提交包含此進度更新；B04 提供共用 typed `CompatibilityEntry` v1、SDK `compatibility_entries`、CLI `--compatibility [--gaps]` 與 xtask `compatibility`，`luaL_openselectedlibs` 仍是可查詢的公開 API 缺口；必要增量編譯 3 項 exit 0，未執行測試／gate／CI／formatter；P20～P24 尚待依序處理。完整上游相容與正式發布尚未宣稱。請以[繁體中文進度頁](IMPLEMENTATION_STATUS.zh-TW.md)為準。下文為歷史快照。**
+
 갱신일: 2026-09-29. 이 문서는 저장소에 구현된 기능과 앞으로 구현할 기능을 구분합니다. 체크된 항목은 명시된 범위의 테스트를 통과했음을 뜻합니다. 체크되지 않은 항목은 아직 구현되지 않았습니다. 사양 문서나 테스트 자료가 있다는 사실만으로 실행 기능이 완성된 것은 아닙니다.
 
 ## 구현 및 검증 완료

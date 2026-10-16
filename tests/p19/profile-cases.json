@@ -1,0 +1,135 @@
+{
+  "cases": [
+    {
+      "case_id": "PROF-001-KEYWORD-GLOBAL",
+      "area": "keywords",
+      "fixture_kind": "lua-source",
+      "fixture": "inputs/local-global.lua",
+      "expected": {
+        "lua55": "parse-reject: global is a keyword",
+        "lua54": "accept; return 3"
+      },
+      "source": [
+        "https://www.lua.org/manual/5.5/manual.html#3.3.7",
+        "https://www.lua.org/manual/5.4/manual.html#3.3.7"
+      ]
+    },
+    {
+      "case_id": "PROF-002-DECL-GLOBAL",
+      "area": "declarations",
+      "fixture_kind": "lua-source",
+      "fixture": "inputs/global-declaration.lua",
+      "expected": {
+        "lua55": "accept; return 3",
+        "lua54": "parse-reject: global declaration syntax is unavailable"
+      },
+      "source": [
+        "https://www.lua.org/manual/5.5/manual.html#3.3.7",
+        "https://www.lua.org/manual/5.4/manual.html#3.3.7",
+        "https://www.lua.org/source/5.4/llex.c.html",
+        "https://www.lua.org/source/5.4/lparser.c.html"
+      ]
+    },
+    {
+      "case_id": "PROF-002-VARARG-NAMED",
+      "area": "vararg",
+      "fixture_kind": "lua-source",
+      "fixture": "inputs/named-vararg.lua",
+      "expected": {
+        "lua55": "accept; return 3, 2; xs is a read-only local referring to the vararg table",
+        "lua54": "parse-reject: named vararg syntax is unavailable"
+      },
+      "source": [
+        "https://www.lua.org/manual/5.5/manual.html#3.4.11",
+        "https://www.lua.org/manual/5.4/manual.html#3.4.11"
+      ]
+    },
+    {
+      "case_id": "PROF-002-LOOP-READONLY",
+      "area": "loop",
+      "fixture_kind": "lua-source",
+      "fixtures": [
+        "inputs/loop-control-write.lua",
+        "inputs/loop-generic-later-write.lua"
+      ],
+      "expected": {
+        "lua55": "numeric and generic first control-variable writes are resolve-rejected; generic later-variable write is accepted",
+        "lua54": "numeric and generic control-variable writes are accepted; generic later-variable write is accepted"
+      },
+      "source": [
+        "https://www.lua.org/manual/5.5/manual.html#3.3.5",
+        "https://www.lua.org/manual/5.4/manual.html#3.3.5",
+        "https://www.lua.org/source/5.4/lparser.c.html"
+      ]
+    },
+    {
+      "case_id": "PROF-002-STDLIB-TABLECREATE",
+      "area": "stdlib",
+      "fixture_kind": "rule-reference-only",
+      "status": "implemented",
+      "expected": {
+        "lua55": "table.create is available with Lua 5.5 argument and bounds semantics",
+        "lua54": "table.create is absent"
+      },
+      "source": [
+        "https://www.lua.org/source/5.5/ltablib.c.html",
+        "https://www.lua.org/source/5.4/ltablib.c.html"
+      ]
+    },
+    {
+      "case_id": "PROF-002-CAPI-OPENSELECTEDLIBS",
+      "area": "c_api",
+      "fixture_kind": "symbol-reference-only",
+      "status": "specified-product-gap",
+      "expected": {
+        "lua55": "luaL_openselectedlibs is part of the API",
+        "lua54": "luaL_openselectedlibs is absent"
+      },
+      "source": [
+        "https://www.lua.org/manual/5.5/manual.html#luaL_openselectedlibs",
+        "https://www.lua.org/manual/5.4/manual.html",
+        "https://www.lua.org/source/5.4/lualib.h.html"
+      ]
+    },
+    {
+      "case_id": "PROF-002-CAPI-MAKESEED",
+      "area": "c_api",
+      "fixture_kind": "symbol-reference-only",
+      "expected": {
+        "lua55": "luaL_makeseed is part of the API",
+        "lua54": "luaL_makeseed is absent"
+      },
+      "source": [
+        "https://www.lua.org/manual/5.5/manual.html#luaL_makeseed",
+        "https://www.lua.org/manual/5.4/manual.html",
+        "https://www.lua.org/source/5.4/lauxlib.h.html"
+      ]
+    },
+    {
+      "case_id": "PROF-006-CHUNK-PROFILE",
+      "area": "chunk",
+      "fixture_kind": "header-version-rule-reference",
+      "expected": {
+        "lua55": "chunk header version must match Lua 5.5",
+        "lua54": "chunk header version must match Lua 5.4"
+      },
+      "source": [
+        "https://www.lua.org/source/5.5/lundump.c.html",
+        "https://www.lua.org/source/5.4/lundump.c.html"
+      ]
+    },
+    {
+      "case_id": "PROF-006-CLI-PROFILE",
+      "area": "cli",
+      "fixture_kind": "metadata-only",
+      "expected": {
+        "lua55": "selecting profile reports Lua 5.5.1 from LUA_RELEASE",
+        "lua54": "selecting profile reports Lua 5.4.9 from LUA_RELEASE"
+      },
+      "source": [
+        "https://www.lua.org/source/5.5/lua.h.html",
+        "https://www.lua.org/source/5.4/lua.h.html"
+      ]
+    }
+  ]
+}

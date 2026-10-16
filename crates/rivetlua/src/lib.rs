@@ -19,8 +19,9 @@ mod transport;
 pub use compile::{CompileBudget, CompileBudgetErrorKind, CompileBudgetLimits};
 pub use rivetlua_compiler::{CompileLimits, IrLimits};
 pub use rivetlua_core::{
-    BytecodeVersion, InputErrorKind, InputFormat, LuaProfile, ModuleOrigin, OfficialChunkLimits,
-    RVLU_V2, TransportErrorKind, TransportLimits, Value, ValueKind, VerifyLimits, classify_input,
+    BytecodeVersion, COMPATIBILITY_VERSION, CompatibilityEntry, InputErrorKind, InputFormat,
+    LuaProfile, ModuleOrigin, OfficialChunkLimits, RVLU_V2, TransportErrorKind, TransportLimits,
+    Value, ValueKind, VerifyLimits, classify_input, compatibility_entries,
 };
 pub use rivetlua_runtime::{
     AbortReason, AllocationAttempt, AllocationFailure, AllocationFailureKind, AllocationLedger,

@@ -30,16 +30,16 @@ use std::ffi::CString;
 use std::rc::Rc;
 
 use rivetlua::{
-    AbortReason, CallbackContext, CallbackContinuation, CallbackFn, CallbackResult, CompileBudget,
-    ContainerLimits, DebugCapability, DebugPermission, DumpCapability,
-    DumpLimits, Engine, FileOperation, FileReadFormat, FileSeekOrigin, HostCloseResult,
+    AbortReason, COMPATIBILITY_VERSION, CallbackContext, CallbackContinuation, CallbackFn,
+    CallbackResult, CompileBudget, ContainerLimits, DebugCapability, DebugPermission,
+    DumpCapability, DumpLimits, Engine, FileOperation, FileReadFormat, FileSeekOrigin, HostCloseResult,
     HostDeadline, HostEntropy, HostEntropyError, HostExitRequest, HostFileLease, HostIo,
     HostLoadError, HostLoadErrorKind, HostModuleBytes, HostModuleRepository, HostOs,
     HostOsOperation, HostOsValue, HostOutput, HostOutputError, HostResourceError,
     HostResourceErrorKind, HostServices, HostSourceReader, HostWarning, HostWarningError,
     InputFormat, LoadBudget, LoadCapability, LoadFormat, LoadLimits, LuaProfile, Module,
     ResourceBudget, ResourceCapability, RunOutcome, RuntimeErrorKind, SdkError, TransportBudget,
-    Value, Vm, VmError,
+    Value, Vm, VmError, compatibility_entries,
 };
 
 const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -455,6 +455,8 @@ enum Action {
 #[derive(Debug)]
 struct Options {
     profile: LuaProfile,
+    compatibility: bool,
+    gaps: bool,
     ignore_environment: bool,
     show_version: bool,
     interactive: bool,
@@ -500,6 +502,8 @@ fn os_from_bytes(value: &[u8]) -> OsString {
 
 fn parse_options(args: &[OsString]) -> CliResult<Options> {
     let mut profile = default_profile();
+    let mut compatibility = false;
+    let mut gaps = false;
     let mut ignore_environment = false;
     let mut show_version = false;
     let mut interactive = false;
@@ -512,6 +516,11 @@ fn parse_options(args: &[OsString]) -> CliResult<Options> {
     while i < args.len() {
         let bytes = os_bytes(&args[i]);
         if bytes == b"--" {
+            if compatibility {
+                return Err(CliFailure::usage(
+                    "--compatibility 只能與 --profile、--gaps 搭配",
+                ));
+            }
             if i + 1 < args.len() {
                 script_index = i + 1;
                 script = Some(args[i + 1].clone());
@@ -571,6 +580,10 @@ fn parse_options(args: &[OsString]) -> CliResult<Options> {
             profile = parse_profile(&value)?;
         } else if bytes.starts_with(b"--profile=") {
             profile = parse_profile(&bytes[b"--profile=".len()..])?;
+        } else if bytes == b"--compatibility" && !compatibility {
+            compatibility = true;
+        } else if bytes == b"--gaps" && !gaps {
+            gaps = true;
         } else {
             let flag = String::from_utf8_lossy(&bytes);
             return Err(CliFailure::usage(format!(
@@ -583,8 +596,24 @@ fn parse_options(args: &[OsString]) -> CliResult<Options> {
     if script.is_none() {
         script_index = 0;
     }
+    if compatibility {
+        if ignore_environment
+            || show_version
+            || interactive
+            || !actions.is_empty()
+            || script.is_some()
+        {
+            return Err(CliFailure::usage(
+                "--compatibility 只能與 --profile、--gaps 搭配",
+            ));
+        }
+    } else if gaps {
+        return Err(CliFailure::usage("--gaps 需要 --compatibility"));
+    }
     Ok(Options {
         profile,
+        compatibility,
+        gaps,
         ignore_environment,
         show_version,
         interactive,
@@ -2798,7 +2827,37 @@ fn sdk_failure(error: SdkError) -> CliFailure {
 }
 
 fn usage() -> &'static [u8] {
-    "用法：rivetlua [--profile lua55|lua54] [-E] [-v] [-i] [-e 程式] [-l 模組] [--] [檔案 [參數...]]\n".as_bytes()
+    "用法：rivetlua [--profile lua55|lua54] [-E] [-v] [-i] [-e 程式] [-l 模組] [--] [檔案 [參數...]]\n       rivetlua [--profile lua55|lua54] --compatibility [--gaps]\n".as_bytes()
+}
+
+fn compatibility_query(profile: LuaProfile, gaps: bool, stdout: &mut dyn Write) -> CliResult<u8> {
+    let entries = compatibility_entries().map_err(CliFailure::failed)?;
+    let profile_name = match profile {
+        LuaProfile::Lua55 => "lua55",
+        LuaProfile::Lua54 => "lua54",
+    };
+    write_bytes(
+        stdout,
+        format!("compatibility\t{COMPATIBILITY_VERSION}\t{profile_name}\n").as_bytes(),
+    )?;
+    write_bytes(stdout, b"case_id\tarea\tstatus\trule\n")?;
+    for entry in entries {
+        if gaps && !entry.is_gap() {
+            continue;
+        }
+        write_bytes(
+            stdout,
+            format!(
+                "{}\t{}\t{}\t{}\n",
+                entry.case_id,
+                entry.area,
+                entry.status,
+                entry.selected_rule(profile),
+            )
+            .as_bytes(),
+        )?;
+    }
+    Ok(0)
 }
 
 pub fn rivetlua_main() -> std::process::ExitCode {
@@ -4482,6 +4541,9 @@ fn run_interpreter_inner(
     standalone_signal: bool,
 ) -> CliResult<u8> {
     let options = parse_options(args)?;
+    if options.compatibility {
+        return compatibility_query(options.profile, options.gaps, stdout);
+    }
     let _signal_session = if standalone_signal
         && (!options.show_version
             || options.interactive

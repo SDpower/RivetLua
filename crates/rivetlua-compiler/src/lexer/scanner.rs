@@ -805,7 +805,7 @@ fn keyword(cursor: &Cursor<'_>, name: &[u8]) -> Option<Keyword> {
         b"true" => Keyword::True,
         b"until" => Keyword::Until,
         b"while" => Keyword::While,
-        b"global" if cursor.profile() == super::LanguageProfile::Lua55 => Keyword::Global,
+        b"global" if cursor.profile().rules().global_declarations => Keyword::Global,
         _ => return None,
     };
     Some(keyword)
