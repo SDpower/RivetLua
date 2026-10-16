@@ -3,6 +3,18 @@
 use crate::host::DebugPermission;
 use rivetlua_core::ObjectRef;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DebugHookEvent {
+    Line(Option<u32>),
+    Count,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DebugHookEvents {
+    pub first: DebugHookEvent,
+    pub followup_line: Option<Option<u32>>,
+}
+
 /// 單一 Lua thread 的 hook；coroutine 以自身 payload 持有強邊。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DebugHook {
@@ -58,24 +70,32 @@ impl DebugHook {
         source_pc: usize,
         line: Option<u32>,
         counted: bool,
-    ) -> Option<Option<u32>> {
+        stripped_first_instruction: bool,
+    ) -> Option<DebugHookEvents> {
         let count = counted && self.tick();
         let location = module.map(|module| (module, prototype));
         let changed = self.last_prototype != location || self.last_line != line;
         let backwards = self.last_prototype == location
             && self.last_pc.is_some_and(|previous| source_pc < previous);
-        let send_line =
-            self.line && line.is_some() && (changed || (backwards && !self.last_line_event));
-        if line.is_some() {
+        let send_line = self.line
+            && (stripped_first_instruction
+                || (line.is_some() && (changed || (backwards && !self.last_line_event))));
+        if line.is_some() || stripped_first_instruction {
             self.last_prototype = location;
             self.last_pc = Some(source_pc);
             self.last_line = line;
         }
         self.last_line_event = send_line;
-        if send_line {
-            Some(line)
-        } else if count {
-            Some(None)
+        if count {
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Count,
+                followup_line: send_line.then_some(line),
+            })
+        } else if send_line {
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Line(line),
+                followup_line: None,
+            })
         } else {
             None
         }
@@ -94,6 +114,90 @@ impl DebugHook {
             self.last_line = line;
             self.last_line_event = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod hook_event_tests {
+    use super::{DebugHook, DebugHookEvent, DebugHookEvents};
+    use rivetlua_core::ObjectRef;
+
+    #[test]
+    fn stripped_entry_distinguishes_nil_line_from_count_and_primes_return() {
+        let function = ObjectRef::new_opaque().unwrap();
+        let caller = ObjectRef::new_opaque().unwrap();
+        let stripped = ObjectRef::new_opaque().unwrap();
+        let mut hook = DebugHook::with_line(function, 2, true);
+
+        assert_eq!(
+            hook.event(Some(caller), 0, 0, Some(10), true, false),
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Line(Some(10)),
+                followup_line: None,
+            })
+        );
+        assert_eq!(
+            hook.event(Some(caller), 0, 1, Some(10), true, false),
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Count,
+                followup_line: None,
+            })
+        );
+        assert_eq!(
+            hook.event(Some(stripped), 1, 0, None, true, true),
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Line(None),
+                followup_line: None,
+            })
+        );
+        assert_eq!(
+            hook.event(Some(stripped), 1, 1, None, true, false),
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Count,
+                followup_line: None,
+            })
+        );
+
+        hook.prime(Some(caller), 0, 1, Some(10));
+        assert_eq!(hook.event(Some(caller), 0, 2, Some(10), true, false), None);
+        assert_eq!(
+            hook.event(Some(stripped), 1, 0, None, true, true),
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Count,
+                followup_line: Some(None),
+            })
+        );
+        assert_eq!(hook.event(Some(stripped), 1, 1, None, false, false), None);
+        assert_eq!(
+            hook.event(Some(stripped), 1, 0, None, true, true),
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Line(None),
+                followup_line: None,
+            })
+        );
+
+        let mut every_instruction = DebugHook::with_line(function, 1, true);
+        assert_eq!(
+            every_instruction.event(Some(caller), 0, 0, Some(10), true, false),
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Count,
+                followup_line: Some(Some(10)),
+            })
+        );
+        assert_eq!(
+            every_instruction.event(Some(caller), 0, 1, Some(10), true, false),
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Count,
+                followup_line: None,
+            })
+        );
+        assert_eq!(
+            every_instruction.event(Some(stripped), 1, 0, None, true, true),
+            Some(DebugHookEvents {
+                first: DebugHookEvent::Count,
+                followup_line: Some(None),
+            })
+        );
     }
 }
 
@@ -157,7 +261,8 @@ impl DebugBuiltin {
             Self::SetUserValue => Some(DebugPermission::UserValueWrite),
             Self::SetUpvalue => Some(DebugPermission::UpvalueMutation),
             Self::UpvalueId | Self::UpvalueJoin => Some(DebugPermission::UpvalueIdentity),
-            Self::Debug | Self::SetCStackLimit => None,
+            Self::Debug => Some(DebugPermission::Console),
+            Self::SetCStackLimit => None,
         }
     }
 }

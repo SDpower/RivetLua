@@ -633,7 +633,6 @@ struct ResolveShape {
     close_paths: usize,
     generic_fors: usize,
     name_bytes: usize,
-    key_bytes: usize,
     literal_bytes: usize,
     current_bindings: usize,
     current_close_paths: usize,
@@ -644,16 +643,30 @@ struct ResolveShape {
     inherited_square_sum: usize,
     inherited_key_sum: usize,
     close_binding_pairs: usize,
+    current_references: usize,
+    current_reference_name_bytes: usize,
+    reference_name_bytes: usize,
+    distinct_scan_work: usize,
+    current_labels: usize,
+    current_gotos: usize,
+    // Lua 5.4 自由名稱只經 _ENV，Lua 5.5 才可能宣告 implicit global。
+    lua55_implicit_globals: bool,
+    // 預付容量後才啟用；每個 function 按名稱去重，保留當前祖先 prefix。
+    distinct_global_names: Option<Vec<Vec<u8>>>,
+    key_compare_ops: usize,
+    key_compare_work: usize,
     depth: usize,
     max_depth: usize,
 }
 
 impl ResolveShape {
-    fn root() -> Self {
+    fn root(profile: crate::LanguageProfile, distinct_implicit_globals: bool) -> Self {
         Self {
             functions: 1,
             current_bindings: 1, // resolver 在 AST 前宣告 root _ENV
             current_key_bytes: 8,
+            lua55_implicit_globals: profile == crate::LanguageProfile::Lua55,
+            distinct_global_names: distinct_implicit_globals.then(Vec::new),
             depth: 1,
             max_depth: 1,
             ..Self::default()
@@ -663,6 +676,38 @@ impl ResolveShape {
     fn binding<E>(&mut self) -> Result<(), BudgetedCompileError<E>> {
         bump(&mut self.declarations)?;
         bump(&mut self.current_bindings)
+    }
+
+    fn finish_function_key_work<E>(&mut self) -> Result<(), BudgetedCompileError<E>> {
+        // resolver 的名稱表只含目前 function 與建立 child 時的祖先
+        // prefix；兄弟 function 的 key 不可能出現在這次碰撞比較。
+        let operations = add(
+            add(mul(self.current_references, 4)?, mul(self.current_bindings, 4)?)?,
+            add(self.current_gotos, self.current_labels)?,
+        )?;
+        self.key_compare_ops = add(self.key_compare_ops, operations)?;
+        self.key_compare_work = add(
+            self.key_compare_work,
+            mul(
+                operations,
+                add(self.inherited_key_bytes, self.current_key_bytes)?,
+            )?,
+        )?;
+        if self.lua55_implicit_globals {
+            // 第二次 shape walk 的去重是逐個名稱掃目前 function 已知
+            // 的不同 key；至多 R² 次項目檢查、R*B bytes 比較，另給
+            // 每個參照 128 單位支付 Vec handle 移動與 clone。
+            let references = self.current_references;
+            let comparisons = add(
+                mul(mul(references, references)?, 4)?,
+                mul(mul(references, self.current_reference_name_bytes)?, 2)?,
+            )?;
+            self.distinct_scan_work = add(
+                self.distinct_scan_work,
+                add(comparisons, mul(references, 128)?)?,
+            )?;
+        }
+        Ok(())
     }
 
     fn add_close_paths<E>(&mut self, count: usize) -> Result<(), BudgetedCompileError<E>> {
@@ -678,7 +723,6 @@ impl ResolveShape {
 
     fn key_name<E>(&mut self, name: &Vec<u8>) -> Result<(), BudgetedCompileError<E>> {
         self.name(name)?;
-        self.key_bytes = add(self.key_bytes, name.capacity())?;
         self.current_key_bytes = add(self.current_key_bytes, name.capacity())?;
         Ok(())
     }
@@ -719,12 +763,24 @@ impl ResolveShape {
         self.inherited_sum = add(self.inherited_sum, inherited)?;
         self.inherited_square_sum = add(self.inherited_square_sum, mul(inherited, inherited)?)?;
         self.inherited_key_sum = add(self.inherited_key_sum, inherited_keys)?;
+        // child 的兩張 parent map 僅複製此刻可見的祖先 prefix。
+        let clone_ops = mul(inherited, 2)?;
+        self.key_compare_ops = add(self.key_compare_ops, clone_ops)?;
+        self.key_compare_work = add(
+            self.key_compare_work,
+            mul(clone_ops, inherited_keys)?,
+        )?;
+        let saved_distinct_names = self.distinct_global_names.take();
         let saved = (
             self.inherited_bindings,
             self.inherited_key_bytes,
             self.current_bindings,
             self.current_close_paths,
             self.current_key_bytes,
+            self.current_references,
+            self.current_reference_name_bytes,
+            self.current_labels,
+            self.current_gotos,
             self.depth,
         );
         self.inherited_bindings = inherited;
@@ -732,6 +788,11 @@ impl ResolveShape {
         self.current_bindings = 0;
         self.current_close_paths = 0;
         self.current_key_bytes = 0;
+        self.current_references = 0;
+        self.current_reference_name_bytes = 0;
+        self.current_labels = 0;
+        self.current_gotos = 0;
+        self.distinct_global_names = saved_distinct_names.as_ref().map(|_| Vec::new());
         self.depth = add(self.depth, 1)?;
         self.max_depth = self.max_depth.max(self.depth);
         if method {
@@ -754,14 +815,20 @@ impl ResolveShape {
             self.close_binding_pairs,
             mul(self.current_close_paths, self.current_bindings)?,
         )?;
+        self.finish_function_key_work()?;
         (
             self.inherited_bindings,
             self.inherited_key_bytes,
             self.current_bindings,
             self.current_close_paths,
             self.current_key_bytes,
+            self.current_references,
+            self.current_reference_name_bytes,
+            self.current_labels,
+            self.current_gotos,
             self.depth,
         ) = saved;
+        self.distinct_global_names = saved_distinct_names;
         Ok(())
     }
 
@@ -821,11 +888,13 @@ impl ResolveShape {
             Stmt::Break { .. } => self.add_close_paths(1)?,
             Stmt::Goto { name, .. } => {
                 bump(&mut self.gotos)?;
+                bump(&mut self.current_gotos)?;
                 self.add_close_paths(1)?;
                 self.key_name(name)?;
             }
             Stmt::Label { name, .. } => {
                 bump(&mut self.labels)?;
+                bump(&mut self.current_labels)?;
                 self.key_name(name)?;
             }
             Stmt::Do { body, .. } => self.block(body)?,
@@ -905,8 +974,41 @@ impl ResolveShape {
             Expr::Nil { .. } | Expr::Bool { .. } | Expr::Vararg { .. } => {}
             Expr::Name { name, .. } => {
                 bump(&mut self.references)?;
-                bump(&mut self.current_bindings)?;
-                self.key_name(name)?;
+                bump(&mut self.current_references)?;
+                self.reference_name_bytes = add(self.reference_name_bytes, name.capacity())?;
+                self.current_reference_name_bytes =
+                    add(self.current_reference_name_bytes, name.capacity())?;
+                self.name(name)?;
+                if self.lua55_implicit_globals {
+                    // implicit_globals 在每個 function 以名稱為 key，並按
+                    // readonly 狀態最多建立兩個 BindingMeta。scope 與
+                    // 兄弟 function 不會增加同名 key 的數量。
+                    let new_name = if let Some(names) = self.distinct_global_names.as_mut() {
+                        if names.iter().any(|prior| prior.as_slice() == name.as_slice()) {
+                            false
+                        } else {
+                            let mut owned = Vec::new();
+                            owned
+                                .try_reserve_exact(name.len())
+                                .map_err(|_| BudgetedCompileError::AdmissionOverflow)?;
+                            owned.extend_from_slice(name);
+                            names
+                                .try_reserve(1)
+                                .map_err(|_| BudgetedCompileError::AdmissionOverflow)?;
+                            names.push(owned);
+                            true
+                        }
+                    } else {
+                        true // 無配置的第一輪僅取得去重掃描工作上界
+                    };
+                    if new_name {
+                        self.current_bindings = add(
+                            self.current_bindings,
+                            if self.distinct_global_names.is_some() { 2 } else { 1 },
+                        )?;
+                        self.current_key_bytes = add(self.current_key_bytes, name.capacity())?;
+                    }
+                }
             }
             Expr::Unary { expression, .. } | Expr::Paren { expression, .. } => {
                 self.expression(expression)?;
@@ -982,7 +1084,9 @@ fn resolve_admission<E>(
     )?;
     let generated_names = mul(add(add(functions, shape.generic_fors)?, 1)?, 32)?;
     let names = add(shape.name_bytes, generated_names)?;
-    let key_names = add(shape.key_bytes, mul(add(functions, 1)?, 8)?)?;
+    // 每個 generated key 最多隸屬一個 function；沿用原本每個
+    // function 八 bytes 的保守額度，逐次加到已定位的 hash 操作。
+    let generated_key_bytes = mul(add(functions, 1)?, 8)?;
     // Parser 限制 reserve_node <=4*(tokens+1)；加實際 AST nodes
     // 覆蓋未經 reserve_node 的 field/Box 與 if-clause 容器元素。
     let node_slots = add(mul(add(tokens, 1)?, 4)?, frontend.ast_nodes)?;
@@ -1132,21 +1236,15 @@ fn resolve_admission<E>(
     let structural = [lookup, visible, capture, goto, close]
         .into_iter()
         .try_fold(0usize, add)?;
-    // 名稱 HashMap 在最壞碰撞下，每次 get/insert 可比對整張表的
-    // key bytes；所有可見 key 來自 AST names（另含固定隱含名稱）。
-    // 空 scope 的 get 不做 hash；非空 scope map 至多 visible_bindings
-    // 張（每張至少一個顯式宣告，root _ENV 另計）。key_names 含全部
-    // 參照名稱，故 4*visible_bindings*key_names 涵蓋跨 scope 重複 hash。
-    // parent-visible clone 對至多 F*D entries 重做 hash/copy；字串
-    // literal 不參與名稱 HashMap，僅在 resolved literal 複製一次。
-    let name_ops = add(
-        add(mul(shape.references, 4)?, mul(visible_bindings, 4)?)?,
-        add(
-            mul(shape.inherited_sum, 2)?,
-            add(shape.gotos, shape.labels)?,
-        )?,
+    // HashMap 最壞碰撞仍按整張可見表的 key bytes 支付。AST walk
+    // 已把每次查找歸到當前 function，加上其 ancestor prefix；child
+    // map clone 只見建立當下的 prefix。另將原本每個 function 的
+    // generated-key 額度套到每次操作，保留未知隱含名稱的保守界。
+    let hash_work = add(
+        shape.key_compare_work,
+        mul(shape.key_compare_ops, generated_key_bytes)?,
     )?;
-    let byte_work = add(mul(name_ops, key_names)?, mul(names, add(functions, 4)?)?)?;
+    let byte_work = add(hash_work, mul(names, add(functions, 4)?)?)?;
     let byte_work = add(byte_work, mul(shape.literal_bytes, 2)?)?;
     let base = mul(
         add(
@@ -1160,9 +1258,11 @@ fn resolve_admission<E>(
 }
 
 pub(crate) struct BudgetedResolved {
-    pub(crate) lexed: LexedChunk,
-    pub(crate) resolved: ResolvedModule,
-    pub(crate) ast_nodes: usize,
+    lexed: LexedChunk,
+    resolved: ResolvedModule,
+    ast_nodes: usize,
+    // 僅由同次 AST walk 建立；public ResolvedModule 不提供此憑證。
+    max_function_depth: usize,
 }
 
 pub(crate) fn resolve_with_budget<S: CompileBudgetSink>(
@@ -1177,19 +1277,44 @@ pub(crate) fn resolve_with_budget<S: CompileBudgetSink>(
     let shape_work = mul(add(frontend.lexed.tokens.len(), 1)?, 512)?;
     sink.spend_work(shape_work)
         .map_err(BudgetedCompileError::Budget)?;
-    let mut shape = ResolveShape::root();
+    let mut shape = ResolveShape::root(profile, false);
     shape.block(&frontend.ast.root)?;
+    shape.finish_function_key_work()?;
+    if profile == crate::LanguageProfile::Lua55 {
+        // 第一輪無配置且只讀 AST，先以逐 function R²、R*B 的 checked
+        // 上界預付；第二輪才可配置暫存名稱表。所有 live function 名稱
+        // 都來自互斥的 AST 參照，Vec grow 舊＋新 buffer 至多 4R handles。
+        let distinct_temporary = add(
+            mul(
+                mul(shape.references, size_of::<Vec<u8>>())?,
+                4,
+            )?,
+            mul(shape.reference_name_bytes, 4)?,
+        )?;
+        admit(
+            sink,
+            add(shape.distinct_scan_work, shape_work)?,
+            distinct_temporary,
+        )?;
+        let mut distinct_shape = ResolveShape::root(profile, true);
+        distinct_shape.block(&frontend.ast.root)?;
+        distinct_shape.finish_function_key_work()?;
+        shape = distinct_shape;
+    }
     let (work, temporary) = resolve_admission(&frontend, &shape)?;
     admit(sink, work, temporary)?;
     let resolved = crate::resolve(&frontend.ast, &frontend.lexed, profile, limits)
         .map_err(BudgetedCompileError::Frontend)?;
-    if resolved_allocation_bytes(&resolved)? > temporary {
+    if resolved_allocation_bytes(&resolved)? > temporary
+        || resolved.functions.len() != shape.functions
+    {
         return Err(BudgetedCompileError::AdmissionUnderestimated);
     }
     Ok(BudgetedResolved {
         lexed: frontend.lexed,
         resolved,
         ast_nodes: frontend.ast_nodes,
+        max_function_depth: shape.max_depth,
     })
 }
 
@@ -1726,6 +1851,27 @@ impl LowerShape {
 
     fn expression<E>(&mut self, expression: &ResolvedExpr) -> Result<(), BudgetedCompileError<E>> {
         self.node()?;
+        // 這些 expression 的自身 lowering 最多五筆指令：Name
+        // target 的 key、upvalue、兩個 snapshot Move 與 store 是最長
+        // 路徑；Binary 的 and/or 最多四筆。子 expression、list
+        // element 與 statement 的指令由各自節點支付；呼叫與 table
+        // constructor 保留原本每節點 32 筆的保守界。
+        if matches!(
+            expression,
+            ResolvedExpr::Literal { .. }
+                | ResolvedExpr::Nil { .. }
+                | ResolvedExpr::Bool { .. }
+                | ResolvedExpr::Name { .. }
+                | ResolvedExpr::Vararg { .. }
+                | ResolvedExpr::Unary { .. }
+                | ResolvedExpr::Binary { .. }
+                | ResolvedExpr::Paren { .. }
+                | ResolvedExpr::Index { .. }
+                | ResolvedExpr::Field { .. }
+                | ResolvedExpr::Function { .. }
+        ) {
+            bump(&mut self.small_emit_nodes)?;
+        }
         match expression {
             ResolvedExpr::Literal { .. }
             | ResolvedExpr::Nil { .. }
@@ -1737,7 +1883,6 @@ impl LowerShape {
         }
         match expression {
             ResolvedExpr::Literal { literal, .. } => {
-                bump(&mut self.small_emit_nodes)?;
                 self.literal_bytes = add(self.literal_bytes, literal_bytes(literal))?;
             }
             ResolvedExpr::Nil { .. } | ResolvedExpr::Bool { .. } | ResolvedExpr::Vararg { .. } => {}
@@ -1983,7 +2128,10 @@ fn lower_admission<E>(
     // Close chain 不重疊，驗證總走訪量按 instruction ceiling 支付。
     let traversal = mul(add(scratch_elements, instruction_ceiling)?, 64)?;
     let binding_work = mul(mul(instruction_ceiling, add(bindings, 1)?)?, 4)?;
-    let ancestry = mul(add(functions, 1)?, add(functions, 1)?)?;
+    // upvalue_origin 每次只沿 resolver 已建好的 parent 鏈上行；
+    // 每層最多線掃 F 個 function，層數由同次 AST 的最大巢狀深度
+    // 界住。兄弟 function 不會增加某條 parent 鏈長度。
+    let ancestry = mul(add(functions, 1)?, resolved.max_function_depth)?;
     let upvalue_work = mul(
         mul(
             mul(
@@ -3618,7 +3766,7 @@ mod tests {
             let frontend =
                 lex_parse_with_budget(source, profile, &CompileLimits::default(), &mut sink)
                     .unwrap();
-            let mut shape = ResolveShape::root();
+            let mut shape = ResolveShape::root(profile, false);
             shape.block::<()>(&frontend.ast.root).unwrap();
             assert_eq!(shape.functions, 4);
             assert_eq!(shape.inherited_sum, 3, "{profile:?}");
@@ -3639,9 +3787,9 @@ mod tests {
             let Stmt::Function { body, .. } = &frontend.ast.root.statements[0] else {
                 panic!("預期 method function")
             };
-            let mut plain = ResolveShape::root();
+            let mut plain = ResolveShape::root(profile, false);
             plain.function::<()>(body, false).unwrap();
-            let mut method = ResolveShape::root();
+            let mut method = ResolveShape::root(profile, false);
             method.function::<()>(body, true).unwrap();
             assert_eq!(method.inherited_sum, plain.inherited_sum + 1, "{profile:?}");
             assert_eq!(
@@ -4468,6 +4616,294 @@ mod tests {
                 Err(BudgetedCompileError::Budget(()))
             ));
         }
+    }
+
+    #[test]
+    fn resolve_repeated_names_do_not_become_ancestor_bindings_or_keys() {
+        let mut source = b"local x=1; ".to_vec();
+        for _ in 0..48 {
+            source.extend_from_slice(b"do x=x+x end; ");
+        }
+        source.extend_from_slice(b"return function() return x+x end");
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            let limits = CompileLimits::default();
+            let mut ample = Probe::unlimited();
+            let frontend = lex_parse_with_budget(&source, profile, &limits, &mut ample).unwrap();
+            let mut sizing = ResolveShape::root(profile, false);
+            sizing.block::<()>(&frontend.ast.root).unwrap();
+            let mut distinct = ResolveShape::root(profile, true);
+            distinct.block::<()>(&frontend.ast.root).unwrap();
+            assert_eq!(distinct.references, 146);
+            if profile == LanguageProfile::Lua54 {
+                // _ENV 與明示 x 是 child 唯二可繼承 binding。
+                assert_eq!(distinct.inherited_sum, 2);
+                assert_eq!(distinct.inherited_key_sum, 9);
+            } else {
+                // 同一名稱在任意 scope 與兩個 readonly 狀態至多兩
+                // 個 implicit BindingMeta，implicit_globals 只有一個 key。
+                assert_eq!(distinct.inherited_sum, 4);
+                assert_eq!(distinct.inherited_key_sum, 10);
+                assert!(sizing.inherited_square_sum > distinct.inherited_square_sum);
+            }
+            let resolved = resolve_with_budget(frontend, profile, &limits, &mut ample).unwrap();
+            assert_eq!(resolved.resolved.functions.len(), 2);
+
+            let mut exact = Probe::unlimited();
+            exact.work_limit = ample.work;
+            exact.temporary_limit = ample.temporary;
+            let frontend = lex_parse_with_budget(&source, profile, &limits, &mut exact).unwrap();
+            assert!(resolve_with_budget(frontend, profile, &limits, &mut exact).is_ok());
+
+            let mut short_work = Probe::unlimited();
+            short_work.work_limit = ample.work - 1;
+            let frontend =
+                lex_parse_with_budget(&source, profile, &limits, &mut short_work).unwrap();
+            assert!(matches!(
+                resolve_with_budget(frontend, profile, &limits, &mut short_work),
+                Err(BudgetedCompileError::Budget(()))
+            ));
+
+            let mut short_temporary = Probe::unlimited();
+            short_temporary.temporary_limit = ample.temporary - 1;
+            let frontend =
+                lex_parse_with_budget(&source, profile, &limits, &mut short_temporary).unwrap();
+            assert!(matches!(
+                resolve_with_budget(frontend, profile, &limits, &mut short_temporary),
+                Err(BudgetedCompileError::Budget(()))
+            ));
+        }
+
+        let mut overflow = ResolveShape::root(LanguageProfile::Lua55, false);
+        overflow.current_references = usize::MAX;
+        overflow.current_reference_name_bytes = usize::MAX;
+        assert!(matches!(
+            overflow.finish_function_key_work::<()>(),
+            Err(BudgetedCompileError::AdmissionOverflow)
+        ));
+    }
+
+    #[test]
+    fn resolve_name_collision_bound_excludes_sibling_private_keys() {
+        let mut source = b"return {".to_vec();
+        for index in 0..48 {
+            let name = format!("private_{index}_{}", "x".repeat(64));
+            source.extend_from_slice(format!("function() local {name}=1; return {name} end,").as_bytes());
+        }
+        source.extend_from_slice(b"}");
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            let limits = CompileLimits::default();
+            let mut ample = Probe::unlimited();
+            let frontend = lex_parse_with_budget(&source, profile, &limits, &mut ample).unwrap();
+            let mut shape = ResolveShape::root(profile, false);
+            shape.block::<()>(&frontend.ast.root).unwrap();
+            shape.finish_function_key_work::<()>().unwrap();
+            assert_eq!(shape.functions, 49);
+            assert_eq!(shape.max_depth, 2);
+            assert!(
+                shape.key_compare_work < shape.name_bytes * shape.references,
+                "{profile:?}: 兄弟 function 的私有名稱不得進入彼此的可見表"
+            );
+            let resolved = resolve_with_budget(frontend, profile, &limits, &mut ample).unwrap();
+            assert_eq!(resolved.max_function_depth, 2);
+            assert_eq!(resolved.resolved.functions.len(), 49);
+
+            let mut exact = Probe::unlimited();
+            exact.work_limit = ample.work;
+            exact.temporary_limit = ample.temporary;
+            let frontend = lex_parse_with_budget(&source, profile, &limits, &mut exact).unwrap();
+            assert!(resolve_with_budget(frontend, profile, &limits, &mut exact).is_ok());
+            let mut short_work = Probe::unlimited();
+            short_work.work_limit = ample.work - 1;
+            let frontend =
+                lex_parse_with_budget(&source, profile, &limits, &mut short_work).unwrap();
+            assert!(matches!(
+                resolve_with_budget(frontend, profile, &limits, &mut short_work),
+                Err(BudgetedCompileError::Budget(()))
+            ));
+        }
+    }
+
+    #[test]
+    fn lower_ancestry_uses_function_depth_and_preserves_exact_admission() {
+        let mut siblings = b"local keep=1; return {".to_vec();
+        for _ in 0..64 {
+            siblings.extend_from_slice(b"function() return ");
+            for index in 0..8 {
+                if index != 0 {
+                    siblings.push(b'+');
+                }
+                siblings.extend_from_slice(b"keep");
+            }
+            siblings.extend_from_slice(b" end,");
+        }
+        siblings.extend_from_slice(b"}");
+        let mut deep = b"local keep=1; return ".to_vec();
+        for _ in 0..8 {
+            deep.extend_from_slice(b"function() return ");
+        }
+        deep.extend_from_slice(b"keep");
+        for _ in 0..8 {
+            deep.extend_from_slice(b" end");
+        }
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            for (source, expected_depth, expected_functions) in [
+                (siblings.as_slice(), 2, 65),
+                (deep.as_slice(), 9, 9),
+            ] {
+                let mut ample = Probe::unlimited();
+                let frontend = lex_parse_with_budget(
+                    source,
+                    profile,
+                    &CompileLimits::default(),
+                    &mut ample,
+                )
+                .unwrap();
+                let resolved = resolve_with_budget(
+                    frontend,
+                    profile,
+                    &CompileLimits::default(),
+                    &mut ample,
+                )
+                .unwrap();
+                assert_eq!(resolved.max_function_depth, expected_depth);
+                assert_eq!(resolved.resolved.functions.len(), expected_functions);
+                let mut shape = LowerShape::default();
+                shape.block::<()>(&resolved.resolved.root).unwrap();
+                let (work, temporary, _) = lower_admission::<()>(
+                    &resolved,
+                    &rivetlua_core::IrLimits::default(),
+                    &shape,
+                )
+                .unwrap();
+                let total_work = ample.work + 1024 * (resolved.lexed.tokens.len() + 1) + work;
+                let total_temporary = ample.temporary + temporary;
+                ample.work_limit = total_work;
+                ample.temporary_limit = total_temporary;
+                let lowered = lower_with_budget(
+                    resolved,
+                    &rivetlua_core::IrLimits::default(),
+                    &mut ample,
+                )
+                .unwrap();
+                assert_eq!(ample.work, total_work);
+                assert_eq!(ample.temporary, total_temporary);
+                assert!(ir_allocation_bytes::<()>(&lowered.ir).unwrap() <= temporary);
+
+                let mut short = Probe::unlimited();
+                let frontend = lex_parse_with_budget(
+                    source,
+                    profile,
+                    &CompileLimits::default(),
+                    &mut short,
+                )
+                .unwrap();
+                let resolved = resolve_with_budget(
+                    frontend,
+                    profile,
+                    &CompileLimits::default(),
+                    &mut short,
+                )
+                .unwrap();
+                short.work_limit = total_work - 1;
+                short.temporary_limit = total_temporary;
+                assert!(matches!(
+                    lower_with_budget(resolved, &rivetlua_core::IrLimits::default(), &mut short),
+                    Err(BudgetedCompileError::Budget(()))
+                ));
+
+                let mut short_temporary = Probe::unlimited();
+                let frontend = lex_parse_with_budget(
+                    source,
+                    profile,
+                    &CompileLimits::default(),
+                    &mut short_temporary,
+                )
+                .unwrap();
+                let resolved = resolve_with_budget(
+                    frontend,
+                    profile,
+                    &CompileLimits::default(),
+                    &mut short_temporary,
+                )
+                .unwrap();
+                short_temporary.work_limit = total_work;
+                short_temporary.temporary_limit = total_temporary - 1;
+                assert!(matches!(
+                    lower_with_budget(
+                        resolved,
+                        &rivetlua_core::IrLimits::default(),
+                        &mut short_temporary,
+                    ),
+                    Err(BudgetedCompileError::Budget(()))
+                ));
+                assert_eq!(short_temporary.temporary, total_temporary);
+            }
+        }
+    }
+
+    #[test]
+    fn lower_small_expression_ceiling_covers_reads_writes_and_control() {
+        let sources: &[&[u8]] = &[
+            b"x=1; return x",
+            b"local t={}; t.x=1; t[2]=3; return t.x+t[2]",
+            b"local a,b,c=1,2,3; return (a and b) or c",
+            b"local x=1; return function() return x end",
+            b"local function f(...) return ... end; return f(1,2)",
+        ];
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            for source in sources {
+                let mut sink = Probe::unlimited();
+                let frontend = lex_parse_with_budget(
+                    source,
+                    profile,
+                    &CompileLimits::default(),
+                    &mut sink,
+                )
+                .unwrap();
+                let resolved = resolve_with_budget(
+                    frontend,
+                    profile,
+                    &CompileLimits::default(),
+                    &mut sink,
+                )
+                .unwrap();
+                let mut shape = LowerShape::default();
+                shape.block::<()>(&resolved.resolved.root).unwrap();
+                let (_, temporary, local_limits) = lower_admission::<()>(
+                    &resolved,
+                    &rivetlua_core::IrLimits::default(),
+                    &shape,
+                )
+                .unwrap();
+                let ir = crate::lower(&resolved.resolved, &rivetlua_core::IrLimits::default())
+                    .unwrap();
+                assert!(ir.prototypes.iter().all(|p| p.instructions.len() <= local_limits.max_instructions));
+                assert!(ir_allocation_bytes::<()>(&ir).unwrap() <= temporary);
+                assert!(lower_with_budget(resolved, &rivetlua_core::IrLimits::default(), &mut sink).is_ok());
+            }
+        }
+        let mut sink = Probe::unlimited();
+        let frontend = lex_parse_with_budget(
+            b"return function() return 1 end",
+            LanguageProfile::Lua54,
+            &CompileLimits::default(),
+            &mut sink,
+        )
+        .unwrap();
+        let mut resolved = resolve_with_budget(
+            frontend,
+            LanguageProfile::Lua54,
+            &CompileLimits::default(),
+            &mut sink,
+        )
+        .unwrap();
+        let mut shape = LowerShape::default();
+        shape.block::<()>(&resolved.resolved.root).unwrap();
+        resolved.max_function_depth = usize::MAX;
+        assert!(matches!(
+            lower_admission::<()>(&resolved, &rivetlua_core::IrLimits::default(), &shape),
+            Err(BudgetedCompileError::AdmissionOverflow)
+        ));
     }
 
     #[test]

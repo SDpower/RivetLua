@@ -8,7 +8,12 @@ repository.workspace = true
 description = "RivetLua 的公開 Rust SDK。"
 readme = "README.md"
 
+[features]
+native-lua55 = ["dep:rivetlua-capi", "rivetlua-capi/lua55"]
+native-lua54 = ["dep:rivetlua-capi", "rivetlua-capi/lua54"]
+
 [dependencies]
 rivetlua-core = { path = "../rivetlua-core" }
 rivetlua-compiler = { path = "../rivetlua-compiler" }
 rivetlua-runtime = { path = "../rivetlua-runtime" }
+rivetlua-capi = { path = "../rivetlua-capi", optional = true, default-features = false }

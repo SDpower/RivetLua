@@ -257,6 +257,10 @@ fn scan_short_string(
                 }
                 continue;
             }
+            b'u' => {
+                scan_unicode_escape(&mut bytes, cursor, limits, start_byte, start)?;
+                continue;
+            }
             b'0'..=b'9' => {
                 let mut value = 0u16;
                 for _ in 0..3 {
@@ -295,6 +299,127 @@ fn scan_short_string(
         TokenKind::String,
         Some(Literal::String(bytes)),
     )
+}
+
+fn scan_unicode_escape(
+    bytes: &mut Vec<u8>,
+    cursor: &mut Cursor<'_>,
+    limits: &CompileLimits,
+    start_byte: usize,
+    start: SourcePosition,
+) -> Result<(), Diagnostic> {
+    advance(cursor, limits, start_byte, start)?;
+    if cursor.peek() != Some(b'{') {
+        return Err(lex_error(
+            cursor,
+            start_byte,
+            start,
+            "Unicode escape 格式不合法",
+        ));
+    }
+    advance(cursor, limits, start_byte, start)?;
+
+    let mut value = 0u32;
+    let mut has_digits = false;
+    loop {
+        match cursor.peek() {
+            Some(b'}') if has_digits => {
+                advance(cursor, limits, start_byte, start)?;
+                break;
+            }
+            Some(b'}') => {
+                return Err(lex_error(
+                    cursor,
+                    start_byte,
+                    start,
+                    "Unicode escape 缺少十六進位數字",
+                ));
+            }
+            Some(byte) => {
+                let Some(digit) = hex_value(byte) else {
+                    return Err(lex_error(
+                        cursor,
+                        start_byte,
+                        start,
+                        "Unicode escape 格式不合法",
+                    ));
+                };
+                let Some(next_value) = value
+                    .checked_mul(16)
+                    .and_then(|value| value.checked_add(u32::from(digit)))
+                else {
+                    return Err(lex_error(
+                        cursor,
+                        start_byte,
+                        start,
+                        "Unicode escape 超出 Lua 範圍",
+                    ));
+                };
+                if next_value > 0x7fff_ffff {
+                    return Err(lex_error(
+                        cursor,
+                        start_byte,
+                        start,
+                        "Unicode escape 超出 Lua 範圍",
+                    ));
+                }
+                value = next_value;
+                has_digits = true;
+                advance(cursor, limits, start_byte, start)?;
+            }
+            None => {
+                return Err(lex_error(
+                    cursor,
+                    start_byte,
+                    start,
+                    "Unicode escape 未結束",
+                ));
+            }
+        }
+    }
+
+    push_unicode_escape_bytes(bytes, value, limits, cursor, start_byte, start)
+}
+
+fn push_unicode_escape_bytes(
+    bytes: &mut Vec<u8>,
+    value: u32,
+    limits: &CompileLimits,
+    cursor: &Cursor<'_>,
+    start_byte: usize,
+    start: SourcePosition,
+) -> Result<(), Diagnostic> {
+    let (length, prefix) = match value {
+        0..=0x7f => (1, 0x00),
+        0x80..=0x7ff => (2, 0xc0),
+        0x800..=0xffff => (3, 0xe0),
+        0x1_0000..=0x1f_ffff => (4, 0xf0),
+        0x20_0000..=0x3ff_ffff => (5, 0xf8),
+        0x400_0000..=0x7fff_ffff => (6, 0xfc),
+        _ => {
+            return Err(lex_error(
+                cursor,
+                start_byte,
+                start,
+                "Unicode escape 超出 Lua 範圍",
+            ));
+        }
+    };
+
+    let first_shift = (length - 1) * 6;
+    push_literal_byte(
+        bytes,
+        prefix | (value >> first_shift) as u8,
+        limits,
+        cursor,
+        start_byte,
+        start,
+    )?;
+    for shift in (0..length - 1).rev() {
+        let byte = 0x80 | ((value >> (shift * 6)) & 0x3f) as u8;
+        push_literal_byte(bytes, byte, limits, cursor, start_byte, start)?;
+    }
+    Ok(())
 }
 
 fn scan_short_comment(cursor: &mut Cursor<'_>, limits: &CompileLimits) -> Result<(), Diagnostic> {
@@ -843,10 +968,7 @@ fn parse_number<B: NumericBudget>(
             .before_conversion(charge)
             .map_err(NumberError::Budget)?;
         let value = text.parse::<f64>().map_err(|_| "浮點 numeral 不合法")?;
-        return value
-            .is_finite()
-            .then_some(Number::Float(value))
-            .ok_or(NumberError::Syntax("浮點數超出範圍"));
+        return Ok(Number::Float(value));
     }
     match text.parse::<i64>() {
         Ok(value) => Ok(Number::Integer(value)),

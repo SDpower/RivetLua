@@ -498,6 +498,7 @@ struct BindingAccess {
 #[derive(Clone, Copy)]
 struct LabelInfo {
     scope: ScopeId,
+    terminal: bool,
     span: Span,
 }
 
@@ -542,12 +543,20 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_block(&mut self, block: &Block) -> Result<ResolvedBlock, Diagnostic> {
+        self.resolve_block_with_terminal_labels(block, true)
+    }
+
+    fn resolve_block_with_terminal_labels(
+        &mut self,
+        block: &Block,
+        terminal_labels_end_scope: bool,
+    ) -> Result<ResolvedBlock, Diagnostic> {
         if block.statements.len() > self.limits.max_statements
             || block.statements.len() > self.limits.max_ast_nodes
         {
             return Err(self.limit(block.span, "陳述式數超過編譯限制"));
         }
-        self.register_labels(block)?;
+        self.register_labels(block, terminal_labels_end_scope)?;
         self.validate_block_gotos(block)?;
         let mut statements = Vec::new();
         statements
@@ -556,10 +565,19 @@ impl<'a> Resolver<'a> {
         for statement in &block.statements {
             statements.push(self.resolve_statement(statement)?);
         }
-        let target_scope = self
-            .scopes
-            .get(self.scopes.len().saturating_sub(2))
-            .map(|scope| scope.id);
+        let terminal_suffix_start = block.statements.iter().rposition(|statement| {
+            !matches!(statement, Stmt::Empty { .. } | Stmt::Label { .. })
+        }).map_or(0, |index| index + 1);
+        let root_terminal_label = self.scopes.len() == 1
+            && block.statements[terminal_suffix_start..].iter()
+                .any(|statement| matches!(statement, Stmt::Label { .. }));
+        let target_scope = if root_terminal_label {
+            None
+        } else {
+            self.scopes
+                .get(self.scopes.len().saturating_sub(2))
+                .map(|scope| scope.id)
+        };
         Ok(ResolvedBlock {
             scope: self.scopes.last().expect("scope 已建立").id,
             statements,
@@ -596,12 +614,27 @@ impl<'a> Resolver<'a> {
                 bindings
                     .try_reserve(names.len())
                     .map_err(|_| self.limit(*span, "binding 配置超過編譯限制"))?;
+                let mut close_count = 0;
                 for name in names {
-                    bindings.push(self.declare_local(
+                    let binding = self.declare_local(
                         name.name.clone(),
                         name.span,
                         name.attribute.clone(),
-                    )?);
+                    )?;
+                    if name
+                        .attribute
+                        .as_ref()
+                        .is_some_and(|attribute| attribute.name.as_slice() == b"close")
+                    {
+                        close_count += 1;
+                        if close_count > 1 {
+                            return Err(self.resolve_error(
+                                name.span,
+                                "local 宣告含多個 close 變數",
+                            ));
+                        }
+                    }
+                    bindings.push(binding);
                 }
                 let names = names
                     .iter()
@@ -703,7 +736,7 @@ impl<'a> Resolver<'a> {
                 Ok(ResolvedStmt::Goto {
                     name: name.clone(),
                     name_span: *name_span,
-                    close_path: self.close_path(ExitKind::Goto, Some(label.scope), *span),
+                    close_path: self.goto_close_path(label, *span)?,
                     span: *span,
                 })
             }
@@ -1105,7 +1138,7 @@ impl<'a> Resolver<'a> {
         self.enter_scope(body.span)?;
         self.loops.push(target);
         let result = (|| {
-            let body = self.resolve_block(body)?;
+            let body = self.resolve_block_with_terminal_labels(body, false)?;
             let condition = self.resolve_expr(condition)?;
             Ok(ResolvedStmt::Repeat {
                 body,
@@ -1820,7 +1853,11 @@ impl<'a> Resolver<'a> {
         self.scopes.last().expect("scope 已建立").id
     }
 
-    fn register_labels(&mut self, block: &Block) -> Result<(), Diagnostic> {
+    fn register_labels(
+        &mut self,
+        block: &Block,
+        terminal_labels_end_scope: bool,
+    ) -> Result<(), Diagnostic> {
         let scope = self.current_scope();
         let label_count = block
             .statements
@@ -1851,7 +1888,10 @@ impl<'a> Resolver<'a> {
             .declaration_spans
             .try_reserve(declaration_count)
             .map_err(|_| declaration_reserve_error)?;
-        for statement in &block.statements {
+        let last_non_void = block.statements.iter().rposition(|statement| {
+            !matches!(statement, Stmt::Empty { .. } | Stmt::Label { .. })
+        });
+        for (index, statement) in block.statements.iter().enumerate() {
             match statement {
                 Stmt::Local { names, .. } => frame
                     .declaration_spans
@@ -1873,6 +1913,8 @@ impl<'a> Resolver<'a> {
                     name.clone(),
                     LabelInfo {
                         scope,
+                        terminal: terminal_labels_end_scope
+                            && last_non_void.map_or(true, |last| index > last),
                         span: *name_span,
                     },
                 )
@@ -1917,11 +1959,40 @@ impl<'a> Resolver<'a> {
                             && declaration.start_byte < label.span.start_byte
                     })
                 });
-            if enters_local {
+            if enters_local && !label.terminal {
                 return Err(self.resolve_error(*span, "goto 不可跳入 local scope"));
             }
         }
         Ok(())
+    }
+
+    fn goto_close_path(&self, label: LabelInfo, span: Span) -> Result<ClosePath, Diagnostic> {
+        let mut path = self.close_path(ExitKind::Goto, Some(label.scope), span);
+        if !label.terminal && label.span.start_byte >= span.start_byte {
+            return Ok(path);
+        }
+        let target = self
+            .scopes
+            .iter()
+            .find(|scope| scope.id == label.scope)
+            .ok_or_else(|| self.resolve_error(span, "goto 目標作用域不符"))?;
+        for binding in target.local_bindings.iter().rev() {
+            let meta = self
+                .bindings
+                .get(binding.ordinal as usize)
+                .filter(|meta| meta.id == *binding)
+                .ok_or_else(|| self.resolve_error(span, "goto binding 索引不符"))?;
+            if !label.terminal && meta.span.start_byte <= label.span.start_byte {
+                break;
+            }
+            if meta.span.start_byte < span.start_byte {
+                path.exited_bindings.push(*binding);
+                if meta.close_marker.is_some() {
+                    path.bindings.push(*binding);
+                }
+            }
+        }
+        Ok(path)
     }
 
     fn close_path(&self, kind: ExitKind, target_scope: Option<ScopeId>, span: Span) -> ClosePath {
@@ -2047,6 +2118,146 @@ mod tests {
     }
 
     #[test]
+    fn p17_local_close_list_cardinality_and_effective_attributes() {
+        let limits = CompileLimits::default();
+        let source = b"local <close> first <const>, second = nil, nil";
+        let chunk = lex(source, LanguageProfile::Lua55, &limits).unwrap();
+        let parsed = parse(&chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let resolved = resolve(&parsed, &chunk, LanguageProfile::Lua55, &limits).unwrap();
+        let ResolvedStmt::Local { bindings, .. } = &resolved.root.statements[0] else {
+            panic!("有效 attribute 未保留為 local binding");
+        };
+        assert_eq!(bindings.len(), 2);
+        let first = &resolved.functions[0].bindings[bindings[0].ordinal as usize];
+        let second = &resolved.functions[0].bindings[bindings[1].ordinal as usize];
+        assert!(first.readonly);
+        assert!(first.close_marker.is_none());
+        assert!(second.readonly);
+        assert!(second.close_marker.is_some());
+
+        for (source, profile) in [
+            (b"local <close> a, b".as_slice(), LanguageProfile::Lua55),
+            (b"local a <close>, b <close>".as_slice(), LanguageProfile::Lua54),
+        ] {
+            let chunk = lex(source, profile, &limits).unwrap();
+            let parsed = parse(&chunk, profile, &limits).unwrap();
+            let error = resolve(&parsed, &chunk, profile, &limits).unwrap_err();
+            assert_eq!(error.code, DiagnosticCode::Resolve, "{profile:?}");
+            assert_eq!(error.message, "local 宣告含多個 close 變數");
+        }
+    }
+
+    #[test]
+    fn p17_terminal_labels_allow_skipped_locals_without_opening_live_scope() {
+        let limits = CompileLimits::default();
+        for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
+            let source = b"do goto done; local x = 1; ::done:: ; end";
+            let chunk = lex(source, profile, &limits).unwrap();
+            let parsed = parse(&chunk, profile, &limits).unwrap();
+            assert!(resolve(&parsed, &chunk, profile, &limits).is_ok(), "{profile:?}");
+
+            for source in [
+                b"do goto live; local x = 1; ::live:: x = 2 end".as_slice(),
+                b"do goto live; local x = 1; ::live:: f = function() return x end end",
+                b"do goto live; local x <close> = nil; ::live:: f = x end",
+                b"repeat goto live; local x = 1; ::live:: until x == nil",
+                b"repeat goto live; local x <close> = nil; ::live:: until x == nil",
+            ] {
+                let chunk = lex(source, profile, &limits).unwrap();
+                let parsed = parse(&chunk, profile, &limits).unwrap();
+                let error = resolve(&parsed, &chunk, profile, &limits).unwrap_err();
+                assert_eq!(error.code, DiagnosticCode::Resolve, "{profile:?}");
+                assert_eq!(error.message, "goto 不可跳入 local scope");
+            }
+        }
+    }
+
+    #[test]
+    fn p17_backward_goto_exits_captured_and_close_locals_in_reverse_order() {
+        let limits = CompileLimits::default();
+        let source = b"local base=1; ::again:: local captured=2; local f=function() return captured end; local first <close> = nil; local second <close> = nil; goto again";
+        for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
+            let chunk = lex(source, profile, &limits).unwrap();
+            let parsed = parse(&chunk, profile, &limits).unwrap();
+            let resolved = resolve(&parsed, &chunk, profile, &limits).unwrap();
+            let statements: Vec<_> = resolved
+                .root
+                .statements
+                .iter()
+                .filter(|statement| !matches!(statement, ResolvedStmt::Empty { .. }))
+                .collect();
+            let local = |index: usize| match statements[index] {
+                ResolvedStmt::Local { bindings, .. } => bindings[0],
+                _ => panic!("預期 local binding"),
+            };
+            let (base, captured, f, first, second) =
+                (local(0), local(2), local(3), local(4), local(5));
+            let ResolvedStmt::Goto { close_path, .. } = statements[6] else {
+                panic!("預期 backward goto");
+            };
+            assert_eq!(close_path.bindings, vec![second, first], "{profile:?}");
+            assert_eq!(
+                close_path.exited_bindings,
+                vec![second, first, f, captured],
+                "{profile:?}"
+            );
+            assert!(!close_path.exited_bindings.contains(&base));
+            assert_eq!(close_path.from_scope, close_path.target_scope.unwrap());
+        }
+    }
+
+    #[test]
+    fn p17_forward_terminal_goto_exits_only_initialized_target_bindings() {
+        let limits = CompileLimits::default();
+        let source = b"local outer=1; local captured=function() return outer end; local outer_close <close> = nil; do local inner_close <close> = nil; goto done end; local skipped <close> = nil; ::done::";
+        for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
+            let chunk = lex(source, profile, &limits).unwrap();
+            let parsed = parse(&chunk, profile, &limits).unwrap();
+            let resolved = resolve(&parsed, &chunk, profile, &limits).unwrap();
+            let statements: Vec<_> = resolved
+                .root
+                .statements
+                .iter()
+                .filter(|statement| !matches!(statement, ResolvedStmt::Empty { .. }))
+                .collect();
+            let local = |statement: &ResolvedStmt| match statement {
+                ResolvedStmt::Local { bindings, .. } => bindings[0],
+                _ => panic!("預期 local binding"),
+            };
+            let (outer, captured, outer_close, skipped) = (
+                local(statements[0]),
+                local(statements[1]),
+                local(statements[2]),
+                local(statements[4]),
+            );
+            let ResolvedStmt::Do { body, .. } = statements[3] else {
+                panic!("預期 do block");
+            };
+            let body_statements: Vec<_> = body
+                .statements
+                .iter()
+                .filter(|statement| !matches!(statement, ResolvedStmt::Empty { .. }))
+                .collect();
+            let inner_close = local(body_statements[0]);
+            let ResolvedStmt::Goto { close_path, .. } = body_statements[1] else {
+                panic!("預期 forward goto");
+            };
+            assert_eq!(close_path.bindings, vec![inner_close, outer_close], "{profile:?}");
+            assert_eq!(
+                close_path.exited_bindings,
+                vec![inner_close, outer_close, captured, outer],
+                "{profile:?}"
+            );
+            assert!(!close_path.exited_bindings.contains(&skipped));
+            assert_eq!(close_path.target_scope, Some(resolved.root.scope));
+            assert_eq!(resolved.root.normal_close_path.bindings, vec![skipped, outer_close]);
+            assert_eq!(resolved.root.normal_close_path.target_scope, None);
+            assert_eq!(resolved.root.normal_close_path.exited_bindings,
+                vec![skipped, outer_close, captured, outer]);
+        }
+    }
+
+    #[test]
     fn budget_private_containers_cover_growth_shadow_reserve_and_clone() {
         let (scope_size, label_size, parent_size, access_size) = budget_layout_sizes();
         assert_eq!(scope_size, core::mem::size_of::<ScopeFrame>());
@@ -2124,6 +2335,7 @@ mod tests {
                 key.clone(),
                 LabelInfo {
                     scope: scope.id,
+                    terminal: false,
                     span,
                 },
             );

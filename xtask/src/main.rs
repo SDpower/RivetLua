@@ -2,6 +2,7 @@
 
 mod p15;
 mod p16;
+mod p17;
 
 use std::env;
 use std::fmt::Write as _;
@@ -12861,8 +12862,9 @@ fn main() -> ExitCode {
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P14") && arguments.len() == 2 => p14_gate(),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P15") && arguments.len() == 2 => p15::gate(),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P16") && arguments.len() == 2 => p16::gate(),
+        Some("gate") if arguments.get(1).map(String::as_str) == Some("P17") => p17::gate(&arguments[2..]),
         _ => Err(
-            "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | official-tests --profile lua55-i64f64|lua54-i64f64 --mode basic | p16-acceptance --profile lua55-i64f64|lua54-i64f64 | gate P00|P01|P02|P03|P04|P05|P06|P07|P08|P09|P10|P11|P12|P13|P14|P15|P16".into(),
+            "用法：rivetlua-xtask toolchain | reference --profile lua55|lua54 [--offline] | runner --profile lua55|lua54 --case <P00-ID> | official-tests --profile lua55-i64f64|lua54-i64f64 --mode basic | p16-acceptance --profile lua55-i64f64|lua54-i64f64 | gate P00|P01|P02|P03|P04|P05|P06|P07|P08|P09|P10|P11|P12|P13|P14|P15|P16|P17 [--batch P17-B01|P17-B02|P17-B03]".into(),
         ),
     };
     match result {

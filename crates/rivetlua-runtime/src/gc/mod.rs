@@ -21,6 +21,15 @@ pub enum GcColor {
     Black,
 }
 
+/// 固定物理 SlotId 的 64 槽摘要；Free 與 Retired 都不參與標記。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GcSlotBits {
+    pub(crate) occupied: u64,
+    pub(crate) reusable_free: u64,
+    pub(crate) gray: u64,
+    pub(crate) black: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GcAge {
     Young,
@@ -150,7 +159,10 @@ pub(crate) struct GcState {
     pub phase: GcPhase,
     pub mode: GcMode,
     pub cycle: GcCycleKind,
-    pub colors: Vec<GcColor>,
+    pub(crate) slot_bits: Vec<GcSlotBits>,
+    pub(crate) slot_bit_charges: Vec<AllocationCharge>,
+    pub(crate) occupied_count: usize,
+    pub(crate) work_capacity: usize,
     pub work: Vec<ObjectRef>,
     pub roots: Vec<ObjectRef>,
     pub root_cursor: usize,
@@ -177,7 +189,7 @@ pub(crate) struct GcState {
     pub atomic_finalizer_stage: AtomicFinalizerStage,
     pub charge: usize,
     pub cycle_charges: AllocationCharges,
-    pub growth_charges: Vec<(usize, AllocationCharge, AllocationCharge)>,
+    pub growth_charges: Vec<(usize, AllocationCharge)>,
 }
 
 impl GcState {
@@ -212,7 +224,10 @@ impl GcState {
             phase: GcPhase::Pause,
             mode: GcMode::Generational,
             cycle: GcCycleKind::Full,
-            colors: Vec::new(),
+            slot_bits: Vec::new(),
+            slot_bit_charges: Vec::new(),
+            occupied_count: 0,
+            work_capacity: 0,
             work: Vec::new(),
             roots: Vec::new(),
             root_cursor: 0,
@@ -240,6 +255,120 @@ impl GcState {
             charge: 0,
             cycle_charges: AllocationCharges::new(),
             growth_charges: Vec::new(),
+        }
+    }
+
+    pub(crate) fn color(&self, index: usize) -> Option<GcColor> {
+        let page = self.slot_bits.get(index / 64)?;
+        let mask = 1u64 << (index % 64);
+        if page.occupied & mask == 0 {
+            None
+        } else if page.gray & mask != 0 {
+            Some(GcColor::Gray)
+        } else if page.black & mask != 0 {
+            Some(GcColor::Black)
+        } else {
+            Some(GcColor::White)
+        }
+    }
+
+    pub(crate) fn set_color(&mut self, index: usize, color: GcColor) {
+        let page = &mut self.slot_bits[index / 64];
+        let mask = 1u64 << (index % 64);
+        debug_assert_ne!(page.occupied & mask, 0);
+        page.gray &= !mask;
+        page.black &= !mask;
+        match color {
+            GcColor::White => {}
+            GcColor::Gray => page.gray |= mask,
+            GcColor::Black => page.black |= mask,
+        }
+    }
+
+    pub(crate) fn clear_colors(&mut self) {
+        for page in &mut self.slot_bits {
+            page.gray = 0;
+            page.black = 0;
+        }
+    }
+
+    pub(crate) fn publish_occupied(&mut self, index: usize) {
+        let page = &mut self.slot_bits[index / 64];
+        let mask = 1u64 << (index % 64);
+        debug_assert_eq!(page.occupied & mask, 0);
+        page.occupied |= mask;
+        page.reusable_free &= !mask;
+        page.gray &= !mask;
+        page.black &= !mask;
+        self.occupied_count += 1;
+    }
+
+    pub(crate) fn retire_or_free(&mut self, index: usize, reusable: bool) {
+        let page = &mut self.slot_bits[index / 64];
+        let mask = 1u64 << (index % 64);
+        debug_assert_ne!(page.occupied & mask, 0);
+        page.occupied &= !mask;
+        page.gray &= !mask;
+        page.black &= !mask;
+        if reusable {
+            page.reusable_free |= mask;
+        } else {
+            page.reusable_free &= !mask;
+        }
+        self.occupied_count -= 1;
+    }
+
+    pub(crate) fn next_occupied(&self, start: usize, end: usize) -> Option<usize> {
+        self.next_bit(start, end, false)
+    }
+
+    pub(crate) fn next_reusable_free(&self, start: usize, end: usize) -> Option<usize> {
+        self.next_bit(start, end, true)
+    }
+
+    fn next_bit(&self, start: usize, end: usize, free: bool) -> Option<usize> {
+        if start >= end {
+            return None;
+        }
+        let mut page_index = start / 64;
+        let mut offset = start % 64;
+        while page_index < self.slot_bits.len() {
+            let base = page_index * 64;
+            if base >= end {
+                break;
+            }
+            let page = &self.slot_bits[page_index];
+            let mut bits = if free { page.reusable_free } else { page.occupied };
+            bits &= u64::MAX << offset;
+            let remaining = end - base;
+            if remaining < 64 {
+                bits &= (1u64 << remaining) - 1;
+            }
+            if bits != 0 {
+                return Some(base + bits.trailing_zeros() as usize);
+            }
+            page_index += 1;
+            offset = 0;
+        }
+        None
+    }
+
+    pub(crate) fn truncate_slot_pages(&mut self, physical_slots: usize) {
+        let wanted = physical_slots / 64 + usize::from(physical_slots % 64 != 0);
+        while self.slot_bits.len() > wanted {
+            if let Some(page) = self.slot_bits.pop() {
+                debug_assert_eq!(page.occupied, 0);
+                self.slot_bit_charges.pop();
+            }
+        }
+        if physical_slots % 64 != 0 {
+            if let Some(last) = self.slot_bits.last_mut() {
+                let valid = (1u64 << (physical_slots % 64)) - 1;
+                debug_assert_eq!(last.occupied & !valid, 0);
+                last.reusable_free &= valid;
+                last.gray &= valid;
+                last.black &= valid;
+            }
         }
     }
 
@@ -274,12 +403,13 @@ impl GcState {
     }
 
     pub fn clear_cycle(&mut self) -> Result<(), crate::VmError> {
-        self.colors = Vec::new();
+        self.clear_colors();
         self.work = Vec::new();
         self.roots = Vec::new();
         self.cycle_charges = AllocationCharges::new();
         self.growth_charges.clear();
         self.charge = 0;
+        self.work_capacity = 0;
         self.root_cursor = 0;
         self.remembered_cursor = 0;
         self.sweep_cursor = 0;

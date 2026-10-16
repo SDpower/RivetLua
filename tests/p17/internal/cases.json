@@ -1,0 +1,157 @@
+{
+  "schema": "rivetlua-internal-cases-v1",
+  "cases": [
+    {
+      "case_id": "allocation-ledger",
+      "profiles": ["lua55-i64f64", "lua54-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_allocation_ledger",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    },
+    {
+      "case_id": "gc-roots",
+      "profiles": ["lua55-i64f64", "lua54-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_gc_roots",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    },
+    {
+      "case_id": "table-string",
+      "profiles": ["lua55-i64f64", "lua54-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_table_string",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    },
+    {
+      "case_id": "verified-code",
+      "profiles": ["lua55-i64f64", "lua54-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_verified_code",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    },
+    {
+      "case_id": "c-stack-errors",
+      "profiles": ["lua55-i64f64", "lua54-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_c_stack_errors",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    },
+    {
+      "case_id": "userdata-registry",
+      "profiles": ["lua55-i64f64", "lua54-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_userdata_registry",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    },
+    {
+      "case_id": "state-coroutine",
+      "profiles": ["lua55-i64f64", "lua54-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_state_coroutine",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    },
+    {
+      "case_id": "upvalue-debug",
+      "profiles": ["lua55-i64f64", "lua54-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_upvalue_debug",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    },
+    {
+      "case_id": "numeric-bytes",
+      "profiles": ["lua55-i64f64", "lua54-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_numeric_bytes",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    },
+    {
+      "case_id": "external-strings",
+      "profiles": ["lua55-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_external_strings",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    },
+    {
+      "case_id": "native-modules",
+      "profiles": ["lua55-i64f64", "lua54-i64f64"],
+      "runs": [],
+      "evidence": {
+        "batch": "P17-B01",
+        "facet": "module-load"
+      }
+    },
+    {
+      "case_id": "gc-parameters",
+      "profiles": ["lua55-i64f64"],
+      "runs": [
+        {
+          "crate": "rivetlua-capi",
+          "target": "p17_internal_replacements",
+          "selector": "p17_internal_gc_parameters",
+          "expected_matched": 1
+        }
+      ],
+      "evidence": null
+    }
+  ]
+}

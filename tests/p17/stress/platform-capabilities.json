@@ -1,0 +1,24 @@
+{
+  "schema": "rivetlua-p17-platform-capabilities-v1",
+  "profiles": [
+    "lua55-i64f64",
+    "lua54-i64f64"
+  ],
+  "target": "aarch64-apple-darwin",
+  "case_ids": [
+    "p17_platform_cli",
+    "p17_platform_c"
+  ],
+  "expected": {
+    "cli": {
+      "os_tmpname": "denied",
+      "os_time": "available",
+      "os_execute": "denied",
+      "os_difftime": "available",
+      "package_loadlib": "denied"
+    },
+    "c": {
+      "tmpnam": "probed"
+    }
+  }
+}

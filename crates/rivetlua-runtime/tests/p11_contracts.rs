@@ -1068,13 +1068,15 @@ fn err_case_002_xpcall_handler_reentry_and_abort() {
         .unwrap()
         .run()
         .unwrap();
-    let RunOutcome::LuaError(error) = outcome else {
-        panic!("32 次 handler 失敗應停止")
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("32 次 handler 失敗應交還 xpcall 失敗結果")
     };
-    assert_eq!(error.diagnostic_id, "E_ERROR_HANDLER_LOOP");
-    let Value::Object(message) = error.value else {
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0], Value::Boolean(false));
+    let Value::Object(message) = values[1] else {
         panic!("handler-loop error 應為 byte string")
     };
+    let message_root = HostHandle::<Value>::new(&mut vm, message).unwrap();
     assert_eq!(
         vm.with_byte_string(message, |string| string.as_bytes().to_vec()),
         Ok(b"error in error handling".to_vec())
@@ -1084,7 +1086,7 @@ fn err_case_002_xpcall_handler_reentry_and_abort() {
         vm.raw_get(env, Value::Object(key_n)),
         Ok(Value::Integer(32))
     );
-    drop(error);
+    drop(message_root);
 
     let abort_source = b"return pcall(function() while true do end end)";
     let mut execution = vm
@@ -1162,18 +1164,20 @@ fn err_case_002_builtin_target_preserves_nested_results() {
         .unwrap()
         .run()
         .unwrap();
-    let RunOutcome::LuaError(error) = outcome else {
-        panic!("內建 error handler 應遵守 32 次上限")
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("內建 error handler 達 32 次上限後應交還 xpcall 失敗結果")
     };
-    assert_eq!(error.diagnostic_id, "E_ERROR_HANDLER_LOOP");
-    let Value::Object(message) = error.value else {
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0], Value::Boolean(false));
+    let Value::Object(message) = values[1] else {
         panic!("handler-loop 須保存 byte string")
     };
+    let message_root = HostHandle::<Value>::new(&mut vm, message).unwrap();
     assert_eq!(
         vm.with_byte_string(message, |string| string.as_bytes().to_vec()),
         Ok(b"error in error handling".to_vec())
     );
-    drop(error);
+    drop(message_root);
     drop(env_root);
     vm.collect().unwrap();
     assert_eq!(vm.roots().total_count(), 0);

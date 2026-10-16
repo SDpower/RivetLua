@@ -319,6 +319,76 @@ fn collect_statement_bodies<'a>(
     }
 }
 
+// 只檢查這一筆敘述直接求值的 expression；內層 block 由自己的敘述迴圈處理。
+// 開放 Call 的第一個結果在目前 binding 版圖下可能跨越舊暫存 home，
+// 因此必須在 lower 它以前切換世代。
+fn expression_may_emit_open_call(expression: &ResolvedExpr) -> bool {
+    match expression {
+        ResolvedExpr::Call { callee, arguments, .. } => {
+            arguments.last().is_some_and(|last| matches!(
+                last, ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }
+            )) || expression_may_emit_open_call(callee)
+                || arguments.iter().any(expression_may_emit_open_call)
+        }
+        ResolvedExpr::MethodCall { receiver, arguments, .. } => {
+            arguments.last().is_some_and(|last| matches!(
+                last, ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }
+            )) || expression_may_emit_open_call(receiver)
+                || arguments.iter().any(expression_may_emit_open_call)
+        }
+        ResolvedExpr::Unary { expression, .. } | ResolvedExpr::Paren { expression, .. }
+        | ResolvedExpr::Field { base: expression, .. } => {
+            expression_may_emit_open_call(expression)
+        }
+        ResolvedExpr::Binary { left, right, .. }
+        | ResolvedExpr::Index { base: left, index: right, .. } => {
+            expression_may_emit_open_call(left) || expression_may_emit_open_call(right)
+        }
+        ResolvedExpr::TableConstructor { fields, .. } => fields.iter().enumerate().any(|(index, field)| {
+            let last_open_array = index + 1 == fields.len() && matches!(field,
+                ResolvedTableField::Array { value: ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }, .. });
+            last_open_array || match field {
+                ResolvedTableField::Array { value, .. } | ResolvedTableField::Named { value, .. } =>
+                    expression_may_emit_open_call(value),
+                ResolvedTableField::Indexed { key, value, .. } =>
+                    expression_may_emit_open_call(key) || expression_may_emit_open_call(value),
+            }
+        }),
+        ResolvedExpr::Function { .. } | ResolvedExpr::Literal { .. }
+        | ResolvedExpr::Nil { .. } | ResolvedExpr::Bool { .. }
+        | ResolvedExpr::Name { .. } | ResolvedExpr::Vararg { .. } => false,
+    }
+}
+
+fn statement_may_emit_open_call(statement: &ResolvedStmt) -> bool {
+    match statement {
+        ResolvedStmt::Return { values, .. } => values.last().is_some_and(|last| matches!(
+            last, ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }
+        )) || values.iter().any(expression_may_emit_open_call),
+        ResolvedStmt::Local { values, .. } | ResolvedStmt::GenericFor { values, .. } =>
+            values.iter().any(expression_may_emit_open_call),
+        ResolvedStmt::Assignment { targets, values, .. } =>
+            targets.iter().chain(values).any(expression_may_emit_open_call),
+        ResolvedStmt::Call { call, .. } | ResolvedStmt::Function { name: call, .. } =>
+            expression_may_emit_open_call(call),
+        ResolvedStmt::If { clauses, .. } => clauses.iter().any(|clause|
+            expression_may_emit_open_call(&clause.condition)),
+        ResolvedStmt::While { condition, .. } | ResolvedStmt::Repeat { condition, .. } =>
+            expression_may_emit_open_call(condition),
+        ResolvedStmt::NumericFor { initial, limit, step, .. } =>
+            expression_may_emit_open_call(initial) || expression_may_emit_open_call(limit)
+                || step.as_ref().is_some_and(expression_may_emit_open_call),
+        ResolvedStmt::Global { declaration, .. } => match declaration {
+            ResolvedGlobalDeclaration::Names { values, .. } =>
+                values.iter().any(expression_may_emit_open_call),
+            ResolvedGlobalDeclaration::Function { .. } | ResolvedGlobalDeclaration::Star { .. } => false,
+        },
+        ResolvedStmt::Empty { .. } | ResolvedStmt::Break { .. } | ResolvedStmt::Goto { .. }
+        | ResolvedStmt::Label { .. } | ResolvedStmt::Do { .. }
+        | ResolvedStmt::LocalFunction { .. } => false,
+    }
+}
+
 struct Builder<'a> {
     function: &'a ResolvedFunction,
     id: ProtoId,
@@ -334,6 +404,12 @@ struct Builder<'a> {
     initial_top: Register,
     dynamic_top: Register,
     next_register: u16,
+    peak_register: u16,
+    helper_private_floor: u16,
+    open_call_generation_floor: u16,
+    debug_binding_epoch: u32,
+    open_call_generation_epoch: Option<u32>,
+    open_call_preisolated_epoch: Option<u32>,
     binding_registers: Vec<(BindingId, Register)>,
     constants: Vec<IrConstant>,
     instructions: Vec<IrInstruction>,
@@ -602,6 +678,12 @@ impl<'a> Builder<'a> {
             initial_top: Register(next_register),
             dynamic_top: Register(next_register),
             next_register,
+            peak_register: next_register,
+            helper_private_floor: next_register,
+            open_call_generation_floor: next_register,
+            debug_binding_epoch: 0,
+            open_call_generation_epoch: None,
+            open_call_preisolated_epoch: None,
             binding_registers,
             constants: Vec::new(),
             instructions: Vec::new(),
@@ -643,6 +725,8 @@ impl<'a> Builder<'a> {
             return Err(limit(span, "native debug local 數超過 IR register 限制"));
         }
         let register = self.binding_register(binding, span)?;
+        let next_epoch = self.debug_binding_epoch.checked_add(1)
+            .ok_or_else(|| limit(span, "native debug binding 世代溢位"))?;
         let slot = u16::try_from(self.debug_active.len())
             .map_err(|_| limit(span, "native debug local slot 溢位"))?;
         let initialized_pc = u32::try_from(initialized_pc)
@@ -658,6 +742,8 @@ impl<'a> Builder<'a> {
             end_pc: u32::MAX,
         });
         self.debug_active.push(self.debug_locals.len() - 1);
+        self.debug_binding_epoch = next_epoch;
+        self.isolate_open_call_generation_after_binding_change();
         self.debug_max_active = self.debug_max_active.max(slot.saturating_add(1));
         Ok(())
     }
@@ -669,6 +755,12 @@ impl<'a> Builder<'a> {
             .ok_or_else(|| invalid(span, "native debug scope stack 不一致"))?;
         let end_pc = u32::try_from(self.instructions.len())
             .map_err(|_| limit(span, "native debug 結束 PC 溢位"))?;
+        let next_epoch = if self.debug_active.len() > count {
+            Some(self.debug_binding_epoch.checked_add(1)
+                .ok_or_else(|| limit(span, "native debug binding 世代溢位"))?)
+        } else {
+            None
+        };
         while self.debug_active.len() > count {
             let index = self
                 .debug_active
@@ -676,7 +768,22 @@ impl<'a> Builder<'a> {
                 .ok_or_else(|| invalid(span, "native debug active stack 不一致"))?;
             self.debug_locals[index].end_pc = end_pc;
         }
+        if let Some(epoch) = next_epoch {
+            self.debug_binding_epoch = epoch;
+            self.isolate_open_call_generation_after_binding_change();
+        }
         Ok(())
+    }
+
+    fn isolate_open_call_generation_after_binding_change(&mut self) {
+        if self.open_call_generation_epoch.is_some_and(|epoch|
+            self.debug_binding_epoch.checked_sub(1) == Some(epoch)) {
+            // 僅在剛離開實際發出 open Call 的版圖時隔離一次；沒有新
+            // open Call 的連續 local 宣告仍可共用同一批暫存 home。
+            self.open_call_generation_floor =
+                self.open_call_generation_floor.max(self.peak_register);
+            self.next_register = self.next_register.max(self.open_call_generation_floor);
+        }
     }
 
     fn begin_debug_scope(&mut self, span: Span) -> Result<(), IrError> {
@@ -709,37 +816,39 @@ impl<'a> Builder<'a> {
                     | Instruction::Jump { .. }
             )
         ) {
-            let close_start = self.instructions.len();
-            if !body.error_close_path.bindings.is_empty() {
-                // 函式 root 的隱含返回沿用 resolver 已確認的退出 binding 清單。
-                let path = ClosePath {
-                    kind: ExitKind::Normal,
-                    span: body.span,
-                    from_scope: body.scope,
-                    target_scope: None,
-                    bindings: body.error_close_path.bindings.clone(),
-                    exited_bindings: body.error_close_path.exited_bindings.clone(),
-                };
-                self.emit_close(&path)?;
-            } else if !body.error_close_path.exited_bindings.is_empty() {
-                self.emit_upvalue_close(&body.error_close_path)?;
-            }
-            if self.instructions.len() > close_start {
-                let close_start_pc = u32::try_from(close_start)
-                    .map_err(|_| limit(self.span, "native debug close 起始 PC 溢位"))?;
-                let close_end_pc = u32::try_from(self.instructions.len())
-                    .map_err(|_| limit(self.span, "native debug close 結束 PC 溢位"))?;
-                for local in &mut self.debug_locals {
-                    if local.end_pc != close_start_pc
-                        || !body
-                            .error_close_path
-                            .exited_bindings
-                            .contains(&local.binding)
-                    {
-                        continue;
+            if body.normal_close_path.target_scope.is_some() {
+                let close_start = self.instructions.len();
+                if !body.error_close_path.bindings.is_empty() {
+                    // 函式 root 的隱含返回沿用 resolver 已確認的退出 binding 清單。
+                    let path = ClosePath {
+                        kind: ExitKind::Normal,
+                        span: body.span,
+                        from_scope: body.scope,
+                        target_scope: None,
+                        bindings: body.error_close_path.bindings.clone(),
+                        exited_bindings: body.error_close_path.exited_bindings.clone(),
+                    };
+                    self.emit_close(&path)?;
+                } else if !body.error_close_path.exited_bindings.is_empty() {
+                    self.emit_upvalue_close(&body.error_close_path)?;
+                }
+                if self.instructions.len() > close_start {
+                    let close_start_pc = u32::try_from(close_start)
+                        .map_err(|_| limit(self.span, "native debug close 起始 PC 溢位"))?;
+                    let close_end_pc = u32::try_from(self.instructions.len())
+                        .map_err(|_| limit(self.span, "native debug close 結束 PC 溢位"))?;
+                    for local in &mut self.debug_locals {
+                        if local.end_pc != close_start_pc
+                            || !body
+                                .error_close_path
+                                .exited_bindings
+                                .contains(&local.binding)
+                        {
+                            continue;
+                        }
+                        // 同一 root scope 的 local 一起結束，維持 slot 的 LIFO 順序。
+                        local.end_pc = close_end_pc;
                     }
-                    // 同一 root scope 的 local 一起結束，維持 slot 的 LIFO 順序。
-                    local.end_pc = close_end_pc;
                 }
             }
             let return_span = if self.function_body.is_none() {
@@ -791,7 +900,7 @@ impl<'a> Builder<'a> {
         let reachable = initializer_reachable_pcs(&self.instructions, self.span)?;
         self.debug_initializer_temporaries
             .retain(|entry| initializer_interval_safe(&self.instructions, &reachable, entry));
-        let register_count = self.next_register.max(1);
+        let register_count = self.peak_register.max(1);
         if register_count > self.limits.max_registers {
             return Err(limit(self.span, "register 數超過 IR 限制"));
         }
@@ -1025,6 +1134,7 @@ impl<'a> Builder<'a> {
             .next_register
             .checked_add(1)
             .ok_or_else(|| limit(span, "register 數超過 IR 限制"))?;
+        self.peak_register = self.peak_register.max(self.next_register);
         Ok(register)
     }
 
@@ -1379,20 +1489,70 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn lower_block_statements(&mut self, block: &ResolvedBlock) -> Result<(), IrError> {
+    fn lower_block_statements(
+        &mut self,
+        block: &ResolvedBlock,
+        terminal_label: Option<usize>,
+    ) -> Result<(), IrError> {
         self.begin_debug_scope(block.span)?;
         self.enter_label_frame(block)?;
-        for statement in &block.statements {
+        for (index, statement) in block.statements.iter().enumerate() {
+            if Some(index) == terminal_label {
+                self.emit_close(&block.normal_close_path)?;
+                self.emit_exited_binding_cleanup(&block.normal_close_path)?;
+                self.end_debug_scope(block.span)?;
+            }
+            let generation_epoch = self.debug_binding_epoch;
+            if self.open_call_generation_epoch != Some(generation_epoch)
+                && self.open_call_preisolated_epoch != Some(generation_epoch)
+                && statement_may_emit_open_call(statement)
+            {
+                self.open_call_generation_floor =
+                    self.open_call_generation_floor.max(self.peak_register);
+                self.next_register = self.next_register.max(self.open_call_generation_floor);
+                self.open_call_preisolated_epoch = Some(generation_epoch);
+            }
+            let temporary_start = self.next_register;
+            let instruction_start = self.instructions.len();
             self.lower_statement(statement)?;
+            if self.open_call_generation_epoch != Some(generation_epoch)
+                && self.instructions[instruction_start..].iter().any(|entry| {
+                    matches!(entry.instruction, Instruction::Call {
+                        result_mode: ResultMode::All, ..
+                    })
+                })
+            {
+                // 開放結果呼叫先隔離舊暫存世代；同一批活躍 local 的後續
+                // 敘述可重用新世代，避免逐次呼叫無界增加虛擬 register。
+                self.open_call_generation_floor = self.peak_register;
+                self.open_call_generation_epoch = Some(generation_epoch);
+            }
+            self.next_register = temporary_start
+                .max(self.helper_private_floor)
+                .max(self.open_call_generation_floor);
         }
         self.leave_label_frame(block)
     }
 
     fn lower_block(&mut self, block: &ResolvedBlock) -> Result<(), IrError> {
-        self.lower_block_statements(block)?;
-        self.emit_close(&block.normal_close_path)?;
-        self.emit_exited_binding_cleanup(&block.normal_close_path)?;
-        self.end_debug_scope(block.span)
+        let terminal_suffix_start = block
+            .statements
+            .iter()
+            .rposition(|statement| {
+                !matches!(statement, ResolvedStmt::Empty { .. } | ResolvedStmt::Label { .. })
+            })
+            .map_or(0, |index| index + 1);
+        let terminal_label = block.statements[terminal_suffix_start..]
+            .iter()
+            .position(|statement| matches!(statement, ResolvedStmt::Label { .. }))
+            .map(|index| terminal_suffix_start + index);
+        self.lower_block_statements(block, terminal_label)?;
+        if terminal_label.is_none() {
+            self.emit_close(&block.normal_close_path)?;
+            self.emit_exited_binding_cleanup(&block.normal_close_path)?;
+            self.end_debug_scope(block.span)?;
+        }
+        Ok(())
     }
 
     fn emit_close(&mut self, path: &ClosePath) -> Result<(), IrError> {
@@ -1772,7 +1932,7 @@ impl<'a> Builder<'a> {
                 // `until` condition 仍在 repeat body scope；只有判斷後才離開該 scope。
                 let loop_start = self.emit_cfg_anchor(body.span)?;
                 self.push_loop();
-                self.lower_block_statements(body)?;
+                self.lower_block_statements(body, None)?;
                 let condition_temporary_start = self.next_register;
                 let condition_register = self.lower_expr(condition)?;
                 let condition_temporary_end = self.next_register;
@@ -1937,6 +2097,8 @@ impl<'a> Builder<'a> {
                 self.activate_debug_binding(name.binding, prepare, body_start.0 as usize, *span)?;
                 self.push_loop();
                 self.lower_block(body)?;
+                // 每輪回邊更新可見 i 前先關閉本輪捕獲，下一輪重用槽時才會建立新 upvalue。
+                self.emit_captured_binding_close(name.binding, *span)?;
                 self.emit(
                     Instruction::NumericForNext {
                         control,
@@ -1992,6 +2154,7 @@ impl<'a> Builder<'a> {
                 )?;
                 let closing_source = register_offset(initial_base, 3, *span)?;
                 let closing_register = self.binding_register(closing.binding, closing.span)?;
+                let closing_marker_pc = self.instructions.len();
                 self.emit(
                     Instruction::Move {
                         dest: closing_register,
@@ -2004,6 +2167,15 @@ impl<'a> Builder<'a> {
                         closing.span,
                         close_path.from_scope,
                     )),
+                )?;
+                // hidden closing 值跨越所有迭代；先於每輪可見 name
+                // 取得 debug/storage slot，讓 body CLOSE 僅關閉內層 binding。
+                self.begin_debug_scope(*span)?;
+                self.activate_debug_binding(
+                    closing.binding,
+                    closing_marker_pc,
+                    self.instructions.len(),
+                    closing.span,
                 )?;
                 let state_source = register_offset(initial_base, 1, *span)?;
                 let state = self.allocate(*span)?;
@@ -2168,6 +2340,7 @@ impl<'a> Builder<'a> {
                     *span,
                     None,
                 )?;
+                self.end_debug_scope(*span)?;
                 let break_exit = self.emit_cfg_anchor(*span)?;
                 self.finish_loop(break_exit, *span)?;
                 Ok(())
@@ -2582,6 +2755,17 @@ impl<'a> Builder<'a> {
             let Some(last) = last_open else {
                 return match fixed_base {
                     Some(base) => {
+                        let slots = values
+                            .len()
+                            .checked_add(1)
+                            .ok_or_else(|| limit(span, "call 引數 register 數超過 IR 限制"))?;
+                        let end = usize::from(base.0)
+                            .checked_add(slots)
+                            .filter(|end| *end <= usize::from(self.limits.max_registers))
+                            .ok_or_else(|| limit(span, "call 引數 register 數超過 IR 限制"))?;
+                        while usize::from(self.next_register) < end {
+                            self.allocate(span)?;
+                        }
                         Ok((base, self.move_call_inputs_at(base, callee, &values, span)?))
                     }
                     None => self.prepare_call_registers(callee, &values, span),
@@ -3093,6 +3277,9 @@ impl<'a> Builder<'a> {
             call_pc,
             function_register: base,
         });
+        self.helper_private_floor = self
+            .helper_private_floor
+            .max(register_offset(base, 4, span)?.0);
         Ok(())
     }
 
@@ -3496,6 +3683,39 @@ mod tests {
     use crate::{CompileLimits, lex, parse, resolve};
 
     #[test]
+    fn generic_for_hidden_close_debug_slot_outlives_visible_names() {
+        let source = b"local f; for i in f,nil,0,f do local g=function() return i end end";
+        let limits = CompileLimits::default();
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            let tokens = lex(source, profile, &limits).unwrap();
+            let ast = parse(&tokens, profile, &limits).unwrap();
+            let resolved = resolve(&ast, &tokens, profile, &limits).unwrap();
+            let ir = lower(&resolved, &IrLimits::default()).unwrap();
+            let function = &resolved.functions[0];
+            let hidden = function.bindings.iter()
+                .find(|binding| binding.kind == BindingKind::GenericForClose)
+                .unwrap();
+            let visible = function.bindings.iter()
+                .find(|binding| binding.kind == BindingKind::GenericFor)
+                .unwrap();
+            let debug = ir.prototypes[0].native_debug.as_ref().unwrap();
+            let hidden_local = debug.locals.iter()
+                .find(|local| local.binding == hidden.id).unwrap();
+            let visible_local = debug.locals.iter()
+                .find(|local| local.binding == visible.id).unwrap();
+            assert!(hidden_local.slot < visible_local.slot);
+            assert!(hidden_local.start_pc <= visible_local.start_pc);
+            assert!(hidden_local.end_pc > visible_local.end_pc);
+            assert_eq!(hidden_local.initialized_pc + 1, hidden_local.start_pc);
+            assert!(matches!(
+                ir.prototypes[0].instructions[hidden_local.initialized_pc as usize].instruction,
+                Instruction::Move { dest, .. } if dest == hidden_local.register
+            ));
+            assert!(debug.max_active_locals > visible_local.slot);
+        }
+    }
+
+    #[test]
     fn pending_call_prefix_is_cleared_after_input_allocation_error() {
         let compile_limits = CompileLimits::default();
         let tokens = lex(b"", LanguageProfile::Lua55, &compile_limits).unwrap();
@@ -3736,6 +3956,75 @@ mod tests {
     }
 
     #[test]
+    fn p17_nested_open_argument_fixed_window_reserves_frame() {
+        let source = b"local c='return 1'; local function read1(x) return x end; return load(read1(c))";
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            let compile_limits = CompileLimits::default();
+            let chunk = lex(source, profile, &compile_limits).unwrap();
+            let parsed = parse(&chunk, profile, &compile_limits).unwrap();
+            let resolved = resolve(&parsed, &chunk, profile, &compile_limits).unwrap();
+            let ir = lower(&resolved, &IrLimits::default()).unwrap();
+            assert!(ir.prototypes.iter().any(|prototype| {
+                prototype.instructions.windows(2).any(|pair| {
+                    matches!(pair[0].instruction, Instruction::Call { result_mode: ResultMode::All, .. })
+                        && matches!(pair[1].instruction, Instruction::TailCall { arg_count: u16::MAX, .. })
+                })
+            }));
+            let encoded = emit(&ir, &rivetlua_core::VerifyLimits::default());
+            assert!(encoded.is_ok(), "{profile:?}: {encoded:?}");
+
+            let empty = lex(b"", profile, &compile_limits).unwrap();
+            let parsed = parse(&empty, profile, &compile_limits).unwrap();
+            let resolved = resolve(&parsed, &empty, profile, &compile_limits).unwrap();
+            let mappings = vec![(FunctionId(0), ProtoId(0))];
+            for (max_registers, should_succeed) in [(4, true), (3, false)] {
+                let ir_limits = IrLimits {
+                    max_registers,
+                    ..IrLimits::default()
+                };
+                let mut builder = Builder::new(
+                    &resolved.functions[0],
+                    ProtoId(0),
+                    None,
+                    resolved.span,
+                    &ir_limits,
+                    &mappings,
+                    &resolved.functions,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(builder.next_register, 2);
+                let local = ResolvedExpr::Name {
+                    name: b"_ENV".to_vec(),
+                    resolution: ResolvedName::Local(builder.global_environment_binding),
+                    span: resolved.span,
+                };
+                let result = builder.lower_call_inputs(
+                    Register(1),
+                    &[],
+                    &[local],
+                    Some(Register(2)),
+                    resolved.span,
+                );
+                if should_succeed {
+                    assert_eq!(result.unwrap(), (Register(2), 1));
+                    assert_eq!(builder.next_register, 4);
+                    assert_eq!(builder.instructions.len(), 2);
+                    assert!(matches!(builder.instructions[0].instruction,
+                        Instruction::Move { dest: Register(2), src: Register(1) }));
+                    assert!(matches!(builder.instructions[1].instruction,
+                        Instruction::Move { dest: Register(3), src: Register(1) }));
+                } else {
+                    assert!(result.is_err(), "{profile:?}: max_registers={max_registers}");
+                    assert_eq!(builder.next_register, 2);
+                    assert!(builder.instructions.is_empty());
+                }
+                assert!(builder.pending_expression_values.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn p09_3_dynamic_call_arguments_builder_rejects_orphan_sentinel() {
         let limits = CompileLimits::default();
         let chunk = lex(b"", LanguageProfile::Lua55, &limits).unwrap();
@@ -3847,6 +4136,107 @@ mod tests {
                     )
                 })
             }));
+        }
+    }
+
+    #[test]
+    fn p17_terminal_label_starts_after_skipped_local_debug_storage() {
+        let source = b"do goto done; local skipped = 1; ::done::; end";
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            let limits = CompileLimits::default();
+            let chunk = lex(source, profile, &limits).unwrap();
+            let parsed = parse(&chunk, profile, &limits).unwrap();
+            let resolved = resolve(&parsed, &chunk, profile, &limits).unwrap();
+            let ResolvedStmt::Do { body, .. } = &resolved.root.statements[0] else {
+                panic!("預期 do block");
+            };
+            let body_statements: Vec<_> = body
+                .statements
+                .iter()
+                .filter(|statement| !matches!(statement, ResolvedStmt::Empty { .. }))
+                .collect();
+            let ResolvedStmt::Local { bindings, .. } = body_statements[1] else {
+                panic!("預期 local binding");
+            };
+            let ir = lower(&resolved, &IrLimits::default()).unwrap();
+            let root = ir.prototype_for(FunctionId(0)).unwrap();
+            let jump_target = root
+                .instructions
+                .iter()
+                .find_map(|entry| match entry.instruction {
+                    Instruction::Jump { target } => Some(target.0),
+                    _ => None,
+                })
+                .expect("預期 goto jump");
+            let local = root
+                .native_debug
+                .as_ref()
+                .unwrap()
+                .locals
+                .iter()
+                .find(|local| local.binding == bindings[0])
+                .expect("預期 skipped local debug storage");
+            assert!(local.end_pc <= jump_target, "{profile:?}");
+            let encoded = emit_with_native_debug(
+                &ir,
+                &resolved,
+                source,
+                b"p17_terminal_label",
+                &rivetlua_core::VerifyLimits::default(),
+            );
+            assert!(encoded.is_ok(), "{profile:?}: {encoded:?}");
+        }
+    }
+
+    #[test]
+    fn p17_goto_close_paths_preserve_forward_fallthrough_and_backward_edges() {
+        let sources = [
+            b"do local active <close> = nil; if flag then goto done end; local skipped <close> = nil; ::done:: end".as_slice(),
+            b"::again:: local active <close> = nil; goto again",
+        ];
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            for source in sources {
+                let limits = CompileLimits::default();
+                let chunk = lex(source, profile, &limits).unwrap();
+                let parsed = parse(&chunk, profile, &limits).unwrap();
+                let resolved = resolve(&parsed, &chunk, profile, &limits).unwrap();
+                let ir = lower(&resolved, &IrLimits::default()).unwrap();
+                let root = ir.prototype_for(FunctionId(0)).unwrap();
+                assert!(root.close_paths.iter().any(|path| {
+                    path.kind == ExitKind::Goto && !path.bindings.is_empty()
+                }), "{profile:?}");
+                if source == sources[0] {
+                    let ResolvedStmt::Do { body, .. } = &resolved.root.statements[0] else {
+                        panic!("預期 do block");
+                    };
+                    assert_eq!(
+                        root.close_paths
+                            .iter()
+                            .filter(|path| {
+                                path.kind == ExitKind::Normal
+                                    && path.from_scope == body.scope
+                                    && path.bindings.len() == 2
+                            })
+                            .count(),
+                        1,
+                        "{profile:?}"
+                    );
+                } else {
+                    assert!(root.close_paths.iter().any(|path| {
+                        path.kind == ExitKind::Goto
+                            && path.target_scope == Some(path.from_scope)
+                            && path.bindings.len() == 1
+                    }), "{profile:?}");
+                }
+                let encoded = emit_with_native_debug(
+                    &ir,
+                    &resolved,
+                    source,
+                    b"p17_goto_close",
+                    &rivetlua_core::VerifyLimits::default(),
+                );
+                assert!(encoded.is_ok(), "{profile:?}: {encoded:?}");
+            }
         }
     }
 }

@@ -1,5 +1,7 @@
 //! VM 局部的 table 函式庫與排序診斷。
 
+use core::fmt::{self, Write};
+
 use rivetlua_core::{ObjectRef, Value};
 
 use crate::alloc::{AllocationLedger, FailPoint, Reservation, reserve_vec};
@@ -204,7 +206,13 @@ impl TableOpState {
         kind: TableBuiltin,
         args: &[Value],
     ) -> Result<Self, RuntimeError> {
-        let table = table_arg(vm, args, 0)?;
+        let table = match table_arg(vm, args, 0) {
+            Err(error) if kind == TableBuiltin::Concat && error.kind == RuntimeErrorKind::BasicArgument => {
+                return Err(concat_table_error(vm)?);
+            }
+            Err(error) => return Err(error),
+            Ok(table) => table,
+        };
         let mut copied = [Value::Nil; 5];
         let count = args.len().min(copied.len());
         copied[..count].copy_from_slice(&args[..count]);
@@ -398,6 +406,41 @@ impl Default for TableSortTrace {
 
 pub(crate) fn argument() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::BasicArgument)
+}
+
+fn concat_table_error(vm: &mut Vm) -> Result<RuntimeError, RuntimeError> {
+    let mut error = argument();
+    error.value = Value::Object(
+        vm.allocate_byte_string(b"bad argument #1 to 'concat' (table expected)")?,
+    );
+    Ok(error)
+}
+
+pub(crate) fn concat_index_error(vm: &mut Vm, index: i64) -> Result<RuntimeError, RuntimeError> {
+    struct Message {
+        bytes: [u8; 64],
+        len: usize,
+    }
+
+    impl Write for Message {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            let end = self.len.checked_add(text.len()).ok_or(fmt::Error)?;
+            let target = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+            target.copy_from_slice(text.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+
+    let mut message = Message {
+        bytes: [0; 64],
+        len: 0,
+    };
+    write!(message, "invalid value (at index {index})")
+        .map_err(|_| VmError::ArithmeticOverflow)?;
+    let mut error = argument();
+    error.value = Value::Object(vm.allocate_byte_string(&message.bytes[..message.len])?);
+    Ok(error)
 }
 
 pub(crate) fn table_arg(vm: &Vm, args: &[Value], index: usize) -> Result<ObjectRef, RuntimeError> {

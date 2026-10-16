@@ -98,6 +98,19 @@ pub struct VerifiedNative {
     bytes: Vec<u8>,
 }
 
+/// 只能由宿主承擔 foreign unwind 契約後建立；安全載入 API 不接受 JSON 聲明。
+pub struct AttestedNative {
+    verified: VerifiedNative,
+}
+
+/// # Safety
+/// 宿主須保證本映像與遞迴依賴的 constructor、destructor、opener 均不跨 Rust frame
+/// unwind；C API 只能在有效 state／執行緒上使用，Lua longjmp 只回到純 C checkpoint。
+/// `preflight` 只能核對 bytes、ABI 與政策欄位，不能證明此宿主保證。
+pub unsafe fn attest_host_native(verified: VerifiedNative) -> AttestedNative {
+    AttestedNative { verified }
+}
+
 /// 此函式不接觸 dlopen/dlsym 或 module code；所有拒絕都發生於 constructor 前。
 pub fn preflight(
     artifact: NativeArtifact,
@@ -243,6 +256,18 @@ impl VerifiedNative {
 
 type NativeOpener = unsafe extern "C" fn(*mut lua_State) -> c_int;
 
+/// 私有函式指標與 image lease 共同存活，僅能交給同 VM 的 C checkpoint。
+pub struct AttestedOpener {
+    function: NativeOpener,
+    _library: Rc<NativeLibrary>,
+}
+
+impl AttestedOpener {
+    pub(crate) fn function(&self) -> NativeOpener {
+        self.function
+    }
+}
+
 unsafe extern "C" {
     fn rivetlua_native_open_candidate(path: *const i8) -> c_int;
     fn rivetlua_native_open(path: *const i8, global: c_int) -> *mut c_void;
@@ -289,6 +314,25 @@ impl NativeLibrary {
     pub fn staged_path(&self) -> &Path {
         &self.image.path
     }
+
+    /// 既有 sealed lease 的符號查詢；呼叫者仍須先核對 grant 的 export 白名單。
+    pub fn bind_symbol(self: &Rc<Self>, symbol: &CStr) -> Result<AttestedOpener, NativeError> {
+        if symbol.to_bytes().is_empty() || symbol.to_bytes().len() > MAX_NAME_BYTES {
+            return Err(NativeError::InvalidName);
+        }
+        let mut opener: Option<NativeOpener> = None;
+        // SAFETY：此 handle 由 attested load 建立且 Rc 維持其存活；CNoUnwind 聲明
+        // 已涵蓋此映像，dlsym 不呼叫 Lua 或 opener。
+        let found =
+            unsafe { rivetlua_native_symbol(self.handle, symbol.as_ptr(), &mut opener) } != 0;
+        if !found {
+            return Err(NativeError::Symbol);
+        }
+        Ok(AttestedOpener {
+            function: opener.ok_or(NativeError::Symbol)?,
+            _library: Rc::clone(self),
+        })
+    }
 }
 
 impl Drop for NativeLibrary {
@@ -318,10 +362,37 @@ pub unsafe fn load_trusted(
     global_result: bool,
     dependencies: &[Rc<NativeLibrary>],
 ) -> Result<(Rc<NativeLibrary>, c_int), NativeError> {
-    if module_name.to_bytes().is_empty()
-        || module_name.to_bytes().len() > MAX_NAME_BYTES
-        || opener_symbol.to_bytes().is_empty()
-        || opener_symbol.to_bytes().len() > MAX_NAME_BYTES
+    if module_name.to_bytes().is_empty() || module_name.to_bytes().len() > MAX_NAME_BYTES {
+        return Err(NativeError::InvalidName);
+    }
+    // SAFETY：本公開 unsafe 入口的宿主前置條件與 sealed ticket constructor 相同。
+    let attested = unsafe { attest_host_native(verified) };
+    let (lease, opener) = load_and_bind(
+        state,
+        attested,
+        cache_root,
+        Some(opener_symbol),
+        dependencies,
+    )?;
+    let opener = opener.ok_or(NativeError::Symbol)?;
+    // SAFETY：ticket 綁定的 CNoUnwind 保證仍由此 unsafe 呼叫者承擔；純 C checkpoint
+    // 呼叫 opener，Rust 不跨越 Lua longjmp。
+    let result =
+        unsafe { state.requiref_protected(module_name, opener.function(), global_result) }?;
+    Ok((lease, result))
+}
+
+/// 同一已驗 bytes 的受控載入／符號解析；`None` 僅開映像並保留 lease。
+pub fn load_and_bind(
+    state: &StateOwner,
+    attested: AttestedNative,
+    cache_root: &Path,
+    symbol: Option<&CStr>,
+    dependencies: &[Rc<NativeLibrary>],
+) -> Result<(Rc<NativeLibrary>, Option<AttestedOpener>), NativeError> {
+    let verified = attested.verified;
+    if symbol
+        .is_some_and(|name| name.to_bytes().is_empty() || name.to_bytes().len() > MAX_NAME_BYTES)
         || dependencies.len() > 16
     {
         return Err(NativeError::InvalidName);
@@ -364,19 +435,22 @@ pub unsafe fn load_trusted(
         return Err(NativeError::Load);
     }
     Rc::get_mut(&mut lease).expect("載入前的唯一 Rc").handle = handle;
-    let mut opener: Option<NativeOpener> = None;
-    // SAFETY：handle 為本次 dlopen 有效值；symbol 名稱 NUL 結尾，out 在 C 呼叫期間唯一可寫。
-    let symbol_ok =
-        unsafe { rivetlua_native_symbol(handle, opener_symbol.as_ptr(), &mut opener) } != 0;
-    if !symbol_ok {
-        return Err(NativeError::Symbol);
-    }
-    let opener = opener.ok_or(NativeError::Symbol)?;
+    let opener = if let Some(symbol) = symbol {
+        let mut opener: Option<NativeOpener> = None;
+        // SAFETY：handle 為本次 dlopen 有效值；symbol NUL 結尾，out 唯一可寫。
+        let found = unsafe { rivetlua_native_symbol(handle, symbol.as_ptr(), &mut opener) } != 0;
+        if !found {
+            return Err(NativeError::Symbol);
+        }
+        Some(AttestedOpener {
+            function: opener.ok_or(NativeError::Symbol)?,
+            _library: Rc::clone(&lease),
+        })
+    } else {
+        None
+    };
     reservation.publish(Rc::clone(&lease) as Rc<dyn std::any::Any>)?;
-    // SAFETY：opener 指向已驗證 staged image 的 CNoUnwind 函式；protected driver
-    // 只在純 C checkpoint 呼叫，可處理 Lua longjmp，Rust 此處不持有 VM 借用。
-    let result = unsafe { state.requiref_protected(module_name, opener, global_result) }?;
-    Ok((lease, result))
+    Ok((lease, opener))
 }
 
 #[cfg(test)]

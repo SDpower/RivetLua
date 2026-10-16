@@ -4564,6 +4564,31 @@ fn translate_prototype(
                 close_path: None,
             },
         )?;
+        if (57..=67).contains(&decoded.opcode) {
+            // 官方條件指令在同一次 dispatch 內消費緊接的 JMP；保留原 JMP 的
+            // 獨立 anchor，讓其他合法入邊直接進入時仍以一般指令計數。
+            let jump_pc = pc + 1;
+            let next = validated.ops.get(jump_pc).ok_or_else(|| {
+                invalid(entry.id, pc, "條件 opcode 缺少 JMP")
+            })?;
+            if next.opcode != 56 {
+                return Err(invalid(entry.id, pc, "條件 opcode 必須緊接 JMP"));
+            }
+            let destination = checked_target(
+                entry,
+                jump_pc,
+                pc as i64 + 2 + i64::from(next.sj),
+                &validated.data,
+            )?;
+            patches.push((instructions.len(), destination));
+            push_instruction(
+                &mut instructions,
+                limits,
+                entry.id,
+                pc,
+                entry_at(pc, Instruction::Jump { target: InstructionOffset(0) }),
+            )?;
+        }
         if decoded.opcode == 78 || decoded.opcode == 82 && profile == LuaProfile::Lua55 {
             let register = if decoded.opcode == 78
                 && (if profile == LuaProfile::Lua55 {

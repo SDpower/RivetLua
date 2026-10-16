@@ -201,14 +201,15 @@ pub(super) fn raw_concat(
     profile: LuaProfile,
     left: Value,
     right: Value,
-) -> Result<Option<Value>, RuntimeError> {
+    publish: impl FnOnce(&mut Vm, Value) -> Result<(), RuntimeError>,
+) -> Result<bool, RuntimeError> {
     let mut a = NumberBytes::new();
     let mut b = NumberBytes::new();
     let Some(a_len) = concat_piece_len(vm, profile, left, &mut a)? else {
-        return Ok(None);
+        return Ok(false);
     };
     let Some(b_len) = concat_piece_len(vm, profile, right, &mut b)? else {
-        return Ok(None);
+        return Ok(false);
     };
     let total = a_len
         .checked_add(b_len)
@@ -223,11 +224,14 @@ pub(super) fn raw_concat(
     let result = (|| {
         append_concat_piece(vm, left, &a, &mut bytes)?;
         append_concat_piece(vm, right, &b, &mut bytes)?;
-        vm.allocate_byte_string(&bytes).map_err(RuntimeError::from)
+        vm.with_unpublished_byte_string(&bytes, |vm, object| {
+            publish(vm, Value::Object(object))
+        })
     })();
     drop(bytes);
     drop(ticket);
-    Ok(Some(Value::Object(result?)))
+    result?;
+    Ok(true)
 }
 
 fn number(value: Value) -> Result<Number, RuntimeError> {

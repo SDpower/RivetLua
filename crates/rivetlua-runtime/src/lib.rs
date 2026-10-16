@@ -43,13 +43,13 @@ pub use heap::{
 };
 pub use host::{
     DebugCapability, DebugLimits, DebugPermission, DumpCapability, DumpLimits, FileOperation,
-    FileReadFormat, FileSeekOrigin, HostCalendar, HostCloseResult, HostDeadline, HostEntropy,
-    HostEntropyError, HostExitStatus, HostFileLease, HostIo, HostIoFailure, HostLoadCompiler,
-    HostLoadError, HostLoadErrorKind, HostModuleBytes, HostModuleRepository, HostNativeLoader,
-    HostNativeModule, HostOs, HostOsOperation, HostOsValue, HostOutput, HostOutputError,
-    HostResourceError, HostResourceErrorKind, HostServices, HostSourceReader, LoadBudget,
-    LoadCapability, LoadFormat, LoadLimits, PathEncoding, ResourceBudget, ResourceCapability,
-    ResourceLimits,
+    FileReadFormat, FileSeekOrigin, ForeignNativeKind, HostCalendar, HostCloseResult, HostDeadline,
+    HostEntropy, HostEntropyError, HostExitStatus, HostFileLease, HostIo, HostIoFailure,
+    HostLoadCompiler, HostLoadError, HostLoadErrorKind, HostModuleBytes, HostModuleRepository,
+    HostExitRequest, HostNativeLoader, HostNativeModule, HostOs, HostOsOperation, HostOsValue, HostOutput,
+    HostOutputError, HostResourceError, HostResourceErrorKind, HostServices, HostSourceReader,
+    HostWarning, HostWarningError, LoadBudget, LoadCapability, LoadFormat, LoadLimits,
+    PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
 };
 pub use metamethod::MetamethodEvent;
 pub use rivetlua_core::{Generation, ObjectId, SlotId, VmId};

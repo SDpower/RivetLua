@@ -1,5 +1,7 @@
 //! 以 Lua bytes 運作的 string 函式庫；暫存輸出由 VM 帳本計費。
 
+use core::fmt::{self, Write};
+
 use rivetlua_core::{LuaProfile, Value};
 
 use crate::alloc::{AllocationLedger, FailPoint, Reservation, reserve_vec};
@@ -33,6 +35,51 @@ pub(crate) enum StringBuiltin {
 
 fn argument() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::StringArgument)
+}
+
+struct ErrorText {
+    bytes: [u8; 96],
+    len: usize,
+}
+
+impl ErrorText {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 96],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl Write for ErrorText {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.len.checked_add(text.len()).ok_or(fmt::Error)?;
+        let target = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        target.copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+fn argument_with_message(vm: &mut Vm, message: &[u8]) -> Result<RuntimeError, RuntimeError> {
+    let mut error = argument();
+    error.value = Value::Object(vm.allocate_byte_string(message)?);
+    Ok(error)
+}
+
+fn char_range_error(vm: &mut Vm, index: usize) -> Result<RuntimeError, RuntimeError> {
+    let mut message = ErrorText::new();
+    write!(message, "bad argument #{index} to 'char' (value out of range)")
+        .map_err(|_| VmError::ArithmeticOverflow)?;
+    argument_with_message(vm, message.as_bytes())
+}
+
+pub(crate) fn rep_too_large_error(vm: &mut Vm) -> Result<RuntimeError, RuntimeError> {
+    argument_with_message(vm, b"resulting string too large")
 }
 
 pub(crate) fn arg(args: &[Value], index: usize) -> Result<Value, RuntimeError> {
@@ -80,13 +127,6 @@ pub(crate) fn max_size(profile: LuaProfile) -> usize {
     usize::try_from(language).unwrap_or(usize::MAX)
 }
 
-fn checked_size(vm: &Vm, bytes: u128) -> Result<usize, RuntimeError> {
-    if bytes > max_size(vm.language_profile()) as u128 {
-        return Err(argument());
-    }
-    usize::try_from(bytes).map_err(|_| VmError::ArithmeticOverflow.into())
-}
-
 pub(crate) fn start_position(position: i64, len: usize) -> usize {
     if position > 0 {
         usize::try_from(position).unwrap_or(usize::MAX)
@@ -121,7 +161,12 @@ fn range(vm: &Vm, args: &[Value], len: usize, byte: bool) -> Result<(usize, usiz
     Ok((start_position(first, len), end_position(last, len)))
 }
 
-fn rep_len(vm: &Vm, args: &[Value]) -> Result<usize, RuntimeError> {
+pub(crate) enum RepLength {
+    Length(usize),
+    TooLarge,
+}
+
+pub(crate) fn rep_len(vm: &Vm, args: &[Value]) -> Result<RepLength, RuntimeError> {
     let count = integer(vm, arg(args, 1)?)?;
     let source_len = table::string_len(vm, arg(args, 0)?)?;
     let separator_len = match args.get(2).copied() {
@@ -129,7 +174,7 @@ fn rep_len(vm: &Vm, args: &[Value]) -> Result<usize, RuntimeError> {
         Some(value) => table::string_len(vm, value)?,
     };
     if count <= 0 || source_len | separator_len == 0 {
-        return Ok(0);
+        return Ok(RepLength::Length(0));
     }
     let unit = (source_len as u128)
         .checked_add(separator_len as u128)
@@ -137,11 +182,15 @@ fn rep_len(vm: &Vm, args: &[Value]) -> Result<usize, RuntimeError> {
     let total_with_last_separator = unit
         .checked_mul(count as u128)
         .ok_or(VmError::ArithmeticOverflow)?;
-    checked_size(vm, total_with_last_separator)?;
+    if total_with_last_separator > max_size(vm.language_profile()) as u128 {
+        return Ok(RepLength::TooLarge);
+    }
     let total = total_with_last_separator
         .checked_sub(separator_len as u128)
         .ok_or(VmError::ArithmeticOverflow)?;
-    checked_size(vm, total)
+    Ok(RepLength::Length(
+        usize::try_from(total).map_err(|_| VmError::ArithmeticOverflow)?,
+    ))
 }
 
 pub(crate) fn numeric_parse_units(
@@ -189,7 +238,10 @@ pub(crate) fn work_units(
             if first > last { 1 } else { last - first + 1 }
         }
         StringBuiltin::Char => args.len().max(1),
-        StringBuiltin::Rep => rep_len(vm, args)?.max(1),
+        StringBuiltin::Rep => match rep_len(vm, args)? {
+            RepLength::Length(length) => length.max(1),
+            RepLength::TooLarge => return Err(argument()),
+        },
         StringBuiltin::Pack => pack::pack_size(vm, args)?.max(1),
         StringBuiltin::Unpack => table::string_len(vm, arg(args, 1)?)?.max(1),
         StringBuiltin::PackSize => 1,
@@ -471,9 +523,9 @@ pub(crate) fn execute(
             Ok((result, Some(ticket)))
         }),
         StringBuiltin::Char => {
-            for value in args {
+            for (index, value) in args.iter().enumerate() {
                 if !(0..=255).contains(&integer(vm, *value)?) {
-                    return Err(argument());
+                    return Err(char_range_error(vm, index + 1)?);
                 }
             }
             let mut buffer = Buffer::new(vm, args.len())?;
@@ -520,7 +572,10 @@ pub(crate) fn execute(
         }
         StringBuiltin::Rep => {
             let count = integer(vm, arg(args, 1)?)?;
-            let total = rep_len(vm, args)?;
+            let total = match rep_len(vm, args)? {
+                RepLength::Length(length) => length,
+                RepLength::TooLarge => return Err(rep_too_large_error(vm)?),
+            };
             let mut buffer = Buffer::new(vm, total)?;
             if total > 0 {
                 with_bytes(vm, arg(args, 0)?, |source| {
@@ -553,5 +608,115 @@ pub(crate) fn execute(
         | StringBuiltin::GMatch
         | StringBuiltin::GSub
         | StringBuiltin::Format => Err(argument()),
+    }
+}
+
+#[cfg(test)]
+mod p17_b03_tests {
+    use super::{StringBuiltin, execute};
+    use crate::vm::{RunOutcome, RuntimeError, RuntimeErrorKind};
+    use crate::{ObjectKind, RootKind, Vm, VmError};
+    use rivetlua_compiler::{CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve};
+    use rivetlua_core::{LuaProfile, Value, VerifyLimits};
+
+    fn assert_error_message(vm: &mut Vm, error: RuntimeError, fragment: &[u8]) {
+        assert_eq!(error.kind, RuntimeErrorKind::StringArgument);
+        assert_eq!(error.diagnostic_id, "E_STRING_ARGUMENT");
+        let Value::Object(message) = error.value else {
+            panic!("字串錯誤應保留 Lua 可見文字")
+        };
+        assert!(vm
+            .with_byte_string(message, |text| text
+                .as_bytes()
+                .windows(fragment.len())
+                .any(|window| window == fragment))
+            .unwrap());
+        let root = vm.add_root(RootKind::Temporary, message).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(message), Ok(ObjectKind::ByteString));
+        vm.remove_root(root).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(message), Err(VmError::StaleObject));
+        assert_eq!(vm.roots().count(RootKind::Temporary), 0);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+
+    #[test]
+    fn p17_b03_string_size_errors_keep_typed_codes_and_lua_messages() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            for value in [256, -1, i64::MAX, i64::MIN] {
+                let error = match execute(
+                    &mut vm,
+                    StringBuiltin::Char,
+                    &[Value::Integer(value)],
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("超出 byte 範圍的 string.char 必須失敗"),
+                };
+                assert_error_message(&mut vm, error, b"out of range");
+            }
+
+            let error = match execute(
+                &mut vm,
+                StringBuiltin::Rep,
+                &[
+                    Value::Integer(1),
+                    Value::Integer(i64::MAX),
+                    Value::Integer(2),
+                ],
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("超過字串長度上限的 string.rep 必須失敗"),
+            };
+            assert_error_message(&mut vm, error, b"too large");
+        }
+    }
+
+    #[test]
+    fn p17_b03_string_size_errors_reach_pcall_through_gc() {
+        let source = b"local a,b=pcall(string.char,256); local c,d=pcall(string.rep,'x',9223372036854775807,'y'); return a,b,c,d,string.char(0,255),string.rep('ab',2,'-')";
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let language = match profile {
+                LuaProfile::Lua54 => LanguageProfile::Lua54,
+                LuaProfile::Lua55 => LanguageProfile::Lua55,
+            };
+            let limits = CompileLimits::default();
+            let tokens = lex(source, language, &limits).unwrap();
+            let parsed = parse(&tokens, language, &limits).unwrap();
+            let resolved = resolve(&parsed, &tokens, language, &limits).unwrap();
+            let ir = lower(&resolved, &IrLimits::default()).unwrap();
+            let module = emit(&ir, &VerifyLimits::default()).unwrap().verified().clone();
+
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let environment = vm.allocate_table().unwrap();
+            let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+            vm.install_basic_builtins(environment).unwrap();
+            vm.install_error_builtins(environment).unwrap();
+            vm.install_string_builtins(environment).unwrap();
+            vm.set_collect_every_allocation(true);
+            let mut execution = vm.load_with_environment(module, Value::Object(environment)).unwrap();
+            let RunOutcome::Returned(values) = execution.run().unwrap() else {
+                panic!("受保護的字串錯誤應返回")
+            };
+            drop(execution);
+            assert_eq!(values.len(), 6);
+            assert_eq!(values[0], Value::Boolean(false));
+            assert_eq!(values[2], Value::Boolean(false));
+            for (index, fragment) in [(1, b"out of range".as_slice()), (3, b"too large")] {
+                let Value::Object(message) = values[index] else {
+                    panic!("pcall 應交付字串錯誤訊息")
+                };
+                assert!(vm.with_byte_string(message, |text| text.as_bytes().windows(fragment.len()).any(|part| part == fragment)).unwrap());
+            }
+            for (index, expected) in [(4, b"\0\xff".as_slice()), (5, b"ab-ab".as_slice())] {
+                let Value::Object(result) = values[index] else {
+                    panic!("正常字串結果應為物件")
+                };
+                assert_eq!(vm.with_byte_string(result, |text| text.as_bytes().to_vec()).unwrap(), expected);
+            }
+            assert_eq!(vm.roots().count(RootKind::Temporary), 0);
+            vm.remove_root(environment_root).unwrap();
+        }
     }
 }

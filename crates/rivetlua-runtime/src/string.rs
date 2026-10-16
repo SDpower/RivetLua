@@ -1,7 +1,8 @@
 //! P08-1 的不可變 byte string。
 
 use crate::VmError;
-use crate::alloc::{AllocationLedger, FailPoint, Reservation, reserve_vec};
+use crate::alloc::{AllocationLedger, FailPoint, PairedLuaCharges, Reservation, reserve_vec};
+use core::mem::size_of;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
@@ -20,7 +21,14 @@ pub trait ExternalStringStorage {
 
 enum StringBacking {
     Owned(Vec<u8>),
+    ManagedShared(Rc<ManagedStringBacking>),
     External(Rc<dyn ExternalStringStorage>),
+}
+
+struct ManagedStringBacking {
+    bytes: Vec<u8>,
+    _charges: PairedLuaCharges,
+    debt_bytes: usize,
 }
 
 /// Heap 內的不可變任意 bytes；相等與 hash 均涵蓋完整內容。
@@ -52,6 +60,15 @@ impl Hash for ByteString {
 }
 
 impl ByteString {
+    /// 共用長字串須比保留第二份 bytes 便宜；Rc owner 的實際配置含控制區。
+    pub(crate) const fn managed_sharing_metadata_bytes() -> usize {
+        size_of::<ManagedStringBacking>() + 2 * size_of::<usize>()
+    }
+
+    pub(crate) const fn managed_sharing_is_cheaper(byte_len: usize) -> bool {
+        byte_len > Self::managed_sharing_metadata_bytes()
+    }
+
     pub(crate) fn try_from_bytes(
         ledger: &AllocationLedger,
         bytes: &[u8],
@@ -78,8 +95,48 @@ impl ByteString {
         }
     }
 
+    /// 長字串的來源物件與 table key 共用不可變 backing；帳款隨最後一個 owner 退還。
+    pub(crate) fn try_managed_shared_from_bytes(
+        ledger: &AllocationLedger,
+        bytes: &[u8],
+    ) -> Result<Self, VmError> {
+        let (owned, bytes_ticket) = Self::try_from_bytes(ledger, bytes)?;
+        let metadata_bytes = Self::managed_sharing_metadata_bytes();
+        let metadata_ticket =
+            ledger.reserve_lua_backing_excess(metadata_bytes, FailPoint::StringBytesReserve)?;
+        let bytes_charge = bytes_ticket.commit_charge()?;
+        let metadata_charge = metadata_ticket.commit_charge()?;
+        let debt_bytes = bytes_charge
+            .bytes()
+            .checked_add(metadata_charge.bytes())
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let StringBacking::Owned(stored) = owned.backing else {
+            unreachable!("新建的 byte string 必須持有自有 backing")
+        };
+        let mut charges = PairedLuaCharges::new(ledger.clone());
+        charges.replace_first(bytes_charge);
+        charges.replace_second(metadata_charge);
+        Ok(Self {
+            backing: StringBacking::ManagedShared(Rc::new(ManagedStringBacking {
+                bytes: stored,
+                _charges: charges,
+                debt_bytes,
+            })),
+        })
+    }
+
     pub(crate) fn shared_external(&self) -> Option<Self> {
         match &self.backing {
+            StringBacking::External(owner) => Some(Self::from_external(Rc::clone(owner))),
+            StringBacking::Owned(_) | StringBacking::ManagedShared(_) => None,
+        }
+    }
+
+    pub(crate) fn shared_table_key(&self) -> Option<Self> {
+        match &self.backing {
+            StringBacking::ManagedShared(owner) => Some(Self {
+                backing: StringBacking::ManagedShared(Rc::clone(owner)),
+            }),
             StringBacking::External(owner) => Some(Self::from_external(Rc::clone(owner))),
             StringBacking::Owned(_) => None,
         }
@@ -101,13 +158,14 @@ impl ByteString {
                 }
                 Some((bytes.as_ptr(), bytes.len()))
             }
-            StringBacking::Owned(_) => None,
+            StringBacking::Owned(_) | StringBacking::ManagedShared(_) => None,
         }
     }
 
     pub(crate) fn managed_payload_len(&self) -> usize {
         match &self.backing {
             StringBacking::Owned(bytes) => bytes.len(),
+            StringBacking::ManagedShared(owner) => owner.debt_bytes,
             StringBacking::External(_) => 0,
         }
     }
@@ -115,6 +173,7 @@ impl ByteString {
     pub fn as_bytes(&self) -> &[u8] {
         match &self.backing {
             StringBacking::Owned(bytes) => bytes,
+            StringBacking::ManagedShared(owner) => &owner.bytes,
             StringBacking::External(owner) => owner.bytes(),
         }
     }
@@ -130,17 +189,48 @@ impl ByteString {
 
 #[cfg(test)]
 mod tests {
+    use super::{ByteString, StringBacking};
+    use core::mem::size_of;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    use std::rc::Rc;
 
     use rivetlua_core::{SlotId, Value};
 
-    use crate::{FailPoint, RootKind, SlotState, Vm, VmError};
+    use crate::{AllocationLedger, FailPoint, RootKind, SlotState, Vm, VmError};
 
     fn hash(value: impl Hash) -> u64 {
         let mut hasher = DefaultHasher::new();
         value.hash(&mut hasher);
         hasher.finish()
+    }
+
+    #[test]
+    fn managed_long_string_table_key_last_owner_refunds_exact_charge() {
+        let ledger = AllocationLedger::new(usize::MAX);
+        let baseline = ledger.snapshot();
+        let source = ByteString::try_managed_shared_from_bytes(&ledger, &[b'k'; 4096]).unwrap();
+        let charged = ledger.snapshot();
+        let key = source.shared_table_key().unwrap();
+        let (StringBacking::ManagedShared(source_owner), StringBacking::ManagedShared(key_owner)) =
+            (&source.backing, &key.backing)
+        else {
+            panic!("長字串 table key 應共用同一 backing");
+        };
+        assert!(Rc::ptr_eq(source_owner, key_owner));
+        assert_eq!(
+            charged.lua_heap_bytes,
+            source_owner.bytes.capacity()
+                + size_of::<super::ManagedStringBacking>()
+                + 2 * size_of::<usize>()
+        );
+        assert_eq!(charged.lua_heap_bytes, source.managed_payload_len());
+        assert_eq!(ledger.snapshot(), charged);
+        drop(source);
+        assert_eq!(ledger.snapshot(), charged);
+        assert_eq!(key.as_bytes(), &[b'k'; 4096]);
+        drop(key);
+        assert_eq!(ledger.snapshot(), baseline);
     }
 
     #[test]
@@ -269,5 +359,66 @@ mod tests {
         assert_eq!(vm.with_byte_string(replacement, |s| s.len()), Ok(17));
         assert_eq!(vm.collect().unwrap(), 1);
         assert_eq!(vm.ledger_snapshot().committed, reusable_slots_charge);
+    }
+
+    #[test]
+    fn managed_long_string_clone_keeps_independent_bytes_and_refunds_after_collection() {
+        let mut vm = Vm::new().unwrap();
+        vm.stop_automatic_gc();
+        let probe = vm.ledger_probe();
+        let bytes = [0x80; 4096];
+        let source = vm.allocate_byte_string(&bytes).unwrap();
+        let source_root = vm.add_root(RootKind::Host, source).unwrap();
+        let before_clone = vm.ledger_snapshot().lua_heap_bytes;
+        let copy = vm.clone_byte_string(source).unwrap();
+        let copy_root = vm.add_root(RootKind::Host, copy).unwrap();
+        assert!(vm.ledger_snapshot().lua_heap_bytes >= before_clone + bytes.len());
+        vm.remove_root(source_root).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(source), Err(VmError::StaleObject));
+        vm.with_byte_string(copy, |stored| assert_eq!(stored.as_bytes(), bytes))
+            .unwrap();
+        vm.remove_root(copy_root).unwrap();
+        vm.collect().unwrap();
+        assert_eq!(vm.object_kind(copy), Err(VmError::StaleObject));
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        drop(vm);
+        assert_eq!(probe.snapshot().committed, 0);
+        assert_eq!(probe.snapshot().reserved, 0);
+    }
+
+    #[test]
+    fn managed_long_string_failure_rolls_back_bytes_metadata_and_roots() {
+        let bytes = [b'x'; 4096];
+        for point in [
+            FailPoint::StringBytesReserve,
+            FailPoint::SlotReserve,
+            FailPoint::ObjectReserve,
+            FailPoint::ObjectInitialize,
+            FailPoint::RootReserve,
+            FailPoint::MarkReserve,
+            FailPoint::WorkReserve,
+        ] {
+            let mut vm = Vm::new().unwrap();
+            vm.set_collect_every_allocation(true);
+            let before = vm.ledger_snapshot();
+            vm.inject_failure_once(point);
+            assert_eq!(
+                vm.allocate_byte_string(&bytes),
+                Err(VmError::InjectedFailure(point)),
+                "{point:?}"
+            );
+            assert_eq!(vm.ledger_snapshot(), before);
+            assert_eq!(vm.roots().total_count(), 0);
+            assert_eq!(vm.slot_state(SlotId::new(0)), None);
+        }
+
+        let mut vm = Vm::new().unwrap();
+        let before = vm.ledger_snapshot();
+        vm.set_allocation_limit(before.committed + bytes.len());
+        assert_eq!(vm.allocate_byte_string(&bytes), Err(VmError::AllocationFailed));
+        assert_eq!(vm.ledger_snapshot().committed, before.committed);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        assert_eq!(vm.roots().total_count(), 0);
     }
 }

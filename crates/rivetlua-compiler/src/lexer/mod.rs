@@ -405,6 +405,41 @@ mod tests {
     }
 
     #[test]
+    fn decimal_overflow_literals_preserve_float_and_syntax_contract() {
+        for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+            let chunk = lex(
+                b"1e9999 1.25 1e-300",
+                profile,
+                &CompileLimits::default(),
+            )
+            .unwrap();
+            let float_at = |index: usize| match chunk.tokens[index].literal.as_ref() {
+                Some(Literal::Float(Number::Float(value))) => *value,
+                other => panic!("{profile:?}: token {index} was {other:?}"),
+            };
+            let overflow = float_at(0);
+            assert!(overflow.is_infinite() && overflow.is_sign_positive());
+            assert_eq!(float_at(1), 1.25);
+            assert_eq!(float_at(2), 1e-300);
+
+            let negative = lex(b"-1e9999", profile, &CompileLimits::default()).unwrap();
+            assert_eq!(negative.tokens[0].kind, TokenKind::Symbol(Symbol::Minus));
+            let magnitude = match negative.tokens[1].literal.as_ref() {
+                Some(Literal::Float(Number::Float(value))) => *value,
+                other => panic!("{profile:?}: negative numeral was {other:?}"),
+            };
+            assert!(magnitude.is_infinite() && magnitude.is_sign_positive());
+
+            assert_eq!(
+                lex(b"1e+", profile, &CompileLimits::default())
+                    .unwrap_err()
+                    .code,
+                DiagnosticCode::Lex
+            );
+        }
+    }
+
+    #[test]
     fn strings_and_operators_are_lexed_without_runtime_values() {
         let chunk = lex(
             b"\"\\x41\\000B\" // .. ... == <= >= ~= << >> ::",

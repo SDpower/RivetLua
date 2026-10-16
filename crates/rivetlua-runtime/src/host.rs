@@ -303,6 +303,14 @@ pub struct HostNativeModule {
     pub loader_data: Vec<u8>,
 }
 
+/// Runtime 只停放請求；宿主在 execution drop 後驗 grant 並以同 VM 續接。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForeignNativeKind {
+    LoadLib,
+    Searcher,
+    RootSearcher,
+}
+
 /// 純 Rust 封閉服務；runtime 不開啟動態函式庫，也不使用 FFI。
 pub trait HostNativeLoader {
     /// VerifiedModule 的巢狀配置不得超過 budget.module_allocation_limit；
@@ -320,6 +328,7 @@ pub struct LoadCapability {
     pub(crate) reader: Option<Box<dyn HostSourceReader>>,
     pub(crate) repository: Option<Box<dyn HostModuleRepository>>,
     pub(crate) native: Option<Box<dyn HostNativeLoader>>,
+    pub(crate) foreign_native_cpath: Option<Vec<u8>>,
     pub(crate) allow_bytecode: bool,
     pub(crate) allow_official_bytecode: bool,
     pub(crate) limits: LoadLimits,
@@ -339,6 +348,7 @@ impl LoadCapability {
             reader: None,
             repository: None,
             native: None,
+            foreign_native_cpath: None,
             allow_bytecode: false,
             allow_official_bytecode: false,
             limits: LoadLimits::default(),
@@ -363,6 +373,12 @@ impl LoadCapability {
 
     pub fn and_native_loader(mut self, native: impl HostNativeLoader + 'static) -> Self {
         self.native = Some(Box::new(native));
+        self
+    }
+
+    /// 僅註冊同 VM foreign opener 的 opaque parked request；實際載入仍須宿主票據。
+    pub fn with_foreign_native_cpath(mut self, initial_cpath: Vec<u8>) -> Self {
+        self.foreign_native_cpath = Some(initial_cpath);
         self
     }
 
@@ -449,6 +465,16 @@ pub trait HostOutput {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostWarningError {
+    WriteFailed,
+}
+
+/// 純 Rust 宿主的 warning 端點；C native session 使用獨立的 lua_warning 橋接。
+pub trait HostWarning {
+    fn write(&mut self, message: &[u8], tocont: bool) -> Result<(), HostWarningError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostEntropyError {
     ReadFailed,
 }
@@ -493,6 +519,8 @@ pub enum DebugPermission {
     MetatableRead,
     /// 只允許 table 的 metatable 設定，沿既有 write barrier。
     TableMetatableWrite,
+    /// 受信任宿主明示允許透過既有標準 I/O 在同一 VM 執行 Lua 偵錯命令。
+    Console,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -548,6 +576,7 @@ impl DebugCapability {
 #[derive(Default)]
 pub struct HostServices {
     output: Option<Box<dyn HostOutput>>,
+    warning: Option<Box<dyn HostWarning>>,
     entropy: Option<Box<dyn HostEntropy>>,
     pub(crate) load: LoadCapability,
     pub(crate) resource: ResourceCapability,
@@ -570,6 +599,11 @@ impl HostServices {
 
     pub fn and_output(mut self, output: impl HostOutput + 'static) -> Self {
         self.output = Some(Box::new(output));
+        self
+    }
+
+    pub fn and_warning(mut self, warning: impl HostWarning + 'static) -> Self {
+        self.warning = Some(Box::new(warning));
         self
     }
 
@@ -618,6 +652,17 @@ impl HostServices {
 
     pub(crate) fn output_allowed(&self) -> bool {
         self.output.is_some()
+    }
+
+    pub(crate) fn warning(&mut self, message: &[u8], tocont: bool) -> Result<(), HostWarningError> {
+        let Some(warning) = self.warning.as_mut() else {
+            return Ok(());
+        };
+        warning.write(message, tocont)
+    }
+
+    pub(crate) fn has_warning(&self) -> bool {
+        self.warning.is_some()
     }
 }
 
@@ -929,6 +974,7 @@ pub trait HostDeadline {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostOsOperation<'a> {
+    Exit(HostExitRequest),
     GetEnv(&'a [u8]),
     Clock,
     Date(&'a [u8], Option<i64>),
@@ -960,8 +1006,16 @@ pub struct HostExitStatus {
     pub code: i64,
 }
 
+/// 宿主已授權的 Lua 終止請求；是否關閉 Lua 狀態與程序狀態碼分開保存。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostExitRequest {
+    pub status: i32,
+    pub close: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostOsValue {
+    ExitRequest(HostExitRequest),
     Nil,
     Boolean(bool),
     Integer(i64),

@@ -42,6 +42,8 @@ pub(crate) struct ThreadContext {
     pub(crate) error_root: Option<RootId>,
     pub(crate) yield_site: Option<YieldSite>,
     pub(crate) close_unwind: Option<CloseUnwind>,
+    pub(crate) suspended_close_for_handler: Vec<CloseUnwind>,
+    pub(crate) suspended_close_charges: AllocationCharges,
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +67,8 @@ impl ThreadContext {
             error_root: None,
             yield_site: None,
             close_unwind: None,
+            suspended_close_for_handler: Vec::new(),
+            suspended_close_charges: AllocationCharges::new(),
         }
     }
 
@@ -107,6 +111,8 @@ impl ThreadContext {
     }
 
     pub(crate) fn finish(&mut self, vm: &mut Vm) -> Result<(), RuntimeError> {
+        self.suspended_close_for_handler = Vec::new();
+        self.suspended_close_charges = AllocationCharges::new();
         if let Some(root) = self.error_root.take() {
             vm.remove_root(root)?;
         }
@@ -138,7 +144,10 @@ impl ThreadContext {
                 visit(object)?;
             }
         }
-        if let Some(unwind) = self.close_unwind {
+        for unwind in self.close_unwind
+            .into_iter()
+            .chain(self.suspended_close_for_handler.iter().copied())
+        {
             if let Value::Object(object) = unwind.error.value {
                 visit(object)?;
             }

@@ -29,6 +29,7 @@ pub(crate) enum Builtin {
     CoroutineResume,
     CoroutineYield,
     CoroutineStatus,
+    CoroutineRunning,
     CoroutineClose,
     CoroutineWrap,
     CoroutineWrapped(rivetlua_core::ObjectRef),
@@ -170,17 +171,27 @@ pub(crate) struct ProtectedBoundary {
     pub(crate) result_mode: ResultMode,
     pub(crate) tail_return: bool,
     pub(crate) inline_target: bool,
+    pub(crate) debug_console: bool,
+    pub(crate) load_reader: bool,
+    pub(crate) host_entry: bool,
     pub(crate) handler: Option<Value>,
     pub(crate) handler_root: Option<RootId>,
     pub(crate) stage: ProtectedStage,
     pub(crate) handler_depth: Option<usize>,
     pub(crate) handler_errors: u8,
+    pub(crate) message_error: Option<crate::RuntimeError>,
+    pub(crate) handler_completed: bool,
+    pub(crate) handler_native: bool,
+    pub(crate) faulting_native: Option<NativeCallInfo>,
     pub(crate) close_scope: Option<PendingCloseSnapshot>,
     pub(crate) finalizer: Option<rivetlua_core::ObjectRef>,
 }
 
 impl ProtectedBoundary {
     pub(crate) fn clear(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        if let Some(mut call) = self.faulting_native.take() {
+            call.clear(vm)?;
+        }
         if let Some(root) = self.handler_root.take() {
             vm.remove_root(root)?;
         }
@@ -190,6 +201,30 @@ impl ProtectedBoundary {
     pub(crate) fn restore_root(&mut self, vm: &mut Vm) -> Result<(), VmError> {
         if let Some(Value::Object(object)) = self.handler {
             self.handler_root = Some(vm.add_root(crate::RootKind::Temporary, object)?);
+        }
+        Ok(())
+    }
+}
+
+/// 尚在錯誤交付堆疊上的真正 native 呼叫；保護它的函式值直到 handler 收束。
+pub(crate) struct NativeCallInfo {
+    pub(crate) function: Value,
+    pub(crate) caller_depth: usize,
+    root: Option<RootId>,
+}
+
+impl NativeCallInfo {
+    pub(crate) fn new(vm: &mut Vm, function: Value, caller_depth: usize) -> Result<Self, VmError> {
+        let root = match function {
+            Value::Object(object) => Some(vm.add_root(crate::RootKind::Temporary, object)?),
+            _ => None,
+        };
+        Ok(Self { function, caller_depth, root })
+    }
+
+    pub(crate) fn clear(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        if let Some(root) = self.root.take() {
+            vm.remove_root(root)?;
         }
         Ok(())
     }

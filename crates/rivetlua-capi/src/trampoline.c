@@ -132,6 +132,7 @@ typedef struct {
 typedef struct {
   lua_WarnFunction callback;
   void *ud;
+  int32_t default_pending;
 } rivetlua_capi_warning_binding_b6;
 
 typedef rivetlua_capi_action_a1 (*rivetlua_capi_action_fn_a1)(
@@ -360,12 +361,22 @@ _Static_assert(offsetof(rivetlua_capi_aux_value_a4b, pointer) ==
                "C/Rust auxiliary value layout");
 _Static_assert(offsetof(rivetlua_capi_tolstring_result_b5, pointer) == 2 * sizeof(int32_t),
                "C/Rust tolstring fallback layout");
-_Static_assert(sizeof(rivetlua_capi_warning_binding_b6) == 2 * sizeof(void *),
+_Static_assert(offsetof(rivetlua_capi_warning_binding_b6, default_pending) ==
+                   2 * sizeof(void *), "C/Rust warning pending offset");
+_Static_assert(sizeof(rivetlua_capi_warning_binding_b6) == 3 * sizeof(void *),
                "C/Rust warning binding layout");
 
+void rivetlua_capi_default_warning_install_b6(lua_State *state);
 void lua_warning(lua_State *state, const char *message, int tocont) {
   rivetlua_capi_warning_binding_b6 binding =
       rivetlua_capi_warning_snapshot_b6(state);
+  if (binding.default_pending) {
+    lua_State *main_state = (lua_State *)binding.ud;
+    if (main_state == NULL) return;
+    /* snapshot 的 Rust 借用已結束，僅此純 C frame 安裝預設 callback。 */
+    rivetlua_capi_default_warning_install_b6(main_state);
+    binding = rivetlua_capi_warning_snapshot_b6(state);
+  }
   if (binding.callback != NULL)
     binding.callback(binding.ud, message, tocont);
 }
@@ -480,7 +491,18 @@ static int rivetlua_b10_invoke_step(
     *count = 0;
     return 1;
   }
+  if (step->kind == 4 && step->token != NULL) {
+    lua_warning(state, (const char *)step->token, step->event);
+    *count = 0;
+    return 1;
+  }
   return 0;
+}
+/* 終止只跳至同一執行緒仍存活的純 C checkpoint，不跨越 Rust frame。 */
+static void rivetlua_b4_raise_terminal_a1(lua_State *state) {
+  rivetlua_capi_checkpoint_a1 *top = rivetlua_capi_top_a1;
+  if (top != NULL && top->state == state && top->rust_action_active == 0)
+    longjmp(top->jump, 3);
 }
 static int rivetlua_b4_call_drive(lua_State *state, int nargs,
                                  int nresults, int public_call,
@@ -505,7 +527,12 @@ static int rivetlua_b4_call_drive(lua_State *state, int nargs,
   /* A1 checkpoint 的跳轉目標仍在此純 C frame，絕不跨越 Rust frame。 */
   for (;;) {
     rivetlua_capi_callback_step_b4 step;
-    if (setjmp(checkpoint.jump) == 0) {
+    int jumped = setjmp(checkpoint.jump);
+    if (jumped == 3) {
+      result = -2;
+      break;
+    }
+    if (jumped == 0) {
       if (!first) break;
       first = 0;
       checkpoint.rust_action_active = 1;
@@ -525,7 +552,7 @@ static int rivetlua_b4_call_drive(lua_State *state, int nargs,
       step = rivetlua_capi_call_resume_error_a2(state, nresults);
       checkpoint.rust_action_active = 0;
     }
-    while (step.kind == 1 || step.kind == 2) {
+    while (step.kind == 1 || step.kind == 2 || step.kind == 4) {
       int count = 0;
       if (!rivetlua_b10_invoke_step(state, &step, &count)) break;
       int close_status = rivetlua_b7_close_drive(
@@ -540,11 +567,13 @@ static int rivetlua_b4_call_drive(lua_State *state, int nargs,
       checkpoint.rust_action_active = 0;
     }
     if (step.kind == 0) result = 0;
+    else if (step.kind == -2) result = -2;
     break;
   }
   if (result != 0) {
     checkpoint.rust_action_active = 1;
-    (void)rivetlua_capi_call_abort_to_b7(state, frame_depth);
+    if (rivetlua_capi_call_abort_to_b7(state, frame_depth) != 1)
+      result = -1;
   }
   checkpoint.rust_action_active = 0;
   rivetlua_capi_top_a1 = checkpoint.previous;
@@ -562,6 +591,16 @@ int rivetlua_capi_call_b4(lua_State *state, int nargs, int nresults) {
 static int rivetlua_a2_call_drive(lua_State *state, int nargs, int nresults,
                                  int yieldable_a5) {
   return rivetlua_b4_call_drive(state, nargs, nresults, 1, yieldable_a5);
+}
+
+static void rivetlua_a2_terminal_cleanup(lua_State *state, int registered,
+                                         void *handler) {
+  if (registered)
+    (void)rivetlua_capi_continuation_step_a5(
+        state, (size_t)rivetlua_capi_call_depth_b7(state), 1);
+  else
+    rivetlua_capi_public_drop_handler_a2(handler);
+  rivetlua_b4_raise_terminal_a1(state);
 }
 
 /* B5：同一 operation 的 callback、pending 與 stack 發布都留在純 C checkpoint。 */
@@ -585,14 +624,18 @@ static int rivetlua_b5_operation_drive(
   rivetlua_capi_top_a1 = &checkpoint;
   int status = -RV_A1_ERROR_LUA;
   *published = 0;
+  int terminal_exit = 0;
   /* callback 只在 Rust step 完整返回且 guard 清零後呼叫。 */
-  if (setjmp(checkpoint.jump) == 0) {
+  int jumped = setjmp(checkpoint.jump);
+  if (jumped == 3) {
+    terminal_exit = 1;
+  } else if (jumped == 0) {
     checkpoint.rust_action_active = 1;
     rivetlua_capi_callback_step_b4 step =
         rivetlua_capi_operation_prepare_b5(
             state, kind, operation, left, right, count);
     checkpoint.rust_action_active = 0;
-    while (step.kind == 1 || step.kind == 2) {
+    while (step.kind == 1 || step.kind == 2 || step.kind == 4) {
       int returned = 0;
       if (!rivetlua_b10_invoke_step(state, &step, &returned)) break;
       int close_status = rivetlua_b7_close_drive(
@@ -605,6 +648,7 @@ static int rivetlua_b5_operation_drive(
       step = rivetlua_capi_operation_resume_b5(state, returned);
       checkpoint.rust_action_active = 0;
     }
+    if (step.kind == -2) terminal_exit = 1;
     if (step.kind == 0) {
       *published = step.value;
       status = 0;
@@ -633,6 +677,7 @@ static int rivetlua_b5_operation_drive(
       state, checkpoint.generation, checkpoint.token,
       checkpoint.previous_state_token);
   if (exited != RV_A1_OK) return -RV_A1_ERROR_LUA;
+  if (terminal_exit) rivetlua_b4_raise_terminal_a1(state);
   return status;
 }
 
@@ -689,7 +734,12 @@ static int rivetlua_b7_close_drive(lua_State *state, size_t target,
     closed++;
     if (step.kind == 2) {
       size_t call_top = (size_t)lua_gettop(state) - (size_t)step.value - 1;
-      if (rivetlua_capi_call_b4(state, step.value, 0) != 0) {
+      int call_status = rivetlua_capi_call_b4(state, step.value, 0);
+      if (call_status == -2) {
+        rivetlua_b4_raise_terminal_a1(state);
+        return -RV_A1_ERROR_LUA;
+      }
+      if (call_status != 0) {
         error_class = rivetlua_b7_capture_or_synthesize(
             state, call_top, RV_A1_ERROR_LUA, 3);
         error_position = (size_t)lua_gettop(state);
@@ -740,12 +790,16 @@ int rivetlua_capi_test_resume_b11(lua_State *state) {
   rivetlua_capi_selfclose_resume_b11 = &checkpoint;
   rivetlua_capi_selfclose_status_b11 = &selfclose_status;
   int result = LUA_ERRRUN;
-  if (setjmp(checkpoint.jump) == 0) {
+  int terminal_exit = 0;
+  int jumped = setjmp(checkpoint.jump);
+  if (jumped == 3) {
+    terminal_exit = 1;
+  } else if (jumped == 0) {
     checkpoint.rust_action_active = 1;
     rivetlua_capi_callback_step_b4 step =
         rivetlua_capi_test_resume_prepare_b11(state);
     checkpoint.rust_action_active = 0;
-    while (step.kind == 1 || step.kind == 2) {
+    while (step.kind == 1 || step.kind == 2 || step.kind == 4) {
       int count = 0;
       if (!rivetlua_b10_invoke_step(state, &step, &count)) break;
       if (rivetlua_b7_close_drive(state, 0, (size_t)lua_gettop(state), 0, 0)
@@ -754,6 +808,7 @@ int rivetlua_capi_test_resume_b11(lua_State *state) {
       step = rivetlua_capi_call_resume_b4(state, count, LUA_MULTRET);
       checkpoint.rust_action_active = 0;
     }
+    if (step.kind == -2) terminal_exit = 1;
     if (step.kind == 0) result = LUA_OK;
     else if (step.kind < 0) result = rivetlua_b11_public_status(step.value);
   } else if (selfclose_status >= 0) {
@@ -773,6 +828,7 @@ int rivetlua_capi_test_resume_b11(lua_State *state) {
           state, checkpoint.generation, checkpoint.token,
           checkpoint.previous_state_token) != RV_A1_OK)
     return LUA_ERRRUN;
+  if (terminal_exit) rivetlua_b4_raise_terminal_a1(state);
   return result;
 }
 
@@ -826,6 +882,7 @@ int lua_closethread(lua_State *state, lua_State *from) {
   int overlay_status = LUA_OK;
   volatile int latest_error_status = LUA_OK;
   int status = LUA_ERRRUN;
+  int terminal_exit_seen = 0;
   checkpoint.rust_action_active = 1;
   int start_status = rivetlua_capi_reset_start_a5(state);
   checkpoint.rust_action_active = 0;
@@ -833,6 +890,12 @@ int lua_closethread(lua_State *state, lua_State *from) {
     status = start_status;
     goto reset_exit_b11;
   }
+  int initial_jump = setjmp(checkpoint.jump);
+  if (initial_jump == 3) {
+    terminal_exit_seen = 1;
+    goto reset_exit_b11;
+  }
+  if (initial_jump != 0) goto reset_exit_b11;
   int close_result = rivetlua_b7_close_drive(
       state, 0, 0, 0, 0);
   if (close_result != 0) {
@@ -870,7 +933,7 @@ int lua_closethread(lua_State *state, lua_State *from) {
 #endif
       rivetlua_capi_reset_prepare_b11(state, overlay_status);
   checkpoint.rust_action_active = 0;
-  while (step.kind == 1 || step.kind == 2 || step.kind == 3) {
+  while (step.kind == 1 || step.kind == 2 || step.kind == 3 || step.kind == 4) {
     if (step.kind == 3) {
       int prior_status = latest_error_status != LUA_OK ? latest_error_status : step.value;
       int original_class = prior_status == LUA_OK ? 0 :
@@ -891,7 +954,12 @@ int lua_closethread(lua_State *state, lua_State *from) {
     }
     volatile int callback_failed = 0;
     volatile int count = 0;
-    if (setjmp(checkpoint.jump) == 0) {
+    int jumped = setjmp(checkpoint.jump);
+    if (jumped == 3) {
+      terminal_exit_seen = 1;
+      goto reset_exit_b11;
+    }
+    if (jumped == 0) {
       int invoked_count = 0;
       if (!rivetlua_b10_invoke_step(state, &step, &invoked_count)) {
         callback_failed = 1;
@@ -923,6 +991,10 @@ int lua_closethread(lua_State *state, lua_State *from) {
         : rivetlua_capi_call_resume_b4(state, (int)count, LUA_MULTRET);
     checkpoint.rust_action_active = 0;
   }
+  if (step.kind == -2) {
+    terminal_exit_seen = 1;
+    goto reset_exit_b11;
+  }
   if (step.kind == 0) {
     checkpoint.rust_action_active = 1;
     status = rivetlua_capi_reset_finish_b11(state, latest_error_status);
@@ -946,6 +1018,7 @@ reset_exit_b11:
           state, checkpoint.generation, checkpoint.token,
           checkpoint.previous_state_token) != RV_A1_OK)
     status = LUA_ERRRUN;
+  if (terminal_exit_seen) rivetlua_b4_raise_terminal_a1(state);
 #if LUA_VERSION_NUM >= 505
   if (selfclose) rivetlua_b11_selfclose_throw(state, status);
 #endif
@@ -976,7 +1049,15 @@ static int rivetlua_b11_close_drive(lua_State *state) {
   rivetlua_capi_top_a1 = &checkpoint;
   int frame_depth = rivetlua_capi_call_depth_b7(main_state);
   int complete = 1;
-  if (rivetlua_b7_close_drive(main_state, 0, 0, 0, 0) != 0) {
+  int initial_jump = setjmp(checkpoint.jump);
+  if (initial_jump == 3) {
+    checkpoint.rust_action_active = 1;
+    if (rivetlua_capi_call_abort_to_b7(main_state, frame_depth) != 1)
+      complete = 0;
+    checkpoint.rust_action_active = 0;
+  } else if (initial_jump != 0) {
+    complete = 0;
+  } else if (rivetlua_b7_close_drive(main_state, 0, 0, 0, 0) != 0) {
     int32_t error_class = 0;
     if (rivetlua_capi_error_consume_a1(main_state, &error_class) != RV_A1_OK ||
         rivetlua_capi_settop_direct_b7(main_state, 0) != 1)
@@ -988,11 +1069,17 @@ static int rivetlua_b11_close_drive(lua_State *state) {
         rivetlua_capi_shutdown_prepare_b11(main_state);
     checkpoint.rust_action_active = 0;
     int external_callback_seen = 0;
-    while (step.kind == 1 || step.kind == 2) {
+    int terminal_exit_seen = 0;
+    while (step.kind == 1 || step.kind == 2 || step.kind == 4) {
       external_callback_seen = 1;
       volatile int callback_failed = 0;
       volatile int count = 0;
-      if (setjmp(checkpoint.jump) == 0) {
+      int jumped = setjmp(checkpoint.jump);
+      if (jumped == 3) {
+        terminal_exit_seen = 1;
+        break;
+      }
+      if (jumped == 0) {
         int invoked_count = 0;
         if (!rivetlua_b10_invoke_step(main_state, &step, &invoked_count))
           callback_failed = 1;
@@ -1013,6 +1100,18 @@ static int rivetlua_b11_close_drive(lua_State *state) {
           ? rivetlua_capi_gc_resume_error_b8(main_state)
           : rivetlua_capi_call_resume_b4(main_state, (int)count, 0);
       checkpoint.rust_action_active = 0;
+    }
+    if (terminal_exit_seen) {
+      checkpoint.rust_action_active = 1;
+      if (rivetlua_capi_call_abort_to_b7(main_state, frame_depth) != 1)
+        complete = 0;
+      checkpoint.rust_action_active = 0;
+      if (complete) continue;
+      break;
+    }
+    if (step.kind == -2) {
+      /* os.exit 是 VM terminal；依最新 close 旗標重查同一 queue。 */
+      continue;
     }
     if (step.kind < 0) complete = 0;
     else if (step.kind == 0) {
@@ -1079,7 +1178,7 @@ static void rivetlua_a4_table_drive(lua_State *state, int index, int setter) {
   if (depth < 0) rivetlua_a4_raise(state, -RV_A1_ERROR_LUA);
   rivetlua_capi_callback_step_b4 step =
       rivetlua_capi_table_prepare_a4a(state, index, setter);
-  while (step.kind == 1 || step.kind == 2) {
+  while (step.kind == 1 || step.kind == 2 || step.kind == 4) {
     int returned = 0;
     if (!rivetlua_b10_invoke_step(state, &step, &returned)) break;
     int close_status = rivetlua_b7_close_drive(
@@ -1708,8 +1807,13 @@ int lua_resume(lua_State *state, lua_State *from, int nargs, int *nresults) {
   volatile int error_class = 0;
   int result = LUA_ERRRUN;
   int result_count = 0;
+  int terminal_exit = 0;
   rivetlua_capi_callback_step_b4 step;
   int jumped = setjmp(checkpoint.jump);
+  if (jumped == 3) {
+    terminal_exit = 1;
+    goto finish;
+  }
   if (jumped == 2) {
     result = LUA_YIELD;
     result_count = lua_gettop(state);
@@ -1768,7 +1872,7 @@ int lua_resume(lua_State *state, lua_State *from, int nargs, int *nresults) {
     step = setup.step;
   }
 drive:
-  while (step.kind == 1 || step.kind == 2) {
+  while (step.kind == 1 || step.kind == 2 || step.kind == 4) {
     int count = 0;
     if (!rivetlua_b10_invoke_step(state, &step, &count)) goto finish;
     int closed = rivetlua_b7_close_drive(
@@ -1780,6 +1884,10 @@ drive:
         : rivetlua_capi_call_resume_error_a2(
               state, rivetlua_capi_continuation_results_a5(state));
     checkpoint.rust_action_active = 0;
+  }
+  if (step.kind == -2) {
+    terminal_exit = 1;
+    goto finish;
   }
   if (rivetlua_capi_call_depth_b7(state) > frame_depth) {
     int depth = rivetlua_capi_call_depth_b7(state);
@@ -1880,6 +1988,7 @@ finish:
           state, checkpoint.generation, checkpoint.token,
           checkpoint.previous_state_token) != RV_A1_OK)
     return LUA_ERRRUN;
+  if (terminal_exit) rivetlua_b4_raise_terminal_a1(state);
   if (result == LUA_OK || result == LUA_YIELD) *nresults = result_count;
   return result;
 }
@@ -1955,7 +2064,12 @@ int lua_pcallk(lua_State *state, int nargs, int nresults, int errfunc,
     registered = 1;
   }
   int status = LUA_OK;
-  if (rivetlua_a2_call_drive(state, nargs, nresults, registered) != 0) {
+  int driven = rivetlua_a2_call_drive(state, nargs, nresults, registered);
+  if (driven == -2) {
+    rivetlua_a2_terminal_cleanup(state, registered, setup.handler);
+    return LUA_ERRRUN;
+  }
+  if (driven != 0) {
     int class_code = RV_A1_ERROR_LUA;
     if (!rivetlua_a2_consume_settle(state, setup.base, &class_code)) {
       if (registered)
@@ -1976,7 +2090,12 @@ int lua_pcallk(lua_State *state, int nargs, int nresults, int errfunc,
           rivetlua_capi_public_drop_handler_a2(setup.handler);
         return LUA_ERRMEM;
       }
-      if (rivetlua_a2_call_drive(state, 1, 1, 0) != 0) {
+      int handler_driven = rivetlua_a2_call_drive(state, 1, 1, 0);
+      if (handler_driven == -2) {
+        rivetlua_a2_terminal_cleanup(state, registered, setup.handler);
+        return LUA_ERRRUN;
+      }
+      if (handler_driven != 0) {
         int handler_class = RV_A1_ERROR_LUA;
         if (!rivetlua_a2_consume_settle(
                 state, setup.base, &handler_class)) {
@@ -2025,7 +2144,12 @@ void lua_callk(lua_State *state, int nargs, int nresults,
     if (pushed != 0) rivetlua_b5_operation_raise_message(state, pushed, 0);
     registered = 1;
   }
-  if (rivetlua_a2_call_drive(state, nargs, nresults, registered) == 0) {
+  int driven = rivetlua_a2_call_drive(state, nargs, nresults, registered);
+  if (driven == -2) {
+    rivetlua_a2_terminal_cleanup(state, registered, NULL);
+    return;
+  }
+  if (driven == 0) {
     if (registered)
       (void)rivetlua_capi_continuation_step_a5(
           state, (size_t)rivetlua_capi_call_depth_b7(state), 1);
@@ -2066,16 +2190,23 @@ static int rivetlua_b8_gc_drive(lua_State *state, int what, size_t bytes,
   rivetlua_capi_top_a1 = &checkpoint;
   int answer = -1;
   int status = 0;
+  int terminal_exit = 0;
   checkpoint.rust_action_active = 1;
   rivetlua_capi_callback_step_b4 step = rivetlua_capi_gc_prepare_b8(
       state, what, bytes, first, second, third);
   checkpoint.rust_action_active = 0;
   if (step.kind >= 0) answer = step.value;
-  for (; step.kind == 1 || step.kind == 2;) {
+  for (; step.kind == 1 || step.kind == 2 || step.kind == 4;) {
     volatile int callback_failed = 0;
     volatile int count = 0;
     /* C finalizer 的錯誤只回到此 C checkpoint，再交給 protected VM boundary。 */
-    if (setjmp(checkpoint.jump) == 0) {
+    int jumped = setjmp(checkpoint.jump);
+    if (jumped == 3) {
+      terminal_exit = 1;
+      status = -RV_A1_ERROR_LUA;
+      break;
+    }
+    if (jumped == 0) {
       int invoked_count = 0;
       if (!rivetlua_b10_invoke_step(state, &step, &invoked_count))
         callback_failed = 1;
@@ -2095,7 +2226,12 @@ static int rivetlua_b8_gc_drive(lua_State *state, int what, size_t bytes,
         : rivetlua_capi_call_resume_b4(state, (int)count, 0);
     checkpoint.rust_action_active = 0;
   }
-  if (step.kind < 0 || step.kind == 1 || step.kind == 2)
+  if (!terminal_exit && step.kind == -2) {
+    terminal_exit = 1;
+    status = -RV_A1_ERROR_LUA;
+  }
+  if (!terminal_exit &&
+      (step.kind < 0 || step.kind == 1 || step.kind == 2 || step.kind == 4))
     status = -(step.value > 0 ? step.value : RV_A1_ERROR_LUA);
   if (status != 0) {
     checkpoint.rust_action_active = 1;
@@ -2109,6 +2245,7 @@ static int rivetlua_b8_gc_drive(lua_State *state, int what, size_t bytes,
       state, checkpoint.generation, checkpoint.token,
       checkpoint.previous_state_token);
   if (exited != RV_A1_OK) return -RV_A1_ERROR_LUA;
+  if (terminal_exit) rivetlua_b4_raise_terminal_a1(state);
   if (status != 0) return status;
   return answer;
 }
@@ -3254,7 +3391,9 @@ static rivetlua_capi_outcome_a1 rivetlua_capi_trampoline_protect_impl_a1(
   rivetlua_capi_top_a1 = &checkpoint;
 
   /* 跳轉目標與 jump 呼叫都在此 C frame；Rust action 已完整返回。 */
-  if (setjmp(checkpoint.jump) == 0) {
+  int terminal_exit = 0;
+  int jumped = setjmp(checkpoint.jump);
+  if (jumped == 0) {
     rivetlua_capi_action_a1 action = action_fn(
         state, checkpoint.generation, checkpoint.token, context);
     if (action.kind == RV_A1_ACTION_RETURN) {
@@ -3289,6 +3428,12 @@ static rivetlua_capi_outcome_a1 rivetlua_capi_trampoline_protect_impl_a1(
       outcome.kind = RV_A1_OUT_REJECTED;
       outcome.value = RV_A1_REJECT_INVALID_ACTION;
     }
+  } else if (jumped == 3) {
+    terminal_exit = 1;
+    outcome.kind = RV_A1_OUT_REJECTED;
+    outcome.value = RV_A1_REJECT_INVALID_ACTION;
+    (void)rivetlua_capi_pending_cancel_a1(
+        state, checkpoint.generation, checkpoint.token);
   } else {
     outcome.kind = RV_A1_OUT_RAISED;
     outcome.value = raised_status;
@@ -3304,6 +3449,7 @@ static rivetlua_capi_outcome_a1 rivetlua_capi_trampoline_protect_impl_a1(
     outcome.kind = RV_A1_OUT_REJECTED;
     outcome.value = exited;
   }
+  if (terminal_exit) rivetlua_b4_raise_terminal_a1((lua_State *)state);
   return outcome;
 }
 

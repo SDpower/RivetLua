@@ -1,0 +1,117 @@
+{
+  "schema": "rivetlua-p17-fuzz-corpus-v1",
+  "families": [
+    {
+      "case_id": "p17_fuzz_parser",
+      "seed": 1519873,
+      "budget": 128,
+      "limits": {
+        "compile_limits": {
+          "max_source_bytes": 4096,
+          "max_tokens": 4096,
+          "max_parse_depth": 64
+        },
+        "ir_limits": {
+          "max_prototypes": 32,
+          "max_instructions": 512,
+          "max_registers": 256,
+          "max_upvalues_per_prototype": 255
+        },
+        "verify_limits": {
+          "max_module_bytes": 16384,
+          "max_artifact_bytes": 16384,
+          "max_prototypes": 32,
+          "max_instructions": 512,
+          "max_constants": 256,
+          "max_registers": 256,
+          "max_upvalues_per_prototype": 255
+        }
+      },
+      "fixtures": []
+    },
+    {
+      "case_id": "p17_fuzz_rvlu",
+      "seed": 1519874,
+      "budget": 128,
+      "limits": {
+        "compile_limits": {
+          "max_source_bytes": 4096,
+          "max_tokens": 4096,
+          "max_parse_depth": 64
+        },
+        "ir_limits": {
+          "max_prototypes": 32,
+          "max_instructions": 512,
+          "max_registers": 256,
+          "max_upvalues_per_prototype": 255
+        },
+        "verify_limits": {
+          "max_module_bytes": 16384,
+          "max_artifact_bytes": 16384,
+          "max_prototypes": 32,
+          "max_instructions": 512,
+          "max_constants": 256,
+          "max_registers": 256,
+          "max_upvalues_per_prototype": 255
+        }
+      },
+      "fixtures": []
+    },
+    {
+      "case_id": "p17_fuzz_official_chunk",
+      "seed": 1519875,
+      "budget": 128,
+      "limits": {
+        "official_chunk_limits": {
+          "max_bytes": 16384,
+          "max_depth": 8,
+          "max_prototypes": 32,
+          "max_instructions": 512,
+          "max_constants": 256,
+          "max_upvalues": 256,
+          "max_debug_entries": 2048,
+          "max_strings": 256,
+          "max_string_bytes": 4096,
+          "max_total_string_bytes": 8192,
+          "max_allocated_bytes": 1048576
+        },
+        "verify_limits": {
+          "max_module_bytes": 16384,
+          "max_artifact_bytes": 16384,
+          "max_prototypes": 32,
+          "max_instructions": 512,
+          "max_constants": 256,
+          "max_registers": 256,
+          "max_upvalues_per_prototype": 255
+        },
+        "work_budget_units": 1000000
+      },
+      "fixtures": [
+        {
+          "path": "crates/rivetlua-core/tests/official_chunk_fixtures/lua55-debug.luac",
+          "sha256": "0f99904d2488fb27868cff66af0be09d1ef64b00c59201bf16456ae9cb05ab7a"
+        },
+        {
+          "path": "crates/rivetlua-core/tests/official_chunk_fixtures/lua55-strip.luac",
+          "sha256": "1fc3dc232f26d69669e9efa0497ab15a0cd00341d4ed10d93109d9bdd00ef7a2"
+        },
+        {
+          "path": "crates/rivetlua-core/tests/official_chunk_fixtures/lua55-closure.luac",
+          "sha256": "1224eeb61b9a11fd6763d4d24845f3f6f36c1588bd7019b498225182fa26afcf"
+        },
+        {
+          "path": "crates/rivetlua-core/tests/official_chunk_fixtures/lua54-debug.luac",
+          "sha256": "df15b0baa436f80b7f4325e9bfea73c469769ab5083c5f30632fc393a5a34d68"
+        },
+        {
+          "path": "crates/rivetlua-core/tests/official_chunk_fixtures/lua54-strip.luac",
+          "sha256": "43bba279e76f316bcccd086c5ac3f2146ef1762759e98c08c8bc4fed087f7308"
+        },
+        {
+          "path": "crates/rivetlua-core/tests/official_chunk_fixtures/lua54-closure.luac",
+          "sha256": "8f49ed293d46f9029972d7b8cf8420aa61f69c141c2dad394a081851cb725bf0"
+        }
+      ]
+    }
+  ]
+}

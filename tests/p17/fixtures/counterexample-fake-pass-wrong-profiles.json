@@ -1,0 +1,18 @@
+{
+  "schema": "rivetlua-phase-gate-v1",
+  "phase": "P17",
+  "batch": "P17-B01",
+  "status": "PASS",
+  "diagnostic": "synthetic counterexample: profile coverage is incomplete",
+  "scope": {
+    "phase": "P17",
+    "batch": "P17-B01",
+    "declared_cases": ["COMPLETE-002"],
+    "facets": ["fixture", "binary", "profile", "abi", "module-build", "module-load", "runner-argv", "runner-cwd", "runner-no-u", "runner-error", "negative-controls"],
+    "selectors": ["lua55-i64f64", "lua54-i64f64"]
+  },
+  "source_inputs": [{"path": "tests/p17/runner-manifest.toml", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],
+  "configuration": {"profiles": ["lua55-i64f64"], "target": "aarch64-apple-darwin", "features": [], "toolchain": "rustc 1.98.1", "environment": {}},
+  "dependencies": [],
+  "checks": [{"case_id": "COMPLETE-002", "facet": "fixture", "command": "synthetic", "cwd": ".", "exit_code": 0, "matched": 1, "passed": 1, "failed": 0, "ignored": 0, "status": "PASS", "log_path": "synthetic.log", "log_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+}

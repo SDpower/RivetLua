@@ -9,9 +9,13 @@ description = "RivetLua 的受控命令列介面。"
 
 [features]
 default-lua54 = []
+native-lua55 = ["rivetlua/native-lua55", "dep:rivetlua-capi", "rivetlua-capi/lua55"]
+native-lua54 = ["rivetlua/native-lua54", "dep:rivetlua-capi", "rivetlua-capi/lua54"]
 
 [dependencies]
 rivetlua = { path = "../rivetlua" }
+rivetlua-capi = { path = "../rivetlua-capi", optional = true, default-features = false }
+ctrlc = "=3.5.2"
 
 [target.'cfg(any(unix, windows))'.dependencies]
 cpu-time = "=1.0.0"

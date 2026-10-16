@@ -40,6 +40,7 @@ pub(crate) enum BasicPending {
         original: Value,
         dynamic_top: usize,
         resume_instruction: bool,
+        followup_line: Option<Option<u32>>,
         local_current_pc: bool,
         target: Option<ObjectRef>,
         target_root: Option<RootId>,
@@ -75,6 +76,16 @@ pub(crate) enum BasicPending {
         outer_mode: ResultMode,
         tail_return: bool,
     },
+    DebugConsole {
+        environment: Value,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    DebugConsoleStringify {
+        environment: Value,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
     ToString {
         outer_mode: ResultMode,
         tail_return: bool,
@@ -91,6 +102,12 @@ pub(crate) enum BasicPending {
     },
     Print {
         buffer: PrintBuffer,
+        arguments: PrintArguments,
+        next_argument: usize,
+        outer_mode: ResultMode,
+        tail_return: bool,
+    },
+    Warning {
         arguments: PrintArguments,
         next_argument: usize,
         outer_mode: ResultMode,
@@ -146,6 +163,9 @@ impl BasicPending {
             state.clear_roots(vm)?;
         }
         if let Self::Print { arguments, .. } = self {
+            arguments.clear_roots(vm)?;
+        }
+        if let Self::Warning { arguments, .. } = self {
             arguments.clear_roots(vm)?;
         }
         if let Self::StringFormat { state, .. } = self {
@@ -222,8 +242,11 @@ impl HostCallbackPending {
         })
     }
 
-    pub(crate) fn invoke(&self, values: &[Value]) -> CallbackResult {
-        (self.callback)(&mut CallbackContext::new(self.captures.values()), values)
+    pub(crate) fn invoke(&self, vm: &mut Vm, values: &[Value]) -> Result<CallbackResult, VmError> {
+        let mut context = CallbackContext::new(self.captures.values(), vm);
+        let result = (self.callback)(&mut context, values);
+        context.finish()?;
+        Ok(result)
     }
 
     pub(crate) fn arguments(&self) -> &[Value] {
@@ -361,6 +384,24 @@ pub(crate) struct PendingOp {
 }
 
 impl PendingOp {
+    pub(crate) fn set_console_error(&mut self, vm: &mut Vm, value: Value) -> Result<(), VmError> {
+        let new_root = match value {
+            Value::Object(object) => Some(vm.add_root(RootKind::Temporary, object)?),
+            _ => None,
+        };
+        if let Some(old_root) = self.roots[3] {
+            if let Err(error) = vm.remove_root(old_root) {
+                if let Some(new_root) = new_root {
+                    vm.remove_root(new_root)?;
+                }
+                return Err(error);
+            }
+        }
+        self.values[3] = value;
+        self.roots[3] = new_root;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         vm: &mut Vm,

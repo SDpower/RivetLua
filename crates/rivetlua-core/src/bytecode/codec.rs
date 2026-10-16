@@ -920,12 +920,15 @@ fn validate_instruction_shape(
             exit,
         } => {
             validate_numeric_for_registers(register, *control, *limit, *step, *visible)?;
-            require_jump_target(prototype, index, *target)?;
+            // 空 body 的 FORLOOP 可直接回到自身；其餘跳躍仍禁止 self-loop。
+            if target.0 as usize != index {
+                require_jump_target(prototype, index, *target)?;
+            }
             require_jump_target(prototype, index, *exit)?;
-            if target.0 as usize >= index || exit.0 as usize <= index {
+            if target.0 as usize > index || exit.0 as usize <= index {
                 return Err(verify(
                     0,
-                    "RVLU NumericForNext 必須有後向回邊與前向 exit CFG edge",
+                    "RVLU NumericForNext 必須有後向或自身回邊與前向 exit CFG edge",
                 ));
             }
         }
@@ -945,7 +948,8 @@ fn validate_instruction_shape(
         (Instruction::Close { count: 0, .. }, None) => {}
         (Instruction::Close { base, count: 1 }, Some(path)) => {
             validate_close_path(prototype, path)?;
-            if path.target_scope == Some(path.from_scope)
+            if (path.target_scope == Some(path.from_scope)
+                && (path.kind != BytecodeExitKind::Goto || path.span != instruction.span))
                 || !prototype.close_paths.contains(path)
                 || !path.registers.contains(base)
             {
@@ -1051,7 +1055,7 @@ fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), Bytec
         }
         if *prepare_exit != exit
             || prepare_index.checked_add(1) != Some(target.0 as usize)
-            || target.0 as usize >= next_index
+            || target.0 as usize > next_index
         {
             return Err(verify(
                 0,
@@ -3359,6 +3363,73 @@ mod tests {
     }
 
     #[test]
+    fn verifier_accepts_paired_empty_numeric_for_self_backedge_only() {
+        let limits = VerifyLimits::default();
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut module = sample();
+            module.profile = profile;
+            let prototype = &mut module.prototypes[0];
+            prototype.register_count = 4;
+            prototype.frame.register_limit = 4;
+            prototype.frame.initial_top = Register(4);
+            prototype.frame.dynamic_top = Register(4);
+            prototype.instructions = [
+                Instruction::NumericForPrepare {
+                    control: Register(0),
+                    limit: Register(1),
+                    step: Register(2),
+                    visible: Register(3),
+                    exit: InstructionOffset(2),
+                },
+                Instruction::NumericForNext {
+                    control: Register(0),
+                    limit: Register(1),
+                    step: Register(2),
+                    visible: Register(3),
+                    target: InstructionOffset(1),
+                    exit: InstructionOffset(2),
+                },
+                Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(0),
+                },
+            ]
+            .into_iter()
+            .map(|instruction| BytecodeInstruction {
+                instruction,
+                span: prototype.span,
+                close_path: None,
+            })
+            .collect();
+            verify_module(module.clone(), profile, &limits)
+                .expect("有唯一 Prepare 與前向 exit 的空 numeric for 回到 Next 自身應合法");
+
+            let mut invalid_target = module.clone();
+            if let Instruction::NumericForNext { target, .. } =
+                &mut invalid_target.prototypes[0].instructions[1].instruction
+            {
+                *target = InstructionOffset(99);
+            }
+            assert_eq!(
+                verify_module(invalid_target, profile, &limits)
+                    .expect_err("越界 NumericForNext target 必須拒絕")
+                    .code,
+                BytecodeErrorCode::Verify
+            );
+
+            module.prototypes[0].instructions[0].instruction = Instruction::Jump {
+                target: InstructionOffset(0),
+            };
+            assert_eq!(
+                verify_module(module, profile, &limits)
+                    .expect_err("一般 Jump self-loop 必須維持拒絕")
+                    .code,
+                BytecodeErrorCode::Verify
+            );
+        }
+    }
+
+    #[test]
     fn verifier_requires_numeric_for_prepare_on_every_next_path() {
         let limits = VerifyLimits::default();
         let mut module = sample();
@@ -3799,6 +3870,124 @@ mod tests {
                 .code,
             BytecodeErrorCode::Verify
         );
+    }
+
+    #[test]
+    fn p17_same_scope_goto_close_requires_exact_metadata() {
+        let limits = VerifyLimits::default();
+        let mut module = sample();
+        let prototype = &mut module.prototypes[0];
+        prototype.register_count = 3;
+        prototype.frame.register_limit = 3;
+        prototype.frame.initial_top = Register(3);
+        prototype.frame.dynamic_top = Register(3);
+        let binding = BytecodeBindingId {
+            function: 0,
+            ordinal: 1,
+        };
+        prototype.binding_registers.push((binding, Register(2)));
+        let marker = BytecodeClosePath {
+            kind: BytecodeExitKind::Normal,
+            span: prototype.span,
+            from_scope: 1,
+            target_scope: Some(1),
+            bindings: vec![binding],
+            registers: vec![Register(2)],
+        };
+        let goto_path = BytecodeClosePath {
+            kind: BytecodeExitKind::Goto,
+            ..marker.clone()
+        };
+        prototype.close_paths.push(goto_path.clone());
+        prototype.instructions = vec![
+            BytecodeInstruction {
+                instruction: Instruction::Move {
+                    dest: Register(2),
+                    src: Register(0),
+                },
+                span: prototype.span,
+                close_path: Some(marker),
+            },
+            BytecodeInstruction {
+                instruction: Instruction::Close {
+                    base: Register(2),
+                    count: 1,
+                },
+                span: prototype.span,
+                close_path: Some(goto_path),
+            },
+            BytecodeInstruction {
+                instruction: Instruction::LoadNil {
+                    start: Register(2),
+                    count: 1,
+                },
+                span: prototype.span,
+                close_path: None,
+            },
+            BytecodeInstruction {
+                instruction: Instruction::Jump {
+                    target: InstructionOffset(4),
+                },
+                span: prototype.span,
+                close_path: None,
+            },
+            BytecodeInstruction {
+                instruction: Instruction::Return {
+                    base: Register(0),
+                    result_mode: ResultMode::Fixed(0),
+                },
+                span: prototype.span,
+                close_path: None,
+            },
+        ];
+        verify_module(module.clone(), LuaProfile::Lua55, &limits)
+            .expect("同 scope Goto 可關閉已宣告的 close binding");
+        let rejected = |candidate: BytecodeModule| {
+            let error = verify_module(candidate, LuaProfile::Lua55, &limits)
+                .expect_err("損壞的 ClosePath metadata 不可通過驗證");
+            assert_eq!(error.code, BytecodeErrorCode::Verify);
+        };
+
+        let mut non_goto = module.clone();
+        non_goto.prototypes[0].close_paths[0].kind = BytecodeExitKind::Normal;
+        non_goto.prototypes[0].instructions[1]
+            .close_path
+            .as_mut()
+            .unwrap()
+            .kind = BytecodeExitKind::Normal;
+        rejected(non_goto);
+
+        let mut wrong_span = module.clone();
+        wrong_span.prototypes[0].instructions[1].span = BytecodeSpan {
+            start_byte: 1,
+            end_byte: 9,
+        };
+        rejected(wrong_span);
+
+        let mut missing_instruction_path = module.clone();
+        missing_instruction_path.prototypes[0].instructions[1].close_path = None;
+        rejected(missing_instruction_path);
+
+        let mut missing_registered_path = module.clone();
+        missing_registered_path.prototypes[0].close_paths.clear();
+        rejected(missing_registered_path);
+
+        let mut wrong_base = module.clone();
+        wrong_base.prototypes[0].instructions[1].instruction = Instruction::Close {
+            base: Register(1),
+            count: 1,
+        };
+        rejected(wrong_base);
+
+        let mut wrong_binding = module;
+        wrong_binding.prototypes[0].close_paths[0].bindings[0].ordinal = 2;
+        wrong_binding.prototypes[0].instructions[1]
+            .close_path
+            .as_mut()
+            .unwrap()
+            .bindings[0]
+            .ordinal = 2;
+        rejected(wrong_binding);
     }
 
     #[test]

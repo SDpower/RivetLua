@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BasicBuiltin {
     Assert,
+    Warn,
     CollectGarbage,
     Select,
     Type,
@@ -22,6 +23,7 @@ pub(crate) enum BasicBuiltin {
 struct Text {
     bytes: [u8; 128],
     len: usize,
+    prefix: Option<ObjectRef>,
 }
 
 impl Text {
@@ -29,11 +31,38 @@ impl Text {
         Self {
             bytes: [0; 128],
             len: 0,
+            prefix: None,
         }
     }
 
     fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
+    }
+
+    fn byte_len(&self, vm: &Vm) -> Result<usize, RuntimeError> {
+        let prefix_len = match self.prefix {
+            Some(prefix) => vm.with_byte_string(prefix, |string| {
+                c_string_len(string.as_bytes())
+            })?,
+            None => 0,
+        };
+        prefix_len
+            .checked_add(self.len)
+            .ok_or(VmError::ArithmeticOverflow.into())
+    }
+
+    fn append_to(
+        &self,
+        vm: &Vm,
+        buffer: &mut PrintBuffer,
+    ) -> Result<(), RuntimeError> {
+        if let Some(prefix) = self.prefix {
+            vm.with_byte_string(prefix, |string| {
+                let bytes = string.as_bytes();
+                buffer.append(&bytes[..c_string_len(bytes)])
+            })??;
+        }
+        buffer.append(self.as_bytes())
     }
 }
 
@@ -49,6 +78,15 @@ impl Write for Text {
 
 fn argument() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::BasicArgument)
+}
+
+pub(crate) fn warn_argument(vm: &mut Vm, index: usize) -> Result<RuntimeError, RuntimeError> {
+    let mut text = Text::new();
+    write!(text, "bad argument #{index} to 'warn' (string expected)")
+        .map_err(|_| VmError::ArithmeticOverflow)?;
+    let mut error = argument();
+    error.value = Value::Object(vm.allocate_byte_string(text.as_bytes())?);
+    Ok(error)
 }
 
 fn arg(args: &[Value], index: usize) -> Result<Value, RuntimeError> {
@@ -121,6 +159,7 @@ fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
             if kind == ObjectKind::ByteString {
                 return Ok(None);
             }
+            let prefix = metatable_name(vm, value)?;
             let name = match kind {
                 ObjectKind::Table => "table",
                 ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin => "function",
@@ -131,6 +170,12 @@ fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
                 | ObjectKind::Userdata => "userdata",
                 ObjectKind::ByteString => unreachable!(),
                 ObjectKind::File => {
+                    if let Some(prefix) = prefix {
+                        text.prefix = Some(prefix);
+                        write!(text, ": {:?}", object.identity())
+                            .map_err(|_| VmError::ArithmeticOverflow)?;
+                        return Ok(Some(text));
+                    }
                     if vm.with_file(object, |file| file.lease.is_some())? {
                         "file"
                     } else {
@@ -142,11 +187,34 @@ fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
                 write!(text, "{name}").map_err(|_| VmError::ArithmeticOverflow)?;
                 return Ok(Some(text));
             }
-            write!(text, "{name}: {:?}", object.identity())
-                .map_err(|_| VmError::ArithmeticOverflow)?;
+            if let Some(prefix) = prefix {
+                text.prefix = Some(prefix);
+                write!(text, ": {:?}", object.identity())
+                    .map_err(|_| VmError::ArithmeticOverflow)?;
+            } else {
+                write!(text, "{name}: {:?}", object.identity())
+                    .map_err(|_| VmError::ArithmeticOverflow)?;
+            }
         }
     }
     Ok(Some(text))
+}
+
+fn metatable_name(vm: &Vm, value: Value) -> Result<Option<ObjectRef>, RuntimeError> {
+    let Some(metatable) = vm.get_metatable_for_value(value)? else {
+        return Ok(None);
+    };
+    let Value::Object(name) = vm.raw_get_byte_key(metatable, b"__name")? else {
+        return Ok(None);
+    };
+    Ok((vm.object_kind(name)? == ObjectKind::ByteString).then_some(name))
+}
+
+fn c_string_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len())
 }
 
 pub(crate) struct PrintBuffer {
@@ -203,7 +271,7 @@ pub(crate) fn print_value_len(
     separator: bool,
 ) -> Result<usize, RuntimeError> {
     let len = match text_for(vm, value)? {
-        Some(text) => text.as_bytes().len(),
+        Some(text) => text.byte_len(vm)?,
         None => {
             let Value::Object(object) = value else {
                 unreachable!()
@@ -225,7 +293,7 @@ pub(crate) fn append_print_value(
         buffer.append(b"\t")?;
     }
     match text_for(vm, value)? {
-        Some(text) => buffer.append(text.as_bytes()),
+        Some(text) => text.append_to(vm, buffer),
         None => {
             let Value::Object(object) = value else {
                 unreachable!()
@@ -243,7 +311,12 @@ fn value_to_string(vm: &mut Vm, value: Value) -> Result<Value, RuntimeError> {
         }
     }
     let text = text_for(vm, value)?.ok_or_else(argument)?;
-    Ok(Value::Object(vm.allocate_byte_string(text.as_bytes())?))
+    if text.prefix.is_none() {
+        return Ok(Value::Object(vm.allocate_byte_string(text.as_bytes())?));
+    }
+    let mut buffer = PrintBuffer::new(vm);
+    text.append_to(vm, &mut buffer)?;
+    Ok(Value::Object(vm.allocate_byte_string(buffer.as_bytes())?))
 }
 
 fn type_name(vm: &Vm, value: Value) -> Result<&'static [u8], RuntimeError> {
@@ -443,10 +516,9 @@ fn protected_metatable_value(vm: &mut Vm, metatable: ObjectRef) -> Result<Value,
 }
 
 fn metatable_field(vm: &mut Vm, metatable: ObjectRef) -> Result<Value, RuntimeError> {
-    let key = vm.allocate_byte_string(b"__metatable")?;
-    let value = vm.raw_get(metatable, Value::Object(key));
-    vm.reclaim(key)?;
-    Ok(value?)
+    vm.with_temporary_byte_string(b"__metatable", |vm, key| {
+        Ok(vm.raw_get(metatable, Value::Object(key))?)
+    })
 }
 
 pub(crate) fn print(vm: &mut Vm, args: &[Value]) -> Result<(), RuntimeError> {
@@ -487,6 +559,32 @@ pub(crate) fn execute(
             }
             result(vm, args)
         }
+        BasicBuiltin::Warn => {
+            if args.is_empty() {
+                return Err(warn_argument(vm, 1)?);
+            }
+            // 官方 luaL_checkstring 會先檢查全部參數，不能先送出部分片段。
+            for (index, value) in args.iter().enumerate() {
+                if !is_string(vm, *value)? {
+                    return Err(warn_argument(vm, index + 1)?);
+                }
+            }
+            if !vm.host_warning_available() {
+                return result(vm, &[]);
+            }
+            for (index, value) in args.iter().copied().enumerate() {
+                let mut buffer = PrintBuffer::new(vm);
+                append_print_value(vm, &mut buffer, value, false)?;
+                let bytes = buffer.as_bytes();
+                let prefix = bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(bytes.len());
+                vm.write_host_warning(&bytes[..prefix], index + 1 < args.len())
+                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostWarningFailed))?;
+            }
+            result(vm, &[])
+        }
         BasicBuiltin::CollectGarbage => {
             let operation = match args.first().copied().unwrap_or(Value::Nil) {
                 Value::Nil => Some(4),
@@ -503,6 +601,14 @@ pub(crate) fn execute(
                         b"param" if vm.language_profile() == rivetlua_core::LuaProfile::Lua55 => {
                             Some(8)
                         }
+                        b"setpause" if vm.language_profile() == rivetlua_core::LuaProfile::Lua54 => {
+                            Some(9)
+                        }
+                        b"setstepmul"
+                            if vm.language_profile() == rivetlua_core::LuaProfile::Lua54 =>
+                        {
+                            Some(10)
+                        }
                         _ => None,
                     })?,
                 _ => return Err(argument()),
@@ -512,7 +618,7 @@ pub(crate) fn execute(
                     let bytes = vm.ledger_snapshot().lua_heap_bytes;
                     result(vm, &[Value::Float(bytes as f64 / 1024.0)])
                 }
-                Some(1..=8) if vm.finalizer_running() => result(vm, &[Value::Nil]),
+                Some(1..=10) if vm.finalizer_running() => result(vm, &[Value::Nil]),
                 Some(1) => result(vm, &[Value::Boolean(vm.automatic_gc_running())]),
                 Some(2) => {
                     let output = result(vm, &[Value::Integer(0)])?;
@@ -592,6 +698,22 @@ pub(crate) fn execute(
                     if let Some(value) = new_value.filter(|value| *value >= 0) {
                         vm.set_gc_param(parameter, value);
                     }
+                    Ok(output)
+                }
+                Some(9 | 10) => {
+                    let parameter = if operation == Some(9) {
+                        GcParameter::Pause
+                    } else {
+                        GcParameter::StepMultiplier
+                    };
+                    let requested = match args.get(1).copied().unwrap_or(Value::Nil) {
+                        Value::Nil => 0,
+                        value => lua_integer(number(vm, value, None)?).ok_or_else(argument)?,
+                    };
+                    let previous = i64::try_from(vm.gc_param(parameter))
+                        .map_err(|_| VmError::ArithmeticOverflow)?;
+                    let output = result(vm, &[Value::Integer(previous)])?;
+                    vm.set_gc_param(parameter, requested);
                     Ok(output)
                 }
                 _ => Err(argument()),
@@ -772,6 +894,57 @@ mod p13_a_tests {
     use super::*;
     use crate::HostHandle;
     use rivetlua_core::{LuaProfile, Value};
+
+    #[test]
+    fn p17_warn_argument_keeps_typed_error_and_releases_message_root() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let baseline_roots = vm.roots().total_count();
+            let late_bad_argument = [Value::Integer(7), Value::Boolean(false)];
+            for (args, expected) in [
+                (&[][..], b"bad argument #1 to 'warn' (string expected)".as_slice()),
+                (
+                    &late_bad_argument[..],
+                    b"bad argument #2 to 'warn' (string expected)".as_slice(),
+                ),
+            ] {
+                let error = match execute(&mut vm, BasicBuiltin::Warn, args, 0) {
+                    Err(error) => error,
+                    Ok(_) => panic!("warn 參數錯誤不得成功"),
+                };
+                assert_eq!(error.kind, RuntimeErrorKind::BasicArgument);
+                assert_eq!(error.diagnostic_id, "E_BASIC_ARGUMENT");
+                let Value::Object(message) = error.value else {
+                    panic!("warn 參數錯誤須有 Lua 字串值")
+                };
+                assert!(
+                    vm.with_byte_string(message, |text| text.as_bytes() == expected)
+                        .unwrap()
+                );
+                let root = vm.add_root(RootKind::Temporary, message).unwrap();
+                vm.collect().unwrap();
+                assert_eq!(vm.object_kind(message), Ok(ObjectKind::ByteString));
+                vm.remove_root(root).unwrap();
+                vm.collect().unwrap();
+                assert_eq!(vm.object_kind(message), Err(VmError::StaleObject));
+                assert_eq!(vm.roots().total_count(), baseline_roots);
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+            }
+
+            vm.inject_failure_once(FailPoint::StringBytesReserve);
+            assert!(matches!(
+                execute(&mut vm, BasicBuiltin::Warn, &[], 0),
+                Err(RuntimeError {
+                    kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                        FailPoint::StringBytesReserve
+                    )),
+                    ..
+                })
+            ));
+            assert_eq!(vm.roots().total_count(), baseline_roots);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
 
     #[test]
     fn lightuserdata_type_and_text_use_address_without_heap_reference() {
@@ -1496,5 +1669,94 @@ mod gc_running_tests {
                 assert_eq!(vm.ledger_snapshot().reserved, 0);
             }
         }
+    }
+
+    #[test]
+    fn p17_lua54_collectgarbage_legacy_parameters_preserve_previous_and_atomicity() {
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua54).unwrap();
+        let pause = vm.allocate_byte_string(b"setpause").unwrap();
+        let stepmul = vm.allocate_byte_string(b"setstepmul").unwrap();
+        let _pause_root = HostHandle::<Value>::new(&mut vm, pause).unwrap();
+        let _stepmul_root = HostHandle::<Value>::new(&mut vm, stepmul).unwrap();
+        for (option, parameter) in [
+            (pause, GcParameter::Pause),
+            (stepmul, GcParameter::StepMultiplier),
+        ] {
+            let original = vm.gc_param(parameter);
+            let roots = vm.roots().total_count();
+            let trace = vm.gc_trace();
+            vm.inject_failure_once(FailPoint::ReturnReserve);
+            assert!(matches!(
+                execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(option), Value::Integer(500)],
+                    0,
+                ),
+                Err(RuntimeError {
+                    kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
+                        FailPoint::ReturnReserve
+                    )),
+                    ..
+                })
+            ));
+            assert_eq!(vm.gc_param(parameter), original);
+            assert_eq!(vm.gc_trace(), trace);
+            assert_eq!(vm.roots().total_count(), roots);
+            for requested in [0, 2, 10, 90, 200, 500, 5000, 30000, 0x7ffffffe] {
+                let previous = vm.gc_param(parameter);
+                let (values, ticket) = execute(
+                    &mut vm,
+                    BasicBuiltin::CollectGarbage,
+                    &[Value::Object(option), Value::Integer(requested)],
+                    0,
+                )
+                .unwrap();
+                assert_eq!(values, [Value::Integer(previous as i64)]);
+                drop(ticket);
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+            }
+            let previous = vm.gc_param(parameter);
+            let (values, ticket) = execute(
+                &mut vm,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(option), Value::Integer(original as i64)],
+                0,
+            )
+            .unwrap();
+            assert_eq!(values, [Value::Integer(previous as i64)]);
+            drop(ticket);
+            assert_eq!(vm.gc_param(parameter), original);
+
+            for args in [
+                vec![Value::Object(option)],
+                vec![Value::Object(option), Value::Nil],
+            ] {
+                vm.set_gc_param(parameter, 200);
+                let previous = vm.gc_param(parameter);
+                let (values, ticket) =
+                    execute(&mut vm, BasicBuiltin::CollectGarbage, &args, 0).unwrap();
+                assert_eq!(values, [Value::Integer(previous as i64)]);
+                drop(ticket);
+                assert_eq!(vm.gc_param(parameter), 0);
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+            }
+        }
+
+        let mut lua55 = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        let option = lua55.allocate_byte_string(b"setpause").unwrap();
+        assert!(matches!(
+            execute(
+                &mut lua55,
+                BasicBuiltin::CollectGarbage,
+                &[Value::Object(option), Value::Integer(200)],
+                0,
+            ),
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::BasicArgument,
+                ..
+            })
+        ));
+        assert_eq!(lua55.ledger_snapshot().reserved, 0);
     }
 }

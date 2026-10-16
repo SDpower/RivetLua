@@ -1,6 +1,6 @@
 use rivetlua_core::{ObjectRef, Value};
 
-use crate::{ObjectKind, RootKind, Vm, VmError};
+use crate::{ObjectKind, Vm, VmError};
 
 /// P10 可識別的封閉事件；Close 只保留名稱，不在本階段執行。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,20 +172,7 @@ impl Vm {
         let Some(metatable) = self.get_metatable_for_value(value)? else {
             return Ok(Value::Nil);
         };
-        let root = match value {
-            Value::Object(object) => Some(self.add_root(RootKind::Temporary, object)?),
-            _ => None,
-        };
-        let result = (|| {
-            let key = self.allocate_byte_string(name)?;
-            let found = self.raw_get(metatable, Value::Object(key));
-            self.reclaim(key)?;
-            found
-        })();
-        if let Some(root) = root {
-            self.remove_root(root)?;
-        }
-        result
+        self.raw_get_byte_key(metatable, name)
     }
 }
 
@@ -193,7 +180,7 @@ impl Vm {
 mod tests {
     use rivetlua_core::Value;
 
-    use crate::{FailPoint, HostHandle, RootKind, Table, Vm, VmError};
+    use crate::{HostHandle, RootKind, Table, Vm, VmError};
 
     use super::MetamethodEvent;
 
@@ -294,28 +281,16 @@ mod tests {
 
         let before = vm.ledger_snapshot();
         let roots_before = vm.roots().total_count();
-        for point in [
-            FailPoint::RootReserve,
-            FailPoint::StringBytesReserve,
-            FailPoint::ObjectReserve,
-        ] {
-            vm.inject_failure_once(point);
-            assert_eq!(
-                vm.lookup_metamethod(owner, MetamethodEvent::Index),
-                Err(VmError::InjectedFailure(point))
-            );
-            assert_eq!(vm.get_metatable(owner), Ok(Some(metatable)));
-            assert_eq!(vm.ledger_snapshot(), before);
-            assert_eq!(vm.roots().total_count(), roots_before);
-        }
         vm.set_allocation_limit(before.committed);
         let limited = vm.ledger_snapshot();
         assert_eq!(
             vm.lookup_metamethod(owner, MetamethodEvent::Index),
-            Err(VmError::AllocationFailed)
+            Ok(Value::Object(event_value))
         );
         assert_eq!(vm.ledger_snapshot(), limited);
         assert_eq!(vm.roots().total_count(), roots_before);
+        assert_eq!(vm.allocate_byte_string(b"still-allocated"), Err(VmError::AllocationFailed));
+        assert_eq!(vm.ledger_snapshot(), limited);
         vm.set_allocation_limit(before.limit);
 
         let mut foreign = Vm::new().unwrap();
@@ -342,5 +317,78 @@ mod tests {
         vm.collect().unwrap();
         assert_eq!(vm.roots().count(RootKind::Host), 0);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+
+    #[test]
+    fn p17_metamethod_lookup_uses_borrowed_key_without_lua_allocation() {
+        let mut vm = Vm::new().unwrap();
+        let owner = vm.allocate_table().unwrap();
+        let _owner_root = HostHandle::<Table>::new(&mut vm, owner).unwrap();
+        let metatable = vm.allocate_table().unwrap();
+        vm.set_metatable(owner, Some(metatable)).unwrap();
+        let outer = vm.allocate_table().unwrap();
+        vm.set_metatable(metatable, Some(outer)).unwrap();
+        let outer_index = vm.allocate_byte_string(b"__index").unwrap();
+        vm.raw_set(outer, Value::Object(outer_index), Value::Boolean(true))
+            .unwrap();
+
+        let index = vm.allocate_byte_string(b"__index").unwrap();
+        vm.raw_set(metatable, Value::Object(index), Value::Integer(17))
+            .unwrap();
+        let name = vm.allocate_byte_string(b"__name").unwrap();
+        vm.raw_set(metatable, Value::Object(name), Value::Integer(23))
+            .unwrap();
+        let new_index = vm.allocate_byte_string(b"__newindex").unwrap();
+        vm.raw_set(metatable, Value::Object(new_index), Value::Integer(37))
+            .unwrap();
+        let mut long_name = vec![b'x'; 80];
+        long_name[9] = 0;
+        long_name[10] = 0xff;
+        let long_key = vm.allocate_byte_string(&long_name).unwrap();
+        vm.raw_set(metatable, Value::Object(long_key), Value::Integer(41))
+            .unwrap();
+        let mut near_name = long_name.clone();
+        near_name[79] = b'y';
+        let dead = vm.allocate_byte_string(b"__call").unwrap();
+        vm.raw_set(metatable, Value::Object(dead), Value::Integer(29))
+            .unwrap();
+        vm.raw_set(metatable, Value::Object(dead), Value::Nil)
+            .unwrap();
+        vm.raw_set(metatable, Value::Integer(7), Value::Integer(31))
+            .unwrap();
+
+        let roots = vm.roots().total_count();
+        let before = vm.ledger_snapshot();
+        vm.set_allocation_limit(before.committed);
+        let limited = vm.ledger_snapshot();
+        assert_eq!(
+            vm.lookup_metamethod_value(Value::Object(owner), MetamethodEvent::Index),
+            Ok(Value::Integer(17))
+        );
+        assert_eq!(
+            vm.lookup_raw_metafield_value(Value::Object(owner), b"__name"),
+            Ok(Value::Integer(23))
+        );
+        assert_eq!(
+            vm.lookup_metamethod_value(Value::Object(owner), MetamethodEvent::NewIndex),
+            Ok(Value::Integer(37))
+        );
+        assert_eq!(
+            vm.lookup_raw_metafield_value(Value::Object(owner), &long_name),
+            Ok(Value::Integer(41))
+        );
+        assert_eq!(
+            vm.lookup_raw_metafield_value(Value::Object(owner), &near_name),
+            Ok(Value::Nil)
+        );
+        for absent in [b"__call".as_slice(), b"__index_suffix", b"7"] {
+            assert_eq!(
+                vm.lookup_raw_metafield_value(Value::Object(owner), absent),
+                Ok(Value::Nil)
+            );
+        }
+        assert_eq!(vm.ledger_snapshot(), limited);
+        assert_eq!(vm.roots().total_count(), roots);
+        vm.set_allocation_limit(before.limit);
     }
 }

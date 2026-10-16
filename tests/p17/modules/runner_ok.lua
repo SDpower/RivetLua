@@ -1,0 +1,8 @@
+assert(_U == nil, "P17 _U must be unset")
+assert(type(arg) == "table", "P17 arg table missing")
+assert(type(arg[0]) == "string" and string.match(arg[0], "runner_ok%.lua$"), "P17 argv mismatch")
+local suite, suite_error = loadfile("all.lua", "t")
+assert(type(suite) == "function", suite_error or "P17 suite cwd mismatch")
+print("P17_RUNNER_ARGV PASS")
+print("P17_RUNNER_CWD PASS")
+print("P17_RUNNER_NO_U PASS")

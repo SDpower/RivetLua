@@ -409,7 +409,7 @@ fn cli_default_profile_identity_and_compiler_roundtrip_match_build_feature() {
     assert_eq!(
         interpreter_version.stdout,
         format!(
-            "RivetLua 0.0.0 (Lua {})\n",
+            "RivetLua 0.0.0 (Lua {}); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n",
             String::from_utf8_lossy(default_version)
         )
         .as_bytes()
@@ -449,7 +449,7 @@ fn cli_default_profile_identity_and_compiler_roundtrip_match_build_feature() {
         assert_eq!(
             interpreter_override.stdout,
             format!(
-                "RivetLua 0.0.0 (Lua {})\n",
+                "RivetLua 0.0.0 (Lua {}); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n",
                 String::from_utf8_lossy(explicit_version)
             )
             .as_bytes()
@@ -579,7 +579,7 @@ fn cli_rejects_missing_option_values_and_version_does_not_consume_stdin() {
         &[],
     );
     assert!(version.status.success());
-    assert!(version.stdout.starts_with(b"RivetLua 0.0.0 (Lua 5.4.9)\n"));
+    assert_eq!(version.stdout, b"RivetLua 0.0.0 (Lua 5.4.9); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n");
     assert!(
         !version
             .stdout
@@ -642,6 +642,28 @@ fn cli_runs_init_before_command_and_versioned_init_wins() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"versioned\naction\n");
+}
+
+#[test]
+fn cli_reports_unversioned_init_error_with_default_source_line() {
+    for profile in ["lua54", "lua55"] {
+        let output = run_lua(
+            &[OsStr::new("--profile"), OsStr::new(profile)],
+            b"",
+            None,
+            &[("LUA_INIT", "error('msg')")],
+        );
+
+        assert_eq!(output.status.code(), Some(1), "profile={profile}: {output:?}");
+        assert!(output.stdout.is_empty(), "profile={profile}: {output:?}");
+        assert!(
+            output
+                .stderr
+                .windows(b"LUA_INIT:1: msg".len())
+                .any(|part| part == b"LUA_INIT:1: msg"),
+            "profile={profile}: {output:?}"
+        );
+    }
 }
 
 #[test]
@@ -1219,7 +1241,7 @@ fn cli_keeps_rvct_whitespace_source_and_routes_unknown_binary_version_to_sdk() {
 }
 
 #[test]
-fn cli_reports_lua_error_bytes_and_keeps_repl_error_status() {
+fn cli_reports_lua_error_bytes_and_recovers_repl_error() {
     let error = lua("lua54", &["-eerror('cli-sentinel')"]);
     assert!(!error.status.success());
     assert!(
@@ -1239,7 +1261,7 @@ fn cli_reports_lua_error_bytes_and_keeps_repl_error_status() {
         None,
         &[],
     );
-    assert!(!repl.status.success());
+    assert!(repl.status.success(), "{repl:?}");
     assert!(
         repl.stdout
             .windows(b"after-error\n".len())
@@ -1304,6 +1326,136 @@ fn cli_repl_accepts_multiline_blocks_and_continues() {
 }
 
 #[test]
+fn p17_repl_nil_print_reports_error_and_continues_for_both_profiles() {
+    for profile in ["lua54", "lua55"] {
+        let output = run_lua(
+            &[
+                OsStr::new("--profile"),
+                OsStr::new(profile),
+                OsStr::new("-e"),
+                OsStr::new("saved_print=print; print=nil"),
+                OsStr::new("-i"),
+            ],
+            b"10\nprint=42\n11\nprint=setmetatable({}, {__call=function(_, ...) saved_print('callable-table', ...) end})\n12\nprint=saved_print\nprint('after-nil-print')\n",
+            None,
+            &[],
+        );
+        assert!(output.status.success(), "profile={profile}: {output:?}");
+        assert!(
+            output
+                .stderr
+                .windows(b"error calling 'print'".len())
+                .any(|part| part == b"error calling 'print'"),
+            "profile={profile}: {output:?}"
+        );
+        assert!(
+            output
+                .stdout
+                .windows(b"after-nil-print\n".len())
+                .any(|part| part == b"after-nil-print\n")
+        );
+        assert!(
+            output
+                .stdout
+                .windows(b"callable-table\t12\n".len())
+                .any(|part| part == b"callable-table\t12\n")
+        );
+        assert_eq!(
+            output
+                .stderr
+                .windows(b"error calling 'print'".len())
+                .filter(|part| *part == b"error calling 'print'")
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn p17_repl_lua_errors_recover_but_host_policy_is_fatal() {
+    for profile in ["lua54", "lua55"] {
+        let recoverable = run_lua(
+            &[
+                OsStr::new("--profile"),
+                OsStr::new(profile),
+                OsStr::new("-i"),
+            ],
+            b"error('repl-error')\nlocal = 1\nprint('after-syntax')\n",
+            None,
+            &[],
+        );
+        assert!(
+            recoverable.status.success(),
+            "profile={profile}: {recoverable:?}"
+        );
+        assert!(
+            recoverable
+                .stderr
+                .windows(b"repl-error".len())
+                .any(|part| part == b"repl-error")
+        );
+        assert!(
+            recoverable
+                .stderr
+                .windows("編譯失敗".len())
+                .any(|part| part == "編譯失敗".as_bytes())
+        );
+        assert!(
+            recoverable
+                .stdout
+                .windows(b"after-syntax\n".len())
+                .any(|part| part == b"after-syntax\n")
+        );
+
+        let incomplete = run_lua(
+            &[
+                OsStr::new("--profile"),
+                OsStr::new(profile),
+                OsStr::new("-i"),
+            ],
+            b"if true then\n",
+            None,
+            &[],
+        );
+        assert!(
+            incomplete.status.success(),
+            "profile={profile}: {incomplete:?}"
+        );
+        assert!(
+            incomplete
+                .stderr
+                .windows("未完成的 REPL 輸入".len())
+                .any(|part| part == "未完成的 REPL 輸入".as_bytes())
+        );
+
+        let policy = run_lua(
+            &[
+                OsStr::new("--profile"),
+                OsStr::new(profile),
+                OsStr::new("-i"),
+            ],
+            b"os.execute('true')\nprint('must-not-run')\n",
+            None,
+            &[],
+        );
+        assert!(!policy.status.success(), "profile={profile}: {policy:?}");
+        assert!(
+            policy
+                .stderr
+                .windows(b"E_HOST_POLICY_OS".len())
+                .any(|part| part == b"E_HOST_POLICY_OS"),
+            "profile={profile}: {policy:?}"
+        );
+        assert!(
+            !policy
+                .stdout
+                .windows(b"must-not-run".len())
+                .any(|part| part == b"must-not-run")
+        );
+    }
+}
+
+#[test]
 fn cli_repl_tries_expressions_before_statements_and_matches_profile_equals_syntax() {
     let expression = run_lua(
         &[
@@ -1322,7 +1474,7 @@ fn cli_repl_tries_expressions_before_statements_and_matches_profile_equals_synta
     );
     assert_eq!(
         expression.stdout,
-        b"RivetLua 0.0.0 (Lua 5.5.1)\ntable\n12\n"
+        b"RivetLua 0.0.0 (Lua 5.5.1); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n> type({})\ntable\n> tonumber('12')\n12\n> \n"
     );
 
     let lua54_equals = run_lua(
@@ -1340,7 +1492,10 @@ fn cli_repl_tries_expressions_before_statements_and_matches_profile_equals_synta
         "{}",
         String::from_utf8_lossy(&lua54_equals.stderr)
     );
-    assert_eq!(lua54_equals.stdout, b"RivetLua 0.0.0 (Lua 5.4.9)\n3\n");
+    assert_eq!(
+        lua54_equals.stdout,
+        b"RivetLua 0.0.0 (Lua 5.4.9); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n> =1+2\n3\n> \n"
+    );
 
     let lua55_equals = run_lua(
         &[
@@ -1352,8 +1507,11 @@ fn cli_repl_tries_expressions_before_statements_and_matches_profile_equals_synta
         None,
         &[],
     );
-    assert!(!lua55_equals.status.success());
-    assert_eq!(lua55_equals.stdout, b"RivetLua 0.0.0 (Lua 5.5.1)\n");
+    assert!(lua55_equals.status.success(), "{lua55_equals:?}");
+    assert_eq!(
+        lua55_equals.stdout,
+        b"RivetLua 0.0.0 (Lua 5.5.1); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n> =1+2\n> \n"
+    );
     assert!(!lua55_equals.stderr.is_empty());
 }
 
@@ -1361,8 +1519,8 @@ fn cli_repl_tries_expressions_before_statements_and_matches_profile_equals_synta
 fn cli_repl_prints_returned_values_through_vm_local_print_for_both_profiles() {
     for profile in ["lua54", "lua55"] {
         let version = match profile {
-            "lua54" => b"RivetLua 0.0.0 (Lua 5.4.9)\n".as_slice(),
-            _ => b"RivetLua 0.0.0 (Lua 5.5.1)\n".as_slice(),
+            "lua54" => b"RivetLua 0.0.0 (Lua 5.4.9); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n".as_slice(),
+            _ => b"RivetLua 0.0.0 (Lua 5.5.1); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n".as_slice(),
         };
 
         let normal_print = lua(profile, &["-e", "print(1/0); print(0/0)"]);
@@ -1387,7 +1545,21 @@ fn cli_repl_prints_returned_values_through_vm_local_print_for_both_profiles() {
             String::from_utf8_lossy(&evaluated.stderr)
         );
         let mut expected = version.to_vec();
-        expected.extend_from_slice(&normal_print.stdout);
+        let mut printed_values = normal_print.stdout.split_inclusive(|byte| *byte == b'\n');
+        expected.extend_from_slice(b"> 1/0\n");
+        expected.extend_from_slice(
+            printed_values
+                .next()
+                .expect("normal print 輸出第一個除法結果"),
+        );
+        expected.extend_from_slice(b"> 0/0\n");
+        expected.extend_from_slice(
+            printed_values
+                .next()
+                .expect("normal print 輸出第二個除法結果"),
+        );
+        assert!(printed_values.next().is_none(), "profile={profile}");
+        expected.extend_from_slice(b"> \n");
         assert_eq!(evaluated.stdout, expected, "profile={profile}");
 
         let tostring = run_lua(
@@ -1408,7 +1580,7 @@ fn cli_repl_prints_returned_values_through_vm_local_print_for_both_profiles() {
             String::from_utf8_lossy(&tostring.stderr)
         );
         let mut expected = version.to_vec();
-        expected.extend_from_slice(b"seen\n");
+        expected.extend_from_slice(b"> t\nseen\n> \n");
         assert_eq!(tostring.stdout, expected, "profile={profile}");
 
         let overridden_print = run_lua(
@@ -1431,7 +1603,9 @@ fn cli_repl_prints_returned_values_through_vm_local_print_for_both_profiles() {
             String::from_utf8_lossy(&overridden_print.stderr)
         );
         let mut expected = version.to_vec();
-        expected.extend_from_slice(b"replacement\t3\t1\tnil\t3\n");
+        expected.extend_from_slice(
+            b"> select(1, 1, nil, 3)\nreplacement\t3\t1\tnil\t3\n> \n",
+        );
         assert_eq!(overridden_print.stdout, expected, "profile={profile}");
 
         let print_error = run_lua(
@@ -1439,23 +1613,43 @@ fn cli_repl_prints_returned_values_through_vm_local_print_for_both_profiles() {
                 OsStr::new("--profile"),
                 OsStr::new(profile),
                 OsStr::new("-e"),
-                OsStr::new("print = function() error('print-failure') end"),
+                OsStr::new("saved_print=print; print = function() error('print-failure') end"),
                 OsStr::new("-i"),
             ],
-            b"1\n",
+            b"1\nprint=saved_print\nprint('after-print-error')\n",
             None,
             &[],
         );
-        assert!(!print_error.status.success(), "profile={profile}");
+        assert!(
+            print_error.status.success(),
+            "profile={profile}: {print_error:?}"
+        );
+        assert!(
+            print_error
+                .stderr
+                .windows(b"error calling 'print' (".len())
+                .any(|part| part == b"error calling 'print' ("),
+            "profile={profile}: {}",
+            String::from_utf8_lossy(&print_error.stderr)
+        );
         assert!(
             print_error
                 .stderr
                 .windows(b"print-failure".len())
-                .any(|part| part == b"print-failure"),
-            "profile={profile}: {}",
-            String::from_utf8_lossy(&print_error.stderr)
+                .any(|part| part == b"print-failure")
         );
+        assert!(
+            print_error
+                .stdout
+                .windows(b"after-print-error\n".len())
+                .any(|part| part == b"after-print-error\n")
+        );
+    }
+}
 
+#[test]
+fn cli_repl_print_fuel_abort_still_fails_for_both_profiles() {
+    for profile in ["lua54", "lua55"] {
         let print_aborted = run_lua(
             &[
                 OsStr::new("--profile"),

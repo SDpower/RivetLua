@@ -14,6 +14,29 @@ fn format_error() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::StringFormat)
 }
 
+fn format_error_with_message(
+    vm: &mut Vm,
+    message: &[u8],
+) -> Result<RuntimeError, RuntimeError> {
+    let mut error = format_error();
+    error.value = Value::Object(vm.allocate_byte_string(message)?);
+    Ok(error)
+}
+
+pub(crate) struct NextError {
+    error: RuntimeError,
+    message: Option<&'static [u8]>,
+}
+
+impl NextError {
+    pub(crate) fn into_runtime(mut self, vm: &mut Vm) -> Result<RuntimeError, RuntimeError> {
+        if let Some(message) = self.message {
+            self.error.value = Value::Object(vm.allocate_byte_string(message)?);
+        }
+        Ok(self.error)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Spec {
     pub kind: u8,
@@ -78,9 +101,10 @@ impl FormatState {
         self.arguments.trace_children(visit)
     }
 
-    pub(crate) fn next(&mut self, vm: &Vm) -> Result<Token, RuntimeError> {
+    pub(crate) fn next(&mut self, vm: &Vm) -> Result<Token, NextError> {
         let source = self.arguments.values()[0];
-        let (token, offset, argument) = string::with_bytes(vm, source, |bytes| {
+        let mut message: Option<&'static [u8]> = None;
+        let parsed = string::with_bytes(vm, source, |bytes| {
             if self.offset >= bytes.len() {
                 return Ok((Token::Done, self.offset, self.argument));
             }
@@ -127,12 +151,18 @@ impl FormatState {
             }
             let flags_end = cursor;
             let width_start = cursor;
+            let mut too_many_digits = false;
             while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
                 if cursor - width_start >= 2 {
+                    too_many_digits = true;
+                } else {
+                    spec.width = spec.width * 10 + usize::from(bytes[cursor] - b'0');
+                }
+                cursor += 1;
+                if cursor - self.offset >= 22 {
+                    message = Some(b"too long");
                     return Err(format_error());
                 }
-                spec.width = spec.width * 10 + usize::from(bytes[cursor] - b'0');
-                cursor += 1;
             }
             if bytes.get(cursor) == Some(&b'.') {
                 cursor += 1;
@@ -140,26 +170,49 @@ impl FormatState {
                 let precision_start = cursor;
                 while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
                     if cursor - precision_start >= 2 {
+                        too_many_digits = true;
+                    } else {
+                        spec.precision = Some(
+                            spec.precision.unwrap_or(0) * 10 + usize::from(bytes[cursor] - b'0'),
+                        );
+                    }
+                    cursor += 1;
+                    if cursor - self.offset >= 22 {
+                        message = Some(b"too long");
                         return Err(format_error());
                     }
-                    spec.precision =
-                        Some(spec.precision.unwrap_or(0) * 10 + usize::from(bytes[cursor] - b'0'));
-                    cursor += 1;
                 }
             }
-            spec.kind = *bytes.get(cursor).ok_or_else(format_error)?;
-            spec.modified = cursor > flags_start;
-            if cursor - self.offset >= 22 || !valid_spec(spec, &bytes[flags_start..flags_end]) {
+            if cursor - self.offset >= 22 {
+                message = Some(b"too long");
                 return Err(format_error());
             }
-            let argument = self
-                .arguments
-                .values()
-                .get(self.argument)
-                .copied()
-                .ok_or_else(format_error)?;
+            spec.kind = match bytes.get(cursor).copied() {
+                Some(kind) => kind,
+                None => {
+                    message = Some(b"invalid conversion");
+                    return Err(format_error());
+                }
+            };
+            spec.modified = cursor > flags_start;
+            if too_many_digits || !valid_spec(spec, &bytes[flags_start..flags_end]) {
+                message = Some(if spec.kind == b'q' && spec.modified && !too_many_digits {
+                    b"cannot have modifiers".as_slice()
+                } else {
+                    b"invalid conversion".as_slice()
+                });
+                return Err(format_error());
+            }
+            let argument = match self.arguments.values().get(self.argument).copied() {
+                Some(argument) => argument,
+                None => {
+                    message = Some(b"no value");
+                    return Err(format_error());
+                }
+            };
             Ok((Token::Spec(spec, argument), cursor + 1, self.argument + 1))
-        })?;
+        });
+        let (token, offset, argument) = parsed.map_err(|error| NextError { error, message })?;
         self.offset = offset;
         self.argument = argument;
         Ok(token)
@@ -198,15 +251,15 @@ impl FormatState {
 
     pub(crate) fn append_string(
         &mut self,
-        vm: &Vm,
+        vm: &mut Vm,
         spec: Spec,
         value: Value,
     ) -> Result<usize, RuntimeError> {
+        if spec.modified && string::with_bytes(vm, value, |bytes| Ok(bytes.contains(&0)))? {
+            return Err(format_error_with_message(vm, b"string contains zeros")?);
+        }
         string::with_bytes(vm, value, |bytes| {
             let raw = !spec.modified;
-            if !raw && bytes.contains(&0) {
-                return Err(format_error());
-            }
             let selected = if raw || (spec.precision.is_none() && bytes.len() >= 100) {
                 bytes
             } else {
@@ -675,7 +728,7 @@ fn quote_length(vm: &Vm, value: Value) -> Result<usize, RuntimeError> {
     })
 }
 
-pub(crate) fn prepare_piece(vm: &Vm, spec: Spec, value: Value) -> Result<Piece, RuntimeError> {
+pub(crate) fn prepare_piece(vm: &mut Vm, spec: Spec, value: Value) -> Result<Piece, RuntimeError> {
     let mut text = Text::new();
     match spec.kind {
         b'q' => match value {
@@ -707,7 +760,7 @@ pub(crate) fn prepare_piece(vm: &Vm, spec: Spec, value: Value) -> Result<Piece, 
                     text.extend(quoted.as_bytes())?;
                 }
             }
-            _ => return Err(format_error()),
+            _ => return Err(format_error_with_message(vm, b"value has no literal form")?),
         },
         b'c' => {
             let value = integer(vm, value)?;
@@ -718,7 +771,9 @@ pub(crate) fn prepare_piece(vm: &Vm, spec: Spec, value: Value) -> Result<Piece, 
             match value {
                 Value::Nil => text.extend(b"(null)")?,
                 Value::Object(object) => {
-                    write!(text, "0x{:?}", object.identity()).map_err(|_| format_error())?
+                    vm.object_kind(object)?;
+                    let token = object.runtime_token().ok_or_else(format_error)?;
+                    write!(text, "0x{:x}", token.get()).map_err(|_| format_error())?
                 }
                 _ => text.extend(b"(null)")?,
             }
@@ -731,6 +786,63 @@ pub(crate) fn prepare_piece(vm: &Vm, spec: Spec, value: Value) -> Result<Piece, 
         _ => return Err(format_error()),
     }
     Ok(Piece::Small(text))
+}
+
+#[cfg(test)]
+mod pointer_format_tests {
+    use super::{Piece, Spec, prepare_piece};
+    use crate::{RootKind, Vm};
+    use rivetlua_core::Value;
+
+    fn pointer_piece(vm: &mut Vm, value: Value, width: usize, left: bool) -> Vec<u8> {
+        let spec = Spec {
+            kind: b'p',
+            left,
+            plus: false,
+            space: false,
+            alternative: false,
+            zero: false,
+            width,
+            precision: None,
+            modified: width != 0 || left,
+        };
+        let Piece::Small(text) = prepare_piece(vm, spec, value).unwrap() else {
+            panic!("%p 應產生短文字");
+        };
+        text.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn object_pointer_text_is_short_stable_distinct_and_padded() {
+        let mut vm = Vm::new().unwrap();
+        let first_object = vm.allocate_table().unwrap();
+        let first_root = vm.add_root(RootKind::Host, first_object).unwrap();
+        let second_object = vm.allocate_table().unwrap();
+        let second_root = vm.add_root(RootKind::Host, second_object).unwrap();
+        let first = Value::Object(first_object);
+        let second = Value::Object(second_object);
+        let raw = pointer_piece(&mut vm, first, 0, false);
+        assert!(raw.starts_with(b"0x"));
+        assert!(raw.len() <= 18);
+        assert_eq!(pointer_piece(&mut vm, first, 0, false), raw);
+        assert_ne!(pointer_piece(&mut vm, second, 0, false), raw);
+
+        let left = pointer_piece(&mut vm, first, 60, true);
+        assert_eq!(left.len(), 60);
+        assert!(left.starts_with(&raw));
+        assert!(left[raw.len()..].iter().all(|byte| *byte == b' '));
+        let right = pointer_piece(&mut vm, first, 60, false);
+        assert_eq!(right.len(), 60);
+        assert!(right.ends_with(&raw));
+        assert!(right[..60 - raw.len()].iter().all(|byte| *byte == b' '));
+        assert_eq!(pointer_piece(&mut vm, first, 90, false).len(), 90);
+
+        for value in [Value::Nil, Value::Boolean(false), Value::Integer(0)] {
+            assert_eq!(pointer_piece(&mut vm, value, 0, false), b"(null)".to_vec());
+        }
+        vm.remove_root(second_root).unwrap();
+        vm.remove_root(first_root).unwrap();
+    }
 }
 
 impl FormatState {

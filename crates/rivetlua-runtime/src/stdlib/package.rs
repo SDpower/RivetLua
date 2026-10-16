@@ -418,12 +418,19 @@ impl LoadBuffer {
 }
 
 pub(crate) fn is_function(vm: &Vm, value: Value) -> Result<bool, RuntimeError> {
+    if let Value::CFunction(function) = value {
+        return if function.vm() == vm.id() {
+            Ok(true)
+        } else {
+            Err(VmError::WrongVm.into())
+        };
+    }
     let Value::Object(object) = value else {
         return Ok(false);
     };
     Ok(matches!(
         vm.object_kind(object)?,
-        ObjectKind::Closure | ObjectKind::Builtin
+        ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin
     ))
 }
 

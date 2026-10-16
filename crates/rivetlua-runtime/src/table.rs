@@ -189,7 +189,8 @@ impl Table {
             }
             if let Some(object) = key.source_object() {
                 if self.weak_mode == WeakMode::Values
-                    || key.class() == CanonicalKeyClass::ByteString
+                    || (self.weak_mode == WeakMode::Keys
+                        && key.class() == CanonicalKeyClass::ByteString)
                 {
                     visit(object)?;
                 }
@@ -238,10 +239,29 @@ impl Table {
         Ok(())
     }
 
+    /// `kv` 表的值清理完成後，只有仍在表內的字串鍵需要同輪保活。
+    pub(crate) fn visit_live_weak_string_keys(
+        &self,
+        mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
+    ) -> Result<(), VmError> {
+        if self.weak_mode != WeakMode::All {
+            return Ok(());
+        }
+        for (key, value) in self.hash.iter().flatten() {
+            if *value != Value::Nil && key.class() == CanonicalKeyClass::ByteString {
+                if let Some(source) = key.source_object() {
+                    visit(source)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn clear_dead_weak_pairs(
         &mut self,
         ledger: &AllocationLedger,
         mut is_dead: impl FnMut(ObjectRef) -> Result<bool, VmError>,
+        mut is_live_key: impl FnMut(ObjectRef) -> Result<bool, VmError>,
         clear_values: bool,
         clear_keys: bool,
     ) -> Result<usize, VmError> {
@@ -260,12 +280,17 @@ impl Table {
             }
         }
         for entry in &mut self.hash {
+            if clear_values && entry
+                .as_ref()
+                .is_some_and(|(_, value)| *value == Value::Nil)
+            {
+                // 弱表的死鍵只供下次 GC 前的 next 邊界使用；GC 可釋放長字串副本。
+                *entry = None;
+                continue;
+            }
             let Some((key, value)) = entry else {
                 continue;
             };
-            if *value == Value::Nil {
-                continue;
-            }
             let dead_key = if clear_keys && matches!(self.weak_mode, WeakMode::Keys | WeakMode::All)
             {
                 match &key.kind {
@@ -285,9 +310,19 @@ impl Table {
                     false
                 };
             if dead_key || dead_value {
-                if dead_key {
+                let key_is_dead = if !dead_key && dead_value && self.weak_mode == WeakMode::All {
+                    match key.source_object() {
+                        Some(source) => !is_live_key(source)?,
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if dead_key || key_is_dead {
+                    // `kv` 的死值若連鍵也不可達，本輪即可釋放其長字串副本。
                     *entry = None;
                 } else {
+                    // 存活的鍵保留到下輪 GC，供 next 接受剛被清掉的欄位。
                     key.make_dead(ledger)?;
                     *value = Value::Nil;
                 }
@@ -372,6 +407,26 @@ impl Table {
         }
         self.find_hash(key)
             .and_then(|index| self.hash[index].as_ref().map(|(_, value)| *value))
+            .unwrap_or(Value::Nil)
+    }
+
+    /// 以借用的完整 bytes 查詢活字串鍵，避免建立暫時的 Lua 字串物件。
+    fn get_byte_key(&self, name: &[u8]) -> Value {
+        let count = self.hash.len();
+        if count == 0 {
+            return Value::Nil;
+        }
+        let mut hasher = DefaultHasher::new();
+        3_u8.hash(&mut hasher);
+        name.hash(&mut hasher);
+        let start = (hasher.finish() as usize) % count;
+        (0..count)
+            .map(|step| Self::probe(start, step, count))
+            .find_map(|index| {
+                self.hash[index].as_ref().and_then(|(key, value)| {
+                    (*value != Value::Nil && key.string_bytes() == Some(name)).then_some(*value)
+                })
+            })
             .unwrap_or(Value::Nil)
     }
 
@@ -1303,6 +1358,10 @@ impl Hash for CanonicalKey {
 }
 
 impl Vm {
+    pub(crate) fn raw_get_byte_key(&self, table: ObjectRef, name: &[u8]) -> Result<Value, VmError> {
+        self.with_table(table, |stored| stored.get_byte_key(name))
+    }
+
     /// 呼叫端先根住舊值並完成 TableValue write barrier，再以此無配置回滾。
     pub(crate) fn restore_existing_byte_key(
         &mut self,
@@ -1355,7 +1414,7 @@ impl Vm {
                         }));
                     }
                     let ledger = self.allocation_ledger();
-                    let (bytes, byte_charge) = if let Some(shared) = string.shared_external() {
+                    let (bytes, byte_charge) = if let Some(shared) = string.shared_table_key() {
                         (shared, None)
                     } else {
                         let (copy, byte_ticket) =
@@ -1561,50 +1620,69 @@ mod tests {
 
     #[test]
     fn b14_long_key_charges_actual_slot_capacity_until_rehash() {
-        let mut vm = Vm::new().unwrap();
-        let probe = vm.ledger_probe();
-        let table = vm.allocate_table_with_capacity(0, 1).unwrap();
-        let table_root = vm.add_root(RootKind::Host, table).unwrap();
-        let bytes = [0, 0x80, 0xff, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let key = vm.allocate_byte_string(&bytes).unwrap();
-        let key_root = vm.add_root(RootKind::Host, key).unwrap();
-        let before_insert = vm.ledger_snapshot().lua_heap_bytes;
-        vm.raw_set(table, Value::Object(key), Value::Integer(1))
-            .unwrap();
-        let slot_capacity = vm
-            .with_table(table, |stored| {
-                let Some((canonical, _)) = stored.hash[0].as_ref() else {
-                    unreachable!("已插入的唯一 hash 欄位須存在")
-                };
-                let super::KeyKind::ByteString(long) = &canonical.kind else {
-                    unreachable!("長 byte key 應使用已計費的 slot backing")
-                };
-                long.0.capacity()
-            })
-            .unwrap();
-        assert!(slot_capacity >= 1);
-        let slot_bytes = slot_capacity * core::mem::size_of::<super::StringKey>();
-        assert_eq!(
-            vm.ledger_snapshot().lua_heap_bytes - before_insert,
-            bytes.len() + slot_bytes
-        );
-        vm.raw_set(table, Value::Object(key), Value::Nil).unwrap();
-        vm.remove_root(key_root).unwrap();
-        vm.collect_major().unwrap();
-        assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
-        let before_rehash = vm.ledger_snapshot().lua_heap_bytes;
-        vm.raw_set(table, Value::Boolean(true), Value::Integer(2))
-            .unwrap();
-        let bucket_bytes = core::mem::size_of::<Option<(CanonicalKey, Value)>>();
-        assert_eq!(
-            vm.ledger_snapshot().lua_heap_bytes + bytes.len() + slot_bytes,
-            before_rehash + bucket_bytes
-        );
-        vm.remove_root(table_root).unwrap();
-        vm.collect_major().unwrap();
-        drop(vm);
-        assert_eq!(probe.snapshot().committed, 0);
-        assert_eq!(probe.snapshot().reserved, 0);
+        for bytes in [
+            vec![0, 0x80, 0xff, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            vec![b'x'; 100],
+            vec![b'y'; 256],
+        ] {
+            let mut vm = Vm::new().unwrap();
+            let probe = vm.ledger_probe();
+            let table = vm.allocate_table_with_capacity(0, 1).unwrap();
+            let table_root = vm.add_root(RootKind::Host, table).unwrap();
+            let key = vm.allocate_byte_string(&bytes).unwrap();
+            let (backing_bytes, shared) = vm
+                .with_byte_string(key, |string| {
+                    (
+                        string.managed_payload_len(),
+                        string.shared_table_key().is_some(),
+                    )
+                })
+                .unwrap();
+            assert_eq!(shared, crate::ByteString::managed_sharing_is_cheaper(bytes.len()));
+            if shared {
+                assert!(backing_bytes > bytes.len());
+            } else {
+                assert_eq!(backing_bytes, bytes.len());
+            }
+            let key_root = vm.add_root(RootKind::Host, key).unwrap();
+            let before_insert = vm.ledger_snapshot().lua_heap_bytes;
+            vm.raw_set(table, Value::Object(key), Value::Integer(1))
+                .unwrap();
+            let slot_capacity = vm
+                .with_table(table, |stored| {
+                    let Some((canonical, _)) = stored.hash[0].as_ref() else {
+                        unreachable!("已插入的唯一 hash 欄位須存在")
+                    };
+                    let super::KeyKind::ByteString(long) = &canonical.kind else {
+                        unreachable!("長 byte key 應使用已計費的 slot backing")
+                    };
+                    long.0.capacity()
+                })
+                .unwrap();
+            assert!(slot_capacity >= 1);
+            let slot_bytes = slot_capacity * core::mem::size_of::<super::StringKey>();
+            assert_eq!(
+                vm.ledger_snapshot().lua_heap_bytes - before_insert,
+                slot_bytes + if shared { 0 } else { bytes.len() }
+            );
+            vm.raw_set(table, Value::Object(key), Value::Nil).unwrap();
+            vm.remove_root(key_root).unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
+            let before_rehash = vm.ledger_snapshot().lua_heap_bytes;
+            vm.raw_set(table, Value::Boolean(true), Value::Integer(2))
+                .unwrap();
+            let bucket_bytes = core::mem::size_of::<Option<(CanonicalKey, Value)>>();
+            assert_eq!(
+                vm.ledger_snapshot().lua_heap_bytes + backing_bytes + slot_bytes,
+                before_rehash + bucket_bytes
+            );
+            vm.remove_root(table_root).unwrap();
+            vm.collect_major().unwrap();
+            drop(vm);
+            assert_eq!(probe.snapshot().committed, 0);
+            assert_eq!(probe.snapshot().reserved, 0);
+        }
     }
 
     fn hash(key: &CanonicalKey) -> u64 {
@@ -2936,5 +3014,199 @@ mod tests {
             vm.remove_root(root).unwrap();
             assert_eq!(vm.ledger_snapshot().reserved, 0);
         }
+    }
+
+    #[test]
+    fn p17_weak_table_drops_deleted_long_string_tombstone_at_gc() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let table = vm.allocate_table().unwrap();
+            let table_root = vm.add_root(RootKind::Host, table).unwrap();
+            let meta = vm.allocate_table().unwrap();
+            let mode_key = vm.allocate_byte_string(b"__mode").unwrap();
+            let mode = vm.allocate_byte_string(b"kv").unwrap();
+            vm.raw_set(meta, Value::Object(mode_key), Value::Object(mode))
+                .unwrap();
+            vm.set_metatable(table, Some(meta)).unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.with_table(table, Table::weak_mode), Ok(WeakMode::All));
+            let baseline = vm.ledger_snapshot().lua_heap_bytes;
+
+            let bytes = vec![b'a'; 16 * 1024];
+            let key = vm.allocate_byte_string(&bytes).unwrap();
+            vm.raw_set(table, Value::Object(key), Value::Integer(25))
+                .unwrap();
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(key), Ok(ObjectKind::ByteString));
+            assert_eq!(vm.raw_get(table, Value::Object(key)), Ok(Value::Integer(25)));
+            vm.raw_set(table, Value::Object(key), Value::Nil).unwrap();
+            assert_eq!(vm.raw_next_value(table, Value::Object(key)).unwrap(), None);
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
+            assert_eq!(vm.with_table(table, Table::hash_capacity), Ok(0));
+            assert!(vm.ledger_snapshot().lua_heap_bytes < baseline + 1024);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            vm.remove_root(table_root).unwrap();
+
+            let mut strong = Vm::new_with_profile(profile).unwrap();
+            strong.stop_automatic_gc();
+            let table = strong.allocate_table().unwrap();
+            let table_root = strong.add_root(RootKind::Host, table).unwrap();
+            let key = strong.allocate_byte_string(&bytes).unwrap();
+            strong.raw_set(table, Value::Object(key), Value::Integer(25))
+                .unwrap();
+            strong.raw_set(table, Value::Object(key), Value::Nil).unwrap();
+            strong.collect_major().unwrap();
+            assert_eq!(strong.object_kind(key), Err(VmError::StaleObject));
+            assert!(strong.ledger_snapshot().lua_heap_bytes >= bytes.len());
+            let equal = strong.allocate_byte_string(&bytes).unwrap();
+            assert_eq!(strong.raw_next_value(table, Value::Object(equal)).unwrap(), None);
+            strong.remove_root(table_root).unwrap();
+            strong.collect_major().unwrap();
+            assert_eq!(strong.ledger_snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn p17_weak_all_preserves_live_previous_keys_after_value_collection() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            vm.stop_automatic_gc();
+            let probe = vm.ledger_probe();
+            let table = vm.allocate_table().unwrap();
+            let table_root = vm.add_root(RootKind::Host, table).unwrap();
+            let meta = vm.allocate_table().unwrap();
+            let mode_key = vm.allocate_byte_string(b"__mode").unwrap();
+            let mode = vm.allocate_byte_string(b"kv").unwrap();
+            vm.raw_set(meta, Value::Object(mode_key), Value::Object(mode))
+                .unwrap();
+            vm.set_metatable(table, Some(meta)).unwrap();
+
+            let shared = vm.allocate_byte_string(&[b's'; 4096]).unwrap();
+            let owned = vm.allocate_byte_string(&[b'o'; 100]).unwrap();
+            assert!(vm.with_byte_string(shared, |key| key.shared_table_key().is_some()).unwrap());
+            assert!(vm.with_byte_string(owned, |key| key.shared_table_key().is_none()).unwrap());
+            let object = vm.allocate_table().unwrap();
+            let roots = [
+                vm.add_root(RootKind::Host, shared).unwrap(),
+                vm.add_root(RootKind::Host, owned).unwrap(),
+                vm.add_root(RootKind::Host, object).unwrap(),
+            ];
+            let keys = [
+                Value::Object(shared),
+                Value::Object(owned),
+                Value::Object(object),
+                Value::Integer(41),
+                Value::Boolean(true),
+            ];
+            for key in keys {
+                let value = vm.allocate_table().unwrap();
+                vm.raw_set(table, key, Value::Object(value)).unwrap();
+            }
+
+            let before_dead_key = vm.ledger_snapshot().lua_heap_bytes;
+            let dead_key = vm.allocate_byte_string(&vec![b'b'; 1 << 22]).unwrap();
+            let dead_value = vm.allocate_table().unwrap();
+            vm.raw_set(table, Value::Object(dead_key), Value::Object(dead_value))
+                .unwrap();
+            assert!(vm.ledger_snapshot().lua_heap_bytes > before_dead_key + (1 << 22));
+            vm.collect_major().unwrap();
+            assert_eq!(vm.object_kind(dead_key), Err(VmError::StaleObject));
+            assert!(vm.ledger_snapshot().lua_heap_bytes < before_dead_key + (1 << 20));
+            for key in keys {
+                assert_eq!(vm.raw_get(table, key), Ok(Value::Nil));
+                assert_eq!(vm.raw_next_value(table, key).unwrap(), None);
+            }
+            for key in [shared, owned, object] {
+                assert!(vm.object_kind(key).is_ok());
+            }
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            for root in roots {
+                vm.remove_root(root).unwrap();
+            }
+            vm.remove_root(table_root).unwrap();
+            drop(vm);
+            assert_eq!(probe.snapshot().committed, 0);
+            assert_eq!(probe.snapshot().reserved, 0);
+        }
+    }
+
+    #[test]
+    fn p17_lua54_weak_long_string_keys_release_one_key_in_same_collection() {
+        let mut vm = Vm::new_with_profile(LuaProfile::Lua54).unwrap();
+        let probe = vm.ledger_probe();
+        vm.stop_automatic_gc();
+        vm.set_gc_mode(GcMode::Incremental).unwrap();
+        vm.collect().unwrap();
+        vm.collect().unwrap();
+        let baseline = vm.ledger_snapshot().lua_heap_bytes;
+
+        let table = vm.allocate_table().unwrap();
+        let table_root = vm.add_root(RootKind::Host, table).unwrap();
+        let meta = vm.allocate_table().unwrap();
+        let mode_key = vm.allocate_byte_string(b"__mode").unwrap();
+        let mode = vm.allocate_byte_string(b"kv").unwrap();
+        vm.raw_set(meta, Value::Object(mode_key), Value::Object(mode))
+            .unwrap();
+        vm.set_metatable(table, Some(meta)).unwrap();
+        let setup_baseline = vm.ledger_snapshot().lua_heap_bytes;
+
+        let a_bytes = vec![b'a'; 1 << 22];
+        let b_bytes = vec![b'b'; 1 << 22];
+        let a_key = vm.allocate_byte_string(&a_bytes).unwrap();
+        vm.raw_set(table, Value::Object(a_key), Value::Integer(25))
+            .unwrap();
+        let b_key = vm.allocate_byte_string(&b_bytes).unwrap();
+        let b_value = vm.allocate_table().unwrap();
+        vm.raw_set(table, Value::Object(b_key), Value::Object(b_value))
+            .unwrap();
+        let table_key = vm.allocate_table().unwrap();
+        vm.raw_set(table, Value::Object(table_key), Value::Integer(14))
+            .unwrap();
+        let peak = vm.ledger_snapshot().lua_heap_bytes;
+        assert!(peak > baseline + (1 << 23));
+
+        vm.collect().unwrap();
+        let after = vm.ledger_snapshot().lua_heap_bytes;
+        eprintln!(
+            "P17 Lua54 弱字串：baseline={baseline} peak={peak} after={after} a={:?} b={:?} value={:?} tablekey={:?}",
+            vm.object_kind(a_key),
+            vm.object_kind(b_key),
+            vm.object_kind(b_value),
+            vm.object_kind(table_key)
+        );
+        assert!(after >= baseline + (1 << 22));
+        assert!(after < baseline + (1 << 23));
+        assert_eq!(vm.object_kind(a_key), Ok(ObjectKind::ByteString));
+        for dead in [b_key, b_value, table_key] {
+            assert_eq!(vm.object_kind(dead), Err(VmError::StaleObject));
+        }
+        assert_eq!(vm.raw_get(table, Value::Object(a_key)), Ok(Value::Integer(25)));
+        assert_eq!(
+            vm.raw_next_value(table, Value::Nil).unwrap(),
+            Some((Value::Object(a_key), Value::Integer(25)))
+        );
+        assert_eq!(vm.raw_next_value(table, Value::Object(a_key)).unwrap(), None);
+        let b_lookup = vm.allocate_byte_string(&b_bytes).unwrap();
+        assert_eq!(vm.raw_get(table, Value::Object(b_lookup)), Ok(Value::Nil));
+        vm.raw_set(table, Value::Object(a_key), Value::Nil).unwrap();
+        vm.collect().unwrap();
+        let final_bytes = vm.ledger_snapshot().lua_heap_bytes;
+        assert!(
+            final_bytes <= setup_baseline + 1024,
+            "final={final_bytes} setup={setup_baseline} a={:?} b_lookup={:?} hash={:?}",
+            vm.object_kind(a_key),
+            vm.object_kind(b_lookup),
+            vm.with_table(table, |stored| (stored.hash.len(), stored.live_hash_count()))
+        );
+        assert_eq!(vm.object_kind(a_key), Err(VmError::StaleObject));
+        assert_eq!(vm.object_kind(b_lookup), Err(VmError::StaleObject));
+        assert!(vm.with_table(table, |stored| stored.hash.iter().all(Option::is_none)).unwrap());
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        vm.remove_root(table_root).unwrap();
+        drop(vm);
+        assert_eq!(probe.snapshot().committed, 0);
+        assert_eq!(probe.snapshot().reserved, 0);
     }
 }

@@ -1,0 +1,25 @@
+schema = "rivetlua-p17-runner-v1"
+batch = "P17-B01"
+profiles = ["lua55-i64f64", "lua54-i64f64"]
+
+[lua55-i64f64]
+release = "5.5.1"
+tarball = "vendor/lua55/tests.tar.gz"
+tarball_sha256 = "da07b543872dc0bb2ff12aabd0c248578d78df3eb6b67efdc537a46d455c7f31"
+suite = "vendor/lua55/lua-5.5.1-tests"
+all_lua_sha256 = "f1b8b8075a71e7abc40260f6b9112e8d2a1057772f26374df4bc800d10296309"
+libs_makefile = "vendor/lua55/lua-5.5.1-tests/libs/makefile"
+modules = ["lib1.so:lib1.c", "lib11.so:lib11.c", "lib2.so:lib2.c", "lib21.so:lib21.c", "lib2-v2.so:lib22.c"]
+p1_init = "libs/P1/init.lua"
+p1_xuxu = "libs/P1/xuxu.lua"
+
+[lua54-i64f64]
+release = "5.4.9"
+tarball = "vendor/lua54/tests.tar.gz"
+tarball_sha256 = "7d971845f545ffc09fbb3128a86b2c6524161c70d0fdf0154a16e8c00c343fca"
+suite = "vendor/lua54/lua-5.4.9-tests"
+all_lua_sha256 = "3e296dd2b26ac6891ccba1ebaa62d40f1816ac93c7efdeaddc05aaa064e7311c"
+libs_makefile = "vendor/lua54/lua-5.4.9-tests/libs/makefile"
+modules = ["lib1.so:lib1.c", "lib11.so:lib11.c", "lib2.so:lib2.c", "lib21.so:lib21.c", "lib2-v2.so:lib22.c"]
+p1_init = "libs/P1/init.lua"
+p1_xuxu = "libs/P1/xuxu.lua"

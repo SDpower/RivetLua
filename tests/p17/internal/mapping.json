@@ -1,0 +1,2223 @@
+{
+  "schema": "rivetlua-internal-mapping-v1",
+  "items": [
+    {
+      "id": "lua55-i64f64:checkmemory",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.checkmemory",
+        "c_function": "lua_checkmemory",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/all.lua",
+            "line": 120,
+            "source_sha256": "f1b8b8075a71e7abc40260f6b9112e8d2a1057772f26374df4bc800d10296309"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 741,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 613,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          }
+        ]
+      },
+      "reason": "內部遍歷器直接解讀 GC 物件與指標圖，核對所有配置物件的引用關係。",
+      "rust_invariant": "配置記帳、root 及物件生命週期在成功與錯誤收尾後一致。",
+      "replacement": {
+        "case_id": "allocation-ledger",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:limits",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.limits",
+        "c_function": "get_limits",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": []
+      },
+      "reason": "回傳編譯器私有指令編碼與參數上限，這些常數不是公開 C ABI。",
+      "rust_invariant": "已驗證程式碼的指令解碼、邊界與載入限制互相一致。",
+      "replacement": {
+        "case_id": "verified-code",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:sizes",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.sizes",
+        "c_function": "get_sizes",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": []
+      },
+      "reason": "直接回報 lua_State、global_State、TValue、Node 與 stack Value 的 sizeof，屬 C 結構布局。",
+      "rust_invariant": "Rust 端維持自己的型別表示；不要求其大小等於 Lua C 內部結構。",
+      "replacement": {
+        "case_id": "allocation-ledger",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:listcode",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.listcode",
+        "c_function": "listcode",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/code.lua",
+            "line": 93,
+            "source_sha256": "b63335ff980dd318f1cc4aa81bbd54952afc7ac3688c7d9042ea4c45e9993663"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/code.lua",
+            "line": 113,
+            "source_sha256": "b63335ff980dd318f1cc4aa81bbd54952afc7ac3688c7d9042ea4c45e9993663"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/code.lua",
+            "line": 114,
+            "source_sha256": "b63335ff980dd318f1cc4aa81bbd54952afc7ac3688c7d9042ea4c45e9993663"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/code.lua",
+            "line": 463,
+            "source_sha256": "b63335ff980dd318f1cc4aa81bbd54952afc7ac3688c7d9042ea4c45e9993663"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/code.lua",
+            "line": 479,
+            "source_sha256": "b63335ff980dd318f1cc4aa81bbd54952afc7ac3688c7d9042ea4c45e9993663"
+          }
+        ]
+      },
+      "reason": "逐一讀取 Proto 指令陣列並解碼內部 opcode 與欄位。",
+      "rust_invariant": "載入或編譯後的程式只執行經驗證的指令，分支與結果符合 Lua 語意。",
+      "replacement": {
+        "case_id": "verified-code",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:printcode",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.printcode",
+        "c_function": "printcode",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": []
+      },
+      "reason": "以 Proto 的指令與欄位格式輸出私有 bytecode listing。",
+      "rust_invariant": "執行器只依有效指令狀態轉移，不依賴 Lua C bytecode 的記憶體布局。",
+      "replacement": {
+        "case_id": "verified-code",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:listk",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.listk",
+        "c_function": "listk",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/calls.lua",
+            "line": 586,
+            "source_sha256": "e0331ba5557c09ba844c11a54810ca7cc01998638316d5192e252a2ab0a2d407"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/calls.lua",
+            "line": 587,
+            "source_sha256": "e0331ba5557c09ba844c11a54810ca7cc01998638316d5192e252a2ab0a2d407"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/code.lua",
+            "line": 40,
+            "source_sha256": "b63335ff980dd318f1cc4aa81bbd54952afc7ac3688c7d9042ea4c45e9993663"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/code.lua",
+            "line": 455,
+            "source_sha256": "b63335ff980dd318f1cc4aa81bbd54952afc7ac3688c7d9042ea4c45e9993663"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/code.lua",
+            "line": 456,
+            "source_sha256": "b63335ff980dd318f1cc4aa81bbd54952afc7ac3688c7d9042ea4c45e9993663"
+          }
+        ]
+      },
+      "reason": "直接讀取 Proto 常數陣列及 TValue 表示。",
+      "rust_invariant": "常數索引在編譯、載入與執行間保持穩定且可正確取值。",
+      "replacement": {
+        "case_id": "verified-code",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:listabslineinfo",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.listabslineinfo",
+        "c_function": "listabslineinfo",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": []
+      },
+      "reason": "直接讀取 Proto 的 abslineinfo 陣列與內部 pc/行號對。",
+      "rust_invariant": "除錯行號對應到執行位置；不要求私有 abslineinfo 排列相同。",
+      "replacement": {
+        "case_id": "verified-code",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:listlocals",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.listlocals",
+        "c_function": "listlocals",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": []
+      },
+      "reason": "直接取得 Proto 並呼叫私有 luaF_getlocalname 讀取區域變數 debug 表。",
+      "rust_invariant": "除錯區域名稱與目前執行位置對應一致，不洩漏已離開作用域的區域。",
+      "replacement": {
+        "case_id": "upvalue-debug",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:printallstack",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.printallstack",
+        "c_function": "lua_printallstack",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": []
+      },
+      "reason": "逐一遍歷 lua_State.stack、top 與 CallInfo 鏈並讀取 TValue。",
+      "rust_invariant": "呼叫框架與 stack root 在正常回傳及錯誤展開後回到一致狀態。",
+      "replacement": {
+        "case_id": "c-stack-errors",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:totalmem",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.totalmem",
+        "c_function": "mem_query",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/all.lua",
+            "line": 121,
+            "source_sha256": "f1b8b8075a71e7abc40260f6b9112e8d2a1057772f26374df4bc800d10296309"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/all.lua",
+            "line": 128,
+            "source_sha256": "f1b8b8075a71e7abc40260f6b9112e8d2a1057772f26374df4bc800d10296309"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/all.lua",
+            "line": 129,
+            "source_sha256": "f1b8b8075a71e7abc40260f6b9112e8d2a1057772f26374df4bc800d10296309"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/errors.lua",
+            "line": 100,
+            "source_sha256": "57bb9cc9e622b16646f5aec072e4f9295a2401b886e98ad4af21f4bd5b19f53d"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/errors.lua",
+            "line": 105,
+            "source_sha256": "57bb9cc9e622b16646f5aec072e4f9295a2401b886e98ad4af21f4bd5b19f53d"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 637,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 639,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 641,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 643,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 644,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 646,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 647,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 649,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 748,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 752,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 767,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 771,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 774,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 777,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 780,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 783,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 786,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 27,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 29,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 55,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 61,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 63,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          }
+        ]
+      },
+      "reason": "讀取私有 l_memcontrol 的總位元組、區塊數與依物件類別計數。",
+      "rust_invariant": "Rust allocator ledger 在配置、釋放、GC 與 VM 關閉後保持守恆。",
+      "replacement": {
+        "case_id": "allocation-ledger",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:alloccount",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.alloccount",
+        "c_function": "alloc_count",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 445,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1306,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1308,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1315,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1317,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1337,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1339,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 730,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 733,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 742,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 745,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 137,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 139,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 692,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 694,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 708,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 715,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 40,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 42,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 86,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 88,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/nextvar.lua",
+            "line": 185,
+            "source_sha256": "a49a917beb9e5c000d60baed697cefcdcb4ca985bba27b71d587cff8776b5029"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/nextvar.lua",
+            "line": 187,
+            "source_sha256": "a49a917beb9e5c000d60baed697cefcdcb4ca985bba27b71d587cff8776b5029"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/nextvar.lua",
+            "line": 190,
+            "source_sha256": "a49a917beb9e5c000d60baed697cefcdcb4ca985bba27b71d587cff8776b5029"
+          }
+        ]
+      },
+      "reason": "直接改寫測試 allocator 的 countlimit，以指定配置次數注入失敗。",
+      "rust_invariant": "配置失敗可傳回錯誤且所有暫存 root、frame 與記帳都能收尾。",
+      "replacement": {
+        "case_id": "allocation-ledger",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:allocfailnext",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.allocfailnext",
+        "c_function": "alloc_failnext",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/events.lua",
+            "line": 387,
+            "source_sha256": "90449c1607a12a7c1841123a68237e0d23b7d6e109b8c445937fcd99306897c9"
+          }
+        ]
+      },
+      "reason": "直接設定測試 allocator 的 failnext 狀態，強制下一次配置失敗。",
+      "rust_invariant": "單次配置失敗不污染後續配置，回收與錯誤路徑保持一致。",
+      "replacement": {
+        "case_id": "allocation-ledger",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:trick",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.trick",
+        "c_function": "settrick",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 299,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          }
+        ]
+      },
+      "reason": "把 TValue 內的 GCObject 指標存入 l_Trick，供私有 GC 測試控制存活關係。",
+      "rust_invariant": "暫存與宿主持有的 GC 值必須被追蹤；根釋放後可正常回收。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:gccolor",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.gccolor",
+        "c_function": "gc_color",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 815,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 569,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 581,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 595,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 596,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 598,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 612,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 624,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 626,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 114,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 116,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          }
+        ]
+      },
+      "reason": "讀取 GCObject 的 white/black/dead tag，暴露私有標記狀態。",
+      "rust_invariant": "GC mark/sweep 後仍可從公開 Lua 行為觀察到被引用物件存活及無引用物件回收。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:gcage",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.gcage",
+        "c_function": "gc_age",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 20,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 24,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 28,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 33,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 46,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 48,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 50,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 66,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 75,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 77,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 112,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 114,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 116,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 118,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 139,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 143,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 144,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 148,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 149,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 154,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 155,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          }
+        ]
+      },
+      "reason": "讀取 GCObject 的世代 age 欄位，暴露分代收集器內部狀態。",
+      "rust_invariant": "跨代引用在收集後保持可達；不要求 Rust 使用 Lua C 相同世代標籤。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:gcstate",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.gcstate",
+        "c_function": "gc_state",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 814,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 817,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 298,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 300,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 302,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 578,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 579,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 582,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 592,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 593,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 620,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 623,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 627,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          }
+        ]
+      },
+      "reason": "直接讀寫 global_State.gcstate，並呼叫私有 luaC_runtilstate 推進 collector。",
+      "rust_invariant": "收集器相位轉換不遺失 live roots，finalizer 與使用者值依可達性執行。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:tracegc",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.tracegc",
+        "c_function": "tracegc",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": []
+      },
+      "reason": "切換全域 tracing 狀態，並在 GC 時暫時修改私有 gcstp 與鎖狀態。",
+      "rust_invariant": "GC callback 執行後恢復 VM 狀態與 root；callback 錯誤不破壞後續收集。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:pobj",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.pobj",
+        "c_function": "gc_printobj",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": []
+      },
+      "reason": "把私有 GCObject 標籤與內容交給內部印出器，結果含實作細節。",
+      "rust_invariant": "公開行為只要求物件型別、可達性與 finalizer 結果正確，不要求內部 dump 格式。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:gcquery",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.gcquery",
+        "c_function": "gc_query",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": []
+      },
+      "reason": "讀取 global_State 的 gckind、gcstate、GCdebt、GCmarked 等私有欄位。",
+      "rust_invariant": "收集完成後物件可達性與 allocator 記帳維持不變量。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:hash",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.hash",
+        "c_function": "hash_query",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/attrib.lua",
+            "line": 343,
+            "source_sha256": "dd2eb13be29628ac0268cddfafdc6a816edcba6552ae15e8637afc6a79742e52"
+          }
+        ]
+      },
+      "reason": "讀取 TString.hash，或由 Table.mainposition 與 node base 推算節點位置。",
+      "rust_invariant": "字串與表鍵依 Lua 等值／雜湊語意查找；內部雜湊值與節點位置不屬公開行為。",
+      "replacement": {
+        "case_id": "table-string",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:stacklevel",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.stacklevel",
+        "c_function": "stacklevel",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/all.lua",
+            "line": 133,
+            "source_sha256": "f1b8b8075a71e7abc40260f6b9112e8d2a1057772f26374df4bc800d10296309"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1334,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1342,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/calls.lua",
+            "line": 383,
+            "source_sha256": "e0331ba5557c09ba844c11a54810ca7cc01998638316d5192e252a2ab0a2d407"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/cstack.lua",
+            "line": 158,
+            "source_sha256": "52ad964a0cf6161c58161d9dd0fcbec81bec949fb7ebd4ea1201c5c978df899c"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/cstack.lua",
+            "line": 168,
+            "source_sha256": "52ad964a0cf6161c58161d9dd0fcbec81bec949fb7ebd4ea1201c5c978df899c"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/cstack.lua",
+            "line": 171,
+            "source_sha256": "52ad964a0cf6161c58161d9dd0fcbec81bec949fb7ebd4ea1201c5c978df899c"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/cstack.lua",
+            "line": 181,
+            "source_sha256": "52ad964a0cf6161c58161d9dd0fcbec81bec949fb7ebd4ea1201c5c978df899c"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/cstack.lua",
+            "line": 185,
+            "source_sha256": "52ad964a0cf6161c58161d9dd0fcbec81bec949fb7ebd4ea1201c5c978df899c"
+          }
+        ]
+      },
+      "reason": "讀取 lua_State 的 stack/top、stacksize、nCcalls 與 nci 私有欄位。",
+      "rust_invariant": "呼叫、錯誤與 callback 返回後，stack/frame 深度和 root 收尾一致。",
+      "replacement": {
+        "case_id": "c-stack-errors",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:resetCI",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.resetCI",
+        "c_function": "resetCI",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 729,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 295,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          }
+        ]
+      },
+      "reason": "直接釋放 CallInfo 鏈並改寫 lua_State.nci，模擬沒有額外呼叫框架。",
+      "rust_invariant": "錯誤與 GC/finalizer 路徑不依賴已失效 frame，frame 回收後不留懸空引用。",
+      "replacement": {
+        "case_id": "c-stack-errors",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:reallocstack",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.reallocstack",
+        "c_function": "reallocstack",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gc.lua",
+            "line": 741,
+            "source_sha256": "e1768dd5a40921af0e5d24b1d61c9fd4727c45716e28bf167246a45e38735a99"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 296,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          }
+        ]
+      },
+      "reason": "呼叫私有 luaD_reallocstack 直接更改 C VM stack 容量。",
+      "rust_invariant": "擴展或配置失敗後 stack indices、live roots 與錯誤狀態仍有效。",
+      "replacement": {
+        "case_id": "c-stack-errors",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:querytab",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.querytab",
+        "c_function": "table_query",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/locals.lua",
+            "line": 120,
+            "source_sha256": "56b5126c40f48bb1a701f041af28cd72a3a7d50b3db9b05da5659f2485f740c1"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/nextvar.lua",
+            "line": 17,
+            "source_sha256": "a49a917beb9e5c000d60baed697cefcdcb4ca985bba27b71d587cff8776b5029"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/nextvar.lua",
+            "line": 20,
+            "source_sha256": "a49a917beb9e5c000d60baed697cefcdcb4ca985bba27b71d587cff8776b5029"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/nextvar.lua",
+            "line": 24,
+            "source_sha256": "a49a917beb9e5c000d60baed697cefcdcb4ca985bba27b71d587cff8776b5029"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/nextvar.lua",
+            "line": 38,
+            "source_sha256": "a49a917beb9e5c000d60baed697cefcdcb4ca985bba27b71d587cff8776b5029"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/nextvar.lua",
+            "line": 237,
+            "source_sha256": "a49a917beb9e5c000d60baed697cefcdcb4ca985bba27b71d587cff8776b5029"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/nextvar.lua",
+            "line": 243,
+            "source_sha256": "a49a917beb9e5c000d60baed697cefcdcb4ca985bba27b71d587cff8776b5029"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/sort.lua",
+            "line": 29,
+            "source_sha256": "283f72b600acda62016689c92a694f2b91c1fc49dbcba377a9a5ed78b2784dc3"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/sort.lua",
+            "line": 36,
+            "source_sha256": "283f72b600acda62016689c92a694f2b91c1fc49dbcba377a9a5ed78b2784dc3"
+          }
+        ]
+      },
+      "reason": "讀取 Table.asize、hash node、lenhint 與內部陣列/雜湊槽。",
+      "rust_invariant": "公開索引、length、迭代、鍵值等語意正確，不承諾相同 table 容量或節點順序。",
+      "replacement": {
+        "case_id": "table-string",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:querystr",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.querystr",
+        "c_function": "string_query",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1328,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1343,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          }
+        ]
+      },
+      "reason": "遍歷 global_State.strt 的私有字串 intern table，回報 bucket 與使用數。",
+      "rust_invariant": "相等字串保持 Lua 字串語意；GC 後字串內容正確且未被 live root 提前回收。",
+      "replacement": {
+        "case_id": "table-string",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:codeparam",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.codeparam",
+        "c_function": "test_codeparam",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 182,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          }
+        ]
+      },
+      "reason": "官方 suite 以 T.codeparam(percent) 呼叫私有 luaO_codeparam 產生 GC 百分比編碼，再用於比例應用；原測試檢查編碼後的有界近似，而非函式參數 metadata。",
+      "rust_invariant": "對 suite 所列百分比 5、10、12、20、50、100、200、500 及各測試值，apply(code_param(percent), value) 與 floor(value*percent/100) 的差不超過 exact/10+1；不要求私有碼位相同。",
+      "replacement": {
+        "case_id": "gc-parameters",
+        "public_gap": "本 case 僅驗 Lua 5.5 GC 百分比內部編碼及套用的近似界限，不保證公開 collectgarbage('param', ...) 對實際 GC 排程與工作量的行為；該公開行為須由公開 API 案例另行驗收。"
+      }
+    },
+    {
+      "id": "lua55-i64f64:applyparam",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.applyparam",
+        "c_function": "test_applyparam",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/gengc.lua",
+            "line": 185,
+            "source_sha256": "5a7a6e525752c97221fbabc4ea4374692e59b3167f6f836d10ceffef16574e03"
+          }
+        ]
+      },
+      "reason": "官方 suite 以 T.applyparam(param, value) 呼叫私有 luaO_applyparam 套用已編碼 GC 百分比，並逐組檢查相對精確整數比例的誤差上限。",
+      "rust_invariant": "套用 code_param(percent) 後，對 suite 所列百分比 5、10、12、20、50、100、200、500 及各測試值，與 floor(value*percent/100) 的差不超過 exact/10+1；比例應用保持有界近似。",
+      "replacement": {
+        "case_id": "gc-parameters",
+        "public_gap": "本 case 僅驗 Lua 5.5 GC 百分比內部編碼及套用的近似界限，不保證公開 collectgarbage('param', ...) 對實際 GC 排程與工作量的行為；該公開行為須由公開 API 案例另行驗收。"
+      }
+    },
+    {
+      "id": "lua55-i64f64:externKstr",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.externKstr",
+        "c_function": "externKstr",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/strings.lua",
+            "line": 534,
+            "source_sha256": "29ae5d36a220f6afcb865e094806fa70c9a05effc35bb83ace0e0bf647097fa6"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/strings.lua",
+            "line": 539,
+            "source_sha256": "29ae5d36a220f6afcb865e094806fa70c9a05effc35bb83ace0e0bf647097fa6"
+          }
+        ]
+      },
+      "reason": "透過 Lua 5.5 external-string API 建立宿主擁有、無釋放 callback 的 TString。",
+      "rust_invariant": "外部字串在 VM 使用期間保持內容有效，VM 不錯誤釋放宿主記憶體。",
+      "replacement": {
+        "case_id": "external-strings",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:externstr",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.externstr",
+        "c_function": "externstr",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/memerr.lua",
+            "line": 182,
+            "source_sha256": "02cc2a754e688bdfcbf507e009d899c4d367f27ced45094b68fdf208a6912491"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/strings.lua",
+            "line": 536,
+            "source_sha256": "29ae5d36a220f6afcb865e094806fa70c9a05effc35bb83ace0e0bf647097fa6"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/strings.lua",
+            "line": 541,
+            "source_sha256": "29ae5d36a220f6afcb865e094806fa70c9a05effc35bb83ace0e0bf647097fa6"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/strings.lua",
+            "line": 544,
+            "source_sha256": "29ae5d36a220f6afcb865e094806fa70c9a05effc35bb83ace0e0bf647097fa6"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/strings.lua",
+            "line": 549,
+            "source_sha256": "29ae5d36a220f6afcb865e094806fa70c9a05effc35bb83ace0e0bf647097fa6"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/strings.lua",
+            "line": 550,
+            "source_sha256": "29ae5d36a220f6afcb865e094806fa70c9a05effc35bb83ace0e0bf647097fa6"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/strings.lua",
+            "line": 555,
+            "source_sha256": "29ae5d36a220f6afcb865e094806fa70c9a05effc35bb83ace0e0bf647097fa6"
+          }
+        ]
+      },
+      "reason": "以 Lua allocator 配置 buffer，再建立帶釋放 callback 的 external TString。",
+      "rust_invariant": "external string 的 callback 恰好釋放其 buffer；GC 與 VM 關閉不遺漏或重複釋放。",
+      "replacement": {
+        "case_id": "external-strings",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:loadlib",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "T.loadlib",
+        "c_function": "loadlib",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1154,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1173,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 1322,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/coroutine.lua",
+            "line": 790,
+            "source_sha256": "d38f7fa8570abb09154d9bf0d8cea34fee08953f0880f3e9c5a641a826c6dfc9"
+          }
+        ]
+      },
+      "reason": "在 ltests 建立的另一個 lua_State 載入標準庫與 package，並驗證 requiref 重複載入身分。",
+      "rust_invariant": "Rust VM 對外建立的各 VM 實例維持狀態隔離；B01 另證明兩版固定 native modules 可由 CAPI host 與 CLI 載入。",
+      "replacement": {
+        "case_id": "native-modules",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:runC:alloccount",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "runC:alloccount",
+        "c_function": "runC",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": [
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 435,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          },
+          {
+            "path": "vendor/lua55/lua-5.5.1-tests/api.lua",
+            "line": 439,
+            "source_sha256": "1601abc0d700cba2240c123afd513c2bb638e378b7cf11470edbbac8291efce0"
+          }
+        ]
+      },
+      "reason": "testC/runC 私有命令直接改寫 l_memcontrol.countlimit，供 panic 子狀態配置失敗腳本使用。",
+      "rust_invariant": "Rust 測試以宿主配置預算注入失敗並確認錯誤返回、root/frame 收尾與記帳一致。",
+      "replacement": {
+        "case_id": "allocation-ledger",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua55-i64f64:runC:printstack",
+      "original": {
+        "profile": "lua55-i64f64",
+        "symbol": "runC:printstack",
+        "c_function": "runC",
+        "c_source": "vendor/lua55/lua-5.5.1-tests/ltests/ltests.c",
+        "c_source_sha256": "62a7015b036d366addd131e4f046f38557d66b8f48aae120e8aad992f3d90199",
+        "lua_references": []
+      },
+      "reason": "testC/runC 私有命令直接讀取 CallInfo、frame slot 及 stack TValue 供除錯輸出。",
+      "rust_invariant": "呼叫框架與 stack root 只按公開執行結果驗證，不要求 Lua C 私有堆疊 dump。",
+      "replacement": {
+        "case_id": "c-stack-errors",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:checkmemory",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.checkmemory",
+        "c_function": "lua_checkmemory",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/all.lua",
+            "line": 117,
+            "source_sha256": "3e296dd2b26ac6891ccba1ebaa62d40f1816ac93c7efdeaddc05aaa064e7311c"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 657,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 623,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          }
+        ]
+      },
+      "reason": "內部遍歷器直接解讀 GC 物件與指標圖，核對所有配置物件的引用關係。",
+      "rust_invariant": "配置記帳、root 及物件生命週期在成功與錯誤收尾後一致。",
+      "replacement": {
+        "case_id": "allocation-ledger",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:listcode",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.listcode",
+        "c_function": "listcode",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/code.lua",
+            "line": 91,
+            "source_sha256": "2ed2b5a4aef2aa0470bbd1b13c613e2ab7f0ec9ba24cf38118ec6ad99c6a3412"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/code.lua",
+            "line": 111,
+            "source_sha256": "2ed2b5a4aef2aa0470bbd1b13c613e2ab7f0ec9ba24cf38118ec6ad99c6a3412"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/code.lua",
+            "line": 112,
+            "source_sha256": "2ed2b5a4aef2aa0470bbd1b13c613e2ab7f0ec9ba24cf38118ec6ad99c6a3412"
+          }
+        ]
+      },
+      "reason": "逐一讀取 Proto 指令陣列並解碼內部 opcode 與欄位。",
+      "rust_invariant": "載入或編譯後的程式只執行經驗證的指令，分支與結果符合 Lua 語意。",
+      "replacement": {
+        "case_id": "verified-code",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:listk",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.listk",
+        "c_function": "listk",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/code.lua",
+            "line": 38,
+            "source_sha256": "2ed2b5a4aef2aa0470bbd1b13c613e2ab7f0ec9ba24cf38118ec6ad99c6a3412"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/code.lua",
+            "line": 444,
+            "source_sha256": "2ed2b5a4aef2aa0470bbd1b13c613e2ab7f0ec9ba24cf38118ec6ad99c6a3412"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/code.lua",
+            "line": 445,
+            "source_sha256": "2ed2b5a4aef2aa0470bbd1b13c613e2ab7f0ec9ba24cf38118ec6ad99c6a3412"
+          }
+        ]
+      },
+      "reason": "直接讀取 Proto 常數陣列及 TValue 表示。",
+      "rust_invariant": "常數索引在編譯、載入與執行間保持穩定且可正確取值。",
+      "replacement": {
+        "case_id": "verified-code",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:pobj",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.pobj",
+        "c_function": "gc_printobj",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": []
+      },
+      "reason": "把私有 GCObject 標籤與內容交給內部印出器，結果含實作細節。",
+      "rust_invariant": "公開行為只要求物件型別、可達性與 finalizer 結果正確，不要求內部 dump 格式。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:gccolor",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.gccolor",
+        "c_function": "gc_color",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 731,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 579,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 591,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 605,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 606,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 608,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 622,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 114,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 116,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          }
+        ]
+      },
+      "reason": "讀取 GCObject 的 white/black/dead tag，暴露私有標記狀態。",
+      "rust_invariant": "GC mark/sweep 後仍可從公開 Lua 行為觀察到被引用物件存活及無引用物件回收。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:gcage",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.gcage",
+        "c_function": "gc_age",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 20,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 24,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 28,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 33,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 46,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 48,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 50,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 66,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 75,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 77,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 112,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 114,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 116,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 118,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 139,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 143,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 144,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 148,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 149,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 154,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gengc.lua",
+            "line": 155,
+            "source_sha256": "f591eaba4922fee792e49d725fe3bd34c8e8af20b3383eaa2be34a1b9c4b54e6"
+          }
+        ]
+      },
+      "reason": "讀取 GCObject 的世代 age 欄位，暴露分代收集器內部狀態。",
+      "rust_invariant": "跨代引用在收集後保持可達；不要求 Rust 使用 Lua C 相同世代標籤。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:gcstate",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.gcstate",
+        "c_function": "gc_state",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 730,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 733,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 305,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 307,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 309,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 588,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 589,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 592,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 602,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 603,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          }
+        ]
+      },
+      "reason": "直接讀寫 global_State.gcstate，並呼叫私有 luaC_runtilstate 推進 collector。",
+      "rust_invariant": "收集器相位轉換不遺失 live roots，finalizer 與使用者值依可達性執行。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:hash",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.hash",
+        "c_function": "hash_query",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": []
+      },
+      "reason": "讀取 TString.hash，或由 Table.mainposition 與 node base 推算節點位置。",
+      "rust_invariant": "字串與表鍵依 Lua 等值／雜湊語意查找；內部雜湊值與節點位置不屬公開行為。",
+      "replacement": {
+        "case_id": "table-string",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:querytab",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.querytab",
+        "c_function": "table_query",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 116,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/nextvar.lua",
+            "line": 14,
+            "source_sha256": "035b70531b3e33e318e5f75c0434608164a2d4dd67efb11b22529dc745ffa425"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/nextvar.lua",
+            "line": 209,
+            "source_sha256": "035b70531b3e33e318e5f75c0434608164a2d4dd67efb11b22529dc745ffa425"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/nextvar.lua",
+            "line": 213,
+            "source_sha256": "035b70531b3e33e318e5f75c0434608164a2d4dd67efb11b22529dc745ffa425"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/nextvar.lua",
+            "line": 215,
+            "source_sha256": "035b70531b3e33e318e5f75c0434608164a2d4dd67efb11b22529dc745ffa425"
+          }
+        ]
+      },
+      "reason": "讀取 Table.array/hash 分區、node 鏈與內部槽位。",
+      "rust_invariant": "公開索引、length、迭代、鍵值等語意正確，不承諾相同 table 容量或節點順序。",
+      "replacement": {
+        "case_id": "table-string",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:querystr",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.querystr",
+        "c_function": "string_query",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1459,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1474,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          }
+        ]
+      },
+      "reason": "遍歷 global_State.strt 的私有字串 intern table，回報 bucket 與使用數。",
+      "rust_invariant": "相等字串保持 Lua 字串語意；GC 後字串內容正確且未被 live root 提前回收。",
+      "replacement": {
+        "case_id": "table-string",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:totalmem",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.totalmem",
+        "c_function": "mem_query",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/all.lua",
+            "line": 118,
+            "source_sha256": "3e296dd2b26ac6891ccba1ebaa62d40f1816ac93c7efdeaddc05aaa064e7311c"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/all.lua",
+            "line": 125,
+            "source_sha256": "3e296dd2b26ac6891ccba1ebaa62d40f1816ac93c7efdeaddc05aaa064e7311c"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/all.lua",
+            "line": 126,
+            "source_sha256": "3e296dd2b26ac6891ccba1ebaa62d40f1816ac93c7efdeaddc05aaa064e7311c"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 419,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 421,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1220,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1225,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1227,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/errors.lua",
+            "line": 100,
+            "source_sha256": "a8ba7ea89a3cdd713ba26d36da216eccf8f536ece26741c0b1aa056005c8c67d"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/errors.lua",
+            "line": 105,
+            "source_sha256": "a8ba7ea89a3cdd713ba26d36da216eccf8f536ece26741c0b1aa056005c8c67d"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 632,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 634,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 636,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 638,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 639,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 641,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 642,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/gc.lua",
+            "line": 644,
+            "source_sha256": "4351d096ad1dc003e914ffee3959955faed723185ad1935bb925853276fa7808"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 697,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 701,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 716,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 720,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 723,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 726,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 729,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 732,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 735,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 738,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 741,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          }
+        ]
+      },
+      "reason": "讀取私有 l_memcontrol 的總位元組、區塊數與依物件類別計數。",
+      "rust_invariant": "Rust allocator ledger 在配置、釋放、GC 與 VM 關閉後保持守恆。",
+      "replacement": {
+        "case_id": "allocation-ledger",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:alloccount",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.alloccount",
+        "c_function": "alloc_count",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1209,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1211,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1249,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1251,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1437,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1439,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1446,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1448,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1468,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1470,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 133,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 135,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 641,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 643,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 657,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/locals.lua",
+            "line": 664,
+            "source_sha256": "89ff0912073780ca8068d16a006377825873bdd77c1a91a24317a1ea1cd2dbad"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/nextvar.lua",
+            "line": 123,
+            "source_sha256": "035b70531b3e33e318e5f75c0434608164a2d4dd67efb11b22529dc745ffa425"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/nextvar.lua",
+            "line": 125,
+            "source_sha256": "035b70531b3e33e318e5f75c0434608164a2d4dd67efb11b22529dc745ffa425"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/nextvar.lua",
+            "line": 128,
+            "source_sha256": "035b70531b3e33e318e5f75c0434608164a2d4dd67efb11b22529dc745ffa425"
+          }
+        ]
+      },
+      "reason": "直接改寫測試 allocator 的 countlimit，以指定配置次數注入失敗。",
+      "rust_invariant": "配置失敗可傳回錯誤且所有暫存 root、frame 與記帳都能收尾。",
+      "replacement": {
+        "case_id": "allocation-ledger",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:allocfailnext",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.allocfailnext",
+        "c_function": "alloc_failnext",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/events.lua",
+            "line": 378,
+            "source_sha256": "1213a3ffd35d7e6465e53aabf3367dab5074fe48e5da3b39812d61bef89e27a2"
+          }
+        ]
+      },
+      "reason": "直接設定測試 allocator 的 failnext 狀態，強制下一次配置失敗。",
+      "rust_invariant": "單次配置失敗不污染後續配置，回收與錯誤路徑保持一致。",
+      "replacement": {
+        "case_id": "allocation-ledger",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:trick",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.trick",
+        "c_function": "settrick",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": []
+      },
+      "reason": "把 TValue 內的 GCObject 指標存入 l_Trick，供私有 GC 測試控制存活關係。",
+      "rust_invariant": "暫存與宿主持有的 GC 值必須被追蹤；根釋放後可正常回收。",
+      "replacement": {
+        "case_id": "gc-roots",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:stacklevel",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.stacklevel",
+        "c_function": "stacklevel",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/all.lua",
+            "line": 130,
+            "source_sha256": "3e296dd2b26ac6891ccba1ebaa62d40f1816ac93c7efdeaddc05aaa064e7311c"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1465,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1473,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/cstack.lua",
+            "line": 158,
+            "source_sha256": "626adc09f79218d3265c57cae83b54ececd693c77f84b09cf28e9a016c63abce"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/cstack.lua",
+            "line": 168,
+            "source_sha256": "626adc09f79218d3265c57cae83b54ececd693c77f84b09cf28e9a016c63abce"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/cstack.lua",
+            "line": 171,
+            "source_sha256": "626adc09f79218d3265c57cae83b54ececd693c77f84b09cf28e9a016c63abce"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/cstack.lua",
+            "line": 181,
+            "source_sha256": "626adc09f79218d3265c57cae83b54ececd693c77f84b09cf28e9a016c63abce"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/cstack.lua",
+            "line": 185,
+            "source_sha256": "626adc09f79218d3265c57cae83b54ececd693c77f84b09cf28e9a016c63abce"
+          }
+        ]
+      },
+      "reason": "讀取 lua_State 的 stack/top、stacksize 與 C-call 深度等私有欄位。",
+      "rust_invariant": "呼叫、錯誤與 callback 返回後，stack/frame 深度和 root 收尾一致。",
+      "replacement": {
+        "case_id": "c-stack-errors",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:loadlib",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "T.loadlib",
+        "c_function": "loadlib",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": [
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1053,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1070,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/api.lua",
+            "line": 1453,
+            "source_sha256": "38e248f069b253da6734096bfe8d38f6deb41aa54ee78577b5dfb8873fe2f7af"
+          },
+          {
+            "path": "vendor/lua54/lua-5.4.9-tests/coroutine.lua",
+            "line": 727,
+            "source_sha256": "7b6e486d147d6ed20424db73e27690ad532ab7d3aa232d1bf6d2ad07d3139e8e"
+          }
+        ]
+      },
+      "reason": "在 ltests 建立的另一個 lua_State 載入標準庫與 package，並驗證 requiref 重複載入身分。",
+      "rust_invariant": "Rust VM 對外建立的各 VM 實例維持狀態隔離；B01 另證明兩版固定 native modules 可由 CAPI host 與 CLI 載入。",
+      "replacement": {
+        "case_id": "native-modules",
+        "public_gap": ""
+      }
+    },
+    {
+      "id": "lua54-i64f64:runC:printstack",
+      "original": {
+        "profile": "lua54-i64f64",
+        "symbol": "runC:printstack",
+        "c_function": "runC",
+        "c_source": "vendor/lua54/lua-5.4.9-tests/ltests/ltests.c",
+        "c_source_sha256": "69837abb3adbdc1cc6e7d2a0bac5fa94d53fb1a811fbd5bedc0214d2d045b6cb",
+        "lua_references": []
+      },
+      "reason": "testC/runC 私有命令直接讀取 CallInfo、frame slot 及 stack TValue 供除錯輸出。",
+      "rust_invariant": "呼叫框架與 stack root 只按公開執行結果驗證，不要求 Lua C 私有堆疊 dump。",
+      "replacement": {
+        "case_id": "c-stack-errors",
+        "public_gap": ""
+      }
+    }
+  ]
+}

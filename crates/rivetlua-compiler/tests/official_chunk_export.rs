@@ -35,6 +35,116 @@ fn native_module(source: &[u8], profile: LanguageProfile) -> rivetlua_core::Veri
 }
 
 #[test]
+fn p17_native_open_call_pending_values_roundtrip() {
+    let cases: [(&str, &[u8]); 4] = [
+        (
+            "開放結果與待用外層 callee",
+            b"local function check(s) local t='abc\\n'; for line in string.gmatch(s, '.-\\n') do assert(string.find(t, line, 1, true)) end; return true end; return check",
+        ),
+        (
+            "固定結果與錯誤分支",
+            b"local function check(s) local t='abc\\n'; for line in string.gmatch(s, '.-\\n') do local found=string.find(t, line, 1, true); if not found then error('missing') end; assert(found) end; return true end; return check",
+        ),
+        (
+            "零結果與開放參數",
+            b"local function check(s) local t='abc\\n'; for line in string.gmatch(s, '.-\\n') do assert(string.find(t, line, 1, true)); assert() end; return true end; return check",
+        ),
+        (
+            "多結果與待用外層 callee",
+            b"local function check(s) local t='abc\\n'; for line in string.gmatch(s, '.-\\n') do local first,last=string.find(t, line, 1, true); assert(first,last) end; return true end; return check",
+        ),
+    ];
+    for (language, profile) in [
+        (LanguageProfile::Lua55, LuaProfile::Lua55),
+        (LanguageProfile::Lua54, LuaProfile::Lua54),
+    ] {
+        for (name, source) in cases {
+            let (resolved, ir) = native_ir_with_resolved(source, language);
+            let emitted = emit_with_native_debug(
+                &ir,
+                &resolved,
+                source,
+                b"@p17-open-call.lua",
+                &VerifyLimits::default(),
+            )
+            .unwrap();
+            for strip in [false, true] {
+                let bytes = emit_official_chunk(
+                    emitted.verified(),
+                    ProtoId(0),
+                    profile,
+                    strip,
+                    &OfficialChunkLimits::default(),
+                    &mut OfficialWorkBudget::new(u64::MAX),
+                )
+                .unwrap_or_else(|error| panic!("{name} {profile:?} strip={strip}: {error:?}"));
+                let decoded =
+                    decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default())
+                        .unwrap();
+                translate_official_chunk(&decoded, &VerifyLimits::default()).unwrap();
+                assert!(!decoded.main.children.is_empty(), "{name} {profile:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn p17_official_main_chunk_export() {
+    for (language, profile, relative) in [
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            "../../vendor/lua55/lua-5.5.1-tests/main.lua",
+        ),
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            "../../vendor/lua54/lua-5.4.9-tests/main.lua",
+        ),
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        let raw = std::fs::read(&path).unwrap();
+        let mut source = Vec::new();
+        let bytes = raw.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&raw);
+        if bytes.first() == Some(&b'#') {
+            let end = bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |index| index + 1);
+            source.push(b'\n');
+            source.extend_from_slice(&bytes[end..]);
+        } else {
+            source.extend_from_slice(bytes);
+        }
+        let (resolved, ir) = native_ir_with_resolved(&source, language);
+        let emitted = emit_with_native_debug(
+            &ir,
+            &resolved,
+            &source,
+            path.to_string_lossy().as_bytes(),
+            &VerifyLimits::default(),
+        )
+        .unwrap();
+        for strip in [false, true] {
+            let exported = emit_official_chunk(
+                emitted.verified(),
+                ProtoId(0),
+                profile,
+                strip,
+                &OfficialChunkLimits::default(),
+                &mut OfficialWorkBudget::new(u64::MAX),
+            )
+            .unwrap_or_else(|error| panic!("{profile:?} strip={strip}: {error:?}"));
+            let decoded =
+                decode_official_chunk(&exported, profile, &OfficialChunkLimits::default()).unwrap();
+            let imported = translate_official_chunk(&decoded, &VerifyLimits::default()).unwrap();
+            assert_eq!(emitted.verified().module().prototypes.len(), 10);
+            assert_eq!(imported.verified().module().prototypes.len(), 10);
+        }
+    }
+}
+
+#[test]
 fn native_pending_call_uses_visible_official_slots_before_callee_in_both_profiles() {
     for (source, pending_count) in [
         (

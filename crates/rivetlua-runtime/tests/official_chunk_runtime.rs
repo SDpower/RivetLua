@@ -1,10 +1,14 @@
-use rivetlua_compiler::{OfficialFixedBuiltin, OfficialTranslation, translate_official_chunk};
+use rivetlua_compiler::{
+    CompileLimits, IrLimits, LanguageProfile, OfficialFixedBuiltin, OfficialTranslation,
+    emit_with_native_debug, lex, lower, parse, resolve, translate_official_chunk,
+};
 use rivetlua_core::bytecode::official::{OfficialChunkLimits, decode_official_chunk};
+use rivetlua_core::bytecode::official_export::emit_official_chunk;
 use rivetlua_core::{
     BytecodeUpvalueSource, EnvironmentSource, LuaProfile, OfficialPlanBuiltin, OfficialPlanCall,
-    OfficialPlanCandidate, OfficialPlanFrameInputSource, OfficialWorkBudget, UpvalueId, Value,
-    VerifyLimits, preflight_official_chunk, translate_official_chunk_with_work, verify_module,
-    verify_official_execution_plan,
+    OfficialPlanCandidate, OfficialPlanFrameInputSource, OfficialWorkBudget, ProtoId, UpvalueId,
+    Value, VerifyLimits, preflight_official_chunk, translate_official_chunk_with_work,
+    verify_module, verify_official_execution_plan,
 };
 use rivetlua_runtime::{
     AbortReason, AllocationFailureKind, CallbackResult, DebugCapability, DebugLimits,
@@ -56,6 +60,303 @@ fn byte_string(vm: &Vm, value: Value) -> Vec<u8> {
     };
     vm.with_byte_string(object, |text| text.as_bytes().to_vec())
         .unwrap()
+}
+
+#[test]
+fn p17_export_open_call_runtime_semantics() {
+    let source = br#"
+local closed_ok, closed_error = 0, 0
+local function check(s)
+  local t = "abc\n"
+  local closer = setmetatable({}, {__close=function(_, e)
+    if e == nil then closed_ok = closed_ok + 1 else closed_error = closed_error + 1 end
+  end})
+  for line in string.gmatch(s, ".-\n"), nil, nil, closer do
+    assert(string.find(t, line, 1, true))
+  end
+  return s, t
+end
+return check, function() return closed_ok, closed_error end
+"#;
+    for (language, profile) in [
+        (LanguageProfile::Lua55, LuaProfile::Lua55),
+        (LanguageProfile::Lua54, LuaProfile::Lua54),
+    ] {
+        for strip in [false, true] {
+            let limits = CompileLimits::default();
+            let chunk = lex(source, language, &limits).unwrap();
+            let syntax = parse(&chunk, language, &limits).unwrap();
+            let resolved = resolve(&syntax, &chunk, language, &limits).unwrap();
+            let ir = lower(&resolved, &IrLimits::default()).unwrap();
+            let emitted = emit_with_native_debug(
+                &ir,
+                &resolved,
+                source,
+                b"@p17-open-call-runtime.lua",
+                &VerifyLimits::default(),
+            )
+            .unwrap();
+            let original = emitted.verified().clone();
+            let bytes = emit_official_chunk(
+                &original,
+                ProtoId(0),
+                profile,
+                strip,
+                &OfficialChunkLimits::default(),
+                &mut OfficialWorkBudget::new(u64::MAX),
+            )
+            .unwrap_or_else(|error| panic!("{profile:?} strip={strip}: {error:?}"));
+            let decoded =
+                decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
+            let imported = translate_official_chunk(&decoded, &VerifyLimits::default())
+                .unwrap_or_else(|error| panic!("{profile:?} strip={strip} translate: {error:?}"))
+                .verified()
+                .clone();
+            for (origin, module) in [("native", original.clone()), ("official", imported)] {
+                let mut vm = Vm::new_with_profile(profile).unwrap();
+                let environment = vm.allocate_table().unwrap();
+                let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+                vm.install_basic_builtins(environment).unwrap();
+                vm.install_string_builtins(environment).unwrap();
+                let baseline_roots = vm.roots().total_count() - 1;
+                let mut execution = vm
+                    .load_with_environment(module, Value::Object(environment))
+                    .unwrap();
+                let RunOutcome::Returned(functions) = execution.run().unwrap() else {
+                    panic!("{profile:?} strip={strip} origin={origin}: 主函式未返回");
+                };
+                drop(execution);
+                assert_eq!(functions.len(), 2);
+                let (Value::Object(check), Value::Object(counts)) = (functions[0], functions[1])
+                else {
+                    panic!("{profile:?} strip={strip} origin={origin}: 返回值不是函式");
+                };
+                let check_root = vm.add_root(RootKind::Host, check).unwrap();
+                let counts_root = vm.add_root(RootKind::Host, counts).unwrap();
+                let good = vm.allocate_byte_string(b"abc\n").unwrap();
+                let good_root = vm.add_root(RootKind::Host, good).unwrap();
+                let mut call = vm
+                    .call(Value::Object(check), &[Value::Object(good)])
+                    .unwrap();
+                let RunOutcome::Returned(values) = call.run().unwrap() else {
+                    panic!("{profile:?} strip={strip} origin={origin}: 正常呼叫未返回");
+                };
+                drop(call);
+                assert_eq!(values.len(), 2);
+                assert_eq!(byte_string(&vm, values[0]), b"abc\n");
+                assert_eq!(byte_string(&vm, values[1]), b"abc\n");
+                let bad = vm.allocate_byte_string(b"bad\n").unwrap();
+                let bad_root = vm.add_root(RootKind::Host, bad).unwrap();
+                let mut call = vm
+                    .call(Value::Object(check), &[Value::Object(bad)])
+                    .unwrap();
+                let RunOutcome::LuaError(error) = call.run().unwrap() else {
+                    panic!("{profile:?} strip={strip} origin={origin}: 錯誤呼叫未拋出 Lua error");
+                };
+                drop(call);
+                assert_eq!(error.kind, RuntimeErrorKind::Thrown);
+                let message = byte_string(&vm, error.value);
+                assert!(
+                    message
+                        .windows(b"assertion failed".len())
+                        .any(|part| part == b"assertion failed"),
+                    "{profile:?} strip={strip} origin={origin}: {message:?}"
+                );
+                let mut call = vm.call(Value::Object(counts), &[]).unwrap();
+                assert_eq!(
+                    call.run().unwrap(),
+                    RunOutcome::Returned(vec![Value::Integer(1), Value::Integer(1)]),
+                    "{profile:?} strip={strip} origin={origin}: Close 狀態"
+                );
+                drop(call);
+                drop(error);
+                for root in [
+                    bad_root,
+                    good_root,
+                    counts_root,
+                    check_root,
+                    environment_root,
+                ] {
+                    vm.remove_root(root).unwrap();
+                }
+                vm.collect().unwrap();
+                assert_eq!(vm.roots().total_count(), baseline_roots);
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+            }
+        }
+    }
+    let source = br#"
+local function values() return 2, 3, 4 end
+local function combine(a, b, c) return a * 100 + b * 10 + c end
+local function none() end
+local function count(...) return select('#', ...) end
+return function()
+  local result = combine(values())
+  local first, last = string.find('abc', 'abc', 1, true)
+  return result, first, last, count(none())
+end, function() assert() end
+"#;
+    for (language, profile) in [
+        (LanguageProfile::Lua55, LuaProfile::Lua55),
+        (LanguageProfile::Lua54, LuaProfile::Lua54),
+    ] {
+        let limits = CompileLimits::default();
+        let chunk = lex(source, language, &limits).unwrap();
+        let syntax = parse(&chunk, language, &limits).unwrap();
+        let resolved = resolve(&syntax, &chunk, language, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let emitted = emit_with_native_debug(
+            &ir,
+            &resolved,
+            source,
+            b"@p17-open-call-results.lua",
+            &VerifyLimits::default(),
+        )
+        .unwrap();
+        let original = emitted.verified().clone();
+        for strip in [false, true] {
+            let bytes = emit_official_chunk(
+                &original,
+                ProtoId(0),
+                profile,
+                strip,
+                &OfficialChunkLimits::default(),
+                &mut OfficialWorkBudget::new(u64::MAX),
+            )
+            .unwrap_or_else(|error| panic!("result modes {profile:?} strip={strip}: {error:?}"));
+            let decoded =
+                decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
+            let imported = translate_official_chunk(&decoded, &VerifyLimits::default())
+                .unwrap_or_else(|error| {
+                    panic!("result modes {profile:?} strip={strip} translate: {error:?}")
+                })
+                .verified()
+                .clone();
+            for (origin, module) in [("native", original.clone()), ("official", imported)] {
+                let mut vm = Vm::new_with_profile(profile).unwrap();
+                let environment = vm.allocate_table().unwrap();
+                let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+                vm.install_basic_builtins(environment).unwrap();
+                vm.install_string_builtins(environment).unwrap();
+                let baseline_roots = vm.roots().total_count() - 1;
+                let mut execution = vm
+                    .load_with_environment(module, Value::Object(environment))
+                    .unwrap();
+                let RunOutcome::Returned(functions) = execution.run().unwrap() else {
+                    panic!("result modes {profile:?} strip={strip} origin={origin}: 主函式未返回");
+                };
+                drop(execution);
+                assert_eq!(functions.len(), 2);
+                let (Value::Object(results), Value::Object(fail)) = (functions[0], functions[1])
+                else {
+                    panic!(
+                        "result modes {profile:?} strip={strip} origin={origin}: 返回值不是函式"
+                    );
+                };
+                let results_root = vm.add_root(RootKind::Host, results).unwrap();
+                let fail_root = vm.add_root(RootKind::Host, fail).unwrap();
+                let mut call = vm.call(Value::Object(results), &[]).unwrap();
+                assert_eq!(
+                    call.run().unwrap(),
+                    RunOutcome::Returned(vec![
+                        Value::Integer(234),
+                        Value::Integer(1),
+                        Value::Integer(3),
+                        Value::Integer(0),
+                    ]),
+                    "result modes {profile:?} strip={strip} origin={origin}"
+                );
+                drop(call);
+                let mut call = vm.call(Value::Object(fail), &[]).unwrap();
+                let RunOutcome::LuaError(error) = call.run().unwrap() else {
+                    panic!(
+                        "result modes {profile:?} strip={strip} origin={origin}: assert() 未錯誤"
+                    );
+                };
+                drop(call);
+                assert_eq!(error.kind, RuntimeErrorKind::BasicArgument);
+                assert_eq!(error.diagnostic_id, "E_BASIC_ARGUMENT");
+                let message = byte_string(&vm, error.value);
+                assert!(
+                    !message.is_empty(),
+                    "result modes {profile:?} strip={strip} origin={origin}"
+                );
+                drop(error);
+                for root in [fail_root, results_root, environment_root] {
+                    vm.remove_root(root).unwrap();
+                }
+                vm.collect().unwrap();
+                assert_eq!(vm.roots().total_count(), baseline_roots);
+                assert_eq!(vm.ledger_snapshot().reserved, 0);
+            }
+        }
+    }
+    // 原官方 main.lua 僅驗可載入；其中宿主命令不可在此測試執行。
+    for (language, profile, relative) in [
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            "../../vendor/lua55/lua-5.5.1-tests/main.lua",
+        ),
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            "../../vendor/lua54/lua-5.4.9-tests/main.lua",
+        ),
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        let raw = std::fs::read(&path).unwrap();
+        let bytes = raw.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&raw);
+        let mut source = Vec::new();
+        if bytes.first() == Some(&b'#') {
+            let end = bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |index| index + 1);
+            source.push(b'\n');
+            source.extend_from_slice(&bytes[end..]);
+        } else {
+            source.extend_from_slice(bytes);
+        }
+        let limits = CompileLimits::default();
+        let chunk = lex(&source, language, &limits).unwrap();
+        let syntax = parse(&chunk, language, &limits).unwrap();
+        let resolved = resolve(&syntax, &chunk, language, &limits).unwrap();
+        let ir = lower(&resolved, &IrLimits::default()).unwrap();
+        let emitted = emit_with_native_debug(
+            &ir,
+            &resolved,
+            &source,
+            path.to_string_lossy().as_bytes(),
+            &VerifyLimits::default(),
+        )
+        .unwrap();
+        for strip in [false, true] {
+            let bytes = emit_official_chunk(
+                emitted.verified(),
+                ProtoId(0),
+                profile,
+                strip,
+                &OfficialChunkLimits::default(),
+                &mut OfficialWorkBudget::new(u64::MAX),
+            )
+            .unwrap_or_else(|error| panic!("main load {profile:?} strip={strip}: {error:?}"));
+            let decoded =
+                decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
+            let imported = translate_official_chunk(&decoded, &VerifyLimits::default()).unwrap();
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let environment = vm.allocate_table().unwrap();
+            let root = vm.add_root(RootKind::Host, environment).unwrap();
+            let execution = vm
+                .load_with_environment(imported.verified().clone(), Value::Object(environment))
+                .unwrap();
+            drop(execution);
+            vm.remove_root(root).unwrap();
+            vm.collect().unwrap();
+            assert_eq!(vm.roots().total_count(), 0);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+        }
+    }
 }
 
 #[test]

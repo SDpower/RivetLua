@@ -1406,6 +1406,12 @@ impl rivetlua_runtime::HostOs for GOs {
         }
         use rivetlua_runtime::{HostCalendar, HostExitStatus, HostOsOperation, HostOsValue};
         Ok(match operation {
+            HostOsOperation::Exit(_) => {
+                return Err(rivetlua_runtime::HostResourceError::new(
+                    rivetlua_runtime::HostResourceErrorKind::Unsupported,
+                    Vec::new(),
+                ));
+            }
             HostOsOperation::Clock => HostOsValue::Number(1.25),
             HostOsOperation::GetEnv(b"KEY") => {
                 budget.claim_temporary(5)?;
@@ -4066,11 +4072,13 @@ fn p13_f_load_function_reader_bad_type_and_lua_error_propagate() {
             names: None,
         },
     ));
-    let (_, outcome) = run_with_load(b"return load(function() return {} end)", services);
-    let RunOutcome::LuaError(error) = outcome else {
-        panic!("reader 非字串應報錯: {outcome:?}")
+    let (vm, outcome) = run_with_load(b"return load(function() return {} end)", services);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("reader 非字串應回傳 nil、錯誤: {outcome:?}")
     };
-    assert_eq!(error.kind, RuntimeErrorKind::LoadReaderType);
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0], Value::Nil);
+    assert_eq!(bytes(&vm, values[1]), b"E_LOAD_READER_TYPE");
     assert_eq!(calls.get(), 0);
 
     let services = HostServices::deny_all().and_load(LoadCapability::deny_all().and_compiler(
@@ -4083,11 +4091,12 @@ fn p13_f_load_function_reader_bad_type_and_lua_error_propagate() {
         b"return load(function() error('reader boom') end)",
         services,
     );
-    let RunOutcome::LuaError(error) = outcome else {
-        panic!("reader error 應傳遞: {outcome:?}")
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("reader error 應回傳 nil、原錯誤值: {outcome:?}")
     };
-    assert_eq!(error.kind, RuntimeErrorKind::Thrown);
-    assert_eq!(bytes(&vm, error.value), b"reader boom");
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0], Value::Nil);
+    assert_eq!(bytes(&vm, values[1]), b"reader boom");
     assert_eq!(calls.get(), 0);
 }
 
@@ -11146,6 +11155,94 @@ fn p13_h_step3_lua55_environment_shared_identity_setup_join_and_gc() {
     assert_eq!(values[7], Value::Boolean(true));
     assert_eq!(values[8], Value::Boolean(true));
     assert_eq!(bytes(&vm, values[9]), b"v");
+}
+
+#[test]
+fn p13_h_step3_lua55_parent_capture_environment_join_stays_coherent() {
+    if profile().2 != LuaProfile::Lua55 {
+        return;
+    }
+    let source = b"local d,gc=debug,collectgarbage\nlocal function exercise()\n  local function child() return marker end\n  return marker,_ENV,child\nend\nlocal replacement={marker=47}\nlocal function donor() return replacement end\nlocal name=d.getupvalue(exercise,1)\nlocal before=exercise()\nd.upvaluejoin(exercise,1,donor,1)\ngc('collect')\nlocal current,environment,child=exercise()\nreturn name,before,current,environment==replacement,child(),d.upvalueid(exercise,1)==d.upvalueid(donor,1)";
+    let verified = compile_debug(source, b"@p13-h-captured-env-join.lua", LanguageProfile::Lua55);
+    let exercise = verified
+        .module()
+        .prototypes
+        .iter()
+        .find(|proto| {
+            proto.parent == Some(rivetlua_core::ProtoId(0))
+                && proto.instructions.iter().any(|entry| {
+                    matches!(entry.instruction, rivetlua_core::Instruction::Closure { .. })
+                })
+                && proto.instructions.iter().any(|entry| {
+                    matches!(
+                        entry.instruction,
+                        rivetlua_core::Instruction::GetTable { table, .. }
+                            if table == proto.global_environment
+                    )
+                })
+        })
+        .expect("exercise 須建立子 closure 並讀取 _ENV");
+    let upvalue = match exercise.frame.environment_source {
+        rivetlua_core::EnvironmentSource::ParentLocal { upvalue }
+        | rivetlua_core::EnvironmentSource::ParentUpvalue { upvalue } => upvalue,
+        other => panic!("exercise 須使用實體 _ENV capture: {other:?}"),
+    };
+    assert_eq!(upvalue.0, 0);
+    assert_eq!(
+        verified
+            .native_debug()
+            .and_then(|debug| debug.semantic_upvalue(exercise.id, 0)),
+        Some(rivetlua_core::bytecode::native_debug::NativeSemanticUpvalue::Closure(upvalue)),
+    );
+    let mut vm = Vm::new_with_services(
+        LuaProfile::Lua55,
+        HostServices::deny_all().and_debug(
+            DebugCapability::deny_all()
+                .allow(DebugPermission::Upvalues)
+                .allow(DebugPermission::UpvalueMutation)
+                .allow(DebugPermission::UpvalueIdentity),
+        ),
+    )
+    .unwrap();
+    vm.set_allocation_limit(64 * 1024 * 1024);
+    let environment = vm.allocate_table().unwrap();
+    let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+    vm.install_basic_builtins(environment).unwrap();
+    vm.install_debug_builtins(environment).unwrap();
+    // 安裝期間以 Host root 保護環境；基線扣除這個暫時 root。
+    let root_baseline = RootKind::ALL.map(|kind| {
+        let count = vm.roots().count(kind);
+        if kind == RootKind::Host {
+            count.checked_sub(1).expect("環境 Host root 須存在")
+        } else {
+            count
+        }
+    });
+    vm.set_collect_every_allocation(true);
+    let mut execution = vm
+        .load_with_environment(verified, Value::Object(environment))
+        .unwrap();
+    execution.set_fuel(500_000).unwrap();
+    let outcome = execution.run().unwrap();
+    drop(execution);
+    let RunOutcome::Returned(values) = outcome else {
+        panic!("Lua55 實體 _ENV join: {outcome:?}")
+    };
+    assert_eq!(values.len(), 6);
+    assert_eq!(bytes(&vm, values[0]), b"_ENV");
+    assert_eq!(values[1], Value::Nil);
+    assert_eq!(values[2], Value::Integer(47));
+    assert_eq!(values[3], Value::Boolean(true));
+    assert_eq!(values[4], Value::Integer(47));
+    assert_eq!(values[5], Value::Boolean(true));
+    drop(values);
+    vm.remove_root(environment_root).unwrap();
+    vm.collect().unwrap();
+    assert_eq!(
+        RootKind::ALL.map(|kind| vm.roots().count(kind)),
+        root_baseline,
+    );
+    assert_eq!(vm.ledger_snapshot().reserved, 0);
 }
 
 #[test]
