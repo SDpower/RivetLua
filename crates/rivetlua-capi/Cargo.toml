@@ -20,6 +20,7 @@ lua55 = []
 lua54 = []
 
 [dependencies]
+libc = "=0.2.190"
 rivetlua-core = { path = "../rivetlua-core" }
 rivetlua-compiler = { path = "../rivetlua-compiler" }
 rivetlua-runtime = { path = "../rivetlua-runtime" }

@@ -39,7 +39,7 @@ use rivetlua::{
     HostResourceErrorKind, HostServices, HostSourceReader, HostWarning, HostWarningError,
     InputFormat, LoadBudget, LoadCapability, LoadFormat, LoadLimits, LuaProfile, Module,
     ResourceBudget, ResourceCapability, RunOutcome, RuntimeErrorKind, SdkError, TransportBudget,
-    Value, Vm, VmError, compatibility_entries,
+    Value, Vm, VmError, VmPolicy, compatibility_entries,
 };
 
 const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -455,6 +455,7 @@ enum Action {
 #[derive(Debug)]
 struct Options {
     profile: LuaProfile,
+    vm_policy: VmPolicy,
     compatibility: bool,
     gaps: bool,
     ignore_environment: bool,
@@ -502,6 +503,7 @@ fn os_from_bytes(value: &[u8]) -> OsString {
 
 fn parse_options(args: &[OsString]) -> CliResult<Options> {
     let mut profile = default_profile();
+    let mut vm_policy = VmPolicy::Compatibility;
     let mut compatibility = false;
     let mut gaps = false;
     let mut ignore_environment = false;
@@ -572,6 +574,14 @@ fn parse_options(args: &[OsString]) -> CliResult<Options> {
             } else {
                 Action::Require(value)
             });
+        } else if bytes == b"--vm-policy" {
+            i += 1;
+            let Some(value) = args.get(i).map(|arg| os_bytes(arg)) else {
+                return Err(CliFailure::usage("--vm-policy 需要 compatibility、sandbox 或 private-service"));
+            };
+            vm_policy = parse_vm_policy(&value)?;
+        } else if bytes.starts_with(b"--vm-policy=") {
+            vm_policy = parse_vm_policy(&bytes[b"--vm-policy=".len()..])?;
         } else if bytes == b"--profile" {
             i += 1;
             let Some(value) = args.get(i).map(|arg| os_bytes(arg)) else {
@@ -597,7 +607,8 @@ fn parse_options(args: &[OsString]) -> CliResult<Options> {
         script_index = 0;
     }
     if compatibility {
-        if ignore_environment
+        if vm_policy != VmPolicy::Compatibility
+            || ignore_environment
             || show_version
             || interactive
             || !actions.is_empty()
@@ -612,6 +623,7 @@ fn parse_options(args: &[OsString]) -> CliResult<Options> {
     }
     Ok(Options {
         profile,
+        vm_policy,
         compatibility,
         gaps,
         ignore_environment,
@@ -622,6 +634,15 @@ fn parse_options(args: &[OsString]) -> CliResult<Options> {
         script,
         stdin_as_file_after_double_dash,
     })
+}
+
+fn parse_vm_policy(value: &[u8]) -> CliResult<VmPolicy> {
+    match value {
+        b"compatibility" => Ok(VmPolicy::Compatibility),
+        b"sandbox" => Ok(VmPolicy::Sandbox),
+        b"private-service" => Ok(VmPolicy::PrivateService),
+        _ => Err(CliFailure::usage("--vm-policy 只接受 compatibility、sandbox 或 private-service")),
+    }
 }
 
 fn parse_profile(value: &[u8]) -> CliResult<LuaProfile> {
@@ -1512,6 +1533,12 @@ fn script_values(
         RunOutcome::Aborted(AbortReason::FuelExhausted) => {
             return Err(CliFailure::failed("script args 長度執行額度耗盡"));
         }
+        RunOutcome::Aborted(AbortReason::OutputLimit) => {
+            return Err(CliFailure::failed("E_OUTPUT_LIMIT"));
+        }
+        RunOutcome::SafeDiagnostic(diagnostic) => {
+            return Err(report_safe_diagnostic(diagnostic, errors)?);
+        }
         RunOutcome::PendingClose(_) => {
             return Err(CliFailure::failed(
                 "script args 長度等待 close continuation",
@@ -1774,6 +1801,20 @@ fn report_unsupported_run_outcome(
 ) -> CliResult<CliFailure> {
     let failure = CliFailure::failed(format!(
         "{operation} 遇到 CLI 不支援的 VM outcome：{outcome:?}"
+    ));
+    write_bytes(errors, b"rivetlua: ")?;
+    write_bytes(errors, &failure.message)?;
+    write_bytes(errors, b"\n")?;
+    Ok(failure)
+}
+
+fn report_safe_diagnostic(
+    diagnostic: rivetlua::SafeDiagnostic,
+    errors: &mut dyn Write,
+) -> CliResult<CliFailure> {
+    let failure = CliFailure::failed(format!(
+        "{} #{}",
+        diagnostic.public_code, diagnostic.correlation_id
     ));
     write_bytes(errors, b"rivetlua: ")?;
     write_bytes(errors, &failure.message)?;
@@ -2097,6 +2138,13 @@ fn run_module(
             write_bytes(errors, "rivetlua: 執行額度耗盡\n".as_bytes())?;
             Err(CliFailure::failed("執行額度耗盡"))
         }
+        RunOutcome::Aborted(AbortReason::OutputLimit) => {
+            write_bytes(errors, b"rivetlua: E_OUTPUT_LIMIT\n")?;
+            Err(CliFailure::failed("E_OUTPUT_LIMIT"))
+        }
+        RunOutcome::SafeDiagnostic(diagnostic) => {
+            Err(report_safe_diagnostic(diagnostic, errors)?)
+        }
         RunOutcome::PendingClose(snapshot) => {
             write_bytes(
                 errors,
@@ -2179,6 +2227,13 @@ fn print_interactive_values_with_fuel(
         RunOutcome::Aborted(AbortReason::FuelExhausted) => {
             write_bytes(errors, "rivetlua: REPL print 執行額度耗盡\n".as_bytes())?;
             Err(CliFailure::failed("REPL print 執行額度耗盡"))
+        }
+        RunOutcome::Aborted(AbortReason::OutputLimit) => {
+            write_bytes(errors, b"rivetlua: E_OUTPUT_LIMIT\n")?;
+            Err(CliFailure::failed("E_OUTPUT_LIMIT"))
+        }
+        RunOutcome::SafeDiagnostic(diagnostic) => {
+            Err(report_safe_diagnostic(diagnostic, errors)?)
         }
         RunOutcome::PendingClose(snapshot) => {
             write_bytes(
@@ -2402,6 +2457,9 @@ fn run_require_action(
             Err(CliFailure::failed("-l 載入模組失敗"))
         }
         RunOutcome::Aborted(_) => Err(CliFailure::failed("-l 載入模組時執行額度耗盡")),
+        RunOutcome::SafeDiagnostic(diagnostic) => {
+            Err(report_safe_diagnostic(diagnostic, errors)?)
+        }
         RunOutcome::PendingClose(_) => {
             Err(CliFailure::failed("-l 載入模組等待 close continuation"))
         }
@@ -2476,6 +2534,9 @@ fn call_original_warning(
             write_lua_error(vm, &error, errors, None)?;
             Err(CliFailure::failed("CLI warning 控制發生 Lua 錯誤"))
         }
+        RunOutcome::SafeDiagnostic(diagnostic) => {
+            Err(report_safe_diagnostic(diagnostic, errors)?)
+        }
         other => Err(report_unsupported_run_outcome(
             "CLI warning 控制",
             &other,
@@ -2523,6 +2584,13 @@ fn run_repl_module(
         RunOutcome::Aborted(AbortReason::FuelExhausted) => {
             write_bytes(errors, "rivetlua: 執行額度耗盡\n".as_bytes())?;
             Err(CliFailure::failed("執行額度耗盡"))
+        }
+        RunOutcome::Aborted(AbortReason::OutputLimit) => {
+            write_bytes(errors, b"rivetlua: E_OUTPUT_LIMIT\n")?;
+            Err(CliFailure::failed("E_OUTPUT_LIMIT"))
+        }
+        RunOutcome::SafeDiagnostic(diagnostic) => {
+            Err(report_safe_diagnostic(diagnostic, errors)?)
         }
         RunOutcome::PendingClose(snapshot) => {
             write_bytes(
@@ -2600,6 +2668,12 @@ fn write_repl_prompt(
             }
             RunOutcome::Aborted(AbortReason::FuelExhausted) => {
                 return Err(CliFailure::failed("REPL prompt 執行額度耗盡"));
+            }
+            RunOutcome::Aborted(AbortReason::OutputLimit) => {
+                return Err(CliFailure::failed("E_OUTPUT_LIMIT"));
+            }
+            RunOutcome::SafeDiagnostic(diagnostic) => {
+                return Err(report_safe_diagnostic(diagnostic, errors)?);
             }
             RunOutcome::PendingClose(snapshot) => {
                 return Err(CliFailure::failed(format!(
@@ -2827,7 +2901,7 @@ fn sdk_failure(error: SdkError) -> CliFailure {
 }
 
 fn usage() -> &'static [u8] {
-    "用法：rivetlua [--profile lua55|lua54] [-E] [-v] [-i] [-e 程式] [-l 模組] [--] [檔案 [參數...]]\n       rivetlua [--profile lua55|lua54] --compatibility [--gaps]\n".as_bytes()
+    "用法：rivetlua [--profile lua55|lua54] [--vm-policy compatibility|sandbox|private-service] [-E] [-v] [-i] [-e 程式] [-l 模組] [--] [檔案 [參數...]]\n       rivetlua [--profile lua55|lua54] --compatibility [--gaps]\n".as_bytes()
 }
 
 fn compatibility_query(profile: LuaProfile, gaps: bool, stdout: &mut dyn Write) -> CliResult<u8> {
@@ -4544,6 +4618,14 @@ fn run_interpreter_inner(
     if options.compatibility {
         return compatibility_query(options.profile, options.gaps, stdout);
     }
+    if options.vm_policy != VmPolicy::Compatibility {
+        if options.script.as_ref().is_some_and(|script| os_bytes(script) != b"-") {
+            return Err(CliFailure::failed("E_POLICY_DENIED"));
+        }
+        if std::env::var_os("RIVETLUA_NATIVE_MANIFEST").is_some() {
+            return Err(CliFailure::failed("E_POLICY_DENIED"));
+        }
+    }
     let _signal_session = if standalone_signal
         && (!options.show_version
             || options.interactive
@@ -4581,7 +4663,13 @@ fn run_interpreter_inner(
     let trusted = bridge.grant.is_some();
     #[cfg(not(any(feature = "native-lua55", feature = "native-lua54")))]
     let trusted = false;
-    let services = host_services(&engine, capability_cpath, trusted);
+    let services = if options.vm_policy == VmPolicy::Compatibility {
+        host_services(&engine, capability_cpath, trusted)
+    } else {
+        HostServices::with_output(StdoutOutput)
+            .and_warning(CliWarning::default())
+            .and_policy(options.vm_policy)
+    };
     #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
     let mut vm = if native_cpath.is_some() {
         engine.new_vm_with_native_services(services)

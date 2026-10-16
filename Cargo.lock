@@ -379,6 +379,7 @@ name = "rivetlua-capi"
 version = "0.0.0"
 dependencies = [
  "cc",
+ "libc",
  "rivetlua-compiler",
  "rivetlua-core",
  "rivetlua-runtime",

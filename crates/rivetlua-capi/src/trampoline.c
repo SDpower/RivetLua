@@ -1302,9 +1302,8 @@ int luaL_getsubtable(lua_State *state, int index, const char *name) {
   return 0;
 }
 
-void luaL_requiref(lua_State *state, const char *modname,
-                   lua_CFunction openf, int glb) {
-  luaL_getsubtable(state, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+static void rivetlua_b2_requiref_loaded(lua_State *state, const char *modname,
+                                        lua_CFunction openf, int glb) {
   lua_getfield(state, -1, modname);
   if (!lua_toboolean(state, -1)) {
     lua_pop(state, 1);
@@ -1321,10 +1320,17 @@ void luaL_requiref(lua_State *state, const char *modname,
   }
 }
 
+void luaL_requiref(lua_State *state, const char *modname,
+                   lua_CFunction openf, int glb) {
+  luaL_getsubtable(state, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+  rivetlua_b2_requiref_loaded(state, modname, openf, glb);
+}
+
 typedef struct rivetlua_b2_requiref_context {
   const char *name;
   lua_CFunction opener;
   int global;
+  int (*private_loaded)(lua_State *);
   int status;
   struct rivetlua_b2_requiref_context *previous;
 } rivetlua_b2_requiref_context;
@@ -1334,7 +1340,15 @@ static _Thread_local rivetlua_b2_requiref_context *rivetlua_b2_requiref_top;
 static int rivetlua_b2_requiref_body(lua_State *state) {
   rivetlua_b2_requiref_context *context = rivetlua_b2_requiref_top;
   if (context == NULL) return luaL_error(state, "requiref context unavailable");
-  luaL_requiref(state, context->name, context->opener, context->global);
+  if (context->private_loaded) {
+    /* Rust 私有 callback 只在此 body 呼叫；opener 無法取得其函式指標。 */
+    if (!context->private_loaded(state))
+      return luaL_error(state, "private loaded table unavailable");
+    rivetlua_b2_requiref_loaded(state, context->name,
+                                context->opener, context->global);
+  } else {
+    luaL_requiref(state, context->name, context->opener, context->global);
+  }
   return 1;
 }
 
@@ -1351,10 +1365,11 @@ static rivetlua_capi_action_a1 rivetlua_b2_requiref_action(
 
 /* Rust 宿主入口只讀取 status；opener 的所有跳轉均止於純 C checkpoint。 */
 int rivetlua_capi_requiref_protected_b2(lua_State *state, const char *name,
-                                         lua_CFunction opener, int global) {
+                                          lua_CFunction opener, int global,
+                                          int (*private_loaded)(lua_State *)) {
   if (state == NULL || name == NULL || opener == NULL) return -1;
   rivetlua_b2_requiref_context request = {
-      name, opener, global, LUA_ERRRUN, rivetlua_b2_requiref_top};
+      name, opener, global, private_loaded, LUA_ERRRUN, rivetlua_b2_requiref_top};
   rivetlua_b2_requiref_top = &request;
   rivetlua_capi_outcome_a1 outcome = rivetlua_capi_trampoline_protect_a1(
       state, rivetlua_b2_requiref_action, &request);
@@ -3483,9 +3498,10 @@ extern int rivetlua_capi_restore_reader_stack_b3(
 extern rivetlua_b3_dump_start rivetlua_capi_dump_begin_b3(
     lua_State *state, int strip);
 extern void rivetlua_capi_dump_drop_b3(void *session);
+extern int rivetlua_capi_allow_file_load_b22(lua_State *state);
 
 enum { RV_B3_SYNTAX = 1, RV_B3_MEMORY = 2, RV_B3_BUDGET = 3,
-       RV_B3_FILE = 4 };
+       RV_B3_FILE = 4, RV_B3_POLICY = 5, RV_B3_OUTPUT_LIMIT = 6 };
 
 typedef struct {
   lua_Reader reader;
@@ -3672,14 +3688,15 @@ static const char *rivetlua_b3_read_file(
 }
 
 int luaL_loadfilex(lua_State *state, const char *filename, const char *mode) {
-  FILE *file = filename == NULL ? stdin : fopen(filename, "rb");
+  int permitted = rivetlua_capi_allow_file_load_b22(state);
+  FILE *file = !permitted ? NULL : filename == NULL ? stdin : fopen(filename, "rb");
   rivetlua_b3_file_reader reader = {file, {0}};
   rivetlua_b3_load_context load = {
     .reader = rivetlua_b3_read_file, .data = &reader,
     .chunkname = filename == NULL ? "=stdin" : filename,
     .mode = mode, .file_style = filename == NULL ? 2 : 1,
     .file = file, .own_file = filename != NULL && file != NULL,
-    .initial_fault = file == NULL ? RV_B3_FILE : 0,
+    .initial_fault = !permitted ? RV_B3_POLICY : file == NULL ? RV_B3_FILE : 0,
   };
   return rivetlua_b3_load_common(&load, state);
 }

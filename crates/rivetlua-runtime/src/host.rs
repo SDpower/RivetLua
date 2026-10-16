@@ -7,6 +7,8 @@ use rivetlua_core::{LuaProfile, VerifiedModule, VerifyLimits};
 
 use crate::VmError;
 use crate::alloc::{AllocationCharges, AllocationLedger};
+use crate::policy::{ExportPolicy, OutputBudget, PolicyCapabilities, PolicyClock, VmPolicy};
+use rivetlua_core::VmId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostLoadErrorKind {
@@ -470,6 +472,7 @@ pub trait HostOutput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostWarningError {
     WriteFailed,
+    OutputLimit,
 }
 
 /// 純 Rust 宿主的 warning 端點；C native session 使用獨立的 lua_warning 橋接。
@@ -585,6 +588,11 @@ pub struct HostServices {
     pub(crate) resource: ResourceCapability,
     pub(crate) debug: DebugCapability,
     pub(crate) dump: DumpCapability,
+    policy: VmPolicy,
+    policy_capabilities: Option<PolicyCapabilities>,
+    policy_clock: Option<Box<dyn PolicyClock>>,
+    output_budget: Option<OutputBudget>,
+    export_policy: ExportPolicy,
 }
 
 impl HostServices {
@@ -635,6 +643,73 @@ impl HostServices {
         self
     }
 
+    pub fn and_policy(mut self, policy: VmPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn and_policy_capabilities(mut self, capabilities: PolicyCapabilities) -> Self {
+        self.policy_capabilities = Some(capabilities);
+        self
+    }
+
+    pub fn and_policy_clock(mut self, clock: impl PolicyClock + 'static) -> Self {
+        self.policy_clock = Some(Box::new(clock));
+        self
+    }
+
+    pub fn and_output_budget(mut self, budget: OutputBudget) -> Self {
+        self.output_budget = Some(budget);
+        self
+    }
+
+    pub fn and_export_policy(mut self, policy: ExportPolicy) -> Self {
+        self.export_policy = policy;
+        self
+    }
+
+    pub fn policy(&self) -> VmPolicy {
+        self.policy
+    }
+
+    pub(crate) fn effective_output_budget(&self) -> OutputBudget {
+        self.output_budget.unwrap_or_else(|| {
+            if self.policy == VmPolicy::Compatibility {
+                OutputBudget::unlimited()
+            } else {
+                OutputBudget::default()
+            }
+        })
+    }
+
+    pub(crate) fn explicit_output_budget(&self) -> bool {
+        self.output_budget.is_some()
+    }
+
+    pub(crate) fn export_policy(&self) -> ExportPolicy {
+        self.export_policy
+    }
+
+    pub(crate) fn apply_policy_restrictions(&mut self) {
+        if self.policy == VmPolicy::Compatibility {
+            return;
+        }
+        self.debug = DebugCapability::deny_all();
+        self.dump = DumpCapability::deny_all();
+        self.load.native = None;
+        self.load.foreign_native_cpath = None;
+        self.load.allow_bytecode = false;
+        self.load.allow_official_bytecode = false;
+    }
+
+    pub(crate) fn policy_issuer(&self) -> Option<VmId> {
+        self.policy_capabilities.as_ref().map(|capabilities| capabilities.issuer)
+    }
+
+    pub(crate) fn policy_now(&self) -> Option<u64> {
+        self.policy_clock.as_ref().map(|clock| clock.now())
+    }
+
     pub(crate) fn entropy_seed(&mut self) -> Result<u64, HostEntropyServiceError> {
         let Some(entropy) = self.entropy.as_mut() else {
             return Err(HostEntropyServiceError::PolicyDenied);
@@ -673,6 +748,7 @@ impl HostServices {
 pub(crate) enum HostServiceError {
     PolicyDenied,
     OutputFailed,
+    OutputLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

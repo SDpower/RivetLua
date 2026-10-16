@@ -44,6 +44,7 @@ use crate::pending_op::{
     BasicPending, DebugBuiltinReturn, DebugTransfer, HostCallbackPending, PendingKind, PendingOp,
     PendingStack, PendingTableKind, PrintArguments, ResumeStage,
 };
+use crate::policy::{SafeDiagnostic, VmPolicy};
 use crate::stdlib::basic::{self, BasicBuiltin};
 use crate::stdlib::debug::{self as debug_lib, DebugBuiltin, DebugHook, DebugHookEvent};
 use crate::stdlib::format::{self as format_lib, FormatState, Token as FormatToken};
@@ -738,6 +739,7 @@ pub enum RuntimeErrorKind {
     CoroutineClose,
     HostPolicyOutput,
     HostOutputFailed,
+    OutputLimit,
     HostWarningFailed,
     HostPolicyEntropy,
     HostEntropyFailed,
@@ -967,6 +969,7 @@ impl RuntimeError {
             RuntimeErrorKind::CoroutineClose => "E_COROUTINE_CLOSE",
             RuntimeErrorKind::HostPolicyOutput => "E_HOST_POLICY_OUTPUT",
             RuntimeErrorKind::HostOutputFailed => "E_HOST_OUTPUT_FAILED",
+            RuntimeErrorKind::OutputLimit => "E_OUTPUT_LIMIT",
             RuntimeErrorKind::HostWarningFailed => "E_HOST_WARNING_FAILED",
             RuntimeErrorKind::HostPolicyEntropy => "E_HOST_POLICY_ENTROPY",
             RuntimeErrorKind::HostEntropyFailed => "E_HOST_ENTROPY_FAILED",
@@ -1045,6 +1048,7 @@ impl From<CoreError> for RuntimeError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AbortReason {
     FuelExhausted,
+    OutputLimit,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1065,6 +1069,8 @@ pub enum RunOutcome {
     NestedErrored(crate::LuaError),
     /// 巢狀呼叫的非 Lua 失敗仍保留外層 parked core 與錯誤類別。
     NestedFailed(RuntimeError),
+    /// 受限 VM 僅向宿主揭露公開錯誤碼與關聯編號。
+    SafeDiagnostic(SafeDiagnostic),
 }
 
 /// 單一 VM parked execution 的不可偽造續接身分。
@@ -1208,6 +1214,11 @@ pub enum ExternalCommand {
         operation: ValueOperation,
         args: Vec<Value>,
     },
+}
+
+enum ExternalCompletion {
+    Presented(Result<(RunOutcome, u64), RuntimeError>),
+    Pending(RunOutcome),
 }
 
 /// C API 單次數值、比較、長度、串接或表操作；語意與 bytecode 共用執行路徑。
@@ -1586,6 +1597,7 @@ pub struct Execution<'vm> {
     gc_finalizer_parent: bool,
     terminal_shutdown_drain: bool,
     nested_repark_token: Option<ExternalToken>,
+    native_internal_output: bool,
     state: ExecutionState,
 }
 
@@ -2022,6 +2034,104 @@ impl Vm {
         })
     }
 
+    pub fn has_parked_executions(&self) -> bool {
+        !self.parked_executions.is_empty()
+    }
+
+    pub fn parked_fuel_remaining(&self, token: ExternalToken) -> Result<u64, RuntimeError> {
+        if token.vm != self.id() || token.depth != self.parked_executions.len() {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        self.parked_executions
+            .last()
+            .filter(|entry| entry.token == token)
+            .and_then(|entry| entry.core.as_ref())
+            .map(|core| core.fuel)
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))
+    }
+
+    pub fn set_parked_fuel_remaining(
+        &mut self,
+        token: ExternalToken,
+        remaining: u64,
+    ) -> Result<(), RuntimeError> {
+        if remaining > self.parked_fuel_remaining(token)? {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let core = self
+            .parked_executions
+            .last_mut()
+            .filter(|entry| entry.token == token)
+            .and_then(|entry| entry.core.as_mut())
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        core.fuel = remaining;
+        Ok(())
+    }
+
+    /// 僅在 Lua 與宿主邊界計量；受限政策的非純量值不可越界。
+    fn measure_host_values(&self, values: &[Value]) -> Option<(usize, usize)> {
+        let restricted = self.policy() != VmPolicy::Compatibility;
+        let measured = values.iter().try_fold(0_usize, |bytes, value| {
+            let size = match *value {
+                Value::Nil => 3,
+                Value::Boolean(false) => 5,
+                Value::Boolean(true) => 4,
+                Value::Integer(_) | Value::Float(_) => {
+                    basic_number_bytes(*value, self.language_profile())
+                        .map(|(_, len)| len)
+                        .ok()?
+                }
+                Value::Object(object)
+                    if self.object_kind(object).ok() == Some(ObjectKind::ByteString) =>
+                {
+                    self.with_byte_string(object, |string| string.as_bytes().len())
+                        .ok()?
+                }
+                _ if !restricted => core::mem::size_of::<Value>(),
+                _ => return None,
+            };
+            bytes.checked_add(size)
+        });
+        measured.and_then(|bytes| {
+            values
+                .len()
+                .checked_add(bytes)
+                .map(|work| (bytes, work.max(1)))
+        })
+    }
+
+    /// VM 所有的 C API bridge 僅在同 VM 內傳值；物件不會序列化為宿主輸出。
+    fn measure_native_internal_values(&self, values: &[Value]) -> Result<(usize, usize), RuntimeError> {
+        let mut bytes = 0_usize;
+        for &value in values {
+            let size = match value {
+                Value::Nil => 3,
+                Value::Boolean(false) => 5,
+                Value::Boolean(true) => 4,
+                Value::Integer(_) | Value::Float(_) => {
+                    basic_number_bytes(value, self.language_profile())?.1
+                }
+                Value::Object(object) => {
+                    if self.object_kind(object)? == ObjectKind::ByteString {
+                        self.with_byte_string(object, |string| string.as_bytes().len())?
+                    } else {
+                        0
+                    }
+                }
+                Value::CFunction(id) => {
+                    if id.vm() != self.id() {
+                        return Err(VmError::WrongVm.into());
+                    }
+                    0
+                }
+                Value::LightUserdata(_) => 0,
+            };
+            bytes = bytes.checked_add(size).ok_or(VmError::ArithmeticOverflow)?;
+        }
+        let work = values.len().checked_add(bytes).ok_or(VmError::ArithmeticOverflow)?;
+        Ok((bytes, work.max(1)))
+    }
+
     /// 讀取最上層 C closure callback 的即時 cell 值，不使用呼叫建立時的捕獲快照。
     pub fn external_capture(
         &self,
@@ -2314,6 +2424,34 @@ impl Vm {
         token: ExternalToken,
         command: ExternalCommand,
     ) -> Result<RunOutcome, RuntimeError> {
+        self.continue_external_with_fuel(token, command)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// 同一 parked core 的續接結果及最後剩餘 fuel；供隔離 worker 扣回 parent 額度。
+    pub fn continue_external_with_fuel(
+        &mut self,
+        token: ExternalToken,
+        command: ExternalCommand,
+    ) -> Result<(RunOutcome, u64), RuntimeError> {
+        self.continue_external_with_audience(token, command, false)
+    }
+
+    /// 只供受控 C API bridge 的同 VM 續接；不供 Lua/C guest 選擇輸出 audience。
+    pub fn continue_external_native_internal_with_fuel(
+        &mut self,
+        token: ExternalToken,
+        command: ExternalCommand,
+    ) -> Result<(RunOutcome, u64), RuntimeError> {
+        self.continue_external_with_audience(token, command, true)
+    }
+
+    fn continue_external_with_audience(
+        &mut self,
+        token: ExternalToken,
+        command: ExternalCommand,
+        native_internal: bool,
+    ) -> Result<(RunOutcome, u64), RuntimeError> {
         if self.execution_running() {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
         }
@@ -2333,12 +2471,65 @@ impl Vm {
             if !request.close {
                 self.cleanup_parked_on_drop();
             }
-            return Ok(RunOutcome::Exited(request));
+            return Ok((RunOutcome::Exited(request), 0));
+        }
+        if self.meter_host_results() {
+            let values = match &command {
+                ExternalCommand::Return(values)
+                | ExternalCommand::NestedCall { args: values, .. }
+                | ExternalCommand::NestedOperation { args: values, .. } => values.as_slice(),
+                ExternalCommand::Error(value) => core::slice::from_ref(value),
+            };
+            let measured = if native_internal {
+                match self.measure_native_internal_values(values) {
+                    Ok(measured) => Some(measured),
+                    Err(error) => {
+                        self.abort_external(token)?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                self.measure_host_values(values)
+            };
+            let stop = if let Some((bytes, work)) = measured {
+                let finalizer_running = self.finalizer_running();
+                let core = self
+                    .parked_executions
+                    .last_mut()
+                    .filter(|entry| entry.token == token)
+                    .and_then(|entry| entry.core.as_mut())
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+                let charged = charge_native_units(
+                    &mut core.fuel,
+                    &mut core.finalizer_steps,
+                    finalizer_running,
+                    work,
+                );
+                match charged {
+                    Ok(false) => Some(AbortReason::FuelExhausted),
+                    Ok(true) if self.charge_output(bytes, 0, work).is_err() => {
+                        Some(AbortReason::OutputLimit)
+                    }
+                    Ok(true) => None,
+                    Err(error) => {
+                        self.abort_external(token)?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                self.reject_output();
+                Some(AbortReason::OutputLimit)
+            };
+            if let Some(reason) = stop {
+                self.abort_external(token)?;
+                return Ok((RunOutcome::Aborted(reason), 0));
+            }
         }
         match command {
             ExternalCommand::Return(values) => {
                 let core = self.take_top_external_core(token)?;
                 let mut execution = Execution::from_core(self, core);
+                execution.native_internal_output = native_internal;
                 let action = || {
                     execution.clear_external_nested_result()?;
                     execution.complete_external_return(values)
@@ -2360,44 +2551,36 @@ impl Vm {
                     }
                 };
                 match outcome {
-                    Ok(value) => {
-                        if matches!(
-                            value,
-                            RunOutcome::NestedReturned(_)
-                                | RunOutcome::NestedErrored(_)
-                                | RunOutcome::NestedFailed(_)
-                        ) {
-                            if let Some(parent) = execution.nested_repark_token.take() {
-                                let core = execution.take_core();
-                                execution.vm.restore_external_core(parent, core)?;
-                            }
-                        }
-                        Ok(value)
+                    Ok(ExternalCompletion::Presented(outcome)) => outcome,
+                    Ok(ExternalCompletion::Pending(value)) => {
+                        let (outcome, remaining) =
+                            execution.present_and_repark_nested_with_fuel(Ok(value));
+                        outcome.map(|outcome| (outcome, remaining))
                     }
                     Err(error) => {
                         if !execution.external_nested.is_empty() {
                             if let Ok(outcome) = execution.finish_external_nested_failure(error) {
-                                let parent = execution.nested_repark_token.take().ok_or(
-                                    RuntimeError::new(RuntimeErrorKind::TerminalExecution),
-                                )?;
-                                let core = execution.take_core();
-                                execution.vm.restore_external_core(parent, core)?;
-                                return Ok(outcome);
+                                let (outcome, remaining) =
+                                    execution.present_and_repark_nested_with_fuel(Ok(outcome));
+                                return outcome.map(|outcome| (outcome, remaining));
                             }
                         }
+                        let presented = execution.present_host_outcome(Err(error));
+                        let remaining = execution.fuel;
                         execution.state = ExecutionState::Failed;
                         let cleanup = execution.finish_owned_external_abort();
                         execution.state = ExecutionState::Parked;
                         execution.vm.discard_empty_external_markers();
                         // 清理已嘗試；原本的 callback/VM 錯誤不可被次要錯誤取代。
                         let _ = cleanup;
-                        Err(error)
+                        presented.map(|outcome| (outcome, remaining))
                     }
                 }
             }
             ExternalCommand::Error(value) => {
                 let core = self.take_top_external_core(token)?;
                 let mut execution = Execution::from_core(self, core);
+                execution.native_internal_output = native_internal;
                 #[cfg_attr(feature = "std", allow(unused_mut))]
                 let mut action = || {
                     execution.clear_external_nested_result()?;
@@ -2420,37 +2603,28 @@ impl Vm {
                     }
                 };
                 match outcome {
-                    Ok(value) => {
-                        if matches!(
-                            value,
-                            RunOutcome::NestedReturned(_)
-                                | RunOutcome::NestedErrored(_)
-                                | RunOutcome::NestedFailed(_)
-                        ) {
-                            if let Some(parent) = execution.nested_repark_token.take() {
-                                let core = execution.take_core();
-                                execution.vm.restore_external_core(parent, core)?;
-                            }
-                        }
-                        Ok(value)
+                    Ok(ExternalCompletion::Presented(outcome)) => outcome,
+                    Ok(ExternalCompletion::Pending(value)) => {
+                        let (outcome, remaining) =
+                            execution.present_and_repark_nested_with_fuel(Ok(value));
+                        outcome.map(|outcome| (outcome, remaining))
                     }
                     Err(error) => {
                         if !execution.external_nested.is_empty() {
                             if let Ok(outcome) = execution.finish_external_nested_failure(error) {
-                                let parent = execution.nested_repark_token.take().ok_or(
-                                    RuntimeError::new(RuntimeErrorKind::TerminalExecution),
-                                )?;
-                                let core = execution.take_core();
-                                execution.vm.restore_external_core(parent, core)?;
-                                return Ok(outcome);
+                                let (outcome, remaining) =
+                                    execution.present_and_repark_nested_with_fuel(Ok(outcome));
+                                return outcome.map(|outcome| (outcome, remaining));
                             }
                         }
+                        let presented = execution.present_host_outcome(Err(error));
+                        let remaining = execution.fuel;
                         execution.state = ExecutionState::Failed;
                         let cleanup = execution.finish_owned_external_abort();
                         execution.state = ExecutionState::Parked;
                         execution.vm.discard_empty_external_markers();
                         let _ = cleanup;
-                        Err(error)
+                        presented.map(|outcome| (outcome, remaining))
                     }
                 }
             }
@@ -2461,6 +2635,7 @@ impl Vm {
             } => {
                 let core = self.borrow_top_external_core(token)?;
                 let mut execution = Execution::from_core(self, core);
+                execution.native_internal_output = native_internal;
                 #[cfg_attr(feature = "std", allow(unused_mut))]
                 let mut action = || {
                     execution.start_external_nested(token, target, &args, results, None)
@@ -2489,12 +2664,13 @@ impl Vm {
                     }
                     Ok(()) => {}
                 }
-                execution.run()
+                execution.run_with_fuel()
             }
             ExternalCommand::NestedOperation { operation, args } => {
                 ValueOperation::validate(operation, args.len())?;
                 let core = self.borrow_top_external_core(token)?;
                 let mut execution = Execution::from_core(self, core);
+                execution.native_internal_output = native_internal;
                 #[cfg_attr(feature = "std", allow(unused_mut))]
                 let mut action = || {
                     execution.start_external_nested(
@@ -2529,7 +2705,7 @@ impl Vm {
                     }
                     Ok(()) => {}
                 }
-                execution.run()
+                execution.run_with_fuel()
             }
         }
     }
@@ -3294,7 +3470,7 @@ impl<'vm> Execution<'vm> {
         Ok(())
     }
 
-    fn complete_external_error(&mut self, value: Value) -> Result<RunOutcome, RuntimeError> {
+    fn complete_external_error(&mut self, value: Value) -> Result<ExternalCompletion, RuntimeError> {
         if self.external_pending.is_none() {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
         }
@@ -3320,7 +3496,7 @@ impl<'vm> Execution<'vm> {
             unwind.error = error;
             unwind.failed = true;
             unwind.waiting_depth = None;
-            return self.run();
+            return Ok(ExternalCompletion::Presented(self.run_with_fuel()));
         }
         let mut held = PrintArguments::new(self.vm, &[value])?;
         let mut pending = self
@@ -3329,12 +3505,14 @@ impl<'vm> Execution<'vm> {
             .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
         self.state = ExecutionState::Ready;
         let error = explicit_error(value, self.frame.pc);
-        let result = (|| -> Result<RunOutcome, RuntimeError> {
+        let result = (|| -> Result<ExternalCompletion, RuntimeError> {
             if self.begin_close_unwind(error)? {
-                return self.run();
+                return Ok(ExternalCompletion::Presented(self.run_with_fuel()));
             }
             match self.handle_protected_error(error)? {
-                ProtectedErrorResult::Caught(DispatchResult::Continue) => self.run(),
+                ProtectedErrorResult::Caught(DispatchResult::Continue) => {
+                    Ok(ExternalCompletion::Presented(self.run_with_fuel()))
+                }
                 ProtectedErrorResult::Caught(DispatchResult::Returned(values, ticket)) => {
                     drop(ticket);
                     if self
@@ -3343,14 +3521,16 @@ impl<'vm> Execution<'vm> {
                         .is_some_and(|nested| self.callers.len() == nested.caller_depth + 1)
                     {
                         self.complete_external_nested_result(values)
+                            .map(ExternalCompletion::Pending)
                     } else {
                         self.state = ExecutionState::Returned;
                         self.finish()?;
-                        Ok(RunOutcome::Returned(values))
+                        Ok(ExternalCompletion::Pending(RunOutcome::Returned(values)))
                     }
                 }
                 ProtectedErrorResult::Uncaught(error) if !self.external_nested.is_empty() => {
                     self.finish_external_nested_error(error)
+                        .map(ExternalCompletion::Pending)
                 }
                 ProtectedErrorResult::Uncaught(error) => {
                     let preserved = crate::LuaError::from_runtime(
@@ -3362,15 +3542,22 @@ impl<'vm> Execution<'vm> {
                     )?;
                     self.state = ExecutionState::LuaError;
                     self.finish()?;
-                    Ok(RunOutcome::LuaError(preserved))
+                    Ok(ExternalCompletion::Pending(RunOutcome::LuaError(preserved)))
                 }
                 _ => Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution)),
             }
         })();
         let pending_cleanup = pending.clear_roots(self.vm);
         let held_cleanup = held.clear_roots(self.vm);
-        pending_cleanup?;
-        held_cleanup?;
+        if let Err(error) = pending_cleanup.and(held_cleanup.map_err(RuntimeError::from)) {
+            // run() 可能已呈現結果並移交 core；收尾錯誤不可再次使用 placeholder 計量。
+            return match result {
+                Ok(ExternalCompletion::Presented(_)) => {
+                    Ok(ExternalCompletion::Presented(Err(error)))
+                }
+                _ => Err(error),
+            };
+        }
         result
     }
 
@@ -3464,7 +3651,10 @@ impl<'vm> Execution<'vm> {
         Ok(())
     }
 
-    fn complete_external_return(&mut self, values: Vec<Value>) -> Result<RunOutcome, RuntimeError> {
+    fn complete_external_return(
+        &mut self,
+        values: Vec<Value>,
+    ) -> Result<ExternalCompletion, RuntimeError> {
         if self.external_pending.is_none() {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
         }
@@ -3510,7 +3700,7 @@ impl<'vm> Execution<'vm> {
                 }) {
                     let _ = self.propagate_tail_result(Vec::new(), None)?;
                 }
-                self.run()
+                Ok(ExternalCompletion::Presented(self.run_with_fuel()))
             }
             RegularCallAction::Completed(DispatchResult::Returned(values, ticket)) => {
                 if self.external_nested.last().is_some_and(|nested| {
@@ -3519,17 +3709,21 @@ impl<'vm> Execution<'vm> {
                         && self.frame.closure.is_none()
                 }) {
                     drop(ticket);
-                    return self.complete_external_nested_result(values);
+                    return self
+                        .complete_external_nested_result(values)
+                        .map(ExternalCompletion::Pending);
                 }
                 self.state = ExecutionState::Returned;
                 self.finish()?;
                 drop(ticket);
-                Ok(RunOutcome::Returned(values))
+                Ok(ExternalCompletion::Pending(RunOutcome::Returned(values)))
             }
             RegularCallAction::Aborted | RegularCallAction::Completed(DispatchResult::Aborted) => {
                 self.state = ExecutionState::Aborted;
                 self.finish()?;
-                Ok(RunOutcome::Aborted(AbortReason::FuelExhausted))
+                Ok(ExternalCompletion::Pending(RunOutcome::Aborted(
+                    AbortReason::FuelExhausted,
+                )))
             }
             RegularCallAction::Completed(_) => {
                 Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution))
@@ -3752,6 +3946,7 @@ impl<'vm> Execution<'vm> {
             gc_finalizer_parent: core.gc_finalizer_parent,
             terminal_shutdown_drain: core.terminal_shutdown_drain,
             nested_repark_token: core.nested_repark_token,
+            native_internal_output: false,
             state: core.state,
         }
     }
@@ -4461,6 +4656,27 @@ impl Vm {
         Ok(())
     }
 
+    fn append_finalizer_public_warning(
+        &mut self,
+        buffer: &mut basic::PrintBuffer,
+    ) -> Result<(), RuntimeError> {
+        let diagnostic = self.safe_diagnostic("E_LUA_THROWN");
+        buffer.append(diagnostic.public_code.as_bytes())?;
+        buffer.append(b":")?;
+        let mut digits = [0_u8; 20];
+        let mut first = digits.len();
+        let mut number = diagnostic.correlation_id;
+        loop {
+            first -= 1;
+            digits[first] = b'0' + (number % 10) as u8;
+            number /= 10;
+            if number == 0 {
+                break;
+            }
+        }
+        buffer.append(&digits[first..])
+    }
+
     fn finalizer_warning_error(error: RuntimeError) -> VmError {
         match error.kind {
             RuntimeErrorKind::Heap(error) => error,
@@ -4487,7 +4703,9 @@ impl Vm {
                 };
                 let mut owned = basic::PrintBuffer::new(self);
                 if segment == 3 {
-                    if let Some(message) = message {
+                    if self.policy() != VmPolicy::Compatibility {
+                        self.append_finalizer_public_warning(&mut owned)?;
+                    } else if let Some(message) = message {
                         self.with_byte_string(message, |string| owned.append(string.as_bytes()))??;
                     } else {
                         owned.append(bytes)?;
@@ -4501,7 +4719,14 @@ impl Vm {
                     .position(|byte| *byte == 0)
                     .unwrap_or(bytes.len());
                 self.write_host_warning(&bytes[..prefix], segment != 4)
-                    .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostWarningFailed))?;
+                    .map_err(|error| match error {
+                        crate::host::HostWarningError::OutputLimit => {
+                            RuntimeError::new(RuntimeErrorKind::OutputLimit)
+                        }
+                        crate::host::HostWarningError::WriteFailed => {
+                            RuntimeError::new(RuntimeErrorKind::HostWarningFailed)
+                        }
+                    })?;
                 Ok(())
             })();
             if let Err(error) = delivered {
@@ -5024,6 +5249,7 @@ impl Vm {
             gc_finalizer_parent: false,
             terminal_shutdown_drain: false,
             nested_repark_token: None,
+            native_internal_output: false,
             state: ExecutionState::Ready,
         })
     }
@@ -5104,6 +5330,9 @@ impl Vm {
         closure: ObjectRef,
         strip: bool,
     ) -> Result<CapiDumpBytes, RuntimeError> {
+        if self.policy() != crate::VmPolicy::Compatibility {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyStringDump));
+        }
         let limits = self.capi_dump_limits();
         let work_limit = u64::try_from(limits.max_work_units)
             .map_err(|_| RuntimeError::new(RuntimeErrorKind::HostDumpBudget))?;
@@ -5316,6 +5545,7 @@ impl Execution<'_> {
             gc_finalizer_parent: false,
             terminal_shutdown_drain: false,
             nested_repark_token: None,
+            native_internal_output: false,
             state: ExecutionState::Ready,
         })
     }
@@ -5641,6 +5871,7 @@ impl Execution<'_> {
             gc_finalizer_parent: false,
             terminal_shutdown_drain: false,
             nested_repark_token: None,
+            native_internal_output: false,
             state: ExecutionState::Ready,
         })
     }
@@ -9882,6 +10113,11 @@ impl Execution<'_> {
             }
         }
         let captures = &capture_values[..capture_count];
+        if !self.meter_native_internal_values(args)?
+            || !self.meter_native_internal_values(captures)?
+        {
+            return Ok(RegularCallAction::Aborted);
+        }
         let function_root = closure
             .map(|object| self.vm.add_root(RootKind::Temporary, object))
             .transpose()?;
@@ -9950,6 +10186,9 @@ impl Execution<'_> {
             return Ok(RegularCallAction::Aborted);
         }
         let (callback, captures, capture_ticket) = self.vm.callback_snapshot(id)?;
+        if !self.meter_callback_values(args)? || !self.meter_callback_values(&captures)? {
+            return Ok(RegularCallAction::Aborted);
+        }
         let mut context = CallbackContext::new(&captures, self.vm);
         let action = callback(&mut context, args);
         let callback_error = context.finish();
@@ -9968,6 +10207,18 @@ impl Execution<'_> {
         next: usize,
         continuation_completion: bool,
     ) -> Result<RegularCallAction, RuntimeError> {
+        let visible = match &action {
+            CallbackResult::Return(values)
+            | CallbackResult::Yield { values, .. }
+            | CallbackResult::Call { args: values, .. }
+            | CallbackResult::Resume { args: values, .. } => self.meter_callback_values(values)?,
+            CallbackResult::Throw(value) => {
+                self.meter_callback_values(core::slice::from_ref(value))?
+            }
+        };
+        if !visible {
+            return Ok(RegularCallAction::Aborted);
+        }
         match action {
             CallbackResult::Return(values) => {
                 if !self.charge_native_work(values.len())? {
@@ -20652,6 +20903,9 @@ impl Execution<'_> {
                     FailPoint::ReturnReserve,
                 )?;
                 values.extend_from_slice(&self.frame.registers[first..end]);
+                if !self.meter_callback_values(&values)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
                 let action = state.invoke(self.vm, &values)?;
                 let result = self.apply_callback_result(
                     action,
@@ -21338,6 +21592,9 @@ impl Execution<'_> {
                     }
                     Err(crate::host::HostServiceError::OutputFailed) => {
                         return Err(RuntimeError::new(RuntimeErrorKind::HostOutputFailed));
+                    }
+                    Err(crate::host::HostServiceError::OutputLimit) => {
+                        return Err(RuntimeError::new(RuntimeErrorKind::OutputLimit));
                     }
                 }
             }
@@ -23014,6 +23271,16 @@ impl Execution<'_> {
     /// 執行直到 Return、pending ClosePath、受控錯誤或 fuel 中止。
     /// PendingClose 保留 frame 與 roots；P11 接上 continuation 前不能再一般 run。
     pub fn run(&mut self) -> Result<RunOutcome, RuntimeError> {
+        self.run_with_fuel().map(|(outcome, _)| outcome)
+    }
+
+    /// 已 VM-owned 的 C API bridge 在同 VM 內交換值；外部 SDK `run` 仍走公開輸出規則。
+    pub fn run_native_internal_with_fuel(&mut self) -> Result<(RunOutcome, u64), RuntimeError> {
+        self.native_internal_output = true;
+        self.run_with_fuel()
+    }
+
+    pub fn run_with_fuel(&mut self) -> Result<(RunOutcome, u64), RuntimeError> {
         if self.vm.execution_running() {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
         }
@@ -23027,7 +23294,7 @@ impl Execution<'_> {
             } else {
                 self.vm.discard_empty_external_markers();
             }
-            return Ok(RunOutcome::Exited(request));
+            return Ok((RunOutcome::Exited(request), 0));
         }
         let shutdown_close_run = self.terminal_shutdown_drain && self.close_unwind.is_some();
         let parked_authorized = match (self.vm.parked_executions.last(), self.nested_origin) {
@@ -23069,6 +23336,7 @@ impl Execution<'_> {
                 resume_unwind(payload);
             }
         };
+        let (outcome, remaining) = self.present_and_repark_nested_with_fuel(outcome);
         match &outcome {
             Ok(RunOutcome::Exited(request)) => {
                 if !request.close {
@@ -23087,27 +23355,190 @@ impl Execution<'_> {
                     .restore_external_core(*token, core)
                     .expect("A5 close 邊界須回填既存 C marker");
             }
-            Ok(
-                RunOutcome::NestedReturned(_)
-                | RunOutcome::NestedErrored(_)
-                | RunOutcome::NestedFailed(_),
-            ) => {
-                let token = self
-                    .nested_repark_token
-                    .take()
-                    .expect("nested result 必須有既存外部 token");
-                let core = self.take_core();
-                self.vm
-                    .restore_external_core(token, core)
-                    .expect("nested result 必須回填最上層 marker");
-            }
             _ => {
                 if self.nested_origin.is_some() {
                     self.vm.discard_empty_external_markers();
                 }
             }
         }
-        outcome
+        outcome.map(|outcome| (outcome, remaining))
+    }
+
+    fn present_and_repark_nested_with_fuel(
+        &mut self,
+        outcome: Result<RunOutcome, RuntimeError>,
+    ) -> (Result<RunOutcome, RuntimeError>, u64) {
+        let was_nested = matches!(
+            &outcome,
+            Ok(
+                RunOutcome::NestedReturned(_)
+                    | RunOutcome::NestedErrored(_)
+                    | RunOutcome::NestedFailed(_)
+            )
+        );
+        let outcome = self.present_host_outcome(outcome);
+        let remaining = self.fuel;
+        if !was_nested {
+            return (outcome, remaining);
+        }
+        if matches!(&outcome, Ok(RunOutcome::Aborted(_)) | Err(_)) {
+            self.state = ExecutionState::Aborted;
+            let cleanup = self.finish_owned_external_abort();
+            self.state = ExecutionState::Parked;
+            self.nested_repark_token = None;
+            self.vm.discard_empty_external_markers();
+            if let Err(error) = cleanup {
+                return (Err(error), remaining);
+            }
+            return (outcome, remaining);
+        }
+        let token = self
+            .nested_repark_token
+            .take()
+            .expect("nested result 必須有既存外部 token");
+        let core = self.take_core();
+        self.vm
+            .restore_external_core(token, core)
+            .expect("nested result 必須回填最上層 marker");
+        (outcome, remaining)
+    }
+
+    fn present_host_outcome(
+        &mut self,
+        outcome: Result<RunOutcome, RuntimeError>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        if !self.vm.meter_host_results() {
+            return outcome;
+        }
+        let restricted = self.vm.policy() != VmPolicy::Compatibility && !self.native_internal_output;
+        match outcome {
+            Ok(RunOutcome::Returned(values)) => {
+                if let Some(reason) = self.meter_execution_values(&values)? {
+                    Ok(RunOutcome::Aborted(reason))
+                } else {
+                    Ok(RunOutcome::Returned(values))
+                }
+            }
+            Ok(RunOutcome::NestedReturned(values)) => {
+                if let Some(reason) = self.meter_execution_values(&values)? {
+                    Ok(RunOutcome::Aborted(reason))
+                } else {
+                    Ok(RunOutcome::NestedReturned(values))
+                }
+            }
+            Ok(RunOutcome::LuaError(error)) => {
+                if restricted {
+                    self.public_diagnostic(error.diagnostic_id)
+                } else if let Some(reason) = self.meter_execution_diagnostic(error.diagnostic_id)? {
+                    Ok(RunOutcome::Aborted(reason))
+                } else {
+                    Ok(RunOutcome::LuaError(error))
+                }
+            }
+            Ok(RunOutcome::NestedErrored(error)) => {
+                if restricted {
+                    self.public_diagnostic(error.diagnostic_id)
+                } else if let Some(reason) = self.meter_execution_diagnostic(error.diagnostic_id)? {
+                    Ok(RunOutcome::Aborted(reason))
+                } else {
+                    Ok(RunOutcome::NestedErrored(error))
+                }
+            }
+            Ok(RunOutcome::NestedFailed(error)) => {
+                if restricted {
+                    self.public_diagnostic(error.diagnostic_id)
+                } else if let Some(reason) = self.meter_execution_diagnostic(error.diagnostic_id)? {
+                    Ok(RunOutcome::Aborted(reason))
+                } else {
+                    Ok(RunOutcome::NestedFailed(error))
+                }
+            }
+            Err(error) => {
+                if restricted {
+                    self.public_diagnostic(error.diagnostic_id)
+                } else if let Some(reason) = self.meter_execution_diagnostic(error.diagnostic_id)? {
+                    Ok(RunOutcome::Aborted(reason))
+                } else {
+                    Err(error)
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn meter_execution_values(
+        &mut self,
+        values: &[Value],
+    ) -> Result<Option<AbortReason>, RuntimeError> {
+        if !self.vm.meter_host_results() {
+            return Ok(None);
+        }
+        let measured = if self.native_internal_output {
+            Some(self.vm.measure_native_internal_values(values)?)
+        } else {
+            self.vm.measure_host_values(values)
+        };
+        let Some((bytes, work)) = measured else {
+            self.vm.reject_output();
+            return Ok(Some(AbortReason::OutputLimit));
+        };
+        self.meter_execution_output(bytes, work)
+    }
+
+    fn meter_native_internal_values(&mut self, values: &[Value]) -> Result<bool, RuntimeError> {
+        if !self.vm.meter_host_results() {
+            return Ok(true);
+        }
+        let (bytes, work) = self.vm.measure_native_internal_values(values)?;
+        match self.meter_execution_output(bytes, work)? {
+            None => Ok(true),
+            Some(AbortReason::FuelExhausted) => Ok(false),
+            Some(AbortReason::OutputLimit) => {
+                Err(RuntimeError::new(RuntimeErrorKind::OutputLimit))
+            }
+        }
+    }
+
+    fn meter_callback_values(&mut self, values: &[Value]) -> Result<bool, RuntimeError> {
+        match self.meter_execution_values(values)? {
+            None => Ok(true),
+            Some(AbortReason::FuelExhausted) => Ok(false),
+            Some(AbortReason::OutputLimit) => {
+                Err(RuntimeError::new(RuntimeErrorKind::OutputLimit))
+            }
+        }
+    }
+
+    fn meter_execution_output(
+        &mut self,
+        bytes: usize,
+        work: usize,
+    ) -> Result<Option<AbortReason>, RuntimeError> {
+        if !self.charge_native_work(work.max(1))? {
+            return Ok(Some(AbortReason::FuelExhausted));
+        }
+        if self.vm.charge_output(bytes, 0, work.max(1)).is_err() {
+            return Ok(Some(AbortReason::OutputLimit));
+        }
+        Ok(None)
+    }
+
+    fn meter_execution_diagnostic(
+        &mut self,
+        public_code: &'static str,
+    ) -> Result<Option<AbortReason>, RuntimeError> {
+        let bytes = public_code.len().saturating_add(core::mem::size_of::<u64>());
+        self.meter_execution_output(bytes, bytes)
+    }
+
+    fn public_diagnostic(
+        &mut self,
+        public_code: &'static str,
+    ) -> Result<RunOutcome, RuntimeError> {
+        if let Some(reason) = self.meter_execution_diagnostic(public_code)? {
+            return Ok(RunOutcome::Aborted(reason));
+        }
+        Ok(RunOutcome::SafeDiagnostic(self.vm.safe_diagnostic(public_code)))
     }
 
     fn finish_active_table_sort(&mut self, stop: TableSortStop) {
@@ -23156,7 +23587,13 @@ impl Execution<'_> {
             _ => return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint)),
         };
         let (value, temporary_root) = if segment == 3 {
-            if let Some(message) = message {
+            if self.vm.policy() != VmPolicy::Compatibility {
+                let mut public = basic::PrintBuffer::new(self.vm);
+                self.vm.append_finalizer_public_warning(&mut public)?;
+                let object = self.vm.allocate_byte_string(public.as_bytes())?;
+                let root = self.vm.add_root(RootKind::Temporary, object)?;
+                (Value::Object(object), Some(root))
+            } else if let Some(message) = message {
                 (Value::Object(message), None)
             } else {
                 let object = self.vm.allocate_byte_string(literal)?;
@@ -27382,6 +27819,33 @@ mod tests {
         RVLU_NUMERIC_I64_F64, RVLU_V2, Register, ResultMode, UpvalueId, Value, VerifyLimits,
         verify_module,
     };
+
+    #[test]
+    fn native_internal_values_stay_in_vm_and_preserve_public_rejection() {
+        for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+            let services = HostServices::deny_all().and_policy(VmPolicy::Sandbox);
+            let mut vm = Vm::new_with_services(profile, services).unwrap();
+            let table = vm.allocate_table().unwrap();
+            assert_eq!(vm.measure_host_values(&[Value::Object(table)]), None);
+            assert_eq!(
+                vm.measure_native_internal_values(&[Value::Object(table)]),
+                Ok((0, 1))
+            );
+            assert_eq!(
+                vm.measure_native_internal_values(&[Value::Integer(12)]),
+                Ok((2, 3))
+            );
+            let mut other = Vm::new_with_profile(profile).unwrap();
+            let foreign = other.allocate_table().unwrap();
+            assert!(matches!(
+                vm.measure_native_internal_values(&[Value::Object(foreign)]),
+                Err(RuntimeError {
+                    kind: RuntimeErrorKind::Heap(VmError::WrongVm),
+                    ..
+                })
+            ));
+        }
+    }
 
     #[test]
     fn p20_integer_lookup_cache_tracks_mutation_and_metadata() {

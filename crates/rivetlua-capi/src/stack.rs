@@ -20,10 +20,10 @@ use rivetlua_core::{
 use rivetlua_runtime::ExternalStringStorage;
 use rivetlua_runtime::{
     AllocationCharges, AllocationFailureKind, CapiDumpBytes, CoroutineState, DebugFrameHandle,
-    DebugFrameInfo, DebugFrameKind, DebugHookConfig, ExternalCommand, ExternalToken, FailPoint,
+    DebugFrameInfo, DebugFrameKind, DebugHookConfig, Execution, ExternalCommand, ExternalToken, FailPoint,
     GcControl, GcControlResult, HostAllocationCharge, HostAllocationReservation, HostExitRequest,
-    HostHandle, ObjectKind, RootId, RootKind, RunOutcome, RuntimeError, RuntimeErrorKind,
-    ValueOperation, Vm, VmError,
+    HostHandle, HostServices, ObjectKind, RootId, RootKind, RunOutcome, RuntimeError,
+    RuntimeErrorKind, ValueOperation, Vm, VmError, VmPolicy,
 };
 
 use crate::allocator::{CAllocatorState, LuaAlloc};
@@ -44,6 +44,7 @@ unsafe extern "C" {
         name: *const c_char,
         opener: LuaCFunction,
         global: c_int,
+        private_loaded: Option<extern "C" fn(*mut lua_State) -> c_int>,
     ) -> c_int;
     fn rivetlua_capi_close_status_b2(pointer: *mut lua_State) -> c_int;
     #[link_name = "lua_pcallk"]
@@ -303,6 +304,8 @@ pub enum StackError {
     PseudoIndexUnavailable,
     StackLimit,
     WrongVm,
+    PolicyDenied,
+    OutputLimit,
     Layout,
     Runtime(VmError),
     Number(RuntimeError),
@@ -1092,6 +1095,8 @@ struct StateGroup {
     callback_frames: CallbackFrames,
     native_call_active: bool,
     native_terminal: Option<HostExitRequest>,
+    worker_fuel_remaining: Option<u64>,
+    execution_started: bool,
     warning: WarningBindingB6,
     panic_callback: Option<LuaCFunction>,
     _charge: HostAllocationCharge,
@@ -1099,6 +1104,58 @@ struct StateGroup {
 }
 
 impl StateGroup {
+    fn worker_fuel(&self) -> Option<u64> {
+        self.worker_fuel_remaining
+    }
+
+    fn account_worker_result(
+        &mut self,
+        result: Result<(RunOutcome, u64), RuntimeError>,
+        parent: Option<ExternalToken>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        self.execution_started = true;
+        if let Some(current) = self.worker_fuel_remaining.as_mut() {
+            let remaining = result.as_ref().map_or(0, |(_, remaining)| *remaining);
+            *current = (*current).min(remaining);
+            if let Some(parent) = parent {
+                if let Ok(parent_remaining) = self.vm.parked_fuel_remaining(parent) {
+                    self.vm
+                        .set_parked_fuel_remaining(parent, parent_remaining.min(*current))?;
+                }
+            }
+        }
+        result.map(|(outcome, _)| outcome)
+    }
+
+    fn continue_worker_external(
+        &mut self,
+        token: ExternalToken,
+        command: ExternalCommand,
+        parent: Option<ExternalToken>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        if let Some(fuel) = self.worker_fuel() {
+            let lowered = self.vm.parked_fuel_remaining(token).and_then(|parked| {
+                self.vm.set_parked_fuel_remaining(token, parked.min(fuel))
+            });
+            if let Err(error) = lowered {
+                self.worker_fuel_remaining = Some(0);
+                return Err(error);
+            }
+        }
+        let result = self
+            .vm
+            .continue_external_native_internal_with_fuel(token, command);
+        self.account_worker_result(result, parent)
+    }
+
+    fn public_registry_allowed(&self) -> Result<(), StackError> {
+        if self.vm.policy() == VmPolicy::Compatibility {
+            Ok(())
+        } else {
+            Err(StackError::PolicyDenied)
+        }
+    }
+
     fn registry_table(&self) -> Result<ObjectRef, StackError> {
         let StackValue::Core(Value::Object(table)) = self.registry_value else {
             return Err(StackError::InvalidIndex);
@@ -1117,6 +1174,7 @@ impl StateGroup {
     }
 
     fn replace_registry(&mut self, value: StackValue) -> Result<(), StackError> {
+        self.public_registry_allowed()?;
         if matches!(
             (self.registry_value, value),
             (StackValue::Core(Value::Object(old)), StackValue::Core(Value::Object(new))) if old == new
@@ -1141,6 +1199,16 @@ impl StateGroup {
         self.registry_root = new_root;
         Ok(())
     }
+}
+
+fn run_worker_execution(
+    execution: &mut Execution<'_>,
+    fuel: Option<u64>,
+) -> Result<(RunOutcome, u64), RuntimeError> {
+    if let Some(fuel) = fuel {
+        execution.set_fuel(fuel)?;
+    }
+    execution.run_native_internal_with_fuel()
 }
 
 type LuaWarnFunction = unsafe extern "C" fn(*mut c_void, *const c_char, c_int);
@@ -1770,10 +1838,12 @@ impl StateControl {
         let StackValue::Core(entry) = stack.slots[base].checked_value(&group.vm)?;
         let arguments = callback_values_b4(&group.vm, &stack.slots[base + 1..])?;
         group.vm.set_host_coroutine_entry_a5(child, entry)?;
+        let worker_fuel = group.worker_fuel();
         let outcome = group
             .vm
             .resume(Value::Object(child), &arguments.values)
-            .and_then(|mut execution| execution.run());
+            .and_then(|mut execution| run_worker_execution(&mut execution, worker_fuel));
+        let outcome = group.account_worker_result(outcome, self.native_parent.get());
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -3178,6 +3248,7 @@ impl StateControl {
         let slot = match resolve_read_index(index, stack.slots.len())? {
             ReadIndex::Stack(source) => stack.slots[source].try_clone(&mut group.vm)?,
             ReadIndex::Registry => {
+                group.public_registry_allowed()?;
                 let registry = group.registry_value;
                 StackSlot::new(&mut group.vm, registry)?
             }
@@ -3932,6 +4003,7 @@ impl StateControl {
             return Err(StackError::StackLimit);
         }
         let registry = group.registry_table()?;
+        group.public_registry_allowed()?;
         let mut prepared_capacity = None;
         let (value, root, created) =
             group
@@ -3974,6 +4046,7 @@ impl StateControl {
         // 先複製 C 名稱，再允許查表期間配置、GC；查詢 key 必須在設定 edge 前清理。
         let name = StringView::new(&group.vm, borrowed_name)?;
         let registry = group.registry_table()?;
+        group.public_registry_allowed()?;
         let (metatable, result_root) = group.vm.with_temporary_byte_string(
             name.as_bytes(),
             |vm, key| -> Result<_, StackError> {
@@ -4011,6 +4084,7 @@ impl StateControl {
         // 呼叫者的 C 名稱可能指向仍有 stack root 的 userdata bytes；先複製再配置暫時 key。
         let name = StringView::new(&group.vm, borrowed_name)?;
         let registry = group.registry_table()?;
+        group.public_registry_allowed()?;
         let registered = group
             .vm
             .with_temporary_byte_string(name.as_bytes(), |vm, key| {
@@ -4593,6 +4667,7 @@ impl StateControl {
         let mut stack = self.stack.try_borrow_mut().map_err(|_| StackError::Busy)?;
         let from = resolve_read_index(source, stack.slots.len())?;
         if destination == REGISTRY_INDEX {
+            group.public_registry_allowed()?;
             if matches!(from, ReadIndex::Registry) {
                 return Ok(());
             }
@@ -4630,6 +4705,7 @@ impl StateControl {
         let replacement = match from {
             ReadIndex::Stack(position) => stack.slots[position].try_clone(&mut group.vm)?,
             ReadIndex::Registry => {
+                group.public_registry_allowed()?;
                 let registry = group.registry_value;
                 StackSlot::new(&mut group.vm, registry)?
             }
@@ -5032,9 +5108,69 @@ impl Drop for StateOwner {
     }
 }
 
+// 只把函式指標交給受保護 requiref driver，不匯出 C ABI 符號；在 body 已進入
+// C checkpoint 後才放入私有表，因此 closure 配置失敗不會留下額外 stack slot。
+extern "C" fn requiref_private_loaded(pointer: *mut lua_State) -> c_int {
+    with_state(pointer, 0, |state| {
+        let loaded = {
+            let group_owner = state.group.upgrade().ok_or(StackError::InvalidState)?;
+            let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
+            if group.vm.policy() == VmPolicy::Compatibility {
+                return Err(StackError::PolicyDenied);
+            }
+            let registry = group.registry_table()?;
+            let Value::Object(loaded) = group.vm.with_temporary_byte_string(b"_LOADED", |vm, key| {
+                vm.raw_get(registry, Value::Object(key))
+            })? else {
+                return Err(StackError::InvalidState);
+            };
+            if group.vm.object_kind(loaded)? != ObjectKind::Table {
+                return Err(StackError::InvalidState);
+            }
+            loaded
+        };
+        state.push(StackValue::Core(Value::Object(loaded)))?;
+        Ok(1)
+    })
+}
+
 impl StateOwner {
     pub fn new() -> Result<Self, StackError> {
         Self::new_with_vm_setup(|_| {})
+    }
+
+    /// 在首筆 VM 配置之前固定政策及宿主服務。
+    pub fn new_with_host_services(services: HostServices) -> Result<Self, StackError> {
+        Self::new_with_allocator_setup(
+            Rc::new(crate::allocator::default_state()),
+            services,
+            |_| {},
+        )
+    }
+
+    /// 隔離 worker 在載入及首次執行前設定單次 request 的 VM 指令額度。
+    pub(crate) fn set_worker_fuel_limit(&mut self, fuel: u64) -> Result<(), StackError> {
+        let allocation = self.allocation.as_ref().ok_or(StackError::InvalidState)?;
+        allocation.control.validate()?;
+        if !allocation.control.main_control
+            || allocation.control.c_owned.get()
+            || allocation.control.native_parent.get().is_some()
+        {
+            return Err(StackError::InvalidState);
+        }
+        let group_owner = allocation.control.group.upgrade().ok_or(StackError::InvalidState)?;
+        let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
+        if group.worker_fuel_remaining.is_some()
+            || group.execution_started
+            || group.native_call_active
+            || !group.callback_frames.entries.is_empty()
+            || group.vm.execution_running()
+            || group.vm.has_parked_executions()
+        {
+            return Err(StackError::Busy);
+        }
+        group.worker_fuel_remaining = Some(fuel);
+        Ok(())
     }
 
     /// 由 Rust owner 明確執行 Lua shutdown finalizers，再依原群組次序釋放 native leases。
@@ -5113,17 +5249,26 @@ impl StateOwner {
         function: LuaAlloc,
         user_data: *mut c_void,
     ) -> Result<Self, StackError> {
-        Self::new_with_allocator_setup(Rc::new(CAllocatorState::new(function, user_data)), |_| {})
+        Self::new_with_allocator_setup(
+            Rc::new(CAllocatorState::new(function, user_data)),
+            HostServices::deny_all(),
+            |_| {},
+        )
     }
 
     /// 測試用建構入口：在 state 配置前調整 VM 額度，不借出 VM 的 heap 指標。
     #[doc(hidden)]
     pub fn new_with_vm_setup(setup: impl FnOnce(&mut Vm)) -> Result<Self, StackError> {
-        Self::new_with_allocator_setup(Rc::new(crate::allocator::default_state()), setup)
+        Self::new_with_allocator_setup(
+            Rc::new(crate::allocator::default_state()),
+            HostServices::deny_all(),
+            setup,
+        )
     }
 
     fn new_with_allocator_setup(
         allocator: Rc<CAllocatorState>,
+        services: HostServices,
         setup: impl FnOnce(&mut Vm),
     ) -> Result<Self, StackError> {
         let profile = if cfg!(feature = "lua55") {
@@ -5131,7 +5276,7 @@ impl StateOwner {
         } else {
             LuaProfile::Lua54
         };
-        let mut vm = Vm::new_with_profile_and_admission(profile, allocator.clone())?;
+        let mut vm = Vm::new_with_services_and_admission(profile, services, allocator.clone())?;
         setup(&mut vm);
         let generation = next_generation()?;
         let group_bytes = group_accounted_bytes()?;
@@ -5229,6 +5374,8 @@ impl StateOwner {
             callback_frames: CallbackFrames::new(),
             native_call_active: false,
             native_terminal: None,
+            worker_fuel_remaining: None,
+            execution_started: false,
             warning: WarningBindingB6::disabled(),
             panic_callback: None,
             _charge: charge,
@@ -5382,6 +5529,8 @@ impl StateOwner {
                 callback_frames: CallbackFrames::new(),
                 native_call_active: false,
                 native_terminal: None,
+                worker_fuel_remaining: None,
+                execution_started: false,
                 warning: WarningBindingB6::pending_default(),
                 panic_callback: None,
                 _charge: charge,
@@ -5750,12 +5899,23 @@ impl StateOwner {
     ) -> Result<c_int, StackError> {
         let allocation = self.allocation.as_ref().ok_or(StackError::InvalidState)?;
         allocation.control.validate()?;
+        let restricted = {
+            let group_owner = allocation.control.group.upgrade().ok_or(StackError::InvalidState)?;
+            let group = group_owner.try_borrow().map_err(|_| StackError::Busy)?;
+            group.vm.policy() != VmPolicy::Compatibility
+        };
         let pointer = self.as_ptr();
         // SAFETY：呼叫者保證 opener／library 有效且 CNoUnwind；driver 在純 C
         // checkpoint 捕捉 Lua 跳轉並同步返回，不保存 name 指標。此處沒有
         // StateGroup／VM／stack 的 Rust 借用。
         let status = unsafe {
-            rivetlua_capi_requiref_protected_b2(pointer, name.as_ptr(), opener, c_int::from(global))
+            rivetlua_capi_requiref_protected_b2(
+                pointer,
+                name.as_ptr(),
+                opener,
+                c_int::from(global),
+                restricted.then_some(requiref_private_loaded),
+            )
         };
         if status < 0 {
             Err(StackError::InvalidState)
@@ -6006,7 +6166,10 @@ fn read_at_index(
 ) -> Result<StackValue, StackError> {
     match index {
         ReadIndex::Stack(position) => stack.slots[position].checked_value(&group.vm),
-        ReadIndex::Registry => Ok(group.registry_value),
+        ReadIndex::Registry => {
+            group.public_registry_allowed()?;
+            Ok(group.registry_value)
+        }
         ReadIndex::Upvalue(index) => {
             let frame = group
                 .callback_frames
@@ -6147,6 +6310,12 @@ fn with_debug_state<R: Copy>(
     ffi_boundary(default, || {
         // SAFETY：有效 C state 為入口前置條件；debug 特例仍核對 thread/group/generation。
         let control = unsafe { checked_debug_state(pointer)? };
+        let owner = control.group.upgrade().ok_or(StackError::InvalidState)?;
+        let group = owner.try_borrow().map_err(|_| StackError::Busy)?;
+        if group.vm.policy() != VmPolicy::Compatibility {
+            return Err(StackError::PolicyDenied);
+        }
+        drop(group);
         operation(control)
     })
 }
@@ -6754,10 +6923,12 @@ impl StateControl {
             .entries
             .last()
             .map(|frame| frame.token);
+        let worker_fuel = group.worker_fuel();
         let outcome = {
             let mut execution = group.vm.gc_finalizer_execution(parent)?;
-            execution.run()?
+            run_worker_execution(&mut execution, worker_fuel)
         };
+        let outcome = group.account_worker_result(outcome, parent)?;
         match outcome {
             RunOutcome::Returned(_) => Ok(CallbackStepB4 {
                 kind: 0,
@@ -6813,9 +6984,11 @@ impl StateControl {
             .ok_or(StackError::InvalidState)?;
         let StackValue::Core(value) = pending.slot.checked_value(&group.vm)?;
         let mut debug = self.debug.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let outcome = group
-            .vm
-            .continue_external(token, ExternalCommand::Error(value));
+        let outcome = group.continue_worker_external(
+            token,
+            ExternalCommand::Error(value),
+            self.native_parent.get(),
+        );
         let frame = group
             .callback_frames
             .entries
@@ -6867,18 +7040,22 @@ impl StateControl {
                 .entries
                 .last()
                 .map(|frame| frame.token);
+            let worker_fuel = group.worker_fuel();
             let outcome = if let Some(token) = token {
-                group.vm.continue_external(
+                group.continue_worker_external(
                     token,
                     ExternalCommand::NestedCall {
                         target: event,
                         args: std::mem::take(&mut args.values),
                         results: ResultMode::Fixed(1),
                     },
+                    self.native_parent.get(),
                 )?
             } else {
                 let mut execution = group.vm.call(event, &args.values)?;
-                execution.run()?
+                let result = run_worker_execution(&mut execution, worker_fuel);
+                drop(execution);
+                group.account_worker_result(result, self.native_parent.get())?
             };
             let mut step = self.callback_outcome_b4(
                 &mut group,
@@ -6954,17 +7131,21 @@ impl StateControl {
             .entries
             .last()
             .map(|frame| frame.token);
+        let worker_fuel = group.worker_fuel();
         let outcome = if let Some(token) = token {
-            group.vm.continue_external(
+            group.continue_worker_external(
                 token,
                 ExternalCommand::NestedOperation {
                     operation,
                     args: std::mem::take(&mut args.values),
                 },
+                self.native_parent.get(),
             )?
         } else {
             let mut execution = group.vm.value_operation(operation, &args.values)?;
-            execution.run()?
+            let result = run_worker_execution(&mut execution, worker_fuel);
+            drop(execution);
+            group.account_worker_result(result, self.native_parent.get())?
         };
         let mut step =
             self.callback_outcome_b4(&mut group, &mut stack, outcome, base, ResultMode::Fixed(1))?;
@@ -7059,19 +7240,22 @@ impl StateControl {
             .entries
             .last()
             .map(|frame| frame.token);
+        let worker_fuel = group.worker_fuel();
         let outcome = if let Some(token) = token {
-            group.vm.continue_external(
+            group.continue_worker_external(
                 token,
                 ExternalCommand::NestedOperation {
                     operation,
                     args: std::mem::take(&mut args.values),
                 },
+                self.native_parent.get(),
             )
         } else {
-            group
+            let result = group
                 .vm
                 .value_operation(operation, &args.values)
-                .and_then(|mut execution| execution.run())
+                .and_then(|mut execution| run_worker_execution(&mut execution, worker_fuel));
+            group.account_worker_result(result, self.native_parent.get())
         };
         match outcome {
             Ok(outcome) => self.table_outcome_a4a(&mut group, &mut stack, outcome, base, setter),
@@ -7273,6 +7457,19 @@ impl StateControl {
             RunOutcome::LuaError(error) | RunOutcome::NestedErrored(error) => {
                 self.callback_pending_value_a2(group, stack, error.value, ErrorClass::Lua)
             }
+            RunOutcome::SafeDiagnostic(diagnostic) => {
+                let public = format!(
+                    "{} #{}",
+                    diagnostic.public_code, diagnostic.correlation_id
+                );
+                let object = group.vm.allocate_byte_string(public.as_bytes())?;
+                self.callback_pending_value_a2(
+                    group,
+                    stack,
+                    Value::Object(object),
+                    ErrorClass::Lua,
+                )
+            }
             RunOutcome::NestedFailed(error) => {
                 self.callback_pending_runtime_a2(group, stack, error)
             }
@@ -7363,29 +7560,30 @@ impl StateControl {
                 .last()
                 .map(|frame| frame.token)
         };
+        let worker_fuel = group.worker_fuel();
+        let native_parent = self.native_parent.get().filter(|_| boundary_token.is_none());
         let outcome = if let Some(token) = callback_token {
-            group.vm.continue_external(
+            group.continue_worker_external(
                 token,
                 ExternalCommand::NestedCall {
                     target,
                     args: std::mem::take(&mut args.values),
                     results: mode,
                 },
+                native_parent,
             )
-        } else if let Some(parent) = self
-            .native_parent
-            .get()
-            .filter(|_| boundary_token.is_none())
-        {
-            group
+        } else if let Some(parent) = native_parent {
+            let result = group
                 .vm
                 .call_with_parked_parent(parent, target, &args.values)
-                .and_then(|mut execution| execution.run())
+                .and_then(|mut execution| run_worker_execution(&mut execution, worker_fuel));
+            group.account_worker_result(result, Some(parent))
         } else {
-            group
+            let result = group
                 .vm
                 .call(target, &args.values)
-                .and_then(|mut execution| execution.run())
+                .and_then(|mut execution| run_worker_execution(&mut execution, worker_fuel));
+            group.account_worker_result(result, None)
         };
         match outcome {
             Ok(outcome) if public => {
@@ -7554,9 +7752,10 @@ impl StateControl {
             .ok_or(StackError::InvalidIndex)?;
         let mut values = callback_values_b4(&group.vm, &stack.slots[stack.slots.len() - count..])?;
         let mut debug = self.debug.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let outcome = group.vm.continue_external(
+        let outcome = group.continue_worker_external(
             token,
             ExternalCommand::Return(std::mem::take(&mut values.values)),
+            self.native_parent.get(),
         );
         let frame = group
             .callback_frames
@@ -7610,9 +7809,11 @@ impl StateControl {
         let StackValue::Core(value) = pending.slot.checked_value(&group.vm)?;
         let class = pending.class;
         let mut debug = self.debug.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let outcome = group
-            .vm
-            .continue_external(token, ExternalCommand::Error(value));
+        let outcome = group.continue_worker_external(
+            token,
+            ExternalCommand::Error(value),
+            self.native_parent.get(),
+        );
         let frame = group
             .callback_frames
             .entries
@@ -9059,10 +9260,12 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_test_push_lua_b4(
             callback_fixture_module_b4(profile, selector)?
         };
         let produced = (|| -> Result<StackSlot, StackError> {
+            let worker_fuel = group.worker_fuel();
             let outcome = {
                 let mut execution = group.vm.load(module)?;
-                execution.run()?
+                run_worker_execution(&mut execution, worker_fuel)
             };
+            let outcome = group.account_worker_result(outcome, state.native_parent.get())?;
             let RunOutcome::Returned(values) = outcome else {
                 return Err(StackError::Layout);
             };
@@ -9251,8 +9454,11 @@ pub(crate) unsafe fn dump_top_bytes(
     // SAFETY：C coordinator 保活 state；private_state 再核對身分與執行緒。
     let state = unsafe { private_state(pointer) }.map_err(|_| StackError::InvalidState)?;
     let group_owner = state.group.upgrade().ok_or(StackError::InvalidState)?;
-    let group = group_owner.try_borrow().map_err(|_| StackError::Busy)?;
+    let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
     let stack = state.stack.try_borrow().map_err(|_| StackError::Busy)?;
+    if group.vm.policy() != VmPolicy::Compatibility {
+        return Err(StackError::PolicyDenied);
+    }
     let Some(slot) = stack.slots.last() else {
         return Err(StackError::InvalidIndex);
     };
@@ -9262,7 +9468,12 @@ pub(crate) unsafe fn dump_top_bytes(
     if group.vm.object_kind(closure)? != ObjectKind::Closure {
         return Err(StackError::InvalidIndex);
     }
-    Ok(group.vm.capi_dump_closure(closure, strip)?)
+    let bytes = group.vm.capi_dump_closure(closure, strip)?;
+    group
+        .vm
+        .charge_output(bytes.as_bytes().len(), 0, bytes.as_bytes().len().max(1))
+        .map_err(|_| StackError::OutputLimit)?;
+    Ok(bytes)
 }
 
 impl StateControl {
@@ -9730,19 +9941,48 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_reset_checkpoint_exit_a5(
     }
 }
 
+fn publish_default_state(owner: StateOwner) -> *mut lua_State {
+    // SAFETY：新建 live state 尚未交出；C installer 僅存入 POD 函式指標。
+    unsafe { rivetlua_capi_default_panic_install_a2(owner.as_ptr()) };
+    // SAFETY：warning installer 同步完成後才將 owner 交給 C。
+    unsafe { rivetlua_capi_default_warning_install_b6(owner.as_ptr()) };
+    owner.into_c_ptr()
+}
+
 /// 建立由 C 持有的預設主 state；失敗或 panic 回 null，不跨越 ABI。
 #[unsafe(no_mangle)]
 #[allow(non_snake_case)]
 pub extern "C" fn luaL_newstate() -> *mut lua_State {
     ffi_boundary(std::ptr::null_mut(), || {
         let owner = StateOwner::new()?;
-        // SAFETY：新建 live state 尚未交出；C installer 僅存入 POD 函式指標，
-        // 不在持有此 Rust frame 時呼叫 panic callback。
-        unsafe { rivetlua_capi_default_panic_install_a2(owner.as_ptr()) };
-        // SAFETY：owner 在呼叫期間持有有效 state；C installer 僅透過無配置的
-        // lua_setwarnf 設定完整 callback/ud 配對，返回後才將 owner 交給 C。
-        unsafe { rivetlua_capi_default_warning_install_b6(owner.as_ptr()) };
-        Ok(owner.into_c_ptr())
+        Ok(publish_default_state(owner))
+    })
+}
+
+/// 宿主在 state 建立前選擇固定政策；0/1/2 分別為 Compatibility/Sandbox/PrivateService。
+#[unsafe(no_mangle)]
+pub extern "C" fn rivetlua_capi_newstate_with_policy_b22(policy: c_int) -> *mut lua_State {
+    ffi_boundary(std::ptr::null_mut(), || {
+        let policy = match policy {
+            0 => VmPolicy::Compatibility,
+            1 => VmPolicy::Sandbox,
+            2 => VmPolicy::PrivateService,
+            _ => return Err(StackError::InvalidState),
+        };
+        let owner = StateOwner::new_with_host_services(
+            HostServices::deny_all().and_policy(policy),
+        )?;
+        Ok(publish_default_state(owner))
+    })
+}
+
+/// C facade 必須在 fopen/stdin 前查詢，不可先由 libc 觸碰宿主檔案。
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn rivetlua_capi_allow_file_load_b22(pointer: *mut lua_State) -> c_int {
+    with_state(pointer, 0, |state| {
+        let owner = state.group.upgrade().ok_or(StackError::InvalidState)?;
+        let group = owner.try_borrow().map_err(|_| StackError::Busy)?;
+        Ok(c_int::from(group.vm.policy() == VmPolicy::Compatibility))
     })
 }
 
@@ -10279,10 +10519,12 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_test_set_entry_b11(pointer: *mut l
         let mut group = owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
         let identity = state.thread_identity.ok_or(StackError::InvalidState)?;
         let module = callback_fixture_module_b4(LuaProfile::Lua55, 1)?;
+        let worker_fuel = group.worker_fuel();
         let outcome = {
             let mut execution = group.vm.load(module)?;
-            execution.run()?
+            run_worker_execution(&mut execution, worker_fuel)
         };
+        let outcome = group.account_worker_result(outcome, state.native_parent.get())?;
         let RunOutcome::Returned(values) = outcome else {
             return Err(StackError::Layout);
         };
@@ -10343,12 +10585,14 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_test_resume_prepare_b11(
             .last()
             .ok_or(StackError::InvalidState)?
             .checked_value(&group.vm)?;
+        let worker_fuel = group.worker_fuel();
         let outcome = {
             let mut execution = group
                 .vm
                 .resume(Value::Object(identity), &[callback, Value::Nil])?;
-            execution.run()?
+            run_worker_execution(&mut execution, worker_fuel)
         };
+        let outcome = group.account_worker_result(outcome, state.native_parent.get())?;
         state.callback_outcome_b4(&mut group, &mut stack, outcome, 0, ResultMode::All)
     })
 }
@@ -10521,9 +10765,11 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_reset_resume_error_b11(
             .ok_or(StackError::InvalidState)?;
         let StackValue::Core(value) = pending.slot.checked_value(&group.vm)?;
         let mut debug = state.debug.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let outcome = group
-            .vm
-            .continue_external(token, ExternalCommand::Error(value));
+        let outcome = group.continue_worker_external(
+            token,
+            ExternalCommand::Error(value),
+            state.native_parent.get(),
+        );
         let frame = group
             .callback_frames
             .entries
@@ -10810,10 +11056,12 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_shutdown_prepare_b11(
         if !group.vm.gc_finalizers_pending() {
             return Ok(CallbackStepB4::done());
         }
+        let worker_fuel = group.worker_fuel();
         let outcome = {
             let mut execution = group.vm.gc_finalizer_execution(None)?;
-            execution.run()?
+            run_worker_execution(&mut execution, worker_fuel)
         };
+        let outcome = group.account_worker_result(outcome, state.native_parent.get())?;
         match outcome {
             RunOutcome::Returned(_) => {
                 // 本輪同步排空有進展；C coordinator 須再掃描 callback 新註冊的物件。
@@ -12524,7 +12772,9 @@ fn generic_error_a3(
             return ErrorClass::from_code(step.value).ok_or(Reject::InvalidAction);
         }
         let class = ErrorClass::Lua;
-        let default = if operation == A3_NEXT {
+        let default = if matches!(error, StackError::PolicyDenied) {
+            b"E_POLICY_DENIED".as_slice()
+        } else if operation == A3_NEXT {
             b"invalid key to 'next'".as_slice()
         } else {
             b"value operation failed".as_slice()
@@ -12673,6 +12923,12 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_upvalue_dispatch_a4b(
         || -> Result<RawStrictResult, StackError> {
             // SAFETY：C facade 持有有效 state；借用與所有可失敗操作在回傳 POD 前結束。
             let state = unsafe { checked_state(pointer)? };
+            let owner = state.group.upgrade().ok_or(StackError::InvalidState)?;
+            let group = owner.try_borrow().map_err(|_| StackError::Busy)?;
+            if group.vm.policy() != VmPolicy::Compatibility {
+                return Err(StackError::PolicyDenied);
+            }
+            drop(group);
             let value = match operation {
                 1 => state.get_c_upvalue(first, first_n)?.cast_mut().cast(),
                 2 => state.set_c_upvalue(first, first_n)?.cast_mut().cast(),
@@ -13936,5 +14192,75 @@ mod lightuserdata_tests {
         // SAFETY：兩個 stack slot 都在有效 state 內。
         unsafe { lua_settop(state, 0) };
         assert_eq!(owner.with_vm(|vm| vm.ledger_snapshot()).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod worker_fuel_and_private_requiref_tests {
+    use super::{StackError, StateOwner, lua_State, lua_createtable, lua_gettop};
+    use rivetlua_core::Value;
+    use rivetlua_runtime::{HostServices, ObjectKind, RunOutcome, VmPolicy};
+    use std::ffi::{CStr, c_int};
+
+    #[test]
+    fn worker_fuel_is_single_assignment_and_never_increases() {
+        let mut owner = StateOwner::new().unwrap();
+        owner.set_worker_fuel_limit(7).unwrap();
+        assert!(matches!(owner.set_worker_fuel_limit(9), Err(StackError::Busy)));
+        let group_owner = owner.allocation.as_ref().unwrap().control.group.upgrade().unwrap();
+        {
+            let mut group = group_owner.borrow_mut();
+            group
+                .account_worker_result(Ok((RunOutcome::Returned(Vec::new()), 4)), None)
+                .unwrap();
+            group
+                .account_worker_result(Ok((RunOutcome::Returned(Vec::new()), 6)), None)
+                .unwrap();
+            assert_eq!(group.worker_fuel_remaining, Some(4));
+        }
+        assert!(matches!(owner.set_worker_fuel_limit(1), Err(StackError::Busy)));
+    }
+
+    unsafe extern "C" fn open_table(state: *mut lua_State) -> c_int {
+        // SAFETY：受保護 requiref checkpoint 在此同步提供有效 C state。
+        unsafe { lua_createtable(state, 0, 0) };
+        1
+    }
+
+    #[test]
+    fn restricted_requiref_uses_private_loaded_table_without_public_registry() {
+        let owner = StateOwner::new_with_host_services(
+            HostServices::deny_all().and_policy(VmPolicy::PrivateService),
+        )
+        .unwrap();
+        let name = CStr::from_bytes_with_nul(b"native.fixture\0").unwrap();
+        // SAFETY：本地 opener 同步返回，library lease 無關；C checkpoint 捕捉 Lua 錯誤。
+        let status = unsafe { owner.requiref_protected(name, open_table, false) }.unwrap();
+        assert_eq!(status, 0);
+        // SAFETY：owner 在呼叫期間保活 state，requiref 成功後留下單一結果。
+        assert_eq!(unsafe { lua_gettop(owner.as_ptr()) }, 1);
+        let group_owner = owner.allocation.as_ref().unwrap().control.group.upgrade().unwrap();
+        let mut group = group_owner.borrow_mut();
+        assert!(matches!(group.public_registry_allowed(), Err(StackError::PolicyDenied)));
+        let registry = group.registry_table().unwrap();
+        let Value::Object(loaded) = group
+            .vm
+            .with_temporary_byte_string(b"_LOADED", |vm, key| {
+                vm.raw_get(registry, Value::Object(key))
+            })
+            .unwrap()
+        else {
+            panic!("私有 loaded 表遺失");
+        };
+        let Value::Object(module) = group
+            .vm
+            .with_temporary_byte_string(name.to_bytes(), |vm, key| {
+                vm.raw_get(loaded, Value::Object(key))
+            })
+            .unwrap()
+        else {
+            panic!("模組表未寫入私有 loaded 表");
+        };
+        assert_eq!(group.vm.object_kind(module), Ok(ObjectKind::Table));
     }
 }

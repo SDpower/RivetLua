@@ -149,7 +149,12 @@ fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
             text.len = len;
         }
         Value::LightUserdata(address) => {
-            write!(text, "userdata: 0x{address:x}").map_err(|_| VmError::ArithmeticOverflow)?;
+            if vm.policy() == crate::VmPolicy::Compatibility {
+                write!(text, "userdata: 0x{address:x}")
+                    .map_err(|_| VmError::ArithmeticOverflow)?;
+            } else {
+                text.write_str("userdata").map_err(|_| VmError::ArithmeticOverflow)?;
+            }
         }
         Value::CFunction(id) => {
             if id.vm() != vm.id() {
@@ -162,6 +167,17 @@ fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
             let kind = vm.object_kind(object)?;
             if kind == ObjectKind::ByteString {
                 return Ok(None);
+            }
+            if vm.policy() != crate::VmPolicy::Compatibility {
+                let name = match kind {
+                    ObjectKind::Table => "table",
+                    ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin => "function",
+                    ObjectKind::Coroutine => "thread",
+                    ObjectKind::File => "file",
+                    _ => "userdata",
+                };
+                text.write_str(name).map_err(|_| VmError::ArithmeticOverflow)?;
+                return Ok(Some(text));
             }
             let prefix = metatable_name(vm, value)?;
             let name = match kind {
@@ -545,6 +561,9 @@ pub(crate) fn print(vm: &mut Vm, args: &[Value]) -> Result<(), RuntimeError> {
         }
         Err(HostServiceError::OutputFailed) => {
             Err(RuntimeError::new(RuntimeErrorKind::HostOutputFailed))
+        }
+        Err(HostServiceError::OutputLimit) => {
+            Err(RuntimeError::new(RuntimeErrorKind::OutputLimit))
         }
     }
 }

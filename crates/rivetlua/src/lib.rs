@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
 use rivetlua_capi::stack::{NativeSession, NativeSessionFactory, StateOwner};
@@ -43,6 +43,9 @@ pub use rivetlua_runtime::{
     GcTrace, HostWarning, HostWarningError, LedgerSnapshot, LoadBudget, LoadCapability, LoadFormat,
     LoadLimits, LuaError, PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
     RunOutcome, RuntimeError, RuntimeErrorKind, VmError,
+    CapabilityGrant, OpaqueServiceHandle, PolicyCapabilities, PolicyClock, PrivateService,
+    ServiceAccessError, ServiceAudience, ServiceOperation, VmPolicy,
+    ExportPolicy, OutputAudit, OutputBudget, OutputError, SafeDiagnostic,
 };
 pub use transport::{ContainerError, ContainerErrorKind, ContainerLimits, TransportBudget};
 
@@ -196,6 +199,49 @@ pub struct Module {
     verified: Arc<VerifiedModule>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportDestination {
+    HostBytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportResourceClass {
+    Module,
+    PrivateService,
+    Closure,
+    ExecutionState,
+    SourceMap,
+    Ast,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportError {
+    Denied,
+    OutputLimit,
+}
+
+impl ExportError {
+    pub const fn public_code(&self) -> &'static str {
+        match self {
+            Self::Denied => "E_EXPORT_DENIED",
+            Self::OutputLimit => "E_OUTPUT_LIMIT",
+        }
+    }
+}
+
+pub struct ExportRequest {
+    owner: rivetlua_core::VmId,
+    issuer: PolicyCapabilities,
+    module: Weak<VerifiedModule>,
+    class: ExportResourceClass,
+    policy: ExportPolicy,
+    destination: ExportDestination,
+}
+
+pub struct ExportResult {
+    pub bytes: Vec<u8>,
+}
+
 impl Module {
     #[cfg(feature = "aot-builder")]
     pub fn build_aot(
@@ -314,6 +360,12 @@ impl DerefMut for RuntimeSlot {
 pub struct Vm {
     runtime: RuntimeSlot,
     profile: LuaProfile,
+    policy: VmPolicy,
+    owned_modules: Vec<Weak<VerifiedModule>>,
+    owned_modules_charge: Option<(
+        rivetlua_runtime::HostAllocationCharge,
+        rivetlua_runtime::HostAllocationCharge,
+    )>,
     globals: Root,
     drop_shutdown_suppressed: bool,
     #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
@@ -397,9 +449,13 @@ impl Vm {
     ) -> Result<Self, SdkError> {
         let mut runtime =
             RuntimeVm::new_with_services(profile, host_services).map_err(SdkError::RuntimeVm)?;
+        let policy = runtime.policy();
         Self::from_runtime(profile, &mut runtime).map(|globals| Self {
             runtime: RuntimeSlot::occupied(runtime),
             profile,
+            policy,
+            owned_modules: Vec::new(),
+            owned_modules_charge: None,
             globals,
             drop_shutdown_suppressed: false,
             #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
@@ -416,6 +472,7 @@ impl Vm {
         let mut runtime =
             RuntimeVm::new_with_services_and_admission(profile, host_services, factory.admission())
                 .map_err(SdkError::RuntimeVm)?;
+        let policy = runtime.policy();
         let globals = Self::from_runtime(profile, &mut runtime)?;
         let Value::Object(environment) = globals
             .handle
@@ -430,10 +487,219 @@ impl Vm {
         Ok(Self {
             runtime: RuntimeSlot::occupied(runtime),
             profile,
+            policy,
+            owned_modules: Vec::new(),
+            owned_modules_charge: None,
             globals,
             drop_shutdown_suppressed: false,
             native_session: Some(session),
         })
+    }
+
+    pub const fn policy(&self) -> VmPolicy {
+        self.policy
+    }
+
+    pub fn output_audit(&self) -> OutputAudit {
+        self.runtime
+            .0
+            .as_ref()
+            .map(RuntimeVm::output_audit)
+            .unwrap_or_default()
+    }
+
+    pub fn charge_output(
+        &mut self,
+        bytes: usize,
+        depth: usize,
+        work: usize,
+    ) -> Result<(), OutputError> {
+        self.runtime
+            .0
+            .as_mut()
+            .ok_or(OutputError::Sink)?
+            .charge_output(bytes, depth, work)
+    }
+
+    pub fn safe_diagnostic(&mut self, public_code: &'static str) -> SafeDiagnostic {
+        self.runtime.safe_diagnostic(public_code)
+    }
+
+    pub fn register_private_service(
+        &mut self,
+        issuer: &PolicyCapabilities,
+        service: impl PrivateService + 'static,
+    ) -> Result<OpaqueServiceHandle, ServiceAccessError> {
+        self.runtime
+            .0
+            .as_mut()
+            .ok_or(ServiceAccessError::Denied)?
+            .register_private_service(issuer, service)
+    }
+
+    pub fn issue_service_grant(
+        &self,
+        issuer: &PolicyCapabilities,
+        handle: &OpaqueServiceHandle,
+        operation: ServiceOperation,
+        audience: ServiceAudience,
+        limits: ResourceLimits,
+        expires_at: u64,
+    ) -> Result<CapabilityGrant, ServiceAccessError> {
+        self.runtime
+            .0
+            .as_ref()
+            .ok_or(ServiceAccessError::Denied)?
+            .issue_service_grant(issuer, handle, operation, audience, limits, expires_at)
+    }
+
+    pub fn dispatch_private_service(
+        &mut self,
+        handle: &OpaqueServiceHandle,
+        grant: &mut CapabilityGrant,
+        operation: ServiceOperation,
+        audience: ServiceAudience,
+        input: &[u8],
+    ) -> Result<Vec<u8>, ServiceAccessError> {
+        self.runtime
+            .0
+            .as_mut()
+            .ok_or(ServiceAccessError::Denied)?
+            .dispatch_private_service(handle, grant, operation, audience, input)
+    }
+
+    pub fn revoke_private_service(
+        &mut self,
+        handle: &OpaqueServiceHandle,
+    ) -> Result<(), ServiceAccessError> {
+        self.runtime
+            .0
+            .as_mut()
+            .ok_or(ServiceAccessError::Denied)?
+            .revoke_private_service(handle)
+    }
+
+    pub fn prepare_module_export(
+        &mut self,
+        issuer: &PolicyCapabilities,
+        module: &Module,
+        destination: ExportDestination,
+    ) -> Result<ExportRequest, ExportError> {
+        let runtime = self.runtime.0.as_ref().ok_or(ExportError::Denied)?;
+        let identity = Arc::downgrade(&module.verified);
+        if !runtime.authorizes_module_export(issuer)
+            || !self.owned_modules.iter().any(|owned| owned.ptr_eq(&identity))
+        {
+            return Err(ExportError::Denied);
+        }
+        Ok(ExportRequest {
+            owner: runtime.id(),
+            issuer: issuer.clone(),
+            module: identity,
+            class: ExportResourceClass::Module,
+            policy: ExportPolicy::OwnerModules,
+            destination,
+        })
+    }
+
+    pub fn export_module(
+        &mut self,
+        request: &ExportRequest,
+        module: &Module,
+    ) -> Result<ExportResult, ExportError> {
+        let runtime = self.runtime.0.as_ref().ok_or(ExportError::Denied)?;
+        let identity = Arc::downgrade(&module.verified);
+        if request.owner != runtime.id()
+            || request.class != ExportResourceClass::Module
+            || request.policy != ExportPolicy::OwnerModules
+            || request.destination != ExportDestination::HostBytes
+            || !runtime.authorizes_module_export(&request.issuer)
+            || !request.module.ptr_eq(&identity)
+            || !self.owned_modules.iter().any(|owned| owned.ptr_eq(&identity))
+        {
+            return Err(ExportError::Denied);
+        }
+        // 只編碼已驗證的 RVLU 主體，不攜帶 debug sidecar、source map 或 AST。
+        let encoded = rivetlua_core::encode_module(
+            module.verified.module().clone(),
+            module.profile(),
+            &VerifyLimits::default(),
+        )
+        .map_err(|_| ExportError::Denied)?;
+        let len = encoded.bytes().len();
+        self.charge_output(len, 0, len.max(1))
+            .map_err(|_| ExportError::OutputLimit)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| ExportError::Denied)?;
+        bytes.extend_from_slice(encoded.bytes());
+        Ok(ExportResult { bytes })
+    }
+
+    /// 僅對已授權的 owner export 保存模組身分；Vec backing 由同一 VM ledger 持有。
+    fn track_exportable_module(&mut self, module: &Module) -> Result<bool, SdkError> {
+        if !self.runtime.module_export_enabled() {
+            return Ok(false);
+        }
+        let identity = Arc::downgrade(&module.verified);
+        if self
+            .owned_modules
+            .iter()
+            .any(|owned| owned.strong_count() != 0 && owned.ptr_eq(&identity))
+        {
+            return Ok(false);
+        }
+        let live_count = self
+            .owned_modules
+            .iter()
+            .filter(|owned| owned.strong_count() != 0)
+            .count();
+        if live_count == self.owned_modules.capacity() {
+            let needed = live_count
+                .checked_add(1)
+                .ok_or(SdkError::RuntimeVm(VmError::ArithmeticOverflow))?;
+            let element_bytes = std::mem::size_of::<Weak<VerifiedModule>>();
+            let base_bytes = needed
+                .checked_mul(element_bytes)
+                .ok_or(SdkError::RuntimeVm(VmError::ArithmeticOverflow))?;
+            let base_reservation = self
+                .runtime
+                .reserve_host_allocation(base_bytes)
+                .map_err(SdkError::RuntimeVm)?;
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(needed)
+                .map_err(|_| SdkError::RuntimeVm(base_reservation.rust_reserve_failure()))?;
+            let actual_bytes = replacement
+                .capacity()
+                .checked_mul(element_bytes)
+                .ok_or(SdkError::RuntimeVm(VmError::ArithmeticOverflow))?;
+            let extra_bytes = actual_bytes
+                .checked_sub(base_bytes)
+                .ok_or(SdkError::RuntimeVm(VmError::ArithmeticOverflow))?;
+            let extra_reservation = self
+                .runtime
+                .reserve_host_allocation(extra_bytes)
+                .map_err(SdkError::RuntimeVm)?;
+            replacement.extend(
+                self.owned_modules
+                    .iter()
+                    .filter(|owned| owned.strong_count() != 0)
+                    .cloned(),
+            );
+            replacement.push(identity);
+            let base_charge = base_reservation.commit().map_err(SdkError::RuntimeVm)?;
+            let extra_charge = extra_reservation.commit().map_err(SdkError::RuntimeVm)?;
+            let old = std::mem::replace(&mut self.owned_modules, replacement);
+            let old_charge = self
+                .owned_modules_charge
+                .replace((base_charge, extra_charge));
+            drop(old);
+            drop(old_charge);
+        } else {
+            self.owned_modules.retain(|owned| owned.strong_count() != 0);
+            self.owned_modules.push(identity);
+        }
+        Ok(true)
     }
 
     /// 獨占借用排除同時執行任何 SDK API；`Execution` 須已 drop。
@@ -597,9 +863,20 @@ impl Vm {
             .handle
             .as_value(&self.runtime)
             .map_err(SdkError::RuntimeVm)?;
-        self.runtime
-            .load_with_environment_and_args(module.verified.as_ref().clone(), environment, args)
-            .map_err(SdkError::Runtime)
+        let recorded = self.track_exportable_module(module)?;
+        match self.runtime.load_with_environment_and_args(
+            module.verified.as_ref().clone(),
+            environment,
+            args,
+        ) {
+            Ok(execution) => Ok(execution),
+            Err(error) => {
+                if recorded {
+                    self.owned_modules.pop();
+                }
+                Err(SdkError::Runtime(error))
+            }
+        }
     }
 
     /// 在原 root chunk frame 上安裝受保護 message handler；正常返回值不加 pcall 標記。

@@ -26,6 +26,7 @@ mod host;
 mod jit;
 mod metamethod;
 mod pending_op;
+mod policy;
 mod roots;
 mod stdlib;
 mod string;
@@ -62,6 +63,11 @@ pub use host::{
     HostOutputError, HostResourceError, HostResourceErrorKind, HostServices, HostSourceReader,
     HostWarning, HostWarningError, LoadBudget, LoadCapability, LoadFormat, LoadLimits,
     PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
+};
+pub use policy::{
+    CapabilityGrant, OpaqueServiceHandle, PolicyCapabilities, PolicyClock, PrivateService,
+    ServiceAccessError, ServiceAudience, ServiceOperation, VmPolicy, ExportPolicy, OutputBudget,
+    OutputAudit, OutputError, SafeDiagnostic,
 };
 #[cfg(any(feature = "jit", feature = "aot"))]
 pub use jit::{JitEligibility, JitFallbackReason, JitPolicy, JitStats};

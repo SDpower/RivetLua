@@ -14,6 +14,7 @@ use rivetlua_core::{
     LuaProfile, OfficialWorkBudget, TransportLimits, Value, VerifyLimits, decode_module,
     decode_transport_module,
 };
+use rivetlua_runtime::{HostServices, OutputBudget, VmPolicy};
 
 use crate::abi;
 use crate::native::{self, NativeLibrary};
@@ -25,6 +26,7 @@ use crate::stack::{
 use super::codec::{
     CopyValue, Frame, FrameKind, HEADER_BYTES, Limits, Request, Response, WireError,
 };
+use super::isolation;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkerOutcome {
@@ -69,6 +71,8 @@ unsafe extern "C" {
 }
 
 static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+// 原每次 call 的預設額度改為同一 worker request 共用，nested/root 不重置剩餘 fuel。
+const WORKER_REQUEST_FUEL: u64 = 1_000_000;
 
 fn private_run_dir(root: &Path) -> Result<PathBuf, std::io::Error> {
     if !root.is_absolute() || !root.is_dir() {
@@ -118,21 +122,35 @@ fn finish(
     run_dir: PathBuf,
     mut outcome: WorkerOutcome,
     already_exited: Option<ExitStatus>,
+    response_exit_confirmed: bool,
+    restricted: bool,
 ) -> WorkerReport {
     let pid = child.id();
-    let status = if let Some(status) = already_exited {
-        Some(status)
+    let (status, group_stopped) = if restricted {
+        // leader 尚未 reap，process-group ID 在終止其餘成員前不會被重用。
+        let group_stopped = isolation::terminate_group(&mut child);
+        (child.wait().ok(), group_stopped)
+    } else if let Some(status) = already_exited {
+        (Some(status), true)
     } else {
         // 普通自有子程序的終止；timeout/malformed 不能留下活 worker 或 pipe。
         let _ = child.kill();
-        child.wait().ok()
+        (child.wait().ok(), true)
     };
-    if let Some(status) = &status {
+    if restricted && !group_stopped {
+        outcome = WorkerOutcome::Crash;
+    } else if let Some(status) = &status {
         if !status.success()
-            && !matches!(outcome, WorkerOutcome::Deadline | WorkerOutcome::Malformed)
+            && ((restricted && response_exit_confirmed
+                && !matches!(outcome, WorkerOutcome::Deadline | WorkerOutcome::Malformed))
+                || (!restricted
+                    && !matches!(outcome, WorkerOutcome::Deadline | WorkerOutcome::Malformed)))
         {
             outcome = WorkerOutcome::Crash;
         }
+    } else if restricted {
+        // 無法確認直系 child 已回收時，不可把完整 RPC 回應當作成功。
+        outcome = WorkerOutcome::Crash;
     }
     drop(child);
     let cache_clean = fs::remove_dir_all(&run_dir).is_ok() && !run_dir.exists();
@@ -271,6 +289,33 @@ fn remaining_ms(start: Instant, deadline: Duration) -> Option<i32> {
     )
 }
 
+#[cfg(unix)]
+fn exited_without_reap(child: &Child) -> Result<bool, ()> {
+    let pid = libc::id_t::try_from(child.id()).map_err(|_| ())?;
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY：P_PID 綁定未 reap 的本 Child；WNOWAIT 保留 PID/PGID 至 group cleanup，
+    // WNOHANG 保證此查詢不越過 request deadline。siginfo buffer 由 kernel 完整填入。
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(());
+    }
+    // SAFETY：buffer 先清零；waitid 成功後，無事件仍保留零 si_signo。
+    let info = unsafe { info.assume_init() };
+    Ok(info.si_signo == libc::SIGCHLD)
+}
+
+#[cfg(not(unix))]
+fn exited_without_reap(_child: &Child) -> Result<bool, ()> {
+    Err(())
+}
+
 /// 每次建立新 process/VM/heap。宿主提供絕對 worker binary path 與完整 CNoUnwind 聲明。
 ///
 /// # Safety
@@ -284,12 +329,75 @@ pub unsafe fn run_worker(
     deadline: Duration,
     limits: Limits,
 ) -> WorkerReport {
+    run_worker_inner(worker_binary, cache_root, request_id, request,
+        VmPolicy::Compatibility, deadline, limits)
+}
+
+/// 在宿主選定的不可變政策下啟動 worker；受限政策缺 OS 證據即拒絕。
+///
+/// # Safety
+/// 宿主仍須核准 request 中每份 native artifact 與 CNoUnwind 聲明；OS 隔離不使 UB 合法。
+pub unsafe fn run_worker_with_policy(
+    worker_binary: &Path,
+    cache_root: &Path,
+    request_id: u64,
+    request: Request,
+    policy: VmPolicy,
+    deadline: Duration,
+    limits: Limits,
+) -> WorkerReport {
+    run_worker_inner(worker_binary, cache_root, request_id, request, policy, deadline, limits)
+}
+
+fn policy_denied() -> WorkerOutcome {
+    WorkerOutcome::Rejected(isolation::PolicyDenied::MissingEvidence.public_code().to_vec())
+}
+
+fn run_worker_inner(
+    worker_binary: &Path,
+    cache_root: &Path,
+    request_id: u64,
+    request: Request,
+    policy: VmPolicy,
+    deadline: Duration,
+    limits: Limits,
+) -> WorkerReport {
+    let restricted = policy != VmPolicy::Compatibility;
     if !worker_binary.is_absolute() || !worker_binary.is_file() || deadline.is_zero() {
-        return immediate(WorkerOutcome::Rejected(
-            b"worker binary/deadline invalid".to_vec(),
-        ));
+        return immediate(if restricted { policy_denied() } else {
+            WorkerOutcome::Rejected(b"worker binary/deadline invalid".to_vec())
+        });
     }
     let started = Instant::now();
+    #[cfg(target_os = "linux")]
+    let artifact_paths = if restricted {
+        if request.native.len() > limits.max_native {
+            return immediate(WorkerOutcome::Rejected(b"E_WORKER_REJECTED".to_vec()));
+        }
+        let mut paths = Vec::new();
+        if paths.try_reserve_exact(request.native.len()).is_err() {
+            return immediate(WorkerOutcome::Rejected(b"E_WORKER_RESOURCE".to_vec()));
+        }
+        for spec in &request.native {
+            if remaining_ms(started, deadline).is_none() {
+                return immediate(WorkerOutcome::Deadline);
+            }
+            if native::preflight(spec.artifact.clone(), &spec.policy, spec.visibility).is_err() {
+                return immediate(policy_denied());
+            }
+            if remaining_ms(started, deadline).is_none() {
+                return immediate(WorkerOutcome::Deadline);
+            }
+            if !paths.contains(&spec.artifact.path) {
+                paths.push(spec.artifact.path.clone());
+            }
+        }
+        paths
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let artifact_paths: Vec<PathBuf> = Vec::new();
     let encoded = (Frame {
         request_id,
         identity: abi::current_identity(),
@@ -301,28 +409,45 @@ pub unsafe fn run_worker(
     }
     let request_bytes = match encoded {
         Ok(bytes) => bytes,
-        Err(_) => return immediate(WorkerOutcome::Rejected(b"request rejected".to_vec())),
+        Err(_) => return immediate(WorkerOutcome::Rejected(if restricted {
+            b"E_WORKER_REJECTED".to_vec()
+        } else {
+            b"request rejected".to_vec()
+        })),
     };
     let run_dir = match private_run_dir(cache_root) {
         Ok(path) => path,
-        Err(_) => return immediate(WorkerOutcome::Rejected(b"worker cache invalid".to_vec())),
+        Err(_) => return immediate(if restricted { policy_denied() } else {
+            WorkerOutcome::Rejected(b"worker cache invalid".to_vec())
+        }),
     };
     if remaining_ms(started, deadline).is_none() {
         let _ = fs::remove_dir_all(&run_dir);
         return immediate(WorkerOutcome::Deadline);
     }
-    let spawned = Command::new(worker_binary)
-        .arg("--rivetlua-worker-v1")
-        .env("RIVETLUA_P16_WORKER_CACHE", &run_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
+    let mut command = Command::new(worker_binary);
+    command.arg("--rivetlua-worker-v1")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let launch = if restricted {
+        match isolation::configure(&mut command, worker_binary, &run_dir, policy, &artifact_paths) {
+            Ok(plan) => Some(plan),
+            Err(_) => {
+                let _ = fs::remove_dir_all(&run_dir);
+                return immediate(policy_denied());
+            }
+        }
+    } else {
+        command.env("RIVETLUA_P16_WORKER_CACHE", &run_dir);
+        None
+    };
+    let spawned = command.spawn();
     let mut child = match spawned {
         Ok(child) => child,
         Err(_) => {
             let _ = fs::remove_dir_all(&run_dir);
-            return immediate(WorkerOutcome::Rejected(b"worker spawn failed".to_vec()));
+            return immediate(if restricted { policy_denied() } else {
+                WorkerOutcome::Rejected(b"worker spawn failed".to_vec())
+            });
         }
     };
     let pid = child.id();
@@ -332,11 +457,14 @@ pub unsafe fn run_worker(
     if unsafe { rivetlua_worker_set_nonblocking(stdin.as_ref().unwrap().as_raw_fd()) } != 0
         || unsafe { rivetlua_worker_set_nonblocking(stdout.as_raw_fd()) } != 0
     {
-        return finish(child, run_dir, WorkerOutcome::Malformed, None);
+        return finish(child, run_dir, if restricted { policy_denied() } else {
+            WorkerOutcome::Malformed
+        }, None, false, restricted);
     }
     let mut received = Vec::new();
     let mut offset = 0;
     let mut hello = false;
+    let mut parent_proof = None;
     let mut response = None;
     let mut eof = false;
     let mut failure = None;
@@ -345,7 +473,9 @@ pub unsafe fn run_worker(
             failure = Some(WorkerOutcome::Deadline);
             break;
         };
-        let want_write = hello && offset < request_bytes.len();
+        let want_write = hello && (!restricted || parent_proof.as_ref()
+            .is_some_and(|proof: &isolation::IsolationProof| proof.matches(policy, pid, true)))
+            && offset < request_bytes.len();
         let mut can_read = 0;
         let mut can_write = 0;
         // SAFETY：pipe fd 有效，兩個 out 只在同步 C poll 呼叫期間唯一可寫；無 callback/reentry。
@@ -365,14 +495,22 @@ pub unsafe fn run_worker(
             break;
         }
         if polled < 0 {
-            failure = Some(WorkerOutcome::Malformed);
+            failure = Some(if restricted && !hello { policy_denied() } else {
+                WorkerOutcome::Malformed
+            });
             break;
         }
         if can_read != 0 {
             match read_available(&mut stdout, &mut received, limits, started, deadline) {
                 Ok(is_eof) => eof = is_eof,
                 Err(error) => {
-                    failure = Some(error);
+                    failure = Some(if restricted && !hello
+                        && !matches!(error, WorkerOutcome::Deadline)
+                    {
+                        policy_denied()
+                    } else {
+                        error
+                    });
                     break;
                 }
             }
@@ -388,18 +526,43 @@ pub unsafe fn run_worker(
                     && hello_pid != std::process::id()
                     && received.is_empty() =>
                 {
+                    if let Some(plan) = &launch {
+                        match isolation::parent_probe(&child, plan) {
+                            Ok(proof) if proof.matches(policy, pid, true) => parent_proof = Some(proof),
+                            _ => {
+                                failure = Some(policy_denied());
+                                break;
+                            }
+                        }
+                    }
                     hello = true
                 }
+                Ok(Some(Frame { request_id: 0, identity,
+                    kind: FrameKind::Response(Response::Rejected(code)) }))
+                    if restricted && identity == abi::current_identity()
+                        && code == b"E_POLICY_DENIED" && received.is_empty() =>
+                {
+                    failure = Some(policy_denied());
+                    break;
+                }
                 Ok(Some(_)) => {
-                    failure = Some(WorkerOutcome::Malformed);
+                    failure = Some(if restricted { policy_denied() } else {
+                        WorkerOutcome::Malformed
+                    });
                     break;
                 }
                 Err(error) => {
-                    failure = Some(error);
+                    failure = Some(if restricted && !matches!(error, WorkerOutcome::Deadline) {
+                        policy_denied()
+                    } else {
+                        error
+                    });
                     break;
                 }
                 Ok(None) if eof => {
-                    failure = Some(WorkerOutcome::Crash);
+                    failure = Some(if restricted { policy_denied() } else {
+                        WorkerOutcome::Crash
+                    });
                     break;
                 }
                 Ok(None) => {}
@@ -430,15 +593,11 @@ pub unsafe fn run_worker(
                             && frame.identity == abi::current_identity() =>
                     {
                         response = Some(match frame.kind {
-                            FrameKind::Response(Response::Complete(values)) => {
-                                WorkerOutcome::Complete(values)
-                            }
-                            FrameKind::Response(Response::RuntimeError(bytes)) => {
-                                WorkerOutcome::RuntimeError(bytes)
-                            }
-                            FrameKind::Response(Response::Rejected(bytes)) => {
-                                WorkerOutcome::Rejected(bytes)
-                            }
+                            FrameKind::Response(response) if restricted =>
+                                restricted_outcome(response),
+                            FrameKind::Response(Response::Complete(values)) => WorkerOutcome::Complete(values),
+                            FrameKind::Response(Response::RuntimeError(bytes)) => WorkerOutcome::RuntimeError(bytes),
+                            FrameKind::Response(Response::Rejected(bytes)) => WorkerOutcome::Rejected(bytes),
                             FrameKind::Response(Response::NonCopyable { index, lua_type }) => {
                                 WorkerOutcome::NonCopyable { index, lua_type }
                             }
@@ -468,18 +627,41 @@ pub unsafe fn run_worker(
             }
         }
         if eof && !hello {
-            failure = Some(WorkerOutcome::Crash);
+            failure = Some(if restricted { policy_denied() } else {
+                WorkerOutcome::Crash
+            });
             break;
         }
     }
-    let mut status = child.try_wait().ok().flatten();
+    let mut status = if restricted { None } else { child.try_wait().ok().flatten() };
+    let mut response_exit_confirmed = false;
     if failure.is_none() && response.is_some() && eof {
-        while status.is_none() && remaining_ms(started, deadline).is_some() {
-            std::thread::sleep(Duration::from_millis(1));
-            status = child.try_wait().ok().flatten();
-        }
-        if status.is_none() {
-            failure = Some(WorkerOutcome::Deadline);
+        if restricted {
+            loop {
+                if remaining_ms(started, deadline).is_none() {
+                    failure = Some(WorkerOutcome::Deadline);
+                    break;
+                }
+                match exited_without_reap(&child) {
+                    Ok(true) => {
+                        response_exit_confirmed = true;
+                        break;
+                    }
+                    Ok(false) => std::thread::sleep(Duration::from_millis(1)),
+                    Err(()) => {
+                        failure = Some(WorkerOutcome::Crash);
+                        break;
+                    }
+                }
+            }
+        } else {
+            while status.is_none() && remaining_ms(started, deadline).is_some() {
+                std::thread::sleep(Duration::from_millis(1));
+                status = child.try_wait().ok().flatten();
+            }
+            if status.is_none() {
+                failure = Some(WorkerOutcome::Deadline);
+            }
         }
     }
     if remaining_ms(started, deadline).is_none()
@@ -488,7 +670,49 @@ pub unsafe fn run_worker(
         failure = Some(WorkerOutcome::Deadline);
     }
     let outcome = failure.unwrap_or_else(|| response.unwrap_or(WorkerOutcome::Malformed));
-    finish(child, run_dir, outcome, status)
+    finish(child, run_dir, outcome, status, response_exit_confirmed, restricted)
+}
+
+fn restricted_outcome(response: Response) -> WorkerOutcome {
+    match sanitize_response(response) {
+        Response::Complete(values) => WorkerOutcome::Complete(values),
+        Response::RuntimeError(code) => WorkerOutcome::RuntimeError(code),
+        Response::Rejected(code) => WorkerOutcome::Rejected(code),
+        Response::NonCopyable { index, lua_type } => WorkerOutcome::NonCopyable { index, lua_type },
+    }
+}
+
+fn sanitize_response(response: Response) -> Response {
+    match response {
+        Response::Complete(values) => {
+            let bytes = values.iter().try_fold(0_usize, |used, value| {
+                let size = match value {
+                    CopyValue::Nil => 1,
+                    CopyValue::Boolean(_) => 2,
+                    CopyValue::Integer(_) | CopyValue::NumberBits(_) => 9,
+                    CopyValue::Bytes(bytes) => bytes.len().checked_add(5)?,
+                };
+                used.checked_add(size)
+            });
+            if bytes.is_none_or(|bytes| bytes > OutputBudget::default().max_bytes) {
+                Response::Rejected(b"E_OUTPUT_LIMIT".to_vec())
+            } else {
+                Response::Complete(values)
+            }
+        }
+        Response::RuntimeError(_) => Response::RuntimeError(b"E_WORKER_RUNTIME".to_vec()),
+        Response::Rejected(code) if code == b"E_POLICY_DENIED" => Response::Rejected(code),
+        Response::Rejected(code) if code == b"E_WORKER_RESOURCE" => Response::Rejected(code),
+        Response::Rejected(code) if code == b"E_OUTPUT_LIMIT"
+            || code == b"response exceeds frame bound"
+            || code == b"string result exceeds bound"
+            || code == b"result count exceeds bound" =>
+        {
+            Response::Rejected(b"E_OUTPUT_LIMIT".to_vec())
+        }
+        Response::Rejected(_) => Response::Rejected(b"E_WORKER_REJECTED".to_vec()),
+        Response::NonCopyable { index, lua_type } => Response::NonCopyable { index, lua_type },
+    }
 }
 
 fn status_bytes(bytes: &[u8]) -> Vec<u8> {
@@ -643,7 +867,7 @@ fn shutdown_after_response<L>(mut owner: StateOwner, libraries: L, response: Res
     response
 }
 
-fn execute_request(request: Request, cache_root: &Path, limits: Limits) -> Response {
+fn execute_request(request: Request, cache_root: &Path, limits: Limits, policy: VmPolicy) -> Response {
     #[cfg(feature = "lua54")]
     let profile = LuaProfile::Lua54;
     #[cfg(feature = "lua55")]
@@ -665,10 +889,27 @@ fn execute_request(request: Request, cache_root: &Path, limits: Limits) -> Respo
             Err(_) => return Response::Rejected(b"transport decode/verify rejected".to_vec()),
         }
     };
-    let owner = match StateOwner::new() {
+    let mut owner = match if policy == VmPolicy::Compatibility {
+        StateOwner::new()
+    } else {
+        StateOwner::new_with_host_services(
+            HostServices::deny_all()
+                .and_policy(policy)
+                .and_output_budget(OutputBudget::default()),
+        )
+    } {
         Ok(owner) => owner,
         Err(_) => return Response::RuntimeError(b"child VM creation failed".to_vec()),
     };
+    if policy != VmPolicy::Compatibility
+        && owner.set_worker_fuel_limit(WORKER_REQUEST_FUEL).is_err()
+    {
+        return shutdown_after_response(
+            owner,
+            (),
+            Response::Rejected(b"E_WORKER_RESOURCE".to_vec()),
+        );
+    }
     let state = owner.as_ptr();
     let mut libraries: Vec<Rc<NativeLibrary>> = Vec::new();
     if libraries.try_reserve_exact(request.native.len()).is_err() {
@@ -688,6 +929,12 @@ fn execute_request(request: Request, cache_root: &Path, limits: Limits) -> Respo
                 Ok(symbol) => symbol,
                 Err(_) => return Response::Rejected(b"opener symbol rejected".to_vec()),
             };
+            if policy != VmPolicy::Compatibility
+                && !isolation::child_probe(policy, cache_root)
+                    .is_ok_and(|proof| proof.matches(policy, std::process::id(), false))
+            {
+                return Response::Rejected(b"E_POLICY_DENIED".to_vec());
+            }
             // SAFETY：worker 私有 request pipe 由已核准宿主送入；預檢已驗 identity/digest，
             // 宿主 CNoUnwind attestation 涵蓋 ctor/dtor/opener，C checkpoint 不跨 Rust frame。
             let (library, status) = match unsafe {
@@ -735,7 +982,17 @@ fn execute_request(request: Request, cache_root: &Path, limits: Limits) -> Respo
                     .unwrap_or_else(|| status_bytes(format!("Lua status {status}").as_bytes())),
             );
         }
-        copy_results(state, limits)
+        let response_limits = if policy == VmPolicy::Compatibility {
+            limits
+        } else {
+            Limits {
+                frame_bytes: limits.frame_bytes.min(
+                    HEADER_BYTES + 3 + OutputBudget::default().max_bytes,
+                ),
+                ..limits
+            }
+        };
+        copy_results(state, response_limits)
     })();
     shutdown_after_response(owner, libraries, response)
 }
@@ -743,19 +1000,44 @@ fn execute_request(request: Request, cache_root: &Path, limits: Limits) -> Respo
 pub fn worker_main() -> i32 {
     let mut args = std::env::args_os();
     let _program = args.next();
-    if args.next().as_deref() != Some(std::ffi::OsStr::new("--rivetlua-worker-v1"))
-        || args.next().is_some()
-    {
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--rivetlua-worker-v1")) {
+        return 2;
+    }
+    let policy = match args.next().as_deref() {
+        None => VmPolicy::Compatibility,
+        Some(arg) if arg == std::ffi::OsStr::new("--rivetlua-policy-sandbox") => VmPolicy::Sandbox,
+        Some(arg) if arg == std::ffi::OsStr::new("--rivetlua-policy-private") => VmPolicy::PrivateService,
+        _ => return 2,
+    };
+    if args.next().is_some() {
         return 2;
     }
     let cache = match std::env::var_os("RIVETLUA_P16_WORKER_CACHE") {
         Some(cache) => PathBuf::from(cache),
-        None => return 2,
+        None if policy == VmPolicy::Compatibility => return 2,
+        None => PathBuf::new(),
     };
-    if !cache.is_absolute() || !cache.is_dir() {
+    let cache_valid = cache.is_absolute() && cache.is_dir();
+    if policy == VmPolicy::Compatibility && !cache_valid {
         return 2;
     }
     let limits = Limits::default();
+    if policy != VmPolicy::Compatibility
+        && (!cache_valid || !isolation::child_probe(policy, &cache)
+            .is_ok_and(|proof| proof.matches(policy, std::process::id(), false)))
+    {
+        let denial = Frame {
+            request_id: 0,
+            identity: abi::current_identity(),
+            kind: FrameKind::Response(Response::Rejected(b"E_POLICY_DENIED".to_vec())),
+        };
+        if let Ok(bytes) = denial.encode(limits) {
+            let mut output = std::io::stdout().lock();
+            let _ = output.write_all(&bytes);
+            let _ = output.flush();
+        }
+        return 2;
+    }
     let hello = Frame {
         request_id: 0,
         identity: abi::current_identity(),
@@ -800,7 +1082,12 @@ pub fn worker_main() -> i32 {
     let FrameKind::Request(request) = frame.kind else {
         return 2;
     };
-    let response = execute_request(request, &cache, limits);
+    let response = execute_request(request, &cache, limits, policy);
+    let response = if policy == VmPolicy::Compatibility {
+        response
+    } else {
+        sanitize_response(response)
+    };
     let frame = Frame {
         request_id: frame.request_id,
         identity: abi::current_identity(),
@@ -812,9 +1099,11 @@ pub fn worker_main() -> i32 {
             let fallback = Frame {
                 request_id: frame.request_id,
                 identity: abi::current_identity(),
-                kind: FrameKind::Response(Response::Rejected(
-                    b"response exceeds frame bound".to_vec(),
-                )),
+                kind: FrameKind::Response(Response::Rejected(if policy == VmPolicy::Compatibility {
+                    b"response exceeds frame bound".to_vec()
+                } else {
+                    b"E_OUTPUT_LIMIT".to_vec()
+                })),
             };
             match fallback.encode(limits) {
                 Ok(bytes) => bytes,

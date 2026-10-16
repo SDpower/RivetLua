@@ -14,7 +14,7 @@ use rivetlua_core::{
 };
 use rivetlua_runtime::{
     AllocationCharges, CapiDumpBytes, HostAllocationCharge, LoadLimits, RuntimeErrorKind, Vm,
-    VmError,
+    VmError, VmPolicy,
 };
 
 use crate::error::ErrorClass;
@@ -31,6 +31,8 @@ enum Fault {
     Memory = 2,
     Budget = 3,
     File = 4,
+    Policy = 5,
+    OutputLimit = 6,
 }
 
 impl Fault {
@@ -40,6 +42,8 @@ impl Fault {
             2 => Self::Memory,
             3 => Self::Budget,
             4 => Self::File,
+            5 => Self::Policy,
+            6 => Self::OutputLimit,
             _ => return None,
         })
     }
@@ -50,6 +54,8 @@ impl Fault {
             Self::Memory => b"not enough memory",
             Self::Budget => b"load resource limit exceeded",
             Self::File => b"cannot open or read Lua file",
+            Self::Policy => b"E_POLICY_DENIED",
+            Self::OutputLimit => b"E_OUTPUT_LIMIT",
         }
     }
 }
@@ -123,6 +129,8 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_restore_reader_stack_b3(
 
 fn stack_fault(error: StackError) -> Fault {
     match error {
+        StackError::PolicyDenied => Fault::Policy,
+        StackError::OutputLimit => Fault::OutputLimit,
         StackError::Runtime(error) => vm_fault(error),
         StackError::Number(error) => match error.kind {
             RuntimeErrorKind::Heap(error) => vm_fault(error),
@@ -346,6 +354,9 @@ impl LoadSession {
         self.preprocess_file();
         let format = classify_input(&self.source.bytes);
         let binary = !matches!(format, InputFormat::Source);
+        if binary && vm.policy() != VmPolicy::Compatibility {
+            return Err(Fault::Policy);
+        }
         let allow_text = mode.is_none_or(|mode| mode.contains(&b't'));
         let allow_binary = mode.is_none_or(|mode| {
             mode.contains(&b'b') || (self.profile == LuaProfile::Lua55 && mode.contains(&b'B'))

@@ -38,6 +38,11 @@ use crate::host::{
     HostServiceError, HostServices, LoadBudget, LoadLimits, LoadServiceError, LoadTemporaryCharge,
     PathEncoding, ResourceBudget, ResourceLimits,
 };
+use crate::policy::{
+    CapabilityGrant, OpaqueServiceHandle, PolicyCapabilities, PrivateService, ServiceAccessError,
+    ServiceAudience, ServiceOperation, ServiceSlot, VmPolicy, ExportPolicy, OutputAudit,
+    OutputError, OutputMeter, SafeDiagnostic,
+};
 use crate::roots::{RootId, RootKind, RootLease, RootSet};
 use crate::stdlib::basic::BasicBuiltin;
 use crate::stdlib::debug::DebugBuiltin;
@@ -2696,6 +2701,12 @@ struct PendingFinalizerWarning {
 pub struct Vm {
     id: VmId,
     profile: LuaProfile,
+    policy: VmPolicy,
+    policy_issuer: Option<VmId>,
+    export_policy: ExportPolicy,
+    output_meter: OutputMeter,
+    output_budget_explicit: bool,
+    next_correlation_id: u64,
     #[cfg(any(feature = "jit", feature = "aot"))]
     pub(crate) jit_state: crate::jit::JitVmState,
     slots: Vec<Slot>,
@@ -2730,6 +2741,8 @@ pub struct Vm {
     pub(crate) parked_charge_owners: AllocationCharges,
     pub(crate) parked_next_generation: u64,
     host_services: HostServices,
+    private_services: Vec<ServiceSlot>,
+    private_services_charge: AllocationCharges,
     native_warning_bridge: Option<(HostFunctionId, ObjectRef)>,
     foreign_native_ids: Option<ForeignNativeIds>,
     math_rng: Option<[u64; 4]>,
@@ -2871,10 +2884,16 @@ impl Vm {
 
     fn new_with_ledger(
         profile: LuaProfile,
-        host_services: HostServices,
+        mut host_services: HostServices,
         ledger: AllocationLedger,
     ) -> Result<Self, VmError> {
+        host_services.apply_policy_restrictions();
         let id = VmId::new_unique().ok_or(VmError::VmIdExhausted)?;
+        let policy = host_services.policy();
+        let policy_issuer = host_services.policy_issuer();
+        let export_policy = host_services.export_policy();
+        let output_meter = OutputMeter::new(host_services.effective_output_budget());
+        let output_budget_explicit = host_services.explicit_output_budget();
         let foreign_native_ids = if host_services.load.foreign_native_cpath.is_some() {
             Some(ForeignNativeIds {
                 loadlib: HostFunctionId::new_unique(id).ok_or(VmError::IdentityExhausted)?,
@@ -2887,6 +2906,12 @@ impl Vm {
         Ok(Self {
             id,
             profile,
+            policy,
+            policy_issuer,
+            export_policy,
+            output_meter,
+            output_budget_explicit,
+            next_correlation_id: 1,
             #[cfg(any(feature = "jit", feature = "aot"))]
             jit_state: crate::jit::JitVmState::new(),
             slots: Vec::new(),
@@ -2920,6 +2945,8 @@ impl Vm {
             parked_charge_owners: AllocationCharges::new(),
             parked_next_generation: 1,
             host_services,
+            private_services: Vec::new(),
+            private_services_charge: AllocationCharges::new(),
             native_warning_bridge: None,
             foreign_native_ids,
             math_rng: None,
@@ -2939,6 +2966,11 @@ impl Vm {
     }
 
     pub(crate) fn write_host_output(&mut self, bytes: &[u8]) -> Result<(), HostServiceError> {
+        if !self.host_services.output_allowed() {
+            return Err(HostServiceError::PolicyDenied);
+        }
+        self.charge_output(bytes.len(), 0, bytes.len().max(1))
+            .map_err(|_| HostServiceError::OutputLimit)?;
         self.host_services.output(bytes)
     }
 
@@ -2947,6 +2979,8 @@ impl Vm {
         message: &[u8],
         tocont: bool,
     ) -> Result<(), crate::host::HostWarningError> {
+        self.charge_output(message.len(), 0, message.len().max(1))
+            .map_err(|_| crate::host::HostWarningError::OutputLimit)?;
         self.host_services.warning(message, tocont)
     }
 
@@ -3504,6 +3538,255 @@ impl Vm {
 
     pub const fn id(&self) -> VmId {
         self.id
+    }
+
+    pub const fn policy(&self) -> VmPolicy {
+        self.policy
+    }
+
+    pub fn output_audit(&self) -> OutputAudit {
+        self.output_meter.audit()
+    }
+
+    pub(crate) fn meter_host_results(&self) -> bool {
+        self.policy != VmPolicy::Compatibility || self.output_budget_explicit
+    }
+
+    pub fn module_export_enabled(&self) -> bool {
+        self.policy == VmPolicy::Compatibility
+            && self.export_policy == ExportPolicy::OwnerModules
+            && self.policy_issuer.is_some()
+    }
+
+    /// 每個 VM 只有一份累積帳本；呼叫者須在送出任何 bytes 前扣款。
+    pub fn charge_output(
+        &mut self,
+        bytes: usize,
+        depth: usize,
+        work: usize,
+    ) -> Result<(), OutputError> {
+        self.output_meter.charge(bytes, depth, work)
+    }
+
+    pub fn reject_output(&mut self) -> OutputError {
+        self.output_meter.reject()
+    }
+
+    pub fn safe_diagnostic(&mut self, public_code: &'static str) -> SafeDiagnostic {
+        let correlation_id = self.next_correlation_id;
+        self.next_correlation_id = self.next_correlation_id.saturating_add(1);
+        SafeDiagnostic {
+            public_code,
+            correlation_id,
+        }
+    }
+
+    pub fn authorizes_module_export(&self, issuer: &PolicyCapabilities) -> bool {
+        self.policy == VmPolicy::Compatibility
+            && self.export_policy == ExportPolicy::OwnerModules
+            && self.policy_issuer == Some(issuer.issuer)
+    }
+
+    fn private_service_slot(&self, handle: &OpaqueServiceHandle) -> Option<&ServiceSlot> {
+        if self.policy != VmPolicy::PrivateService
+            || handle.scope != self.policy
+            || handle.owner != self.id
+        {
+            return None;
+        }
+        let slot = self.private_services.get(handle.slot)?;
+        (slot.generation == handle.generation && slot.service.is_some()).then_some(slot)
+    }
+
+    /// 服務只進入 VM 私有登錄表，任何失效身分均回傳同一拒絕結果。
+    pub fn register_private_service(
+        &mut self,
+        issuer: &PolicyCapabilities,
+        service: impl PrivateService + 'static,
+    ) -> Result<OpaqueServiceHandle, ServiceAccessError> {
+        if self.policy != VmPolicy::PrivateService
+            || self.policy_issuer != Some(issuer.issuer)
+            || self.execution_running
+            || !self.parked_executions.is_empty()
+        {
+            return Err(ServiceAccessError::Denied);
+        }
+        let service_charge = self
+            .ledger
+            .reserve(core::mem::size_of_val(&service))
+            .and_then(Reservation::commit_charge)
+            .map_err(|_| ServiceAccessError::Denied)?;
+        let reusable = self
+            .private_services
+            .iter()
+            .position(|slot| slot.service.is_none() && slot.generation != u64::MAX);
+        let slot_index = if let Some(index) = reusable {
+            index
+        } else {
+            let needed = self.private_services.len().checked_add(1).ok_or(ServiceAccessError::Denied)?;
+            let minimum = checked_bytes(needed, size_of::<ServiceSlot>())
+                .map_err(|_| ServiceAccessError::Denied)?;
+            let mut replacement = Vec::new();
+            let ticket = reserve_vec(
+                &self.ledger,
+                &mut replacement,
+                needed,
+                FailPoint::WorkReserve,
+            )
+            .map_err(|_| ServiceAccessError::Denied)?;
+            let actual = checked_bytes(replacement.capacity(), size_of::<ServiceSlot>())
+                .map_err(|_| ServiceAccessError::Denied)?;
+            let extra = self.ledger.reserve(actual.checked_sub(minimum).ok_or(ServiceAccessError::Denied)?)
+                .map_err(|_| ServiceAccessError::Denied)?;
+            let mut charges = AllocationCharges::new();
+            charges.try_reserve(2).map_err(|_| ServiceAccessError::Denied)?;
+            let base = ticket.commit_charge().map_err(|_| ServiceAccessError::Denied)?;
+            let excess = extra.commit_charge().map_err(|_| ServiceAccessError::Denied)?;
+            charges.push_prepared(base);
+            charges.push_prepared(excess);
+            replacement.append(&mut self.private_services);
+            replacement.push(ServiceSlot {
+                generation: 1,
+                service: None,
+                _service_charge: None,
+            });
+            self.private_services = replacement;
+            self.private_services_charge = charges;
+            self.private_services.len() - 1
+        };
+        let slot = &mut self.private_services[slot_index];
+        slot.service = Some(Box::new(service));
+        slot._service_charge = Some(service_charge);
+        Ok(OpaqueServiceHandle {
+            owner: self.id,
+            slot: slot_index,
+            generation: slot.generation,
+            scope: self.policy,
+        })
+    }
+
+    pub fn issue_service_grant(
+        &self,
+        issuer: &PolicyCapabilities,
+        handle: &OpaqueServiceHandle,
+        operation: ServiceOperation,
+        audience: ServiceAudience,
+        limits: ResourceLimits,
+        expires_at: u64,
+    ) -> Result<CapabilityGrant, ServiceAccessError> {
+        if self.policy_issuer != Some(issuer.issuer)
+            || self.private_service_slot(handle).is_none()
+            || self.host_services.policy_now().is_none()
+            || operation != ServiceOperation::Invoke
+            || audience != ServiceAudience::Host
+        {
+            return Err(ServiceAccessError::Denied);
+        }
+        Ok(CapabilityGrant {
+            issuer: issuer.issuer,
+            owner: self.id,
+            slot: handle.slot,
+            generation: handle.generation,
+            scope: self.policy,
+            operation,
+            audience,
+            expires_at,
+            limits,
+            work_left: limits.max_work_units as u64,
+            read_left: limits.max_read_bytes,
+            write_left: limits.max_write_bytes,
+            exhausted: false,
+        })
+    }
+
+    pub fn dispatch_private_service(
+        &mut self,
+        handle: &OpaqueServiceHandle,
+        grant: &mut CapabilityGrant,
+        operation: ServiceOperation,
+        audience: ServiceAudience,
+        input: &[u8],
+    ) -> Result<Vec<u8>, ServiceAccessError> {
+        if self.execution_running
+            || !self.parked_executions.is_empty()
+            || grant.exhausted
+            || operation != ServiceOperation::Invoke
+            || audience != ServiceAudience::Host
+            || grant.operation != operation
+            || grant.audience != audience
+            || grant.issuer != self.policy_issuer.ok_or(ServiceAccessError::Denied)?
+            || grant.owner != self.id
+            || grant.slot != handle.slot
+            || grant.generation != handle.generation
+            || grant.scope != self.policy
+            || self.private_service_slot(handle).is_none()
+        {
+            return Err(ServiceAccessError::Denied);
+        }
+        let now = self.host_services.policy_now().ok_or(ServiceAccessError::Denied)?;
+        if now >= grant.expires_at || grant.work_left == 0 || input.len() > grant.read_left {
+            grant.exhausted = true;
+            return Err(ServiceAccessError::Denied);
+        }
+        // callback 若 unwind，既有 grant 保持失效，不能重放已消耗的工作或副作用。
+        grant.exhausted = true;
+        grant.read_left -= input.len();
+        let mut fuel = grant.work_left;
+        let mut finalizer_steps = 0;
+        let mut limits = grant.limits;
+        limits.max_work_units = grant.work_left.min(usize::MAX as u64) as usize;
+        let mut budget = ResourceBudget::metered(
+            limits,
+            &mut fuel,
+            &mut finalizer_steps,
+            false,
+            self.ledger.clone(),
+        );
+        let outcome = (|| {
+            budget.spend_work(1).map_err(|_| ServiceAccessError::Denied)?;
+            budget.claim_temporary(input.len()).map_err(|_| ServiceAccessError::Denied)?;
+            let slot = self.private_services.get_mut(handle.slot).ok_or(ServiceAccessError::Denied)?;
+            let service = slot.service.as_mut().ok_or(ServiceAccessError::Denied)?;
+            let output = service.invoke(input, &mut budget).map_err(|_| ServiceAccessError::Denied)?;
+            if output.len() > grant.write_left {
+                return Err(ServiceAccessError::Denied);
+            }
+            budget.claim_temporary(output.len()).map_err(|_| ServiceAccessError::Denied)?;
+            budget.ensure_active().map_err(|_| ServiceAccessError::Denied)?;
+            Ok(output)
+        })();
+        drop(budget);
+        grant.work_left = fuel;
+        match outcome {
+            Ok(output) => {
+                self.charge_output(output.len(), 0, output.len().max(1))
+                    .map_err(|_| ServiceAccessError::OutputLimit)?;
+                grant.write_left -= output.len();
+                grant.exhausted = false;
+                Ok(output)
+            }
+            Err(error) => {
+                grant.exhausted = true;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn revoke_private_service(
+        &mut self,
+        handle: &OpaqueServiceHandle,
+    ) -> Result<(), ServiceAccessError> {
+        if self.execution_running
+            || !self.parked_executions.is_empty()
+            || self.private_service_slot(handle).is_none()
+        {
+            return Err(ServiceAccessError::Denied);
+        }
+        let slot = &mut self.private_services[handle.slot];
+        slot.service = None;
+        slot._service_charge = None;
+        slot.generation = slot.generation.checked_add(1).unwrap_or(u64::MAX);
+        Ok(())
     }
 
     pub fn slot_state(&self, slot: SlotId) -> Option<SlotState> {
