@@ -435,7 +435,10 @@ version = "0.0.0"
 dependencies = [
  "rivetlua",
  "rivetlua-cli",
+ "rivetlua-compiler",
+ "rivetlua-core",
  "rivetlua-native",
+ "rivetlua-runtime",
 ]
 
 [[package]]

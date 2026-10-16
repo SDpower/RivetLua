@@ -9,6 +9,9 @@ const WARMUP: usize = 2;
 const ITERATIONS: usize = 5;
 const FUEL: u64 = 100_000;
 const HEAP_LIMIT: usize = 16 * 1024 * 1024;
+pub(super) const P23_FUEL: u64 = FUEL;
+pub(super) const P23_HEAP_LIMIT: usize = HEAP_LIMIT;
+pub(super) const P23_RUNS_PER_WORKLOAD: usize = 1 + WARMUP + ITERATIONS;
 const USAGE: &str =
     "用法：perf baseline --target <target-triple> --toolchain <toolchain-label> [--jit] [lua54|lua55]";
 
@@ -255,6 +258,22 @@ fn run_scenario(
     ))
 }
 
+pub(super) fn p23_workloads() -> Vec<(&'static str, &'static str)> {
+    WORKLOADS.iter().map(|workload| (workload.id, workload.source)).collect()
+}
+
+pub(super) fn p23_collect(
+    profile_name: &str,
+    profile: LuaProfile,
+    target: &str,
+    toolchain: &str,
+    jit: bool,
+) -> Result<Vec<String>, String> {
+    WORKLOADS.iter()
+        .map(|workload| run_scenario(workload, profile_name, profile, target, toolchain, jit))
+        .collect()
+}
+
 fn measure_sample(
     vm: &mut rivetlua::Vm,
     module: &rivetlua::Module,
@@ -336,7 +355,7 @@ fn ensure_expected_return(workload: &Workload, outcome: &RunOutcome) -> Result<(
 
 fn sample_json(sample: &Sample) -> String {
     format!(
-        "{{\"kind\":\"{}\",\"iteration\":{},\"compile_ns\":{},\"load_ns\":{},\"first_ns\":{},\"hot_ns\":{},\"gc_ns\":{},\"jit_compile_ns\":{},\"allocation_ledger\":{{\"before_load\":{},\"after_run\":{},\"after_collect\":{}}},\"gc_trace\":{{\"before_load\":{},\"after_run\":{},\"after_collect\":{}}},\"code_bytes\":{},\"cache_bytes\":{},\"metadata_bytes\":{},\"native_executed\":{},\"total_logical_instructions\":{},\"native_ratio\":{:.6},\"fallback_reason\":{}}}",
+        "{{\"kind\":\"{}\",\"iteration\":{},\"compile_ns\":{},\"load_ns\":{},\"first_ns\":{},\"hot_ns\":{},\"gc_ns\":{},\"jit_compile_ns\":{},\"allocation_ledger\":{{\"before_load\":{},\"after_run\":{},\"after_collect\":{}}},\"gc_trace\":{{\"before_load\":{},\"after_run\":{},\"after_collect\":{}}},\"code_bytes\":{},\"cache_bytes\":{},\"lookup_cache_metadata_bytes\":{},\"metadata_bytes\":{},\"shared_module_resident_bytes\":null,\"physical_rss_bytes\":null,\"native_executed\":{},\"total_logical_instructions\":{},\"native_ratio\":{:.6},\"fallback_reason\":{}}}",
         sample.kind.as_str(),
         sample.iteration,
         optional_number(sample.compile_ns),
@@ -353,6 +372,7 @@ fn sample_json(sample: &Sample) -> String {
         trace_json(sample.trace_after_collect),
         sample.jit_stats.code_bytes,
         sample.cache_bytes.saturating_add(sample.jit_stats.metadata_bytes),
+        sample.cache_bytes,
         sample.jit_stats.metadata_bytes,
         sample.jit_stats.native_executed_instructions,
         sample.jit_stats.total_logical_instructions,

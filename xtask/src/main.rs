@@ -7,6 +7,7 @@ mod p18;
 mod p19;
 mod p20;
 mod p21;
+mod p23;
 
 use std::env;
 use std::fmt::Write as _;
@@ -12849,6 +12850,7 @@ fn main() -> ExitCode {
         Some("compatibility") => p19::compatibility(&arguments[1..]),
         Some("perf") => p20::run(&arguments[1..]),
         Some("platform") => p21::run(&arguments[1..]),
+        Some("experiment") => p23::run(&arguments[1..]),
         Some("runner") => runner(&arguments[1..]),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P00") && arguments.len() == 2 => {
             GATE_REPORT_WRITTEN.store(false, Ordering::Relaxed);
@@ -12872,7 +12874,7 @@ fn main() -> ExitCode {
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P16") && arguments.len() == 2 => p16::gate(),
         Some("gate") if arguments.get(1).map(String::as_str) == Some("P17") => p17::gate(&arguments[2..]),
         _ => Err(
-            "用法：rivetlua-xtask package <tree-init|rockspec|lock|install|remove|run|moonrocks> ... | toolchain | reference --profile lua55|lua54 [--offline] | compatibility [lua54|lua55] [--gaps] | perf baseline --target <target-triple> --toolchain <toolchain-label> [lua54|lua55] | platform runtime-audit --artifact <rlib> --dependencies <cargo-tree-text> --target <triple> | platform matrix [lua54|lua55] | platform resources [lua54|lua55] | runner --profile lua55|lua54 --case <P00-ID> | official-tests --profile lua55-i64f64|lua54-i64f64 --mode basic | p16-acceptance --profile lua55-i64f64|lua54-i64f64 | gate P00|P01|P02|P03|P04|P05|P06|P07|P08|P09|P10|P11|P12|P13|P14|P15|P16|P17 [--batch P17-B01|P17-B02|P17-B03]".into(),
+            "用法：rivetlua-xtask package <tree-init|rockspec|lock|install|remove|run|moonrocks> ... | toolchain | reference --profile lua55|lua54 [--offline] | compatibility [lua54|lua55] [--gaps] | perf baseline --target <target-triple> --toolchain <toolchain-label> [lua54|lua55] | platform runtime-audit --artifact <rlib> --dependencies <cargo-tree-text> --target <triple> | platform matrix [lua54|lua55] | platform resources [lua54|lua55] | experiment registry | experiment manifest --input <json> | experiment fuzz --manifest <json> --input <file> | experiment fault --manifest <json> | experiment tools | experiment schedule pr|nightly|release [--seeds n] | experiment performance --manifest <json> | experiment perf-compare --baseline <json> --candidate <json> [--pair <baseline> <candidate>]... | runner --profile lua55|lua54 --case <P00-ID> | official-tests --profile lua55-i64f64|lua54-i64f64 --mode basic | p16-acceptance --profile lua55-i64f64|lua54-i64f64 | gate P00|P01|P02|P03|P04|P05|P06|P07|P08|P09|P10|P11|P12|P13|P14|P15|P16|P17 [--batch P17-B01|P17-B02|P17-B03]".into(),
         ),
     };
     match result {

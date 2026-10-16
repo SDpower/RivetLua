@@ -1,0 +1,121 @@
+# 純資料模板；所有 VERIFIED_* 與 TASK_OWNED_* 均須先靜態驗證，不可直接執行。
+version = 1
+mode = "manual-only"
+launch_chain = "UNVERIFIED"
+
+[[job]]
+registry_ids = ["P23-MIRI-PURE"]
+tool = "miri"
+scopes = ["pure-rust"]
+profiles = ["lua54-i64f64", "lua55-i64f64"]
+target_candidates = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+sources = ["crates/rivetlua-core/tests/p01_value.rs", "crates/rivetlua-runtime/tests/gc_controls.rs", "xtask/fixtures/p23/miri_negative.rs"]
+status = "NOT_RUN"
+nightly_toolchain = "nightly-2026-09-21"
+instrumentation = "Miri nightly-2026-09-21；core/runtime default features，排除 JIT/FFI/xtask"
+program = "VERIFIED_NIGHTLY_CARGO"
+argv = ["miri", "test", "--locked", "-p", "rivetlua-core", "--test", "p01_value", "public_value_api_preserves_categories_and_object_identity", "--", "--exact"]
+second_program = "VERIFIED_NIGHTLY_CARGO"
+second_argv = ["miri", "test", "--locked", "-p", "rivetlua-runtime", "--test", "gc_controls", "typed_gc_control_defaults_and_running_b8", "--", "--exact"]
+negative_program = "VERIFIED_MIRI_DRIVER"
+negative_argv = ["--test", "xtask/fixtures/p23/miri_negative.rs"]
+expected_negative_exit = "nonzero"
+expected_negative_diagnostic = "P23_MIRI_NEGATIVE_CONTROL"
+
+[[job]]
+registry_ids = ["P23-ASAN-FFI", "P23-ASAN-NATIVE"]
+tool = "asan"
+scopes = ["ffi", "native"]
+profiles = ["lua54-i64f64", "lua55-i64f64"]
+target_candidates = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+sources = ["xtask/fixtures/p23/sanitizer_negative.c", "xtask/fixtures/p23/capi_sequence.c"]
+status = "NOT_RUN"
+instrumentation = "-fsanitize=address -fno-omit-frame-pointer -O0；產品 CAPI 與 native library 亦須受 instrument"
+program = "VERIFIED_CLANG"
+argv = ["-std=c11", "-O0", "-g", "-fsanitize=address", "-fno-omit-frame-pointer", "xtask/fixtures/p23/sanitizer_negative.c", "-o", "TASK_OWNED_ASAN_NEGATIVE"]
+negative_program = "TASK_OWNED_ASAN_NEGATIVE"
+negative_argv = []
+expected_negative_exit = "nonzero"
+expected_negative_diagnostic = "AddressSanitizer"
+product_program = "VERIFIED_CLANG"
+product_argv = ["-fsanitize=address", "-fno-omit-frame-pointer", "-I", "VERIFIED_PROFILE_INCLUDE", "-I", "include/rivetlua", "xtask/fixtures/p23/capi_sequence.c", "VERIFIED_INSTRUMENTED_RIVETLUA_STATICLIB", "VERIFIED_LINK_ARGS", "-o", "TASK_OWNED_ASAN_CAPI"]
+product_input = "TASK_OWNED_BOUNDED_CAPI_INPUT"
+
+[[job]]
+registry_ids = ["P23-UBSAN-FFI", "P23-UBSAN-NATIVE"]
+tool = "ubsan"
+scopes = ["ffi", "native"]
+profiles = ["lua54-i64f64", "lua55-i64f64"]
+target_candidates = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+sources = ["xtask/fixtures/p23/sanitizer_negative.c", "xtask/fixtures/p23/capi_sequence.c"]
+status = "NOT_RUN"
+instrumentation = "-fsanitize=undefined -fno-sanitize-recover=all -O0；產品 CAPI 與 native library 亦須受 instrument"
+program = "VERIFIED_CLANG"
+argv = ["-std=c11", "-O0", "-g", "-fsanitize=undefined", "-fno-sanitize-recover=all", "-DP23_NEGATIVE_UBSAN", "xtask/fixtures/p23/sanitizer_negative.c", "-o", "TASK_OWNED_UBSAN_NEGATIVE"]
+negative_program = "TASK_OWNED_UBSAN_NEGATIVE"
+negative_argv = []
+expected_negative_exit = "nonzero"
+expected_negative_diagnostic = "runtime error: signed integer overflow"
+product_program = "VERIFIED_CLANG"
+product_argv = ["-fsanitize=undefined", "-fno-sanitize-recover=all", "-I", "VERIFIED_PROFILE_INCLUDE", "-I", "include/rivetlua", "xtask/fixtures/p23/capi_sequence.c", "VERIFIED_INSTRUMENTED_RIVETLUA_STATICLIB", "VERIFIED_LINK_ARGS", "-o", "TASK_OWNED_UBSAN_CAPI"]
+product_input = "TASK_OWNED_BOUNDED_CAPI_INPUT"
+
+[[job]]
+registry_ids = ["P23-TSAN-SHARED"]
+tool = "tsan"
+scopes = ["native"]
+profiles = ["lua54-i64f64", "lua55-i64f64"]
+target_candidates = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+sources = ["xtask/fixtures/p23/race_negative.c", "crates/rivetlua-capi/tests/stack_lifecycle.rs"]
+status = "NOT_RUN"
+instrumentation = "-fsanitize=thread -pthread -O1；產品共享狀態與相依 native library 亦須受 instrument"
+program = "VERIFIED_CLANG"
+argv = ["-std=c11", "-O1", "-g", "-pthread", "-fsanitize=thread", "xtask/fixtures/p23/race_negative.c", "-o", "TASK_OWNED_TSAN_NEGATIVE"]
+negative_program = "TASK_OWNED_TSAN_NEGATIVE"
+negative_argv = []
+expected_negative_exit = "nonzero"
+expected_negative_diagnostic = "ThreadSanitizer: data race"
+product_program = "VERIFIED_INSTRUMENTED_TSAN_JOB"
+product_argv = ["--source", "crates/rivetlua-capi/tests/stack_lifecycle.rs", "--profile", "VERIFIED_PROFILE", "--target", "VERIFIED_TARGET"]
+
+[[job]]
+registry_ids = ["P23-JIT-INSTRUMENTED"]
+tool = "native-jit"
+scopes = ["jit"]
+profiles = ["lua54-i64f64", "lua55-i64f64"]
+target_candidates = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+sources = ["crates/rivetlua-runtime/src/jit.rs", "crates/rivetlua-native/src/execmem.rs"]
+status = "BLOCKED"
+instrumentation = "generated code instrumentation、guard-page、ISA、fuel、GC/deopt 與 interpreter differential 尚無核准工作"
+program = "APPROVED_JIT_JOB_REQUIRED"
+argv = []
+expected_negative_exit = "undefined-until-approved-negative-job"
+expected_negative_diagnostic = "undefined-until-generated-code-instrumented"
+
+[[job]]
+registry_ids = ["P23-WORKER-POLICY-DENY"]
+tool = "worker-os"
+scopes = ["os-worker"]
+profiles = ["lua54-i64f64", "lua55-i64f64"]
+target_candidates = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+sources = ["crates/rivetlua-capi/tests/p22_worker_policy.rs", "crates/rivetlua-capi/src/worker/process.rs"]
+status = "BLOCKED"
+instrumentation = "VmPolicy::Sandbox 必須於 native load 前實際取得 OS isolation denial evidence"
+program = "APPROVED_OS_WORKER_JOB_REQUIRED"
+argv = []
+expected_negative_exit = "undefined-until-approved-os-job"
+expected_negative_diagnostic = "E_POLICY_DENIED"
+
+[[job]]
+registry_ids = ["P23-FZ006-CAPI"]
+tool = "cargo-fuzz"
+scopes = ["c-api"]
+profiles = ["lua54-i64f64", "lua55-i64f64"]
+target_candidates = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+sources = ["xtask/fixtures/p23/capi_sequence.c"]
+status = "BLOCKED"
+instrumentation = "cargo-fuzz 0.13.2 為計畫參考；外部 CAPI job 尚無已驗證啟動鏈"
+program = "VERIFIED_CAPI_FUZZ_JOB_REQUIRED"
+argv = ["--profile", "VERIFIED_PROFILE", "--target", "VERIFIED_TARGET", "--source", "xtask/fixtures/p23/capi_sequence.c", "--input", "TASK_OWNED_BOUNDED_CAPI_INPUT"]
+expected_negative_exit = "nonzero-only-for-confirmed-finding"
+expected_negative_diagnostic = "FINDING"
