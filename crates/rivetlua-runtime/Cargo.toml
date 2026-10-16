@@ -7,8 +7,12 @@ license.workspace = true
 repository.workspace = true
 description = "RivetLua 的純 Rust VM 與 heap。"
 
+[features]
+jit = ["dep:rivetlua-native"]
+
 [dependencies]
 rivetlua-core = { path = "../rivetlua-core" }
+rivetlua-native = { path = "../rivetlua-native", optional = true }
 
 [dev-dependencies]
 rivetlua-compiler = { path = "../rivetlua-compiler" }

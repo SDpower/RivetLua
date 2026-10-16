@@ -1,0 +1,15 @@
+[package]
+name = "rivetlua-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RivetLua 的可移除受限原生碼後端。"
+
+[dependencies]
+rivetlua-core = { path = "../rivetlua-core" }
+cranelift-codegen = { version = "=0.134.2", default-features = false, features = ["std", "x86", "arm64"] }
+cranelift-frontend = { version = "=0.134.2", default-features = false }
+target-lexicon = "=0.13.5"
+libc = "=0.2.190"

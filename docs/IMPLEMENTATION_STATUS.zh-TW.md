@@ -10,10 +10,13 @@
 
 - **P17：已交付並推送**（[commit](https://github.com/SDpower/RivetLua/commit/f84b0d74ac743e26dd02e7749b37d8298b1c5be1)）。
 - **P18：四批已交付並推送**（[commit](https://github.com/SDpower/RivetLua/commit/fba6e4bbe94ddcc3916ceed21a1ac58eb87ff233)）。
-- **P19：** B01～B04 四批實作與整合複閱已完成，本階段提交包含此進度更新。B04 提供共用 typed `CompatibilityEntry` v1、SDK `compatibility_entries`、CLI `--compatibility [--gaps]` 與 xtask `compatibility`；`luaL_openselectedlibs` 仍是可查詢的公開 API 缺口。必要增量編譯 3 項 exit 0；未執行測試／gate／CI／formatter。
-- **P20～P24：** 尚待依序處理。
+- **P19：** B01～B04 四批已整合並 commit/push（[commit](https://github.com/SDpower/RivetLua/commit/e33e0cc14efee253771958a79a7b8c61f8ebf7bc)）。B04 提供共用 typed `CompatibilityEntry` v1、SDK `compatibility_entries`、CLI `--compatibility [--gaps]` 與 xtask `compatibility`；`luaL_openselectedlibs` 仍是可查詢的公開 API 缺口。必要增量編譯 3 項 exit 0；未執行測試／gate／CI／formatter。
+- **P20-B01／B02：** 基線工具、資料來源與本機基線完成；I-A fixed 8-slot lookup cache 與 I-B 後端工程評估完成。每個 Execution 的 inline cache metadata 為 1152 bytes；原 array lookup 不走 hash cache，沒有加速證據，synthetic fixture 僅為契約範例。
+- **P20-B03／B04：** 四批實作與整合完成。獨立 `crates/rivetlua-native` 使用 Cranelift codegen／frontend 0.134.2 與鎖定的 libc（不使用 `cranelift-jit`）；受限數值／控制流程以 128-instruction quantum 執行，guard/deopt 保留未執行 pc、fuel 與既有 cleanup 路徑，code／metadata 採有界 VM-local FIFO 退役。core／compiler／runtime 維持 safe；native ABI／execmem 薄層逐處提供安全理由與檢查。
+- **必要建置與產品基線：** xtask 建置、SDK 預設與 `jit` library check 均 exit 0；產品 interpreter 與 `--jit` 基線各有 6 scenarios／36 raw。當前環境沒有 JIT entitlement，整數 while 因 `Platform` 回退，float／table 因 `UnsupportedInstruction` 回退，native executed 為 0；不宣稱 JIT 加速。修改來源由 for-loop 改為 while-loop，因此不與舊來源基線混比。
+- **測試與提交：** `cargo check -p rivetlua --test p20_jit --features jit` exit 0，只編譯測試來源，未執行測試。所有測試、Basic／Complete、phase／batch gate、CI acceptance 與驗收紀錄均已取消。本階段提交包含此進度更新；P21～P24 尚未開始。
 
-目前未宣稱完整上游相容或 production release。使用者已取消所有 phase／batch gate、Basic／Complete、測試／CI acceptance 與驗收紀錄；詳情與驗證界線見下方 P17～P24 狀態。
+目前未宣稱完整上游相容或 production release。P20 四批實作與整合已完成，但未執行測試；使用者已取消所有 phase／batch gate、Basic／Complete、測試／CI acceptance 與驗收紀錄。本階段提交包含此進度更新。
 
 ## 已實作並驗收
 
@@ -84,10 +87,11 @@ NEG006 在兩版各有 30 個已綁來源 SHA 的 LLVM bitcode member，受本�
 
 - **P17：已交付並推送**，[commit f84b0d7](https://github.com/SDpower/RivetLua/commit/f84b0d74ac743e26dd02e7749b37d8298b1c5be1)。完整官方 suite 相容 PASS 未獲證明；使用者已取消階段／批次驗收，因此舊驗收結果不改寫交付狀態。
 - **P18：四批已交付並推送**，[commit fba6e4b](https://github.com/SDpower/RivetLua/commit/fba6e4bbe94ddcc3916ceed21a1ac58eb87ff233)。產品實作、fixtures 與複閱完成；default、Lua 5.4 native、Lua 5.5 native 的必要 incremental compile 均 exit 0，這只表示編譯成功，不代表測試或官方相容。範圍包括隔離 package tree／rockspec、完整 ClosureLock、transaction install/remove、native build（不自動 attestation）、受限 LuaUnit／Busted runner、僅 loopback localtest 的 Moonrocks、固定 lock 模式的 outdated 檢查及 rockspec-only upload；native 執行需宿主 NativeDriver／attestor。
-- **P19：B01～B04 四批實作與整合複閱已完成，待隨本階段提交交付。** B04 提供共用 typed `CompatibilityEntry` v1、SDK `compatibility_entries`、CLI `--compatibility [--gaps]` 與 xtask `compatibility`；`luaL_openselectedlibs` 仍是可查詢的公開 API 缺口。未新增 `unsafe`。
-- **P20～P24：尚未開始，依序待辦。**
+- **P19：B01～B04 四批已整合並 commit/push**（[commit](https://github.com/SDpower/RivetLua/commit/e33e0cc14efee253771958a79a7b8c61f8ebf7bc)）。B04 提供共用 typed `CompatibilityEntry` v1、SDK `compatibility_entries`、CLI `--compatibility [--gaps]` 與 xtask `compatibility`；`luaL_openselectedlibs` 仍是可查詢的公開 API 缺口。未新增 `unsafe`。
+- **P20：** B01～B04 實作與整合完成，必要建置／check exit 0；`p20_jit` 測試來源僅編譯，未執行。產品 interpreter 與 `--jit` 基線均為 6 scenarios／36 raw，但此環境 native executed 為 0，沒有 JIT 加速證據。本階段提交包含此進度更新；不宣稱完整相容或正式發布。
+- **P21～P24：** 尚未開始。
 
-使用者已取消所有 phase／batch gate、Basic／Complete、測試／CI acceptance 與驗收紀錄。P19 未執行測試、gate、CI 或 formatter；規格、fixtures 或 compile 結果不代表官方行為 PASS；目前未宣稱完整上游相容或 production release。
+使用者已取消所有 phase／batch gate、Basic／Complete、測試／CI acceptance 與驗收紀錄。P20 未執行測試、gate、CI 或 formatter；測試來源編譯與效能觀察不代表官方行為 PASS，native executed 為 0，也不代表 JIT 加速；目前未宣稱完整上游相容或 production release。
 
 ## 歷史驗證命令與紀錄（P00～P14）
 

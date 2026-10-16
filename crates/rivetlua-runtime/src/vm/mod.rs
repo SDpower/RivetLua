@@ -1531,6 +1531,7 @@ fn arithmetic_event(op: BinaryOperation) -> Option<MetamethodEvent> {
 pub struct Execution<'vm> {
     vm: &'vm mut Vm,
     vm_id: VmId,
+    lookup_cache: [Option<LookupCacheEntry>; 8],
     module: Option<VerifiedModule>,
     module_root: Option<RootId>,
     frame: CallFrame,
@@ -1558,6 +1559,12 @@ pub struct Execution<'vm> {
     resume_charge: usize,
     resume_charges: AllocationCharges,
     fuel: u64,
+    #[cfg(feature = "jit")]
+    jit_stats: crate::jit::JitStats,
+    #[cfg(feature = "jit")]
+    jit_prepared: Option<crate::jit::JitPrepared>,
+    #[cfg(feature = "jit")]
+    jit_cooldown: bool,
     finalizer_steps: u64,
     debug_hook_skip_once: bool,
     debug_hook_c_call_pending: Option<(ObjectRef, RootId)>,
@@ -1577,6 +1584,17 @@ pub struct Execution<'vm> {
     terminal_shutdown_drain: bool,
     nested_repark_token: Option<ExternalToken>,
     state: ExecutionState,
+}
+
+#[derive(Clone, Copy)]
+struct LookupCacheEntry {
+    vm_id: VmId,
+    profile: LuaProfile,
+    table: ObjectRef,
+    metatable: Option<ObjectRef>,
+    key: i64,
+    version: u64,
+    value: Value,
 }
 
 /// 不含 `&mut Vm` 的完整執行狀態；停在外部 C 邊界時由 Vm arena 持有。
@@ -1609,6 +1627,10 @@ pub(crate) struct ExecutionCore {
     resume_charge: usize,
     resume_charges: AllocationCharges,
     fuel: u64,
+    #[cfg(feature = "jit")]
+    jit_stats: crate::jit::JitStats,
+    #[cfg(feature = "jit")]
+    jit_cooldown: bool,
     finalizer_steps: u64,
     debug_hook_skip_once: bool,
     debug_hook_c_call_pending: Option<(ObjectRef, RootId)>,
@@ -3622,6 +3644,7 @@ impl<'vm> Execution<'vm> {
         Self {
             vm,
             vm_id: core.vm_id,
+            lookup_cache: [None; 8],
             module: core.module,
             module_root: core.module_root,
             frame: core.frame,
@@ -3649,6 +3672,12 @@ impl<'vm> Execution<'vm> {
             resume_charge: core.resume_charge,
             resume_charges: core.resume_charges,
             fuel: core.fuel,
+            #[cfg(feature = "jit")]
+            jit_stats: core.jit_stats,
+            #[cfg(feature = "jit")]
+            jit_prepared: None,
+            #[cfg(feature = "jit")]
+            jit_cooldown: core.jit_cooldown,
             finalizer_steps: core.finalizer_steps,
             debug_hook_skip_once: core.debug_hook_skip_once,
             debug_hook_c_call_pending: core.debug_hook_c_call_pending,
@@ -3672,6 +3701,10 @@ impl<'vm> Execution<'vm> {
     }
 
     fn take_core(&mut self) -> ExecutionCore {
+        #[cfg(feature = "jit")]
+        {
+            self.jit_prepared = None;
+        }
         let ledger = self.vm.allocation_ledger().clone();
         ExecutionCore {
             vm_id: self.vm_id,
@@ -3708,6 +3741,10 @@ impl<'vm> Execution<'vm> {
             resume_charge: core::mem::replace(&mut self.resume_charge, 0),
             resume_charges: core::mem::replace(&mut self.resume_charges, AllocationCharges::new()),
             fuel: core::mem::replace(&mut self.fuel, 0),
+            #[cfg(feature = "jit")]
+            jit_stats: core::mem::take(&mut self.jit_stats),
+            #[cfg(feature = "jit")]
+            jit_cooldown: core::mem::replace(&mut self.jit_cooldown, false),
             finalizer_steps: core::mem::replace(&mut self.finalizer_steps, 0),
             debug_hook_skip_once: core::mem::replace(&mut self.debug_hook_skip_once, false),
             debug_hook_c_call_pending: self.debug_hook_c_call_pending.take(),
@@ -4879,6 +4916,7 @@ impl Vm {
         Ok(Execution {
             vm_id: self.id(),
             vm: self,
+            lookup_cache: [None; 8],
             module: owned_module,
             module_root,
             frame,
@@ -4906,6 +4944,12 @@ impl Vm {
             resume_charge: 0,
             resume_charges: AllocationCharges::new(),
             fuel: 1_000_000,
+            #[cfg(feature = "jit")]
+            jit_stats: crate::jit::JitStats::default(),
+            #[cfg(feature = "jit")]
+            jit_prepared: None,
+            #[cfg(feature = "jit")]
+            jit_cooldown: false,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
             debug_hook_c_call_pending: None,
@@ -5165,6 +5209,7 @@ impl Execution<'_> {
             vm_id: vm.id(),
             pending_ops: PendingStack::new(vm.allocation_ledger().clone()),
             vm,
+            lookup_cache: [None; 8],
             module: None,
             module_root: None,
             frame,
@@ -5191,6 +5236,12 @@ impl Execution<'_> {
             resume_charge: 0,
             resume_charges: AllocationCharges::new(),
             fuel: 1_000_000,
+            #[cfg(feature = "jit")]
+            jit_stats: crate::jit::JitStats::default(),
+            #[cfg(feature = "jit")]
+            jit_prepared: None,
+            #[cfg(feature = "jit")]
+            jit_cooldown: false,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
             debug_hook_c_call_pending: None,
@@ -5483,6 +5534,7 @@ impl Execution<'_> {
             vm_id: vm.id(),
             pending_ops: PendingStack::new(vm.allocation_ledger().clone()),
             vm,
+            lookup_cache: [None; 8],
             module: None,
             module_root: None,
             frame,
@@ -5509,6 +5561,12 @@ impl Execution<'_> {
             resume_charge: 0,
             resume_charges: AllocationCharges::new(),
             fuel: 1_000_000,
+            #[cfg(feature = "jit")]
+            jit_stats: crate::jit::JitStats::default(),
+            #[cfg(feature = "jit")]
+            jit_prepared: None,
+            #[cfg(feature = "jit")]
+            jit_cooldown: false,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
             debug_hook_c_call_pending: None,
@@ -5878,6 +5936,50 @@ impl Execution<'_> {
         }
     }
 
+    fn raw_read_table_cached(&mut self, table: ObjectRef, key: Value) -> Result<Value, VmError> {
+        let Value::Integer(integer) = key else {
+            return self.vm.raw_get(table, key);
+        };
+        let index = (integer as u64 as usize) & (self.lookup_cache.len() - 1);
+        let cached = self.lookup_cache[index];
+        let vm_id = self.vm.id();
+        let profile = self.vm.language_profile();
+        let (value, replacement) = self.vm.with_table(table, |stored| {
+            let Some(version) = stored.lookup_cache_version(integer) else {
+                return (stored.get_integer(integer), Some(None));
+            };
+            if let Some(hit) = cached.filter(|hit| {
+                hit.vm_id == vm_id
+                    && hit.profile == profile
+                    && hit.table == table
+                    && hit.metatable == stored.metatable()
+                    && hit.key == integer
+                    && hit.version == version
+            }) {
+                return (hit.value, None);
+            }
+            let value = stored.get_integer(integer);
+            let replacement = matches!(
+                value,
+                Value::Boolean(_) | Value::Integer(_) | Value::Float(_)
+            )
+            .then_some(LookupCacheEntry {
+                vm_id,
+                profile,
+                table,
+                metatable: None,
+                key: integer,
+                version,
+                value,
+            });
+            (value, Some(replacement))
+        })?;
+        if let Some(replacement) = replacement {
+            self.lookup_cache[index] = replacement;
+        }
+        Ok(value)
+    }
+
     fn regular_table_access(
         &mut self,
         target: Value,
@@ -5899,6 +6001,7 @@ impl Execution<'_> {
                 _ => None,
             };
             let raw = match table {
+                Some(table) if value.is_none() => self.raw_read_table_cached(table, key)?,
                 Some(table) => self.vm.raw_get(table, key)?,
                 None => Value::Nil,
             };
@@ -7910,6 +8013,11 @@ impl Execution<'_> {
 
     pub fn peak_frame_count(&self) -> usize {
         self.peak_frame_count
+    }
+
+    /// 固定內嵌的 lookup cache metadata 大小；不計入 VM heap 或原生碼。
+    pub fn lookup_cache_metadata_bytes(&self) -> usize {
+        core::mem::size_of_val(&self.lookup_cache)
     }
 
     pub fn pending_close(&self) -> Option<PendingCloseSnapshot> {
@@ -23024,6 +23132,354 @@ impl Execution<'_> {
         Ok(Some(token))
     }
 
+    #[cfg(feature = "jit")]
+    pub fn jit_stats(&self) -> crate::jit::JitStats {
+        let mut stats = self.jit_stats;
+        stats.code_bytes = self.vm.jit_state.code_bytes();
+        stats.metadata_bytes = self.vm.jit_state.metadata_bytes();
+        if let Some(prepared) = self.jit_prepared.as_ref() {
+            stats.metadata_bytes = stats.metadata_bytes
+                .saturating_add(core::mem::size_of::<crate::jit::JitPrepared>())
+                .saturating_add(prepared.mask.capacity())
+                .saturating_add(prepared.scratch.capacity()
+                    .saturating_mul(core::mem::size_of::<rivetlua_native::NumericValue>()));
+        }
+        stats
+    }
+
+    #[cfg(feature = "jit")]
+    fn jit_runtime_guard(&self) -> Option<crate::jit::JitEligibility> {
+        use crate::jit::{JitEligibility as E, JitFallbackReason as R, JitPolicy};
+        if self.vm.jit_state.policy == JitPolicy::Disabled {
+            return Some(E::Unsupported { reason: R::Disabled });
+        }
+        if self.state != ExecutionState::Ready
+            || self.vm.finalizer_running()
+            || self.close_unwind.is_some()
+            || self.pending_ops.last().is_some()
+            || !self.frame.open_upvalues.is_empty()
+            || !self.frame.close_entries.is_empty()
+            || self.debug_hook_c_call_pending.is_some()
+            || self.debug_hook_skip_once
+            || self.host_call_bootstrap_active()
+            || self.operation_bootstrap_active()
+            || self.basic_bootstrap_active()
+            || self.external_pending.is_some()
+            || self.vm.debug_hook_running()
+        {
+            return Some(E::Rejected { reason: R::StateConflict });
+        }
+        match self.vm.debug_hook_for(self.active_coroutine) {
+            Ok(Some(_)) => return Some(E::Unsupported { reason: R::DebugHook }),
+            Err(_) => return Some(E::Rejected { reason: R::StateConflict }),
+            Ok(None) => {}
+        }
+        None
+    }
+
+    #[cfg(feature = "jit")]
+    pub fn jit_eligibility(&self) -> crate::jit::JitEligibility {
+        use crate::jit::{JitEligibility as E, JitFallbackReason as R};
+        if let Some(eligibility) = self.jit_runtime_guard() {
+            return eligibility;
+        }
+        if let Some(prepared) = self.jit_prepared.as_ref() {
+            if prepared.module_ref == self.frame.module
+                && prepared.prototype == self.frame.prototype
+                && prepared.epoch == self.vm.jit_state.epoch
+            {
+                return prepared.eligibility;
+            }
+        }
+        let Ok(module) = self.current_module() else {
+            return E::Rejected { reason: R::StateConflict };
+        };
+        match rivetlua_native::NativeArtifact::validate(module, self.frame.prototype) {
+            Ok(()) => E::Supported,
+            Err(error) => crate::jit::classify(&error),
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    fn ensure_jit_prepared(&mut self) -> crate::jit::JitEligibility {
+        use crate::jit::{JitEligibility as E, JitFallbackReason as R, JitPrepared};
+        if let Some(eligibility) = self.jit_runtime_guard() {
+            return eligibility;
+        }
+        if let Some(prepared) = self.jit_prepared.as_ref() {
+            if prepared.module_ref == self.frame.module
+                && prepared.prototype == self.frame.prototype
+                && prepared.epoch == self.vm.jit_state.epoch
+            {
+                return prepared.eligibility;
+            }
+        }
+        let (eligibility, digest) = match self.current_module() {
+            Ok(module) => match rivetlua_native::NativeArtifact::validate(module, self.frame.prototype) {
+                Err(error) => (crate::jit::classify(&error), [0; 32]),
+                Ok(()) => {
+                    let mut work = rivetlua_core::OfficialWorkBudget::new(u64::MAX);
+                    match rivetlua_core::bytecode::encode_transport_module(
+                        module,
+                        &rivetlua_core::TransportLimits::default(),
+                        &mut work,
+                    ) {
+                        Ok(encoded) => match rivetlua_core::sha256_bytes(encoded.rvlu()) {
+                            Some(digest) => (E::Supported, digest),
+                            None => (E::Rejected { reason: R::ResourceLimit }, [0; 32]),
+                        },
+                        Err(_) => (E::Rejected { reason: R::ResourceLimit }, [0; 32]),
+                    }
+                }
+            },
+            Err(_) => (E::Rejected { reason: R::StateConflict }, [0; 32]),
+        };
+        self.jit_prepared = Some(JitPrepared {
+            module_ref: self.frame.module,
+            prototype: self.frame.prototype,
+            epoch: self.vm.jit_state.epoch,
+            module_digest: digest,
+            eligibility,
+            mask: Vec::new(),
+            scratch: Vec::new(),
+        });
+        eligibility
+    }
+
+    #[cfg(feature = "jit")]
+    fn try_native_quantum(&mut self) -> Result<bool, RuntimeError> {
+        use crate::jit::{JitEligibility, JitFallbackReason as R};
+        use rivetlua_native::{NativeArtifact, NativeCompileError, NativeCompileInput, NativeError, NativeExit, NativeState, NumericValue};
+
+        if self.jit_cooldown {
+            self.jit_cooldown = false;
+            return Ok(false);
+        }
+        match self.ensure_jit_prepared() {
+            JitEligibility::Supported => {}
+            JitEligibility::Unsupported { reason } | JitEligibility::Rejected { reason } => {
+                self.jit_stats.fallback_reason = Some(reason);
+                return Ok(false);
+            }
+        }
+        let register_count = usize::from(self.prototype().register_count);
+        if self.frame.registers.len() < register_count
+            || self.frame.dynamic_top > register_count
+            || self.frame.pc >= self.prototype().instructions.len()
+        {
+            self.jit_stats.fallback_reason = Some(R::StateConflict);
+            return Ok(false);
+        }
+        let digest = self.jit_prepared.as_ref()
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?
+            .module_digest;
+        let vm_id = self.vm_id;
+        let entry_pc = self.frame.pc;
+        let module = self.current_module()?;
+        let current = self.vm.jit_state.cache.iter().position(|artifact| {
+            artifact.matches_identity(module, digest, self.frame.prototype, entry_pc, vm_id)
+        });
+        let index = match current {
+            Some(index) => index,
+            None => {
+                if !self.vm.jit_state.make_room_for_compile() {
+                    self.jit_stats.fallback_reason = Some(R::ResourceLimit);
+                    if let Some(prepared) = self.jit_prepared.as_mut() {
+                        prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+                    }
+                    return Ok(false);
+                }
+                let artifact = loop {
+                    let result = {
+                        let module = self.current_module()?;
+                        NativeArtifact::compile(NativeCompileInput {
+                            module,
+                            prototype_index: self.frame.prototype,
+                            entry_pc,
+                            module_digest: digest,
+                            vm_id,
+                            code_limit_bytes: self.vm.jit_state.code_limit_bytes,
+                        })
+                    };
+                    match result {
+                        Ok(artifact) => break artifact,
+                        Err(NativeCompileError::Native(NativeError::AllocationFailed))
+                            if !self.vm.jit_state.cache.is_empty() => {
+                            self.vm.jit_state.cache.remove(0);
+                            self.vm.jit_state.cache.shrink_to_fit();
+                        }
+                        Err(error) => {
+                            let eligibility = crate::jit::classify(&error);
+                            self.jit_stats.fallback_reason = match eligibility {
+                                JitEligibility::Supported => None,
+                                JitEligibility::Unsupported { reason }
+                                | JitEligibility::Rejected { reason } => Some(reason),
+                            };
+                            if let Some(prepared) = self.jit_prepared.as_mut() {
+                                prepared.eligibility = eligibility;
+                            }
+                            self.jit_cooldown = true;
+                            return Ok(false);
+                        }
+                    }
+                };
+                self.jit_stats.jit_compile_ns = self.jit_stats.jit_compile_ns
+                    .saturating_add(artifact.compile_ns());
+                let prepared_bytes = register_count
+                    .saturating_mul(core::mem::size_of::<NumericValue>())
+                    .saturating_add(core::mem::size_of::<crate::jit::JitPrepared>())
+                    .saturating_add(artifact.register_mask().len());
+                if !self.vm.jit_state.admit(artifact, prepared_bytes) {
+                    self.jit_stats.fallback_reason = Some(R::ResourceLimit);
+                    if let Some(prepared) = self.jit_prepared.as_mut() {
+                        prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+                    }
+                    return Ok(false);
+                }
+                self.vm.jit_state.cache.len() - 1
+            }
+        };
+        let prepared_bytes = register_count
+            .saturating_mul(core::mem::size_of::<NumericValue>())
+            .saturating_add(core::mem::size_of::<crate::jit::JitPrepared>())
+            .saturating_add(self.vm.jit_state.cache[index].register_mask().len());
+        let Some(index) = self.vm.jit_state.make_room_for_metadata(index, prepared_bytes) else {
+            self.jit_stats.fallback_reason = Some(R::ResourceLimit);
+            if let Some(prepared) = self.jit_prepared.as_mut() {
+                prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+            }
+            return Ok(false);
+        };
+        let (mask, mut scratch) = {
+            let prepared = self.jit_prepared.as_mut()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+            if prepared.mask.is_empty() {
+                prepared.mask = self.vm.jit_state.cache[index].register_mask().to_vec();
+            }
+            let mask = core::mem::take(&mut prepared.mask);
+            let mut scratch = core::mem::take(&mut prepared.scratch);
+            scratch.clear();
+            if scratch.try_reserve_exact(register_count).is_err() {
+                prepared.mask = mask;
+                prepared.scratch = scratch;
+                prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+                self.jit_stats.fallback_reason = Some(R::ResourceLimit);
+                return Ok(false);
+            }
+            for (slot, value) in self.frame.registers[..register_count].iter().copied().enumerate() {
+                match NumericValue::from_value(value) {
+                    Some(value) => scratch.push(value),
+                    None if !mask[slot] => scratch.push(NumericValue::nil()),
+                    None => {
+                        prepared.mask = mask;
+                        prepared.scratch = scratch;
+                        self.jit_stats.fallback_reason = Some(R::NonNumericOperand);
+                        self.jit_cooldown = true;
+                        return Ok(false);
+                    }
+                }
+            }
+            (mask, scratch)
+        };
+        let actual_prepared_bytes = core::mem::size_of::<crate::jit::JitPrepared>()
+            .saturating_add(mask.capacity())
+            .saturating_add(scratch.capacity()
+                .saturating_mul(core::mem::size_of::<NumericValue>()));
+        let Some(index) = self.vm.jit_state.make_room_for_metadata(index, actual_prepared_bytes) else {
+            if let Some(prepared) = self.jit_prepared.as_mut() {
+                prepared.mask = mask;
+                prepared.scratch = scratch;
+                prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+            }
+            self.jit_stats.fallback_reason = Some(R::ResourceLimit);
+            return Ok(false);
+        };
+        let mut state = NativeState {
+            registers: &mut scratch,
+            pc: entry_pc as u64,
+            dynamic_top: self.frame.dynamic_top as u64,
+            fuel_remaining: self.fuel,
+            step_budget: 128,
+            cancel_requested: false,
+            expected_epoch: self.vm.jit_state.epoch,
+            observed_epoch: self.vm.jit_state.epoch,
+            executed: 0,
+        };
+        let outcome = self.vm.jit_state.cache[index].execute(&mut state);
+        let exit = match outcome {
+            Ok(exit) => exit,
+            Err(NativeError::InvalidState) => {
+                drop(state);
+                if let Some(prepared) = self.jit_prepared.as_mut() {
+                    prepared.mask = mask;
+                    prepared.scratch = scratch;
+                }
+                self.jit_stats.fallback_reason = Some(R::StateConflict);
+                self.jit_cooldown = true;
+                return Ok(false);
+            }
+            Err(_) => {
+                self.state = ExecutionState::Failed;
+                self.finish()?;
+                return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+            }
+        };
+        let executed = state.executed;
+        let next_pc = state.pc;
+        let dynamic_top = state.dynamic_top;
+        let fuel_remaining = state.fuel_remaining;
+        drop(state);
+        if dynamic_top != self.frame.dynamic_top as u64 {
+            self.state = ExecutionState::Failed;
+            self.finish()?;
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        if executed > 0 {
+            for (slot, value) in scratch.iter().copied().enumerate() {
+                if !mask[slot] { continue; }
+                let value = value.to_value().ok_or(RuntimeError::new(
+                    RuntimeErrorKind::MissingEntryPoint,
+                ))?;
+                self.frame.write(self.vm, rivetlua_core::Register(slot as u16), value)?;
+            }
+            self.frame.pc = next_pc as usize;
+            self.fuel = fuel_remaining;
+            self.jit_stats.total_logical_instructions = self.jit_stats.total_logical_instructions
+                .saturating_add(executed);
+            self.jit_stats.native_executed_instructions = self.jit_stats.native_executed_instructions
+                .saturating_add(executed);
+        }
+        scratch.clear();
+        if let Some(prepared) = self.jit_prepared.as_mut() {
+            prepared.mask = mask;
+            prepared.scratch = scratch;
+        }
+        match exit {
+            NativeExit::Deopt => {
+                self.jit_stats.fallback_reason = Some(R::NonNumericOperand);
+                self.jit_cooldown = true;
+            }
+            NativeExit::Invalidated => {
+                self.vm.jit_state.invalidate();
+                self.jit_prepared = None;
+                self.jit_stats.fallback_reason = Some(R::Invalidated);
+                self.jit_cooldown = true;
+            }
+            NativeExit::Cancelled => {
+                self.state = ExecutionState::Failed;
+                self.finish()?;
+                return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+            }
+            NativeExit::Return => {
+                self.jit_cooldown = true;
+            }
+            NativeExit::Safepoint | NativeExit::FuelExhausted => {
+                if executed == 0 { self.jit_cooldown = true; }
+            }
+        }
+        Ok(executed > 0)
+    }
+
     fn run_inner(&mut self) -> Result<RunOutcome, RuntimeError> {
         if self.state != ExecutionState::Ready {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
@@ -23171,6 +23627,16 @@ impl Execution<'_> {
                 self.state = ExecutionState::Aborted;
                 self.finish()?;
                 return Ok(RunOutcome::Aborted(AbortReason::FuelExhausted));
+            }
+            #[cfg(feature = "jit")]
+            if !interrupted
+                && !resume_deferred
+                && !self.vm.finalizer_running()
+                && !shutdown_close_run
+                && self.close_unwind.is_none()
+                && self.try_native_quantum()?
+            {
+                continue;
             }
             if resume_deferred {
                 self.clear_deferred_roots()?;
@@ -24442,6 +24908,11 @@ impl Execution<'_> {
     }
 
     fn dispatch_one(&mut self) -> Result<DispatchResult, RuntimeError> {
+        #[cfg(feature = "jit")]
+        {
+            self.jit_stats.total_logical_instructions =
+                self.jit_stats.total_logical_instructions.saturating_add(1);
+        }
         let instruction = self.prototype().instructions[self.frame.pc]
             .instruction
             .clone();
@@ -26809,6 +27280,7 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::WeakMode;
     use crate::{HostOutput, HostOutputError, HostServices, RootKind, Vm};
     use rivetlua_core::{
         BytecodeBindingId, BytecodeConstant, BytecodeInstruction, BytecodeModule,
@@ -26817,6 +27289,89 @@ mod tests {
         RVLU_NUMERIC_I64_F64, RVLU_V2, Register, ResultMode, UpvalueId, Value, VerifyLimits,
         verify_module,
     };
+
+    #[test]
+    fn p20_integer_lookup_cache_tracks_mutation_and_metadata() {
+        let verified = module(
+            vec![Instruction::Return {
+                base: Register(0),
+                result_mode: ResultMode::Fixed(0),
+            }],
+            vec![],
+        );
+        let mut vm = Vm::new().unwrap();
+        let mut execution = vm.load(verified).unwrap();
+        let table = execution.vm.allocate_table().unwrap();
+        let root = execution.vm.add_root(RootKind::Host, table).unwrap();
+        let key = Value::Integer(-1);
+        let slot = (-1_i64 as u64 as usize) & 7;
+
+        execution
+            .vm
+            .raw_set(table, key, Value::Boolean(false))
+            .unwrap();
+        assert_eq!(
+            execution.raw_read_table_cached(table, key),
+            Ok(Value::Boolean(false))
+        );
+        let version = execution.lookup_cache[slot].unwrap().version;
+        assert_eq!(
+            execution.raw_read_table_cached(table, key),
+            Ok(Value::Boolean(false))
+        );
+        assert_eq!(execution.lookup_cache[slot].unwrap().version, version);
+
+        execution.vm.raw_set(table, key, Value::Integer(7)).unwrap();
+        assert_eq!(
+            execution.raw_read_table_cached(table, key),
+            Ok(Value::Integer(7))
+        );
+        assert!(execution.lookup_cache[slot].unwrap().version > version);
+
+        let metatable = execution.vm.allocate_table().unwrap();
+        execution.vm.set_metatable(table, Some(metatable)).unwrap();
+        assert_eq!(
+            execution.raw_read_table_cached(table, key),
+            Ok(Value::Integer(7))
+        );
+        assert!(execution.lookup_cache[slot].is_none());
+        execution.vm.set_metatable(table, None).unwrap();
+        execution
+            .vm
+            .with_table_mut(table, |stored, _| {
+                stored.set_weak_mode(WeakMode::Values);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            execution.raw_read_table_cached(table, key),
+            Ok(Value::Integer(7))
+        );
+        assert!(execution.lookup_cache[slot].is_none());
+
+        execution
+            .vm
+            .with_table_mut(table, |stored, _| {
+                stored.set_weak_mode(WeakMode::Strong);
+                Ok(())
+            })
+            .unwrap();
+        execution.vm.raw_set(table, key, Value::Nil).unwrap();
+        assert_eq!(execution.raw_read_table_cached(table, key), Ok(Value::Nil));
+        assert!(execution.lookup_cache[slot].is_none());
+        execution
+            .vm
+            .raw_set(table, Value::Integer(1), Value::Integer(3))
+            .unwrap();
+        assert_eq!(
+            execution.raw_read_table_cached(table, Value::Integer(1)),
+            Ok(Value::Integer(3))
+        );
+        assert!(execution.lookup_cache[1].is_none());
+        assert!(execution.lookup_cache_metadata_bytes() > 0);
+
+        execution.vm.remove_root(root).unwrap();
+    }
 
     mod full_userdata_a27_correction_tests {
         use super::*;

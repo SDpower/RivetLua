@@ -55,7 +55,7 @@
 ## Core Quality and Verification
 
 - For core changes, the implementation agent must identify the applicable contracts, invariants, and state transitions, then trace relevant normal paths, error cleanup, and necessary cross-layer interactions. Do not turn a bounded task into a full-system audit without cause.
-- Do not pass acceptance by disabling GC, leaking memory, retaining objects that should be collectible, weakening assertions or tests, or hiding errors. Any addition or expansion of `unsafe` requires explicit authorization, a safety rationale, and supporting verification.
+- Do not pass acceptance by disabling GC, leaking memory, retaining objects that should be collectible, weakening assertions or tests, or hiding errors. Any addition or expansion of `unsafe` requires a safety rationale and supporting verification.
 - Establish the smallest relevant baseline before changing code. For a bug fix, create or identify a minimal reproducer and regression test; for a feature, add tests tied to the specification. Expected output and error behavior must be checkable. Inspect coherent, verifiable units as they become ready; do not run a full test suite after every edit.
 - Documentation-only changes require content and diff review; do not run runtime tests automatically for them. Run the checks specified by the plan and any other verification justified by the changed behavior and risk.
 - **Basic tests** cover the feature's normal path, boundaries, error behavior, and minimal regression cases.

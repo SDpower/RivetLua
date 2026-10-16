@@ -17,6 +17,7 @@ use crate::{ByteString, ObjectKind, Vm, VmError};
 pub struct Table {
     metatable: Option<ObjectRef>,
     weak_mode: WeakMode,
+    mutation_version: u64,
     array: Vec<Option<Value>>,
     hash: Vec<Option<(CanonicalKey, Value)>>,
     charges: PairedLuaCharges,
@@ -56,6 +57,7 @@ impl Table {
             Self {
                 metatable: None,
                 weak_mode: WeakMode::Strong,
+                mutation_version: 0,
                 array,
                 hash,
                 charges: PairedLuaCharges::new(ledger.clone()),
@@ -79,6 +81,9 @@ impl Table {
     }
 
     pub(crate) fn set_metatable(&mut self, metatable: Option<ObjectRef>) {
+        if self.metatable != metatable {
+            self.bump_mutation_version();
+        }
         self.metatable = metatable;
     }
 
@@ -87,7 +92,32 @@ impl Table {
     }
 
     pub(crate) fn set_weak_mode(&mut self, mode: WeakMode) {
+        if self.weak_mode != mode {
+            self.bump_mutation_version();
+        }
         self.weak_mode = mode;
+    }
+
+    fn bump_mutation_version(&mut self) {
+        self.mutation_version = self.mutation_version.saturating_add(1);
+    }
+
+    pub(crate) fn lookup_cache_version(&self, key: i64) -> Option<u64> {
+        let array_slot = usize::try_from(key)
+            .ok()
+            .and_then(|index| index.checked_sub(1))
+            .is_some_and(|index| index < self.array.len());
+        (self.metatable.is_none()
+            && self.weak_mode == WeakMode::Strong
+            && self.mutation_version != u64::MAX
+            && !array_slot)
+            .then_some(self.mutation_version)
+    }
+
+    pub(crate) fn get_integer(&self, key: i64) -> Value {
+        self.get(&CanonicalKey {
+            kind: KeyKind::Integer(key),
+        })
     }
 
     pub(crate) fn mode_value(&self) -> Value {
@@ -275,6 +305,7 @@ impl Table {
                     if is_dead(*object)? {
                         *entry = None;
                         cleared += 1;
+                        self.mutation_version = self.mutation_version.saturating_add(1);
                     }
                 }
             }
@@ -286,6 +317,7 @@ impl Table {
             {
                 // 弱表的死鍵只供下次 GC 前的 next 邊界使用；GC 可釋放長字串副本。
                 *entry = None;
+                self.mutation_version = self.mutation_version.saturating_add(1);
                 continue;
             }
             let Some((key, value)) = entry else {
@@ -327,11 +359,13 @@ impl Table {
                     *value = Value::Nil;
                 }
                 cleared += 1;
+                self.mutation_version = self.mutation_version.saturating_add(1);
             }
         }
         if !self.hash.is_empty() && self.hash.iter().all(Option::is_none) {
             self.hash = Vec::new();
             self.charges.clear_second();
+            self.bump_mutation_version();
         }
         Ok(cleared)
     }
@@ -853,6 +887,7 @@ impl Table {
         } else if let Some((_, stored)) = &mut self.hash[index] {
             *stored = value;
         }
+        self.bump_mutation_version();
         Ok(())
     }
 }
@@ -936,6 +971,7 @@ impl PreparedTableMutation {
     }
 
     pub(crate) fn apply(self, table: &mut Table) {
+        let changed = !matches!(self, Self::Noop);
         match self {
             Self::Noop => {}
             Self::ArraySlot { index, value } => {
@@ -990,6 +1026,9 @@ impl PreparedTableMutation {
                     table.charges.replace_second(charge);
                 }
             }
+        }
+        if changed {
+            table.bump_mutation_version();
         }
     }
 }
@@ -1114,6 +1153,7 @@ impl PreparedRefPair {
                 }
             }
         }
+        table.bump_mutation_version();
     }
 }
 
@@ -1561,6 +1601,7 @@ mod tests {
         struct BaselineTableFields {
             metatable: Option<ObjectRef>,
             weak_mode: WeakMode,
+            mutation_version: u64,
             array: Vec<Option<Value>>,
             hash: Vec<Option<(CanonicalKey, Value)>>,
             charges: crate::alloc::PairedLuaCharges,
@@ -1577,6 +1618,22 @@ mod tests {
             std::mem::size_of::<Option<(CanonicalKey, Value)>>(),
             std::mem::size_of::<super::StringKey>(),
         );
+    }
+
+    #[test]
+    fn p20_saturated_table_version_disables_lookup_cache() {
+        let mut vm = Vm::new().unwrap();
+        let table = vm.allocate_table().unwrap();
+        vm.with_table_mut(table, |stored, _| {
+            stored.mutation_version = u64::MAX - 1;
+            assert_eq!(stored.lookup_cache_version(-1), Some(u64::MAX - 1));
+            stored.set_weak_mode(WeakMode::Values);
+            assert_eq!(stored.mutation_version, u64::MAX);
+            stored.set_weak_mode(WeakMode::Strong);
+            assert_eq!(stored.lookup_cache_version(-1), None);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 pub mod bytecode;
 mod compatibility;
+mod digest;
 pub mod error;
 pub mod limits;
 pub mod number;
@@ -53,6 +54,7 @@ pub use bytecode::{
     decode_module, encode_module, verify_module,
 };
 pub use compatibility::{COMPATIBILITY_VERSION, CompatibilityEntry, compatibility_entries};
+pub use digest::sha256_bytes;
 pub use error::{CoreError, CoreErrorKind, Operation};
 pub use number::{
     Number, add, bit_and, bit_not, bit_or, bit_xor, compare, divide, equal, floor_divide, modulo,

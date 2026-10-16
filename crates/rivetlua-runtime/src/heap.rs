@@ -2693,6 +2693,8 @@ struct PendingFinalizerWarning {
 pub struct Vm {
     id: VmId,
     profile: LuaProfile,
+    #[cfg(feature = "jit")]
+    pub(crate) jit_state: crate::jit::JitVmState,
     slots: Vec<Slot>,
     short_strings: ShortStringIndex,
     // 尾端連續 Free slot 保留實體與帳款，但不參與 GC 掃描。Retired 不可越過。
@@ -2882,6 +2884,8 @@ impl Vm {
         Ok(Self {
             id,
             profile,
+            #[cfg(feature = "jit")]
+            jit_state: crate::jit::JitVmState::new(),
             slots: Vec::new(),
             short_strings: ShortStringIndex::default(),
             gc_scan_end: 0,

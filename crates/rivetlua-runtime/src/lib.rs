@@ -12,6 +12,8 @@ mod gc;
 mod handle;
 mod heap;
 mod host;
+#[cfg(feature = "jit")]
+mod jit;
 mod metamethod;
 mod pending_op;
 mod roots;
@@ -51,6 +53,8 @@ pub use host::{
     HostWarning, HostWarningError, LoadBudget, LoadCapability, LoadFormat, LoadLimits,
     PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
 };
+#[cfg(feature = "jit")]
+pub use jit::{JitEligibility, JitFallbackReason, JitPolicy, JitStats};
 pub use metamethod::MetamethodEvent;
 pub use rivetlua_core::{Generation, ObjectId, SlotId, VmId};
 pub use roots::{RootId, RootKind, RootSet};

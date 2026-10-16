@@ -9,6 +9,7 @@ description = "RivetLua 的公開 Rust SDK。"
 readme = "README.md"
 
 [features]
+jit = ["rivetlua-runtime/jit"]
 native-lua55 = ["dep:rivetlua-capi", "rivetlua-capi/lua55"]
 native-lua54 = ["dep:rivetlua-capi", "rivetlua-capi/lua54"]
 

@@ -23,6 +23,9 @@ pub use rivetlua_core::{
     LuaProfile, ModuleOrigin, OfficialChunkLimits, RVLU_V2, TransportErrorKind, TransportLimits,
     Value, ValueKind, VerifyLimits, classify_input, compatibility_entries,
 };
+pub use rivetlua_core::sha256_bytes;
+#[cfg(feature = "jit")]
+pub use rivetlua_runtime::{JitEligibility, JitFallbackReason, JitPolicy, JitStats};
 pub use rivetlua_runtime::{
     AbortReason, AllocationAttempt, AllocationFailure, AllocationFailureKind, AllocationLedger,
     AllocationTrace, CallbackContext, CallbackContinuation, CallbackFn, CallbackResult,
@@ -33,7 +36,7 @@ pub use rivetlua_runtime::{
     HostLoadCompiler, HostLoadError, HostLoadErrorKind, HostModuleBytes, HostModuleRepository,
     HostNativeLoader, HostNativeModule, HostOs, HostOsOperation, HostOsValue, HostOutput,
     HostOutputError, HostResourceError, HostResourceErrorKind, HostServices, HostSourceReader,
-    HostWarning, HostWarningError, LedgerSnapshot, LoadBudget, LoadCapability, LoadFormat,
+    GcTrace, HostWarning, HostWarningError, LedgerSnapshot, LoadBudget, LoadCapability, LoadFormat,
     LoadLimits, LuaError, PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
     RunOutcome, RuntimeError, RuntimeErrorKind, VmError,
 };
@@ -299,6 +302,12 @@ pub struct Vm {
 }
 
 impl Vm {
+    #[cfg(feature = "jit")]
+    pub fn set_jit_policy(&mut self, policy: JitPolicy) -> Result<(), SdkError> {
+        let runtime = self.runtime.0.as_mut().ok_or(SdkError::Busy)?;
+        runtime.set_jit_policy(policy).map_err(SdkError::RuntimeVm)
+    }
+
     /// 將已核准的終止請求收束在同一 VM；只有 standalone 宿主決定程序退出。
     pub fn finish_exit(&mut self, request: HostExitRequest) -> Result<HostExitRequest, SdkError> {
         if !request.close {
@@ -678,6 +687,11 @@ impl Vm {
     /// 讀取目前配置帳本快照，不會借出 heap 或可變 runtime 狀態。
     pub fn allocation_snapshot(&self) -> LedgerSnapshot {
         self.runtime.ledger_snapshot()
+    }
+
+    /// 讀取目前 GC 追蹤計數，不會修改 runtime 狀態。
+    pub fn gc_trace(&self) -> GcTrace {
+        self.runtime.gc_trace()
     }
 
     /// 以 VM-local globals 進行安全 raw lookup；回傳物件值仍須由宿主提升為 Root。
