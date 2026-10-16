@@ -10,6 +10,8 @@ readme = "README.md"
 
 [features]
 jit = ["rivetlua-runtime/jit"]
+aot = ["rivetlua-runtime/aot", "dep:rivetlua-native"]
+aot-builder = ["aot", "rivetlua-native/compiler"]
 native-lua55 = ["dep:rivetlua-capi", "rivetlua-capi/lua55"]
 native-lua54 = ["dep:rivetlua-capi", "rivetlua-capi/lua54"]
 
@@ -17,4 +19,5 @@ native-lua54 = ["dep:rivetlua-capi", "rivetlua-capi/lua54"]
 rivetlua-core = { path = "../rivetlua-core" }
 rivetlua-compiler = { path = "../rivetlua-compiler" }
 rivetlua-runtime = { path = "../rivetlua-runtime" }
+rivetlua-native = { path = "../rivetlua-native", optional = true, default-features = false }
 rivetlua-capi = { path = "../rivetlua-capi", optional = true, default-features = false }

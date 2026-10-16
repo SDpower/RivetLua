@@ -1,11 +1,13 @@
 //! P08-1 的不可變 byte string。
 
+use crate::rust_alloc::vec::Vec;
+
 use crate::VmError;
 use crate::alloc::{AllocationLedger, FailPoint, PairedLuaCharges, Reservation, reserve_vec};
 use core::mem::size_of;
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use core::fmt;
+use core::hash::{Hash, Hasher};
+use crate::rust_alloc::rc::Rc;
 
 /// 外部不可變 byte string 的安全擁有者。bytes 在 owner 存活期間須保持不變；
 /// 最後一個 owner 消失時由實作者釋放資源。

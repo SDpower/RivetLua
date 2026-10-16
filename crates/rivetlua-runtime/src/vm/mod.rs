@@ -1,5 +1,7 @@
 //! 已驗證模組的最小暫存器執行器。
 
+use crate::rust_alloc::vec::Vec;
+
 mod numeric_for;
 mod ops;
 
@@ -15,9 +17,10 @@ use rivetlua_core::{
     decode_input_module, decode_official_chunk, input_scan_admission, preflight_input_module,
     preflight_official_chunk, translate_official_chunk_with_work, verified_module_measurement_work,
 };
+#[cfg(feature = "std")]
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use crate::rust_alloc::sync::Arc;
+use core::sync::atomic::AtomicBool;
 
 use crate::alloc::{
     AllocationCharge, AllocationCharges, AllocationLedger, FailPoint, Reservation, checked_bytes,
@@ -1559,11 +1562,11 @@ pub struct Execution<'vm> {
     resume_charge: usize,
     resume_charges: AllocationCharges,
     fuel: u64,
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     jit_stats: crate::jit::JitStats,
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     jit_prepared: Option<crate::jit::JitPrepared>,
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     jit_cooldown: bool,
     finalizer_steps: u64,
     debug_hook_skip_once: bool,
@@ -1627,9 +1630,9 @@ pub(crate) struct ExecutionCore {
     resume_charge: usize,
     resume_charges: AllocationCharges,
     fuel: u64,
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     jit_stats: crate::jit::JitStats,
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     jit_cooldown: bool,
     finalizer_steps: u64,
     debug_hook_skip_once: bool,
@@ -2336,12 +2339,28 @@ impl Vm {
             ExternalCommand::Return(values) => {
                 let core = self.take_top_external_core(token)?;
                 let mut execution = Execution::from_core(self, core);
-                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let action = || {
                     execution.clear_external_nested_result()?;
                     execution.complete_external_return(values)
-                }));
+                };
+                #[cfg(feature = "std")]
+                let outcome = catch_unwind(AssertUnwindSafe(action));
+                #[cfg(not(feature = "std"))]
+                let outcome = action();
+                #[cfg(feature = "std")]
+                let outcome = match outcome {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        execution.state = ExecutionState::Failed;
+                        let cleanup = execution.finish_owned_external_abort();
+                        debug_assert!(cleanup.is_ok());
+                        execution.state = ExecutionState::Parked;
+                        execution.vm.discard_empty_external_markers();
+                        resume_unwind(payload);
+                    }
+                };
                 match outcome {
-                    Ok(Ok(value)) => {
+                    Ok(value) => {
                         if matches!(
                             value,
                             RunOutcome::NestedReturned(_)
@@ -2355,7 +2374,7 @@ impl Vm {
                         }
                         Ok(value)
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         if !execution.external_nested.is_empty() {
                             if let Ok(outcome) = execution.finish_external_nested_failure(error) {
                                 let parent = execution.nested_repark_token.take().ok_or(
@@ -2374,6 +2393,23 @@ impl Vm {
                         let _ = cleanup;
                         Err(error)
                     }
+                }
+            }
+            ExternalCommand::Error(value) => {
+                let core = self.take_top_external_core(token)?;
+                let mut execution = Execution::from_core(self, core);
+                #[cfg_attr(feature = "std", allow(unused_mut))]
+                let mut action = || {
+                    execution.clear_external_nested_result()?;
+                    execution.complete_external_error(value)
+                };
+                #[cfg(feature = "std")]
+                let outcome = catch_unwind(AssertUnwindSafe(action));
+                #[cfg(not(feature = "std"))]
+                let outcome = action();
+                #[cfg(feature = "std")]
+                let outcome = match outcome {
+                    Ok(result) => result,
                     Err(payload) => {
                         execution.state = ExecutionState::Failed;
                         let cleanup = execution.finish_owned_external_abort();
@@ -2382,17 +2418,9 @@ impl Vm {
                         execution.vm.discard_empty_external_markers();
                         resume_unwind(payload);
                     }
-                }
-            }
-            ExternalCommand::Error(value) => {
-                let core = self.take_top_external_core(token)?;
-                let mut execution = Execution::from_core(self, core);
-                let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    execution.clear_external_nested_result()?;
-                    execution.complete_external_error(value)
-                }));
+                };
                 match outcome {
-                    Ok(Ok(value)) => {
+                    Ok(value) => {
                         if matches!(
                             value,
                             RunOutcome::NestedReturned(_)
@@ -2406,7 +2434,7 @@ impl Vm {
                         }
                         Ok(value)
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         if !execution.external_nested.is_empty() {
                             if let Ok(outcome) = execution.finish_external_nested_failure(error) {
                                 let parent = execution.nested_repark_token.take().ok_or(
@@ -2424,14 +2452,6 @@ impl Vm {
                         let _ = cleanup;
                         Err(error)
                     }
-                    Err(payload) => {
-                        execution.state = ExecutionState::Failed;
-                        let cleanup = execution.finish_owned_external_abort();
-                        debug_assert!(cleanup.is_ok());
-                        execution.state = ExecutionState::Parked;
-                        execution.vm.discard_empty_external_markers();
-                        resume_unwind(payload);
-                    }
                 }
             }
             ExternalCommand::NestedCall {
@@ -2441,15 +2461,17 @@ impl Vm {
             } => {
                 let core = self.borrow_top_external_core(token)?;
                 let mut execution = Execution::from_core(self, core);
-                let start = catch_unwind(AssertUnwindSafe(|| {
+                #[cfg_attr(feature = "std", allow(unused_mut))]
+                let mut action = || {
                     execution.start_external_nested(token, target, &args, results, None)
-                }));
-                match start {
-                    Ok(Err(error)) => {
-                        let core = execution.take_core();
-                        execution.vm.restore_external_core(token, core)?;
-                        return Err(error);
-                    }
+                };
+                #[cfg(feature = "std")]
+                let start = catch_unwind(AssertUnwindSafe(action));
+                #[cfg(not(feature = "std"))]
+                let start = action();
+                #[cfg(feature = "std")]
+                let start = match start {
+                    Ok(result) => result,
                     Err(payload) => {
                         execution.state = ExecutionState::Failed;
                         let cleanup = execution.finish_owned_external_abort();
@@ -2458,7 +2480,14 @@ impl Vm {
                         execution.vm.discard_empty_external_markers();
                         resume_unwind(payload);
                     }
-                    Ok(Ok(())) => {}
+                };
+                match start {
+                    Err(error) => {
+                        let core = execution.take_core();
+                        execution.vm.restore_external_core(token, core)?;
+                        return Err(error);
+                    }
+                    Ok(()) => {}
                 }
                 execution.run()
             }
@@ -2466,7 +2495,8 @@ impl Vm {
                 ValueOperation::validate(operation, args.len())?;
                 let core = self.borrow_top_external_core(token)?;
                 let mut execution = Execution::from_core(self, core);
-                let start = catch_unwind(AssertUnwindSafe(|| {
+                #[cfg_attr(feature = "std", allow(unused_mut))]
+                let mut action = || {
                     execution.start_external_nested(
                         token,
                         Value::Nil,
@@ -2474,13 +2504,14 @@ impl Vm {
                         operation.result_mode(),
                         Some(operation),
                     )
-                }));
-                match start {
-                    Ok(Err(error)) => {
-                        let core = execution.take_core();
-                        execution.vm.restore_external_core(token, core)?;
-                        return Err(error);
-                    }
+                };
+                #[cfg(feature = "std")]
+                let start = catch_unwind(AssertUnwindSafe(action));
+                #[cfg(not(feature = "std"))]
+                let start = action();
+                #[cfg(feature = "std")]
+                let start = match start {
+                    Ok(result) => result,
                     Err(payload) => {
                         execution.state = ExecutionState::Failed;
                         let cleanup = execution.finish_owned_external_abort();
@@ -2489,7 +2520,14 @@ impl Vm {
                         execution.vm.discard_empty_external_markers();
                         resume_unwind(payload);
                     }
-                    Ok(Ok(())) => {}
+                };
+                match start {
+                    Err(error) => {
+                        let core = execution.take_core();
+                        execution.vm.restore_external_core(token, core)?;
+                        return Err(error);
+                    }
+                    Ok(()) => {}
                 }
                 execution.run()
             }
@@ -2571,19 +2609,17 @@ impl Vm {
         }
         let core = self.take_top_external_core(token)?;
         let mut execution = Execution::from_core(self, core);
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg_attr(feature = "std", allow(unused_mut))]
+        let mut action = || {
             execution.complete_external_self_close(error, boundaries)
-        }));
-        match outcome {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => {
-                execution.state = ExecutionState::Failed;
-                let cleanup = execution.finish_owned_external_abort();
-                execution.state = ExecutionState::Parked;
-                execution.vm.discard_empty_external_markers();
-                cleanup?;
-                Err(error)
-            }
+        };
+        #[cfg(feature = "std")]
+        let outcome = catch_unwind(AssertUnwindSafe(action));
+        #[cfg(not(feature = "std"))]
+        let outcome = action();
+        #[cfg(feature = "std")]
+        let outcome = match outcome {
+            Ok(result) => result,
             Err(payload) => {
                 execution.state = ExecutionState::Failed;
                 let cleanup = execution.finish_owned_external_abort();
@@ -2591,6 +2627,17 @@ impl Vm {
                 execution.state = ExecutionState::Parked;
                 execution.vm.discard_empty_external_markers();
                 resume_unwind(payload);
+            }
+        };
+        match outcome {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                execution.state = ExecutionState::Failed;
+                let cleanup = execution.finish_owned_external_abort();
+                execution.state = ExecutionState::Parked;
+                execution.vm.discard_empty_external_markers();
+                cleanup?;
+                Err(error)
             }
         }
     }
@@ -2612,7 +2659,8 @@ impl Vm {
         }
         let core = self.take_top_external_core(token)?;
         let mut execution = Execution::from_core(self, core);
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg_attr(feature = "std", allow(unused_mut))]
+        let mut action = || {
             if let Some(value) = error {
                 let previous = execution
                     .close_unwind
@@ -2630,19 +2678,27 @@ impl Vm {
             }
             execution.state = ExecutionState::Ready;
             execution.run()
-        }));
-        match outcome {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => {
-                execution.state = ExecutionState::Failed;
-                execution.finish_owned_external_abort()?;
-                Err(error)
-            }
+        };
+        #[cfg(feature = "std")]
+        let outcome = catch_unwind(AssertUnwindSafe(action));
+        #[cfg(not(feature = "std"))]
+        let outcome = action();
+        #[cfg(feature = "std")]
+        let outcome = match outcome {
+            Ok(result) => result,
             Err(payload) => {
                 execution.state = ExecutionState::Failed;
                 let cleanup = execution.finish_owned_external_abort();
                 debug_assert!(cleanup.is_ok());
                 resume_unwind(payload)
+            }
+        };
+        match outcome {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                execution.state = ExecutionState::Failed;
+                execution.finish_owned_external_abort()?;
+                Err(error)
             }
         }
     }
@@ -3672,11 +3728,11 @@ impl<'vm> Execution<'vm> {
             resume_charge: core.resume_charge,
             resume_charges: core.resume_charges,
             fuel: core.fuel,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_stats: core.jit_stats,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_prepared: None,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_cooldown: core.jit_cooldown,
             finalizer_steps: core.finalizer_steps,
             debug_hook_skip_once: core.debug_hook_skip_once,
@@ -3701,7 +3757,7 @@ impl<'vm> Execution<'vm> {
     }
 
     fn take_core(&mut self) -> ExecutionCore {
-        #[cfg(feature = "jit")]
+        #[cfg(any(feature = "jit", feature = "aot"))]
         {
             self.jit_prepared = None;
         }
@@ -3741,9 +3797,9 @@ impl<'vm> Execution<'vm> {
             resume_charge: core::mem::replace(&mut self.resume_charge, 0),
             resume_charges: core::mem::replace(&mut self.resume_charges, AllocationCharges::new()),
             fuel: core::mem::replace(&mut self.fuel, 0),
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_stats: core::mem::take(&mut self.jit_stats),
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_cooldown: core::mem::replace(&mut self.jit_cooldown, false),
             finalizer_steps: core::mem::replace(&mut self.finalizer_steps, 0),
             debug_hook_skip_once: core::mem::replace(&mut self.debug_hook_skip_once, false),
@@ -4944,11 +5000,11 @@ impl Vm {
             resume_charge: 0,
             resume_charges: AllocationCharges::new(),
             fuel: 1_000_000,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_stats: crate::jit::JitStats::default(),
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_prepared: None,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_cooldown: false,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
@@ -5236,11 +5292,11 @@ impl Execution<'_> {
             resume_charge: 0,
             resume_charges: AllocationCharges::new(),
             fuel: 1_000_000,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_stats: crate::jit::JitStats::default(),
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_prepared: None,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_cooldown: false,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
@@ -5561,11 +5617,11 @@ impl Execution<'_> {
             resume_charge: 0,
             resume_charges: AllocationCharges::new(),
             fuel: 1_000_000,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_stats: crate::jit::JitStats::default(),
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_prepared: None,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_cooldown: false,
             finalizer_steps: 0,
             debug_hook_skip_once: false,
@@ -22996,8 +23052,12 @@ impl Execution<'_> {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
         }
         self.vm.set_execution_running(true);
+        #[cfg(feature = "std")]
         let outcome = catch_unwind(AssertUnwindSafe(|| self.run_inner()));
+        #[cfg(not(feature = "std"))]
+        let outcome = self.run_inner();
         self.vm.set_execution_running(false);
+        #[cfg(feature = "std")]
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(payload) => {
@@ -23132,7 +23192,7 @@ impl Execution<'_> {
         Ok(Some(token))
     }
 
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     pub fn jit_stats(&self) -> crate::jit::JitStats {
         let mut stats = self.jit_stats;
         stats.code_bytes = self.vm.jit_state.code_bytes();
@@ -23147,7 +23207,7 @@ impl Execution<'_> {
         stats
     }
 
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     fn jit_runtime_guard(&self) -> Option<crate::jit::JitEligibility> {
         use crate::jit::{JitEligibility as E, JitFallbackReason as R, JitPolicy};
         if self.vm.jit_state.policy == JitPolicy::Disabled {
@@ -23177,7 +23237,7 @@ impl Execution<'_> {
         None
     }
 
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     pub fn jit_eligibility(&self) -> crate::jit::JitEligibility {
         use crate::jit::{JitEligibility as E, JitFallbackReason as R};
         if let Some(eligibility) = self.jit_runtime_guard() {
@@ -23188,6 +23248,18 @@ impl Execution<'_> {
                 && prepared.prototype == self.frame.prototype
                 && prepared.epoch == self.vm.jit_state.epoch
             {
+                #[cfg(not(feature = "jit"))]
+                if prepared.eligibility == E::Supported {
+                    let Ok(module) = self.current_module() else {
+                        return E::Rejected { reason: R::StateConflict };
+                    };
+                    if !self.vm.jit_state.cache.iter().any(|artifact| artifact.matches_identity(
+                        module, prepared.module_digest, self.frame.prototype,
+                        self.frame.pc, self.vm_id,
+                    )) {
+                        return E::Unsupported { reason: R::ArtifactUnavailable };
+                    }
+                }
                 return prepared.eligibility;
             }
         }
@@ -23195,12 +23267,25 @@ impl Execution<'_> {
             return E::Rejected { reason: R::StateConflict };
         };
         match rivetlua_native::NativeArtifact::validate(module, self.frame.prototype) {
-            Ok(()) => E::Supported,
+            Ok(()) => {
+                #[cfg(not(feature = "jit"))]
+                {
+                    let Some(digest) = crate::jit::module_digest(module) else {
+                        return E::Rejected { reason: R::ResourceLimit };
+                    };
+                    if !self.vm.jit_state.cache.iter().any(|artifact| artifact.matches_identity(
+                        module, digest, self.frame.prototype, self.frame.pc, self.vm_id,
+                    )) {
+                        return E::Unsupported { reason: R::ArtifactUnavailable };
+                    }
+                }
+                E::Supported
+            }
             Err(error) => crate::jit::classify(&error),
         }
     }
 
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     fn ensure_jit_prepared(&mut self) -> crate::jit::JitEligibility {
         use crate::jit::{JitEligibility as E, JitFallbackReason as R, JitPrepared};
         if let Some(eligibility) = self.jit_runtime_guard() {
@@ -23217,20 +23302,10 @@ impl Execution<'_> {
         let (eligibility, digest) = match self.current_module() {
             Ok(module) => match rivetlua_native::NativeArtifact::validate(module, self.frame.prototype) {
                 Err(error) => (crate::jit::classify(&error), [0; 32]),
-                Ok(()) => {
-                    let mut work = rivetlua_core::OfficialWorkBudget::new(u64::MAX);
-                    match rivetlua_core::bytecode::encode_transport_module(
-                        module,
-                        &rivetlua_core::TransportLimits::default(),
-                        &mut work,
-                    ) {
-                        Ok(encoded) => match rivetlua_core::sha256_bytes(encoded.rvlu()) {
-                            Some(digest) => (E::Supported, digest),
-                            None => (E::Rejected { reason: R::ResourceLimit }, [0; 32]),
-                        },
-                        Err(_) => (E::Rejected { reason: R::ResourceLimit }, [0; 32]),
-                    }
-                }
+                Ok(()) => match crate::jit::module_digest(module) {
+                    Some(digest) => (E::Supported, digest),
+                    None => (E::Rejected { reason: R::ResourceLimit }, [0; 32]),
+                },
             },
             Err(_) => (E::Rejected { reason: R::StateConflict }, [0; 32]),
         };
@@ -23246,10 +23321,12 @@ impl Execution<'_> {
         eligibility
     }
 
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     fn try_native_quantum(&mut self) -> Result<bool, RuntimeError> {
         use crate::jit::{JitEligibility, JitFallbackReason as R};
-        use rivetlua_native::{NativeArtifact, NativeCompileError, NativeCompileInput, NativeError, NativeExit, NativeState, NumericValue};
+        use rivetlua_native::{NativeError, NativeExit, NativeState, NumericValue};
+        #[cfg(feature = "jit")]
+        use rivetlua_native::{NativeArtifact, NativeCompileError, NativeCompileInput};
 
         if self.jit_cooldown {
             self.jit_cooldown = false;
@@ -23282,61 +23359,69 @@ impl Execution<'_> {
         let index = match current {
             Some(index) => index,
             None => {
-                if !self.vm.jit_state.make_room_for_compile() {
-                    self.jit_stats.fallback_reason = Some(R::ResourceLimit);
-                    if let Some(prepared) = self.jit_prepared.as_mut() {
-                        prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
-                    }
+                #[cfg(not(feature = "jit"))]
+                {
+                    self.jit_stats.fallback_reason = Some(R::ArtifactUnavailable);
                     return Ok(false);
                 }
-                let artifact = loop {
-                    let result = {
-                        let module = self.current_module()?;
-                        NativeArtifact::compile(NativeCompileInput {
-                            module,
-                            prototype_index: self.frame.prototype,
-                            entry_pc,
-                            module_digest: digest,
-                            vm_id,
-                            code_limit_bytes: self.vm.jit_state.code_limit_bytes,
-                        })
-                    };
-                    match result {
-                        Ok(artifact) => break artifact,
-                        Err(NativeCompileError::Native(NativeError::AllocationFailed))
-                            if !self.vm.jit_state.cache.is_empty() => {
-                            self.vm.jit_state.cache.remove(0);
-                            self.vm.jit_state.cache.shrink_to_fit();
+                #[cfg(feature = "jit")]
+                {
+                    if !self.vm.jit_state.make_room_for_compile() {
+                        self.jit_stats.fallback_reason = Some(R::ResourceLimit);
+                        if let Some(prepared) = self.jit_prepared.as_mut() {
+                            prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
                         }
-                        Err(error) => {
-                            let eligibility = crate::jit::classify(&error);
-                            self.jit_stats.fallback_reason = match eligibility {
-                                JitEligibility::Supported => None,
-                                JitEligibility::Unsupported { reason }
-                                | JitEligibility::Rejected { reason } => Some(reason),
-                            };
-                            if let Some(prepared) = self.jit_prepared.as_mut() {
-                                prepared.eligibility = eligibility;
+                        return Ok(false);
+                    }
+                    let artifact = loop {
+                        let result = {
+                            let module = self.current_module()?;
+                            NativeArtifact::compile(NativeCompileInput {
+                                module,
+                                prototype_index: self.frame.prototype,
+                                entry_pc,
+                                module_digest: digest,
+                                vm_id,
+                                code_limit_bytes: self.vm.jit_state.code_limit_bytes,
+                            })
+                        };
+                        match result {
+                            Ok(artifact) => break artifact,
+                            Err(NativeCompileError::Native(NativeError::AllocationFailed))
+                                if !self.vm.jit_state.cache.is_empty() => {
+                                self.vm.jit_state.cache.remove(0);
+                                self.vm.jit_state.cache.shrink_to_fit();
                             }
-                            self.jit_cooldown = true;
-                            return Ok(false);
+                            Err(error) => {
+                                let eligibility = crate::jit::classify(&error);
+                                self.jit_stats.fallback_reason = match eligibility {
+                                    JitEligibility::Supported => None,
+                                    JitEligibility::Unsupported { reason }
+                                    | JitEligibility::Rejected { reason } => Some(reason),
+                                };
+                                if let Some(prepared) = self.jit_prepared.as_mut() {
+                                    prepared.eligibility = eligibility;
+                                }
+                                self.jit_cooldown = true;
+                                return Ok(false);
+                            }
                         }
+                    };
+                    self.jit_stats.jit_compile_ns = self.jit_stats.jit_compile_ns
+                        .saturating_add(artifact.compile_ns());
+                    let prepared_bytes = register_count
+                        .saturating_mul(core::mem::size_of::<NumericValue>())
+                        .saturating_add(core::mem::size_of::<crate::jit::JitPrepared>())
+                        .saturating_add(artifact.register_mask().len());
+                    if !self.vm.jit_state.admit(artifact, prepared_bytes) {
+                        self.jit_stats.fallback_reason = Some(R::ResourceLimit);
+                        if let Some(prepared) = self.jit_prepared.as_mut() {
+                            prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+                        }
+                        return Ok(false);
                     }
-                };
-                self.jit_stats.jit_compile_ns = self.jit_stats.jit_compile_ns
-                    .saturating_add(artifact.compile_ns());
-                let prepared_bytes = register_count
-                    .saturating_mul(core::mem::size_of::<NumericValue>())
-                    .saturating_add(core::mem::size_of::<crate::jit::JitPrepared>())
-                    .saturating_add(artifact.register_mask().len());
-                if !self.vm.jit_state.admit(artifact, prepared_bytes) {
-                    self.jit_stats.fallback_reason = Some(R::ResourceLimit);
-                    if let Some(prepared) = self.jit_prepared.as_mut() {
-                        prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
-                    }
-                    return Ok(false);
+                    self.vm.jit_state.cache.len() - 1
                 }
-                self.vm.jit_state.cache.len() - 1
             }
         };
         let prepared_bytes = register_count
@@ -23628,7 +23713,7 @@ impl Execution<'_> {
                 self.finish()?;
                 return Ok(RunOutcome::Aborted(AbortReason::FuelExhausted));
             }
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             if !interrupted
                 && !resume_deferred
                 && !self.vm.finalizer_running()
@@ -24908,7 +24993,7 @@ impl Execution<'_> {
     }
 
     fn dispatch_one(&mut self) -> Result<DispatchResult, RuntimeError> {
-        #[cfg(feature = "jit")]
+        #[cfg(any(feature = "jit", feature = "aot"))]
         {
             self.jit_stats.total_logical_instructions =
                 self.jit_stats.total_logical_instructions.saturating_add(1);
@@ -27169,7 +27254,8 @@ impl Vm {
             .last_mut()
             .and_then(|parked| parked.core.take())
             .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
-        let written = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg_attr(feature = "std", allow(unused_mut))]
+        let mut action = || {
             let frame = Self::debug_external_mut_lua_frame(&mut core, rank)
                 .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
             match slot {
@@ -27184,16 +27270,23 @@ impl Vm {
                     Err(RuntimeError::new(RuntimeErrorKind::DebugArgument))
                 }
             }
-        }));
+        };
+        #[cfg(feature = "std")]
+        let written = catch_unwind(AssertUnwindSafe(action));
+        #[cfg(not(feature = "std"))]
+        let written = action();
         let top = self
             .parked_executions
             .last_mut()
             .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
         top.core = Some(core);
+        #[cfg(feature = "std")]
         match written {
             Ok(result) => result,
             Err(panic) => resume_unwind(panic),
         }
+        #[cfg(not(feature = "std"))]
+        written
     }
 
     #[doc(hidden)]

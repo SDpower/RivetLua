@@ -1,3 +1,5 @@
+use crate::rust_alloc::vec::Vec;
+
 pub(crate) mod trace;
 
 use rivetlua_core::{LuaProfile, ObjectRef};

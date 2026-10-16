@@ -1,5 +1,8 @@
 //! 每個 VM 明確注入的宿主能力。
 
+use crate::rust_alloc::boxed::Box;
+use crate::rust_alloc::vec::Vec;
+
 use rivetlua_core::{LuaProfile, VerifiedModule, VerifyLimits};
 
 use crate::VmError;

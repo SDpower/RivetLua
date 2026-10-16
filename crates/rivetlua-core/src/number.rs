@@ -5,6 +5,56 @@ use core::cmp::Ordering;
 use crate::error::{CoreError, CoreErrorKind, Operation};
 use crate::value::{Value, ValueKind};
 
+/// 只在 no_std 目標補足浮點函式；std 繼續使用原本的 f64 方法。
+#[cfg(not(feature = "std"))]
+pub trait NoStdFloat {
+    fn powf(self, exponent: f64) -> f64;
+    fn floor(self) -> f64;
+    fn trunc(self) -> f64;
+    fn fract(self) -> f64;
+    fn ceil(self) -> f64;
+    fn acos(self) -> f64;
+    fn asin(self) -> f64;
+    fn atan2(self, other: f64) -> f64;
+    fn cos(self) -> f64;
+    fn exp(self) -> f64;
+    fn ln(self) -> f64;
+    fn log2(self) -> f64;
+    fn log10(self) -> f64;
+    fn sin(self) -> f64;
+    fn sqrt(self) -> f64;
+    fn tan(self) -> f64;
+}
+
+#[cfg(not(feature = "std"))]
+impl NoStdFloat for f64 {
+    fn powf(self, exponent: f64) -> f64 { libm::pow(self, exponent) }
+    fn floor(self) -> f64 { libm::floor(self) }
+    fn trunc(self) -> f64 { libm::trunc(self) }
+    fn fract(self) -> f64 {
+        if self.is_finite() { libm::modf(self).0 } else { f64::NAN }
+    }
+    fn ceil(self) -> f64 { libm::ceil(self) }
+    fn acos(self) -> f64 { libm::acos(self) }
+    fn asin(self) -> f64 { libm::asin(self) }
+    fn atan2(self, other: f64) -> f64 { libm::atan2(self, other) }
+    fn cos(self) -> f64 { libm::cos(self) }
+    fn exp(self) -> f64 { libm::exp(self) }
+    fn ln(self) -> f64 { libm::log(self) }
+    fn log2(self) -> f64 { libm::log2(self) }
+    fn log10(self) -> f64 { libm::log10(self) }
+    fn sin(self) -> f64 { libm::sin(self) }
+    fn sqrt(self) -> f64 { libm::sqrt(self) }
+    fn tan(self) -> f64 { libm::tan(self) }
+}
+
+/// 十六進位浮點解析中的 2^n，保留整數指數與次正規邊界。
+#[cfg(not(feature = "std"))]
+#[doc(hidden)]
+pub fn no_std_pow2i(exponent: i32) -> f64 {
+    libm::scalbn(1.0, exponent)
+}
+
 /// 保留 Integer 與 Float 子型別的數值。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Number {

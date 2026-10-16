@@ -1,6 +1,8 @@
 //! P19 固定版本的語言相容差異表。
 
-use std::collections::HashSet;
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::collections::BTreeSet;
 
 use crate::LuaProfile;
 
@@ -63,7 +65,7 @@ fn parse_table(contents: &str) -> Result<Vec<CompatibilityEntry<'_>>, String> {
         return Err("P19 compatibility table header 不符".into());
     }
 
-    let mut ids = HashSet::new();
+    let mut ids = BTreeSet::new();
     let mut entries = Vec::new();
     for (index, line) in lines.enumerate() {
         let columns: Vec<_> = line.split(',').collect();

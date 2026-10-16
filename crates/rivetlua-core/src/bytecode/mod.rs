@@ -1,5 +1,7 @@
 //! P05 自有 typed IR 的共用 bytecode 契約；不含 VM。
 
+use alloc::vec::Vec;
+
 pub mod codec;
 pub mod input;
 pub mod native_debug;

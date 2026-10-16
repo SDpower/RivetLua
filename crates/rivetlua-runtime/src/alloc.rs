@@ -1,10 +1,12 @@
 //! P06-4 的 VM 邏輯配置額度與可控失敗點。
 
+use crate::rust_alloc::vec::Vec;
+
 use core::cell::Cell;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::panic::Location;
-use std::rc::Rc;
+use crate::rust_alloc::rc::Rc;
 
 use crate::VmError;
 
@@ -159,15 +161,38 @@ pub struct LedgerSnapshot {
     pub shared_rss_observation: Option<usize>,
 }
 
+/// VM 邏輯配置的歷史高水位；不代表 Rust allocator、RSS 或實體 RAM。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocationPeaks {
+    pub committed: usize,
+    pub outstanding: usize,
+    pub lua_heap_bytes: usize,
+    pub host_allocation_bytes: usize,
+}
+
 #[derive(Clone, Copy)]
 struct LedgerState {
     snapshot: LedgerSnapshot,
+    peaks: AllocationPeaks,
     fail_once: Option<FailPoint>,
     poisoned: bool,
     lua_reserved: usize,
     host_reserved: usize,
     trace: AllocationTrace,
     fail_at_ordinal: Option<u64>,
+}
+
+impl LedgerState {
+    fn record_peaks(&mut self) -> Result<(), VmError> {
+        let outstanding = self.snapshot.committed
+            .checked_add(self.snapshot.reserved)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        self.peaks.committed = self.peaks.committed.max(self.snapshot.committed);
+        self.peaks.outstanding = self.peaks.outstanding.max(outstanding);
+        self.peaks.lua_heap_bytes = self.peaks.lua_heap_bytes.max(self.snapshot.lua_heap_bytes);
+        self.peaks.host_allocation_bytes = self.peaks.host_allocation_bytes.max(self.snapshot.host_allocation_bytes);
+        Ok(())
+    }
 }
 
 /// VM 的邏輯配置帳本；保留票據可跨短暫 heap 借用邊界。
@@ -201,6 +226,10 @@ impl LedgerProbe {
         self.0.snapshot()
     }
 
+    pub fn peaks(&self) -> AllocationPeaks {
+        self.0.peaks()
+    }
+
     pub fn trace(&self) -> AllocationTrace {
         self.0.trace()
     }
@@ -230,6 +259,12 @@ impl AllocationLedger {
                     host_allocation_bytes: 0,
                     shared_rss_observation: None,
                 },
+                peaks: AllocationPeaks {
+                    committed: 0,
+                    outstanding: 0,
+                    lua_heap_bytes: 0,
+                    host_allocation_bytes: 0,
+                },
                 fail_once: None,
                 poisoned: false,
                 lua_reserved: 0,
@@ -248,6 +283,10 @@ impl AllocationLedger {
 
     pub fn snapshot(&self) -> LedgerSnapshot {
         self.inner.get().snapshot
+    }
+
+    pub fn peaks(&self) -> AllocationPeaks {
+        self.inner.get().peaks
     }
 
     pub(crate) fn probe(&self) -> LedgerProbe {
@@ -453,6 +492,7 @@ impl AllocationLedger {
                     .ok_or(VmError::ArithmeticOverflow)?;
             }
         }
+        state.record_peaks()?;
         self.inner.set(state);
         Ok(Reservation {
             ledger: self.clone(),
@@ -778,6 +818,7 @@ impl AllocationCharges {
             charge.bytes = 0;
         }
         self.entries.clear();
+        state.peaks = partial.ledger.inner.get().peaks;
         state.snapshot.committed -= partial.excess;
         match partial.domain {
             AllocationDomain::LuaHeap => state.snapshot.lua_heap_bytes -= partial.excess,
@@ -867,6 +908,7 @@ impl Reservation {
             .ok_or(VmError::ArithmeticOverflow)?;
         state.snapshot.reserved = reserved;
         state.snapshot.committed = committed;
+        state.record_peaks()?;
         self.ledger.inner.set(state);
         self.active = false;
         Ok(AllocationCharge {
@@ -937,8 +979,40 @@ pub(crate) fn reserve_vec<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{AllocationLedger, FailPoint, checked_bytes, reserve_vec};
+    use super::{AllocationDomain, AllocationLedger, AllocationPeaks, FailPoint, checked_bytes, reserve_vec};
     use crate::VmError;
+
+    #[test]
+    fn p21_5_logical_peaks_track_only_published_charges() {
+        let ledger = AllocationLedger::new(100);
+        let zero = AllocationPeaks {
+            committed: 0,
+            outstanding: 0,
+            lua_heap_bytes: 0,
+            host_allocation_bytes: 0,
+        };
+        let probe = ledger.probe();
+        assert_eq!(probe.peaks(), zero);
+        let abandoned = ledger.reserve(40).unwrap();
+        assert_eq!(ledger.peaks().outstanding, 40);
+        drop(abandoned);
+        assert_eq!(ledger.peaks().outstanding, 40);
+        let host = ledger.reserve(60).unwrap().commit_charge().unwrap();
+        assert_eq!(ledger.peaks().committed, 60);
+        assert_eq!(ledger.peaks().host_allocation_bytes, 60);
+        assert_eq!(ledger.peaks().outstanding, 60);
+        let before_reject = ledger.peaks();
+        assert_eq!(ledger.reserve(41).err(), Some(VmError::AllocationFailed));
+        assert_eq!(ledger.peaks(), before_reject);
+        drop(host);
+        let lua = ledger.reserve_at(20, AllocationDomain::LuaHeap, None)
+            .unwrap().commit_charge().unwrap();
+        assert_eq!(ledger.peaks().lua_heap_bytes, 20);
+        drop(lua);
+        assert_eq!(ledger.snapshot().committed, 0);
+        assert_eq!(ledger.peaks().outstanding, 60);
+        assert_eq!(probe.peaks(), ledger.peaks());
+    }
 
     #[test]
     fn ledger_reserve_commit_rollback_and_refund_are_balanced() {

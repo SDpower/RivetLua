@@ -1,5 +1,7 @@
 //! 官方 chunk 的無配置結構預掃描，供 P13 在 decode 前預扣工作與配置。
 
+use alloc::vec::Vec;
+
 use core::mem::size_of;
 
 use super::official::{OfficialChunkError, OfficialChunkErrorKind, OfficialChunkLimits};

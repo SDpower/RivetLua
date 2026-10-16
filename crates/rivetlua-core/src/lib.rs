@@ -1,6 +1,15 @@
 //! RivetLua 的值與數值核心。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[macro_use]
+extern crate alloc;
+
+#[cfg(all(not(feature = "std"), panic = "unwind"))]
+compile_error!("rivetlua-core 的 no_std 組態需要 panic=abort");
+#[cfg(not(target_has_atomic = "ptr"))]
+compile_error!("rivetlua-core 需要指標原子操作以支援 Arc");
 
 pub mod bytecode;
 mod compatibility;
@@ -9,6 +18,7 @@ pub mod error;
 pub mod limits;
 pub mod number;
 pub mod profile;
+pub mod target;
 pub mod value;
 
 pub use bytecode::input::{
@@ -61,6 +71,7 @@ pub use number::{
     multiply, negate, number_from_value, power, shift_left, shift_right, subtract,
 };
 pub use profile::ProfileRules;
+pub use target::{BoardConfig, DeploymentStatus, Endian, ExecMemoryPolicy, TargetDescriptor, TargetError};
 pub use value::{
     Generation, HostFunctionId, ObjectId, ObjectRef, SlotId, Value, ValueKind, VmId, select_and,
     select_or,

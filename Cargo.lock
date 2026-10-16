@@ -370,6 +370,7 @@ dependencies = [
  "rivetlua-capi",
  "rivetlua-compiler",
  "rivetlua-core",
+ "rivetlua-native",
  "rivetlua-runtime",
 ]
 
@@ -403,6 +404,9 @@ dependencies = [
 [[package]]
 name = "rivetlua-core"
 version = "0.0.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "rivetlua-native"
@@ -430,6 +434,7 @@ version = "0.0.0"
 dependencies = [
  "rivetlua",
  "rivetlua-cli",
+ "rivetlua-native",
 ]
 
 [[package]]

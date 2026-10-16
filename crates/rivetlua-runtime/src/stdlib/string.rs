@@ -1,5 +1,7 @@
 //! 以 Lua bytes 運作的 string 函式庫；暫存輸出由 VM 帳本計費。
 
+use crate::rust_alloc::vec::Vec;
+
 use core::fmt::{self, Write};
 
 use rivetlua_core::{LuaProfile, Value};

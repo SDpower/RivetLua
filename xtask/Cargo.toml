@@ -14,3 +14,4 @@ path = "src/main.rs"
 [dependencies]
 rivetlua = { path = "../crates/rivetlua", default-features = false, features = ["jit"] }
 rivetlua-cli = { path = "../crates/rivetlua-cli", default-features = false }
+rivetlua-native = { path = "../crates/rivetlua-native", default-features = false }

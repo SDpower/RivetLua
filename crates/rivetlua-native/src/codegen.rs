@@ -1,103 +1,48 @@
 //! 僅編譯已驗證、無 heap 效果的 RVLU 數值函式。
 
 use std::time::Instant;
-
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, AbiParam, InstBuilder, MemFlagsData, Value as ClifValue, types};
 use cranelift_codegen::isa::{self, TargetIsa};
 use cranelift_codegen::settings;
 use cranelift_codegen::{Context, control::ControlPlane};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use rivetlua_core::bytecode::{
-    BinaryOperation, BytecodeConstant, BytecodePrototype, Instruction, InstructionEffects,
-    Register, UnaryOperation,
-};
-use rivetlua_core::{LuaProfile, ProtoId, RVLU_V2, VerifiedModule, VmId};
+use rivetlua_core::bytecode::{BinaryOperation, BytecodeConstant, BytecodePrototype, Instruction, Register, UnaryOperation};
+use rivetlua_core::{LuaProfile, RVLU_V2};
 use target_lexicon::Triple;
-
-use crate::abi::{
-    FRAME_EXECUTED_OFFSET, FRAME_EXIT_OFFSET, FRAME_FUEL_OFFSET, FRAME_PC_OFFSET,
-    FRAME_REGISTERS_OFFSET, FRAME_STEP_BUDGET_OFFSET, TAG_BOOLEAN, TAG_FLOAT, TAG_INTEGER,
-    TAG_NIL, VALUE_BITS_OFFSET, VALUE_SIZE, VALUE_TAG_OFFSET, NativeError, NativeExit, NativeState,
-};
+use crate::abi::{FRAME_EXECUTED_OFFSET, FRAME_EXIT_OFFSET, FRAME_FUEL_OFFSET, FRAME_PC_OFFSET, FRAME_REGISTERS_OFFSET, FRAME_STEP_BUDGET_OFFSET, TAG_BOOLEAN, TAG_FLOAT, TAG_INTEGER, TAG_NIL, VALUE_BITS_OFFSET, VALUE_SIZE, VALUE_TAG_OFFSET, NativeExit};
+use crate::artifact::{check_prototype, NativeArtifact, NativeCompileError, NativeCompileInput, ValidatedCode, CODE_VERSION};
 use crate::execmem::{self, ExecutableCode};
 
-pub const BACKEND_VERSION: &str = "cranelift-0.134.2-rvlu-v2-1";
-pub const CODE_VERSION: u32 = 1;
-
-pub struct NativeCompileInput<'a> {
-    pub module: &'a VerifiedModule,
-    pub prototype_index: usize,
-    pub entry_pc: usize,
-    pub module_digest: [u8; 32],
-    pub vm_id: VmId,
-    pub code_limit_bytes: usize,
-}
-
-#[derive(Debug)]
-pub enum NativeCompileError {
-    Unsupported(&'static str),
-    Rejected(&'static str),
-    Backend(String),
-    Native(NativeError),
-}
-
-/// 只有本模組在完整靜態檢查及 relocation 檢查後才可建立的機器碼權杖。
-pub(crate) struct ValidatedCode {
-    bytes: Vec<u8>,
-    entry_offset: usize,
-    entry_pc: u64,
-    max_pc: u64,
-    register_count: usize,
-    target: String,
-    required_cpu_features: Vec<&'static str>,
-}
-
-impl ValidatedCode {
-    pub(crate) fn bytes(&self) -> &[u8] { &self.bytes }
-    pub(crate) fn entry_offset(&self) -> usize { self.entry_offset }
-    pub(crate) fn entry_pc(&self) -> u64 { self.entry_pc }
-    pub(crate) fn max_pc(&self) -> u64 { self.max_pc }
-    pub(crate) fn register_count(&self) -> usize { self.register_count }
-    pub(crate) fn target(&self) -> &str { &self.target }
-    pub(crate) fn required_cpu_features(&self) -> &[&str] { &self.required_cpu_features }
-}
-
-pub struct NativeArtifact {
-    code: ExecutableCode,
-    module_digest: [u8; 32],
-    vm_id: VmId,
-    function_id: ProtoId,
-    function: u32,
-    format_version: rivetlua_core::BytecodeVersion,
-    code_version: u32,
-    profile: LuaProfile,
-    numeric_config: u8,
+pub(crate) fn lower_aot(
+    module: &rivetlua_core::VerifiedModule,
+    prototype_index: usize,
     entry_pc: usize,
-    register_mask: Vec<bool>,
-    code_bytes: usize,
-    compile_ns: u64,
     target: String,
-    cpu_features: &'static [&'static str],
+) -> Result<(ValidatedCode, Vec<bool>), NativeCompileError> {
+    if module.format_version() != RVLU_V2 {
+        return Err(NativeCompileError::Rejected("RVLU version"));
+    }
+    let prototype = module.module().prototypes.get(prototype_index)
+        .ok_or(NativeCompileError::Rejected("prototype index"))?;
+    if prototype.register_count == 0 || prototype.register_count > 4096
+        || prototype.instructions.is_empty() || prototype.instructions.len() > 100_000
+        || entry_pc >= prototype.instructions.len() || !prototype.close_paths.is_empty()
+    {
+        return Err(NativeCompileError::Rejected("function limits or close path"));
+    }
+    let mask = check_prototype(prototype)?;
+    let triple = target.parse::<Triple>()
+        .map_err(|_| NativeCompileError::Rejected("AOT target triple"))?;
+    let isa_builder = isa::lookup(triple)
+        .map_err(|_| NativeCompileError::Rejected("AOT target ISA"))?;
+    let isa = isa_builder.finish(settings::Flags::new(settings::builder()))
+        .map_err(|error| NativeCompileError::Backend(format!("{error:?}")))?;
+    let code = lower(prototype, entry_pc, isa.as_ref(), target)?;
+    Ok((code, mask))
 }
 
 impl NativeArtifact {
-    pub fn validate(module: &VerifiedModule, prototype_index: usize) -> Result<(), NativeCompileError> {
-        if module.format_version() != RVLU_V2 {
-            return Err(NativeCompileError::Rejected("RVLU version"));
-        }
-        let prototype = module.module().prototypes.get(prototype_index)
-            .ok_or(NativeCompileError::Rejected("prototype index"))?;
-        if prototype.register_count == 0 || prototype.register_count > 4096
-            || prototype.instructions.is_empty() || prototype.instructions.len() > 100_000
-            || !prototype.close_paths.is_empty()
-        {
-            return Err(NativeCompileError::Rejected("function limits or close path"));
-        }
-        check_prototype(prototype)?;
-        execmem::platform_preflight().map_err(NativeCompileError::Native)
-    }
-
     pub fn compile(input: NativeCompileInput<'_>) -> Result<Self, NativeCompileError> {
         let started = Instant::now();
         if input.module.format_version() != RVLU_V2 {
@@ -151,113 +96,6 @@ impl NativeArtifact {
         })
     }
 
-    pub fn execute(&self, state: &mut NativeState<'_>) -> Result<NativeExit, NativeError> {
-        self.code.execute(state)
-    }
-    pub fn module_digest(&self) -> [u8; 32] { self.module_digest }
-    pub fn vm_id(&self) -> VmId { self.vm_id }
-    pub fn function_id(&self) -> ProtoId { self.function_id }
-    pub fn function(&self) -> u32 { self.function }
-    pub fn format_version(&self) -> rivetlua_core::BytecodeVersion { self.format_version }
-    pub fn code_version(&self) -> u32 { self.code_version }
-    pub fn profile(&self) -> LuaProfile { self.profile }
-    pub fn numeric_config(&self) -> u8 { self.numeric_config }
-    pub fn entry_pc(&self) -> usize { self.entry_pc }
-    pub fn register_mask(&self) -> &[bool] { &self.register_mask }
-    pub fn code_bytes(&self) -> usize { self.code_bytes }
-    pub fn allocated_bytes(&self) -> usize { self.code.allocated_bytes() }
-    pub fn metadata_bytes(&self) -> usize {
-        self.code.metadata_bytes()
-            .saturating_add(self.register_mask.capacity())
-            .saturating_add(self.target.capacity())
-    }
-    pub fn compile_ns(&self) -> u64 { self.compile_ns }
-    pub fn target(&self) -> &str { &self.target }
-    pub fn cpu_features(&self) -> &'static [&'static str] { self.cpu_features }
-    pub fn backend_version(&self) -> &'static str { BACKEND_VERSION }
-    pub fn matches_identity(
-        &self,
-        module: &VerifiedModule,
-        module_digest: [u8; 32],
-        prototype_index: usize,
-        entry_pc: usize,
-        vm_id: VmId,
-    ) -> bool {
-        let Some(prototype) = module.module().prototypes.get(prototype_index) else {
-            return false;
-        };
-        self.module_digest == module_digest
-            && self.vm_id == vm_id
-            && self.function_id == prototype.id
-            && self.function == prototype.function
-            && self.format_version == module.format_version()
-            && self.format_version == RVLU_V2
-            && self.code_version == CODE_VERSION
-            && self.profile == module.profile()
-            && self.numeric_config == module.module().numeric_config
-            && self.entry_pc == entry_pc
-            && self.target == Triple::host().to_string()
-            && self.cpu_features.is_empty()
-            && self.backend_version() == BACKEND_VERSION
-    }
-}
-
-fn check_prototype(prototype: &BytecodePrototype) -> Result<Vec<bool>, NativeCompileError> {
-    let mut mask = vec![false; usize::from(prototype.register_count)];
-    let count = prototype.instructions.len();
-    for (pc, entry) in prototype.instructions.iter().enumerate() {
-        if entry.close_path.is_some() {
-            return Err(NativeCompileError::Unsupported("close path"));
-        }
-        let instruction = &entry.instruction;
-        let flags = instruction.effects().encoded_flags();
-        let allowed = match instruction {
-            Instruction::LoadConst { constant, .. } => {
-                matches!(prototype.constants.get(constant.0 as usize),
-                    Some(BytecodeConstant::Integer(_) | BytecodeConstant::FloatBits(_)
-                        | BytecodeConstant::Boolean(_))) && flags == 0
-            }
-            Instruction::LoadNil { .. } | Instruction::Move { .. }
-            | Instruction::Jump { .. } | Instruction::JumpIfFalse { .. }
-            | Instruction::Return { .. } => flags == 0,
-            Instruction::UnaryOp { op: UnaryOperation::Negate | UnaryOperation::Not, .. }
-            | Instruction::BinaryOp { op: BinaryOperation::Add | BinaryOperation::Subtract
-                | BinaryOperation::Multiply | BinaryOperation::Equal
-                | BinaryOperation::NotEqual | BinaryOperation::Less
-                | BinaryOperation::LessEqual | BinaryOperation::Greater
-                | BinaryOperation::GreaterEqual, .. } => {
-                    flags == (InstructionEffects::MAY_CALL | InstructionEffects::MAY_YIELD
-                        | InstructionEffects::MAY_ERROR | InstructionEffects::SAFE_POINT)
-                }
-            _ => false,
-        };
-        if !allowed {
-            return Err(NativeCompileError::Unsupported("instruction or effect"));
-        }
-        if let Instruction::LoadNil { start, count } = instruction {
-            if usize::from(start.0).checked_add(usize::from(*count))
-                .is_none_or(|end| end > mask.len())
-            {
-                return Err(NativeCompileError::Rejected("nil register range"));
-            }
-        }
-        let effects = instruction.effects();
-        for register in effects.reads.iter().chain(effects.writes.iter()) {
-            let slot = mask.get_mut(usize::from(register.0))
-                .ok_or(NativeCompileError::Rejected("register effect"))?;
-            *slot = true;
-        }
-        match instruction {
-            Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. }
-                if target.0 as usize >= count =>
-                    return Err(NativeCompileError::Rejected("jump target")),
-            Instruction::Return { .. } => {}
-            _ if pc + 1 == count && !matches!(instruction, Instruction::Jump { .. }) =>
-                return Err(NativeCompileError::Rejected("fallthrough")),
-            _ => {}
-        }
-    }
-    Ok(mask)
 }
 
 fn field(builder: &mut FunctionBuilder<'_>, frame: ClifValue, offset: i32) -> ClifValue {

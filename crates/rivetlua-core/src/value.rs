@@ -1,12 +1,26 @@
 //! P01 值分類與不透明物件身分。
 
 use core::num::NonZeroU64;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
+#[cfg(target_has_atomic = "64")]
+use core::sync::atomic::AtomicU64 as IdAtomic;
+#[cfg(all(not(target_has_atomic = "64"), target_has_atomic = "32"))]
+use core::sync::atomic::AtomicU32 as IdAtomic;
 
-static NEXT_OPAQUE_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_VM_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_RUNTIME_TOKEN: AtomicU64 = AtomicU64::new(1);
-static NEXT_HOST_FUNCTION_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(not(any(target_has_atomic = "64", target_has_atomic = "32")))]
+compile_error!("RivetLua 唯一 ID 需要 32 或 64 位元原子操作");
+
+static NEXT_OPAQUE_ID: IdAtomic = IdAtomic::new(1);
+static NEXT_VM_ID: IdAtomic = IdAtomic::new(1);
+static NEXT_RUNTIME_TOKEN: IdAtomic = IdAtomic::new(1);
+static NEXT_HOST_FUNCTION_ID: IdAtomic = IdAtomic::new(1);
+
+fn next_unique_id(counter: &IdAtomic) -> Option<NonZeroU64> {
+    let id = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .ok()?;
+    NonZeroU64::new(u64::from(id))
+}
 
 /// 每個 VM 建立時取得的唯一身分。全域流水號只用於區分 VM，不能單獨識別物件。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -15,10 +29,7 @@ pub struct VmId(NonZeroU64);
 impl VmId {
     /// 取得唯一 VM 身分；耗盡時回傳 None，不繞回舊 VM。
     pub fn new_unique() -> Option<Self> {
-        let id = NEXT_VM_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .ok()?;
-        NonZeroU64::new(id).map(Self)
+        next_unique_id(&NEXT_VM_ID).map(Self)
     }
 }
 
@@ -31,12 +42,9 @@ pub struct HostFunctionId {
 
 impl HostFunctionId {
     pub fn new_unique(vm: VmId) -> Option<Self> {
-        let token = NEXT_HOST_FUNCTION_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .ok()?;
         Some(Self {
             vm,
-            token: NonZeroU64::new(token)?,
+            token: next_unique_id(&NEXT_HOST_FUNCTION_ID)?,
         })
     }
 
@@ -116,10 +124,7 @@ enum ObjectRefKind {
 impl ObjectRef {
     /// 配置新的不透明身分；配置器耗盡時回傳 None。
     pub fn new_opaque() -> Option<Self> {
-        let id = NEXT_OPAQUE_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .ok()?;
-        NonZeroU64::new(id).map(|id| Self(ObjectRefKind::Opaque(id)))
+        next_unique_id(&NEXT_OPAQUE_ID).map(|id| Self(ObjectRefKind::Opaque(id)))
     }
 
     /// 包裝未驗證的完整身分；單憑公開欄位不能建立可解參照的物件。
@@ -130,12 +135,9 @@ impl ObjectRef {
     /// 取得本次配置的唯一驗證 token；runtime 必須保存並逐次比對原參照。
     /// 即使呼叫者自行建立此值，也無法重建已配置物件的 token。
     pub fn new_runtime(id: ObjectId) -> Option<Self> {
-        let token = NEXT_RUNTIME_TOKEN
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .ok()?;
         Some(Self(ObjectRefKind::Heap {
             id,
-            token: Some(NonZeroU64::new(token)?),
+            token: Some(next_unique_id(&NEXT_RUNTIME_TOKEN)?),
         }))
     }
 

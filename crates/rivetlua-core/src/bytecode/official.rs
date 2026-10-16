@@ -1,11 +1,25 @@
 //! Lua 5.5.1／5.4.9 官方 binary chunk 的純 Rust 結構 codec。
 //! 本模組只處理可界定資源的資料格式；指令語意與 CFG 由後續轉譯階段驗證。
 
-use std::hash::{Hash, Hasher};
-use std::mem::size_of;
+use alloc::vec::Vec;
+
+use core::hash::{Hash, Hasher};
+use core::mem::size_of;
 
 use super::official_translation::OfficialWorkBudget;
 use super::{LuaProfile, ProtoId};
+
+#[cfg(feature = "std")]
+type OfficialHasher = std::collections::hash_map::DefaultHasher;
+// no_std 缺少 DefaultHasher；官方 chunk 的內部字串 slot 不屬於 wire 格式。
+#[cfg(not(feature = "std"))]
+#[allow(deprecated)]
+type OfficialHasher = core::hash::SipHasher;
+
+#[allow(deprecated)]
+fn official_slot_hasher() -> OfficialHasher {
+    OfficialHasher::new()
+}
 
 const SIGNATURE: &[u8] = b"\x1bLua";
 const DATA: &[u8] = b"\x19\x93\r\n\x1a\n";
@@ -34,13 +48,13 @@ pub struct OfficialChunkError {
     pub detail: &'static str,
 }
 
-impl std::fmt::Display for OfficialChunkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for OfficialChunkError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "官方 chunk 位移 {}：{}", self.offset, self.detail)
     }
 }
 
-impl std::error::Error for OfficialChunkError {}
+impl core::error::Error for OfficialChunkError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OfficialChunkLimits {
@@ -1340,7 +1354,7 @@ impl<'a> StringIndex<'a> {
             ));
         }
         meter(work, bytes.len(), 0)?;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = official_slot_hasher();
         bytes.hash(&mut hasher);
         let mut index = hasher.finish() as usize & (self.slots.len() - 1);
         for _ in 0..self.slots.len() {

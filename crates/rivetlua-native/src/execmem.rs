@@ -1,7 +1,7 @@
 //! 已驗證原生碼的頁面發布與生命週期；只接受 codegen 的密封輸出。
 
 use crate::abi::{self, NativeError, NativeExit, NativeState};
-use crate::codegen::ValidatedCode;
+use crate::artifact::ValidatedCode;
 #[cfg(target_os = "linux")]
 use core::ptr::NonNull;
 
@@ -10,6 +10,11 @@ const HARD_CODE_LIMIT: usize = 16 * 1024 * 1024;
 struct PagePlan {
     allocation: usize,
     capacity: usize,
+}
+
+pub(crate) struct PlannedUsage {
+    pub(crate) code_bytes: usize,
+    pub(crate) metadata_bytes: usize,
 }
 
 /// 在配置可執行頁面前檢查封閉的目標、額度與目前程序的平台能力。
@@ -23,6 +28,23 @@ pub(crate) fn preflight(code: &ValidatedCode, code_limit_bytes: usize) -> Result
     #[cfg(not(target_os = "macos"))]
     let _ = plan;
     Ok(())
+}
+
+pub(crate) fn planned_usage(code: &ValidatedCode, code_limit_bytes: usize) -> Result<PlannedUsage, NativeError> {
+    let plan = page_plan(code, code_limit_bytes)?;
+    #[cfg(target_os = "macos")]
+    {
+        let free_slots = plan.capacity.checked_div(page_size()?)
+            .and_then(|n| n.checked_add(1)).ok_or(NativeError::InvalidCode)?;
+        let free_bytes = free_slots.checked_mul(core::mem::size_of::<(usize, usize)>())
+            .ok_or(NativeError::InvalidCode)?;
+        let metadata_bytes = core::mem::size_of::<ExecutableCode>()
+            .checked_add(core::mem::size_of::<std::sync::OnceLock<std::sync::Mutex<mac::Arena>>>())
+            .and_then(|n| n.checked_add(free_bytes)).ok_or(NativeError::InvalidCode)?;
+        Ok(PlannedUsage { code_bytes: plan.capacity, metadata_bytes })
+    }
+    #[cfg(not(target_os = "macos"))]
+    { Ok(PlannedUsage { code_bytes: plan.allocation, metadata_bytes: core::mem::size_of::<ExecutableCode>() }) }
 }
 
 /// 可在 codegen 前呼叫；不接觸 guest，也不分配可執行頁面。
@@ -62,6 +84,7 @@ fn page_plan(code: &ValidatedCode, code_limit_bytes: usize) -> Result<PagePlan, 
     Ok(PagePlan { allocation, capacity })
 }
 
+#[cfg(unix)]
 fn page_size() -> Result<usize, NativeError> {
     // SAFETY: sysconf 只讀取目前程序的頁面大小，沒有指標或子程序。
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -72,20 +95,25 @@ fn page_size() -> Result<usize, NativeError> {
     Ok(size)
 }
 
-fn host_target() -> &'static str {
+#[cfg(not(unix))]
+fn page_size() -> Result<usize, NativeError> {
+    Err(NativeError::Unsupported("此平台不支援原生碼頁面"))
+}
+
+pub(crate) fn host_target() -> &'static str {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     { return "aarch64-apple-darwin"; }
     #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
     { return "x86_64-apple-darwin"; }
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_env = "gnu"))]
     { return "aarch64-unknown-linux-gnu"; }
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
     { return "x86_64-unknown-linux-gnu"; }
     #[cfg(not(any(
         all(target_arch = "aarch64", target_os = "macos"),
         all(target_arch = "x86_64", target_os = "macos"),
-        all(target_arch = "aarch64", target_os = "linux"),
-        all(target_arch = "x86_64", target_os = "linux")
+        all(target_arch = "aarch64", target_os = "linux", target_env = "gnu"),
+        all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")
     )))]
     { "unsupported" }
 }
@@ -246,7 +274,7 @@ mod mac {
         Ok(())
     }
 
-    struct Arena {
+    pub(super) struct Arena {
         base: Option<NonNull<u8>>,
         capacity: usize,
         free: Vec<(usize, usize)>,
@@ -302,13 +330,22 @@ mod mac {
             let page = super::page_size()?;
             arena.free.try_reserve_exact(plan.capacity / page + 1)
                 .map_err(|_| NativeError::AllocationFailed)?;
+            // 事前 RAM 預算以此上界計費；allocator 若給更多容量就不能發布映射。
+            if arena.free.capacity() > plan.capacity / page + 1 {
+                arena.free = Vec::new();
+                return Err(NativeError::AllocationFailed);
+            }
             // SAFETY: quota/頁面對齊已檢查；MAP_JIT 映射只在這個 arena 建立一次。
             let raw = unsafe { libc::mmap(core::ptr::null_mut(), plan.capacity,
                 libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
                 libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT, -1, 0) };
-            if raw == libc::MAP_FAILED { return Err(NativeError::AllocationFailed); }
+            if raw == libc::MAP_FAILED {
+                arena.free = Vec::new();
+                return Err(NativeError::AllocationFailed);
+            }
             let Some(base) = NonNull::new(raw.cast::<u8>()) else {
                 unsafe { libc::munmap(raw, plan.capacity) };
+                arena.free = Vec::new();
                 return Err(NativeError::AllocationFailed);
             };
             arena.base = Some(base);

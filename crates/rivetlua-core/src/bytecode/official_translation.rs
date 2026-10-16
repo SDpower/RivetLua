@@ -1,8 +1,13 @@
 //! 官方 Lua 指令的驗證與 RVLU_V2 轉譯。
 
+use alloc::string::String;
+use alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+use alloc::string::ToString;
+
 use core::mem::size_of;
-use std::rc::Rc;
-use std::sync::Arc;
+use alloc::rc::Rc;
+use alloc::sync::Arc;
 
 use super::official::{
     OfficialChunk, OfficialChunkError, OfficialChunkErrorKind, OfficialChunkLimits,
@@ -36,8 +41,8 @@ pub struct OfficialTranslationError {
     pub detail: String,
 }
 
-impl std::fmt::Display for OfficialTranslationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for OfficialTranslationError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             formatter,
             "官方 prototype {} PC {}：{}",
@@ -46,7 +51,7 @@ impl std::fmt::Display for OfficialTranslationError {
     }
 }
 
-impl std::error::Error for OfficialTranslationError {}
+impl core::error::Error for OfficialTranslationError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReserveFailure {
@@ -1570,11 +1575,11 @@ fn charge_close_metadata(
     count: usize,
     copies: usize,
 ) -> Result<(), OfficialTranslationError> {
-    let per_path = std::mem::size_of::<BytecodeClosePath>()
+    let per_path = core::mem::size_of::<BytecodeClosePath>()
         .checked_add(
             count
                 .checked_mul(
-                    std::mem::size_of::<BytecodeBindingId>() + std::mem::size_of::<Register>(),
+                    core::mem::size_of::<BytecodeBindingId>() + core::mem::size_of::<Register>(),
                 )
                 .ok_or_else(|| invalid(id, pc, "close metadata bytes 溢位"))?,
         )
@@ -3583,7 +3588,7 @@ fn translate_prototype(
                     )?;
                     right = scratch;
                     if adjacent.k {
-                        std::mem::swap(&mut left, &mut right);
+                        core::mem::swap(&mut left, &mut right);
                     }
                 }
                 Instruction::BinaryOp {

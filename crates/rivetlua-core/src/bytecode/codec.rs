@@ -1,6 +1,9 @@
 //! RVLU v2 little-endian module codec；只做受限結構驗證，不含 VM 或 CFG/dataflow 驗證。
 
-use std::sync::Arc;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use alloc::sync::Arc;
 
 use super::{
     BinaryOperation, BytecodeVersion, EnvironmentSource, FrameLayout, Instruction,
@@ -31,7 +34,7 @@ impl core::fmt::Display for BytecodeError {
     }
 }
 
-impl std::error::Error for BytecodeError {}
+impl core::error::Error for BytecodeError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerifyLimits {

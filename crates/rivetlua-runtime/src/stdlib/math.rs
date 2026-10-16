@@ -1,6 +1,10 @@
 //! Lua 5.4／5.5 的數值函式；random 狀態與比較續行由 VM 管理。
 
+use crate::rust_alloc::vec::Vec;
+
 use rivetlua_core::{LuaProfile, Value};
+#[cfg(not(feature = "std"))]
+use rivetlua_core::number::NoStdFloat;
 
 use crate::alloc::{FailPoint, Reservation, reserve_vec};
 use crate::pending_op::PrintArguments;

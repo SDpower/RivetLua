@@ -1,5 +1,7 @@
 //! P07 數值與比較運算沿用 P01 helper；P08 加入 raw 長度路徑。
 
+use crate::rust_alloc::vec::Vec;
+
 use core::cmp::Ordering;
 use core::fmt::Write;
 

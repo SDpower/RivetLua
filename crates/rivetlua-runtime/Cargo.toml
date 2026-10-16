@@ -8,11 +8,14 @@ repository.workspace = true
 description = "RivetLua 的純 Rust VM 與 heap。"
 
 [features]
-jit = ["dep:rivetlua-native"]
+default = ["std"]
+std = ["rivetlua-core/std"]
+jit = ["std", "dep:rivetlua-native", "rivetlua-native/compiler"]
+aot = ["std", "dep:rivetlua-native"]
 
 [dependencies]
-rivetlua-core = { path = "../rivetlua-core" }
-rivetlua-native = { path = "../rivetlua-native", optional = true }
+rivetlua-core = { path = "../rivetlua-core", default-features = false }
+rivetlua-native = { path = "../rivetlua-native", optional = true, default-features = false }
 
 [dev-dependencies]
 rivetlua-compiler = { path = "../rivetlua-compiler" }

@@ -1,13 +1,16 @@
 //! P06-1 最小非移動 heap 與 slot 生命週期。
 
+use crate::rust_alloc::boxed::Box;
+use crate::rust_alloc::vec::Vec;
+
 use core::cell::Cell;
 use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
-use std::any::Any;
-use std::hash::{Hash, Hasher};
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use core::any::Any;
+use core::hash::{Hash, Hasher};
+use crate::rust_alloc::rc::Rc;
+use crate::rust_alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use rivetlua_core::bytecode::native_debug::NativeSemanticUpvalue;
 use rivetlua_core::{
@@ -17,7 +20,7 @@ use rivetlua_core::{
 
 use crate::alloc::{
     AllocationAttempt, AllocationCharge, AllocationCharges, AllocationLedger, AllocationTrace,
-    FailPoint, LedgerProbe, LedgerSnapshot, PairedLuaCharges, Reservation, checked_bytes,
+    AllocationPeaks, FailPoint, LedgerProbe, LedgerSnapshot, PairedLuaCharges, Reservation, checked_bytes,
     reserve_vec,
 };
 use crate::callback::CallbackFn;
@@ -2584,7 +2587,7 @@ struct ManagedByteStringAllocation {
 
 impl ShortStringIndex {
     fn hash(bytes: &[u8]) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = crate::hash::new_default_hasher();
         bytes.hash(&mut hasher);
         hasher.finish()
     }
@@ -2693,7 +2696,7 @@ struct PendingFinalizerWarning {
 pub struct Vm {
     id: VmId,
     profile: LuaProfile,
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     pub(crate) jit_state: crate::jit::JitVmState,
     slots: Vec<Slot>,
     short_strings: ShortStringIndex,
@@ -2800,7 +2803,7 @@ impl HostAllocationCharge {
 }
 
 struct CallbackEntry {
-    callback: std::rc::Rc<CallbackFn>,
+    callback: crate::rust_alloc::rc::Rc<CallbackFn>,
     captures: Vec<Value>,
     _capture_charges: AllocationCharges,
 }
@@ -2848,7 +2851,7 @@ impl Vm {
     /// C state 在第一筆 VM 邏輯配置前安裝宿主 admission 橋接。
     pub fn new_with_profile_and_admission(
         profile: LuaProfile,
-        admission: std::rc::Rc<dyn crate::alloc::AllocationAdmission>,
+        admission: crate::rust_alloc::rc::Rc<dyn crate::alloc::AllocationAdmission>,
     ) -> Result<Self, VmError> {
         Self::new_with_services_and_admission(profile, HostServices::deny_all(), admission)
     }
@@ -2857,7 +2860,7 @@ impl Vm {
     pub fn new_with_services_and_admission(
         profile: LuaProfile,
         host_services: HostServices,
-        admission: std::rc::Rc<dyn crate::alloc::AllocationAdmission>,
+        admission: crate::rust_alloc::rc::Rc<dyn crate::alloc::AllocationAdmission>,
     ) -> Result<Self, VmError> {
         Self::new_with_ledger(
             profile,
@@ -2884,7 +2887,7 @@ impl Vm {
         Ok(Self {
             id,
             profile,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_state: crate::jit::JitVmState::new(),
             slots: Vec::new(),
             short_strings: ShortStringIndex::default(),
@@ -3520,6 +3523,10 @@ impl Vm {
         self.ledger.snapshot()
     }
 
+    pub fn allocation_peaks(&self) -> AllocationPeaks {
+        self.ledger.peaks()
+    }
+
     /// 為 C API overlay 等宿主配置預留同一 VM 的帳本費用；不借出帳本本體。
     pub fn reserve_host_allocation(
         &self,
@@ -3993,12 +4000,18 @@ impl Vm {
     pub fn with_host_result_rooting<R>(&mut self, action: impl FnOnce(&mut Vm) -> R) -> R {
         let automatic_running = self.gc.automatic_running;
         self.gc.automatic_running = false;
+        #[cfg(feature = "std")]
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self)));
+        #[cfg(not(feature = "std"))]
+        let result = action(self);
         self.gc.automatic_running = automatic_running;
+        #[cfg(feature = "std")]
         match result {
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),
         }
+        #[cfg(not(feature = "std"))]
+        result
     }
 
     pub(crate) fn stop_automatic_gc(&mut self) {
@@ -4244,12 +4257,18 @@ impl Vm {
     fn with_gc_control_collection<R>(&mut self, action: impl FnOnce(&mut Vm) -> R) -> R {
         let previous = self.gc_control_collecting;
         self.gc_control_collecting = true;
+        #[cfg(feature = "std")]
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(self)));
+        #[cfg(not(feature = "std"))]
+        let result = action(self);
         self.gc_control_collecting = previous;
+        #[cfg(feature = "std")]
         match result {
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),
         }
+        #[cfg(not(feature = "std"))]
+        result
     }
 
     fn finish_gc_cycle_for_mode(&mut self) -> Result<(), VmError> {
@@ -7071,7 +7090,7 @@ impl Vm {
     pub fn register_callback(
         &mut self,
         captures: &[Value],
-        callback: std::rc::Rc<CallbackFn>,
+        callback: crate::rust_alloc::rc::Rc<CallbackFn>,
     ) -> Result<crate::HostHandle<Value>, VmError> {
         for &value in captures {
             if let Value::Object(object) = value {
@@ -7196,7 +7215,7 @@ impl Vm {
     pub(crate) fn callback_snapshot(
         &self,
         id: usize,
-    ) -> Result<(std::rc::Rc<CallbackFn>, Vec<Value>, Reservation), VmError> {
+    ) -> Result<(crate::rust_alloc::rc::Rc<CallbackFn>, Vec<Value>, Reservation), VmError> {
         let entry = self
             .callbacks
             .get(id)
@@ -7210,7 +7229,7 @@ impl Vm {
             FailPoint::WorkReserve,
         )?;
         captures.extend_from_slice(&entry.captures);
-        Ok((std::rc::Rc::clone(&entry.callback), captures, ticket))
+        Ok((crate::rust_alloc::rc::Rc::clone(&entry.callback), captures, ticket))
     }
 
     pub(crate) fn callback_capture_len(&self, id: usize) -> Result<usize, VmError> {
@@ -9650,7 +9669,7 @@ impl Drop for Vm {
 mod p12_5_tests {
     use core::cell::Cell;
     use core::num::NonZeroUsize;
-    use std::rc::Rc;
+    use crate::rust_alloc::rc::Rc;
 
     use rivetlua_core::Value;
 
@@ -11519,9 +11538,9 @@ mod capi_join_lazy_environment_a43_tests {
 
 #[cfg(test)]
 mod p16_b3_host_coroutine_transaction_tests {
-    use std::any::Any;
-    use std::cell::Cell;
-    use std::rc::Rc;
+    use core::any::Any;
+    use core::cell::Cell;
+    use crate::rust_alloc::rc::Rc;
 
     use rivetlua_core::LuaProfile;
 
@@ -11633,8 +11652,8 @@ mod p16_b10_debug_line_table_transaction_tests {
 
 #[cfg(test)]
 mod p16_a4a_file_metatable_tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
+    use core::cell::Cell;
+    use crate::rust_alloc::rc::Rc;
 
     use rivetlua_core::{LuaProfile, Value};
 

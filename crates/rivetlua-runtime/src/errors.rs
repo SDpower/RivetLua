@@ -1,7 +1,7 @@
 //! P11 的 Lua 錯誤值、受保護呼叫邊界與三個必要內建入口。
 
 use core::mem::size_of;
-use std::rc::Rc;
+use crate::rust_alloc::rc::Rc;
 
 use rivetlua_core::{ObjectRef, Register, ResultMode, Value};
 

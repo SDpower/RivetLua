@@ -1,7 +1,9 @@
 //! P05 所有的 RVLU 外掛來源資料傳輸。Sidecar 不屬於 RVLU_V2 wire。
 
+use alloc::vec::Vec;
+
 use core::mem::size_of;
-use std::sync::Arc;
+use alloc::sync::Arc;
 
 use super::codec::{
     BytecodeClosePath, BytecodeConstant, BytecodeError, BytecodeErrorCode, BytecodeModule,
@@ -187,7 +189,7 @@ impl core::fmt::Display for TransportError {
     }
 }
 
-impl std::error::Error for TransportError {}
+impl core::error::Error for TransportError {}
 
 fn invalid(offset: usize, detail: &'static str) -> TransportError {
     TransportError {

@@ -1,5 +1,7 @@
 //! VM 局部的 table 函式庫與排序診斷。
 
+use crate::rust_alloc::vec::Vec;
+
 use core::fmt::{self, Write};
 
 use rivetlua_core::{ObjectRef, Value};

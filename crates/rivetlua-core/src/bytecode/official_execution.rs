@@ -1,5 +1,7 @@
 //! P05 對官方 chunk 轉譯所得私有執行描述的驗證；描述不屬於 RVLU_V2 wire。
 
+use alloc::vec::Vec;
+
 use super::codec::{BytecodeError, BytecodeErrorCode, VerifiedModule, VerifyLimits};
 use super::official_translation::{BoundedVecReserve, ReserveFailure};
 use super::{
@@ -9,8 +11,8 @@ use super::{
 
 #[cfg(test)]
 thread_local! {
-    static NATIVE_RESERVE_HOOK: std::cell::Cell<(usize, Option<usize>)> = const {
-        std::cell::Cell::new((0, None))
+    static NATIVE_RESERVE_HOOK: core::cell::Cell<(usize, Option<usize>)> = const {
+        core::cell::Cell::new((0, None))
     };
 }
 

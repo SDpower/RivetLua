@@ -88,14 +88,23 @@ pub(crate) struct RawFrame {
     pub executed: u64,
 }
 
+#[cfg(feature = "compiler")]
 pub(crate) const VALUE_TAG_OFFSET: i32 = core::mem::offset_of!(NumericValue, tag) as i32;
+#[cfg(feature = "compiler")]
 pub(crate) const VALUE_BITS_OFFSET: i32 = core::mem::offset_of!(NumericValue, bits) as i32;
+#[cfg(feature = "compiler")]
 pub(crate) const VALUE_SIZE: i32 = core::mem::size_of::<NumericValue>() as i32;
+#[cfg(feature = "compiler")]
 pub(crate) const FRAME_REGISTERS_OFFSET: i32 = core::mem::offset_of!(RawFrame, registers_ptr) as i32;
+#[cfg(feature = "compiler")]
 pub(crate) const FRAME_PC_OFFSET: i32 = core::mem::offset_of!(RawFrame, pc) as i32;
+#[cfg(feature = "compiler")]
 pub(crate) const FRAME_FUEL_OFFSET: i32 = core::mem::offset_of!(RawFrame, fuel_remaining) as i32;
+#[cfg(feature = "compiler")]
 pub(crate) const FRAME_STEP_BUDGET_OFFSET: i32 = core::mem::offset_of!(RawFrame, step_budget) as i32;
+#[cfg(feature = "compiler")]
 pub(crate) const FRAME_EXIT_OFFSET: i32 = core::mem::offset_of!(RawFrame, exit) as i32;
+#[cfg(feature = "compiler")]
 pub(crate) const FRAME_EXECUTED_OFFSET: i32 = core::mem::offset_of!(RawFrame, executed) as i32;
 
 pub(crate) fn call_entry(

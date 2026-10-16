@@ -1,5 +1,7 @@
 //! P10-3 execution 所屬的 table 事件續接堆疊與暫時 root。
 
+use crate::rust_alloc::vec::Vec;
+
 use rivetlua_core::{ObjectRef, Register, ResultMode, Value};
 
 use crate::alloc::{AllocationLedger, FailPoint, checked_bytes, reserve_vec};
@@ -216,7 +218,7 @@ pub(crate) struct DebugBuiltinReturn {
 }
 
 pub(crate) struct HostCallbackPending {
-    callback: std::rc::Rc<CallbackFn>,
+    callback: crate::rust_alloc::rc::Rc<CallbackFn>,
     captures: PrintArguments,
     arguments: PrintArguments,
 }

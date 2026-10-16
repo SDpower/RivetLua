@@ -1,6 +1,9 @@
 //! 協程狀態與可由 heap 追蹤的暫停執行內容。
 
-use std::any::Any;
+use crate::rust_alloc::boxed::Box;
+use crate::rust_alloc::vec::Vec;
+
+use core::any::Any;
 
 use rivetlua_core::{ObjectRef, Register, ResultMode, Value};
 

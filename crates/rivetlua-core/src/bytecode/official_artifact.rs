@@ -1,5 +1,7 @@
 //! P05 驗證後的官方來源資料；不屬於 RVLU_V2 wire，也不是執行快照。
 
+use alloc::vec::Vec;
+
 use core::mem::size_of;
 
 use super::official::{OfficialChunk, OfficialPrototype};

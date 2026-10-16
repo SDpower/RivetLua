@@ -67,7 +67,7 @@ impl core::fmt::Display for InputError {
     }
 }
 
-impl std::error::Error for InputError {}
+impl core::error::Error for InputError {}
 
 fn invalid(detail: &'static str) -> InputError {
     InputError {

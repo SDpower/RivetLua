@@ -1,5 +1,7 @@
 //! 將 P05 已驗證模組輸出為 Lua 5.4.9／5.5.1 官方 binary chunk。
 
+use alloc::vec::Vec;
+
 use super::official::{
     OfficialAbsLine, OfficialChunk, OfficialChunkErrorKind, OfficialChunkLimits, OfficialConstant,
     OfficialDebug, OfficialLocal, OfficialPrototype, encode_official_chunk_metered,
@@ -37,7 +39,7 @@ impl core::fmt::Display for OfficialExportError {
     }
 }
 
-impl std::error::Error for OfficialExportError {}
+impl core::error::Error for OfficialExportError {}
 
 pub(super) fn error(
     kind: OfficialExportErrorKind,

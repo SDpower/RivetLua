@@ -1,5 +1,7 @@
 //! 顯式 Lua 呼叫 frame 與暫存器 root 生命週期。
 
+use crate::rust_alloc::vec::Vec;
+
 use crate::alloc::{AllocationCharges, AllocationLedger, FailPoint, checked_bytes, reserve_vec};
 use crate::unwind::CloseEntry;
 use crate::vm::{RuntimeError, RuntimeErrorKind};

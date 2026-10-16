@@ -1,5 +1,7 @@
 //! 將一般 RVLU_V2 原型降低成官方 Lua opcode。
 
+use alloc::vec::Vec;
+
 use super::codec::{
     BytecodeConstant, BytecodeExitKind, BytecodeInstruction, BytecodePrototype,
     BytecodeUpvalueSource,
@@ -17,7 +19,7 @@ use super::{
     Register, ResultMode, UnaryOperation, VerifiedModule,
 };
 use core::mem::size_of;
-use std::borrow::Cow;
+use alloc::borrow::Cow;
 
 use super::native_debug::{NativeCloseGroup, NativeInitializerTemporary, NativeLocal, NativePrototypeDebug, NativeStorageInterval, NativeTemporary, register_access};
 use super::official_execution::OfficialPlanCall;

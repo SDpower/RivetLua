@@ -1,6 +1,8 @@
 //! 宿主回呼只回傳動作；Lua 執行與暫停由原執行器管理。
 
-use std::rc::Rc;
+use crate::rust_alloc::vec::Vec;
+
+use crate::rust_alloc::rc::Rc;
 
 use rivetlua_core::Value;
 

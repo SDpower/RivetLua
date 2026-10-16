@@ -1,5 +1,7 @@
 //! Lua string pack 格式、大小前置檢查與 endian 編解碼。
 
+use crate::rust_alloc::vec::Vec;
+
 use core::mem::size_of;
 use rivetlua_core::{LuaProfile, Value};
 

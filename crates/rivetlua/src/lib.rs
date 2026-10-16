@@ -20,14 +20,18 @@ pub use compile::{CompileBudget, CompileBudgetErrorKind, CompileBudgetLimits};
 pub use rivetlua_compiler::{CompileLimits, IrLimits};
 pub use rivetlua_core::{
     BytecodeVersion, COMPATIBILITY_VERSION, CompatibilityEntry, InputErrorKind, InputFormat,
-    LuaProfile, ModuleOrigin, OfficialChunkLimits, RVLU_V2, TransportErrorKind, TransportLimits,
-    Value, ValueKind, VerifyLimits, classify_input, compatibility_entries,
+    BoardConfig, DeploymentStatus, Endian, ExecMemoryPolicy, LuaProfile, ModuleOrigin,
+    OfficialChunkLimits, RVLU_NUMERIC_I64_F64, RVLU_V2, TargetDescriptor, TargetError, TransportErrorKind,
+    TransportLimits, Value, ValueKind, VerifyLimits, classify_input, compatibility_entries,
 };
 pub use rivetlua_core::sha256_bytes;
-#[cfg(feature = "jit")]
+#[cfg(any(feature = "jit", feature = "aot"))]
 pub use rivetlua_runtime::{JitEligibility, JitFallbackReason, JitPolicy, JitStats};
+#[cfg(feature = "aot")]
+pub use rivetlua_native::{AotArtifact, AotError, AotManifest, NativeError, TrustedAotBuild};
 pub use rivetlua_runtime::{
     AbortReason, AllocationAttempt, AllocationFailure, AllocationFailureKind, AllocationLedger,
+    AllocationPeaks,
     AllocationTrace, CallbackContext, CallbackContinuation, CallbackFn, CallbackResult,
     DebugCapability, DebugLimits, DebugPermission, DumpCapability, DumpLimits, Execution,
     ExternalCommand, ExternalEventView, ExternalToken, FileOperation, FileReadFormat,
@@ -193,6 +197,21 @@ pub struct Module {
 }
 
 impl Module {
+    #[cfg(feature = "aot-builder")]
+    pub fn build_aot(
+        &self,
+        target: &TargetDescriptor,
+        prototype_index: usize,
+        entry_pc: usize,
+    ) -> Result<AotArtifact, AotError> {
+        rivetlua_native::build_aot(rivetlua_native::AotBuildInput {
+            module: self.verified.as_ref(),
+            prototype_index,
+            entry_pc,
+            target,
+        })
+    }
+
     pub fn profile(&self) -> LuaProfile {
         self.verified.profile()
     }
@@ -302,10 +321,23 @@ pub struct Vm {
 }
 
 impl Vm {
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     pub fn set_jit_policy(&mut self, policy: JitPolicy) -> Result<(), SdkError> {
         let runtime = self.runtime.0.as_mut().ok_or(SdkError::Busy)?;
         runtime.set_jit_policy(policy).map_err(SdkError::RuntimeVm)
+    }
+
+    #[cfg(feature = "aot")]
+    pub fn install_aot(
+        &mut self,
+        module: &Module,
+        bytes: &[u8],
+        target: &TargetDescriptor,
+        trust: &TrustedAotBuild,
+    ) -> Result<(), AotError> {
+        let runtime = self.runtime.0.as_mut()
+            .ok_or(AotError::Unsupported("SDK VM busy"))?;
+        runtime.install_aot(module.verified.as_ref(), bytes, target, trust)
     }
 
     /// 將已核准的終止請求收束在同一 VM；只有 standalone 宿主決定程序退出。
@@ -687,6 +719,10 @@ impl Vm {
     /// 讀取目前配置帳本快照，不會借出 heap 或可變 runtime 狀態。
     pub fn allocation_snapshot(&self) -> LedgerSnapshot {
         self.runtime.ledger_snapshot()
+    }
+
+    pub fn allocation_peaks(&self) -> AllocationPeaks {
+        self.runtime.allocation_peaks()
     }
 
     /// 讀取目前 GC 追蹤計數，不會修改 runtime 狀態。

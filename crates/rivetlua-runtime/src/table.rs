@@ -1,10 +1,14 @@
 //! P08 的 table 儲存與可儲存鍵分類。
 
+use crate::rust_alloc::vec::Vec;
+
 use core::hash::{Hash, Hasher};
 use core::mem::size_of;
-use std::collections::hash_map::DefaultHasher;
+use crate::hash::new_default_hasher;
 
 use rivetlua_core::{ObjectId, ObjectRef, Value};
+#[cfg(not(feature = "std"))]
+use rivetlua_core::number::NoStdFloat;
 
 use crate::alloc::{
     AllocationCharge, AllocationLedger, FailPoint, PairedLuaCharges, Reservation, checked_bytes,
@@ -371,7 +375,7 @@ impl Table {
     }
 
     fn bucket(key: &CanonicalKey, count: usize) -> usize {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = new_default_hasher();
         key.hash(&mut hasher);
         (hasher.finish() as usize) % count
     }
@@ -450,7 +454,7 @@ impl Table {
         if count == 0 {
             return Value::Nil;
         }
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = new_default_hasher();
         3_u8.hash(&mut hasher);
         name.hash(&mut hasher);
         let start = (hasher.finish() as usize) % count;

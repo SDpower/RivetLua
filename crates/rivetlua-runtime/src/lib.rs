@@ -1,6 +1,15 @@
 //! RivetLua 的 VM 與 heap。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[macro_use]
+extern crate alloc as rust_alloc;
+
+#[cfg(all(not(feature = "std"), panic = "unwind"))]
+compile_error!("rivetlua-runtime 的 no_std 組態需要 panic=abort");
+#[cfg(not(target_has_atomic = "ptr"))]
+compile_error!("rivetlua-runtime 需要指標原子操作以支援 Arc");
 
 mod alloc;
 mod call;
@@ -10,9 +19,10 @@ mod coroutine;
 mod errors;
 mod gc;
 mod handle;
+mod hash;
 mod heap;
 mod host;
-#[cfg(feature = "jit")]
+#[cfg(any(feature = "jit", feature = "aot"))]
 mod jit;
 mod metamethod;
 mod pending_op;
@@ -26,7 +36,7 @@ mod vm;
 
 pub use alloc::{
     AllocationAdmission, AllocationAttempt, AllocationCharge, AllocationCharges, AllocationDomain,
-    AllocationFailure, AllocationFailureKind, AllocationLedger, AllocationSite, AllocationTrace,
+    AllocationFailure, AllocationFailureKind, AllocationLedger, AllocationPeaks, AllocationSite, AllocationTrace,
     FailPoint, LedgerProbe, LedgerSnapshot,
 };
 pub use call::PendingCloseSnapshot;
@@ -53,8 +63,12 @@ pub use host::{
     HostWarning, HostWarningError, LoadBudget, LoadCapability, LoadFormat, LoadLimits,
     PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
 };
-#[cfg(feature = "jit")]
+#[cfg(any(feature = "jit", feature = "aot"))]
 pub use jit::{JitEligibility, JitFallbackReason, JitPolicy, JitStats};
+#[cfg(feature = "aot")]
+pub use rivetlua_native::{AotArtifact, AotError, AotManifest, NativeError, TrustedAotBuild};
+#[cfg(feature = "aot")]
+pub use rivetlua_core::TargetDescriptor;
 pub use metamethod::MetamethodEvent;
 pub use rivetlua_core::{Generation, ObjectId, SlotId, VmId};
 pub use roots::{RootId, RootKind, RootSet};

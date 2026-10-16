@@ -1,5 +1,7 @@
 //! Closure 保存已驗證模組身分及共享 upvalue 物件參照。
 
+use crate::rust_alloc::vec::Vec;
+
 use rivetlua_core::{HostFunctionId, ObjectRef, ProtoId, Value};
 
 use crate::VmError;

@@ -1,5 +1,7 @@
 //! `string.gsub` 的逐次匹配、替換與可暫停 callback 狀態。
 
+use crate::rust_alloc::vec::Vec;
+
 use rivetlua_core::{ObjectRef, Value};
 
 use crate::alloc::Reservation;

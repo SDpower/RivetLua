@@ -1,3 +1,7 @@
+use crate::rust_alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+use rivetlua_core::number::NoStdFloat;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BasicBuiltin {
     Assert,
@@ -397,7 +401,11 @@ fn lua_hex_number(text: &str) -> Option<Value> {
             .ok()?
             .parse::<i32>()
             .ok()?;
-        number *= 2_f64.powi(exponent);
+        #[cfg(feature = "std")]
+        let scale = 2_f64.powi(exponent);
+        #[cfg(not(feature = "std"))]
+        let scale = rivetlua_core::number::no_std_pow2i(exponent);
+        number *= scale;
     } else if !bytes.is_empty() {
         return None;
     }

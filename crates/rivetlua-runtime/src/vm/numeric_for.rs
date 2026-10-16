@@ -1,6 +1,8 @@
 //! RVLU_V2 numeric-for 專用指令的數值狀態轉換。
 
 use core::cmp::Ordering;
+#[cfg(not(feature = "std"))]
+use rivetlua_core::number::NoStdFloat;
 
 use rivetlua_core::{Number, Value, add, compare, number_from_value};
 

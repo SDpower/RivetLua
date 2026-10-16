@@ -47,3 +47,21 @@ assert!(matches!(table.value(&vm)?, Value::Object(_)));
 `Vm::register_callback` 接受明確的 Lua capture 值，runtime 會驗證其 VM 所屬並在登錄期間追蹤物件捕獲。回呼只能透過 `CallbackContext` 回傳、丟出錯誤、呼叫、續跑或 yield 動作；它不會取得第二個 VM 借用。
 
 `Execution::set_fuel` 設定單次執行額度，`run` 回傳 runtime 的 `RunOutcome`。`Returned`、`LuaError`、`Aborted` 與 `PendingClose` 各自保留原有語意，不合併成單一錯誤結果。可執行的公開 API 範例位於 [`examples/embed.rs`](examples/embed.rs)。
+
+## Runtime 與 AOT
+
+`rivetlua-runtime` 預設使用 `std`；以 `--no-default-features` 建置時採 `no_std + alloc`，嵌入端須提供 allocator、`panic=abort`、程式入口，並確認目標支援 pointer atomics。runtime 的 `aot` feature 提供 AOT artifact 載入；SDK 的 `aot` 僅提供載入，`aot-builder` 才提供建置與載入。SDK 預設仍包含 source compiler，因此 SDK 依賴圖不能稱為 runtime-only；runtime 的 AOT normal dependency graph 不含 compiler 或 Cranelift。使用 `Module::build_aot` 建置，再由 `Vm::install_aot` 驗證及載入：
+
+```rust
+let artifact = module.build_aot(&target, proto_index, entry_pc)?;
+vm.install_aot(
+    &module,
+    artifact.bytes(),
+    &target,
+    &artifact.trusted_build(),
+)?;
+```
+
+載入前會核對 trusted-build digest 與完整 target／profile／module／entry identity，再映射 bytes。若以 unsafe external attestation 載入外部 artifact，必須由帶外流程保證它來自正確 builder；檔案自帶的 hash 只能核對內容，不能建立信任。macOS entitlement 不足、Linux AArch64 instruction-cache 條件不滿足，或 Windows native backend 尚不支援時，應拒絕載入或回退 interpreter；目前不宣稱已在目標平台執行 AOT native code。
+
+xtask 的 platform matrix、resources 與 runtime-audit 可盤點 target metadata、邏輯配置資源及 normal dependency／symbol；這些資料不代表實板執行能力或實體 RAM 峰值。

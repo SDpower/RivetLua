@@ -1,5 +1,7 @@
 //! UTF-8 函式庫以原始 bytes 和 Lua byte position 運作。
 
+use crate::rust_alloc::vec::Vec;
+
 use rivetlua_core::{LuaProfile, ObjectRef, Value};
 
 use crate::alloc::{FailPoint, Reservation, reserve_vec};

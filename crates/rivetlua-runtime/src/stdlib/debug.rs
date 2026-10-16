@@ -1,5 +1,7 @@
 //! 受 VM 專屬 capability 控制的 debug 入口與公開能力矩陣。
 
+use crate::rust_alloc::vec::Vec;
+
 use crate::host::DebugPermission;
 use rivetlua_core::ObjectRef;
 

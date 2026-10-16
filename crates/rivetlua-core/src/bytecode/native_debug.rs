@@ -1,5 +1,7 @@
 //! P05 驗證的一般 RVLU 來源除錯資料；不屬於 RVLU_V2 wire。
 
+use alloc::vec::Vec;
+
 use core::mem::size_of;
 use core::ops::Range;
 

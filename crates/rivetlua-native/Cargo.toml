@@ -7,9 +7,13 @@ license.workspace = true
 repository.workspace = true
 description = "RivetLua 的可移除受限原生碼後端。"
 
+[features]
+default = ["compiler"]
+compiler = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:target-lexicon"]
+
 [dependencies]
 rivetlua-core = { path = "../rivetlua-core" }
-cranelift-codegen = { version = "=0.134.2", default-features = false, features = ["std", "x86", "arm64"] }
-cranelift-frontend = { version = "=0.134.2", default-features = false }
-target-lexicon = "=0.13.5"
+cranelift-codegen = { version = "=0.134.2", default-features = false, features = ["std", "x86", "arm64"], optional = true }
+cranelift-frontend = { version = "=0.134.2", default-features = false, optional = true }
+target-lexicon = { version = "=0.13.5", optional = true }
 libc = "=0.2.190"

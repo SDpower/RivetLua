@@ -1,8 +1,10 @@
 //! VM 集中持有的六類強參照來源。
 
-use std::cell::{Cell, RefCell};
-use std::mem::size_of;
-use std::rc::Rc;
+use crate::rust_alloc::vec::Vec;
+
+use core::cell::{Cell, RefCell};
+use core::mem::size_of;
+use crate::rust_alloc::rc::Rc;
 
 use rivetlua_core::{ObjectRef, VmId};
 

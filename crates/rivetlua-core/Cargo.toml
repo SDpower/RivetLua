@@ -9,3 +9,10 @@ description = "RivetLua 的共用契約骨架；尚未提供 Lua 語意。"
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+libm = { version = "0.2.16", default-features = false }
