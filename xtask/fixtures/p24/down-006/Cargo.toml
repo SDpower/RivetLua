@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "p24-down-006-capi-driver"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["lua55"]
+lua54 = ["rivetlua-capi/lua54"]
+lua55 = ["rivetlua-capi/lua55"]
+
+[dependencies]
+rivetlua-capi = { version = "=0.0.0", registry = "p24-stage", default-features = false }

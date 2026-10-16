@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "p24-negative-parent-path"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rivetlua = { version = "=0.0.0", path = "../../../../crates/rivetlua" }

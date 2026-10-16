@@ -70,12 +70,12 @@ fn main() {
         .warnings(true)
         .extra_warnings(true)
         .warnings_into_errors(true);
-    if env::var_os("CARGO_FEATURE_LUA55").is_some() {
-        build
-            .include("../../include/rivetlua/lua55")
-            .define("RV_LUA55_B2", None);
-    } else {
-        build.include("../../include/rivetlua/lua54");
+    let profile = if env::var_os("CARGO_FEATURE_LUA55").is_some() { "lua55" } else { "lua54" };
+    let packaged = PathBuf::from("include/rivetlua").join(profile);
+    let workspace = PathBuf::from("../../include/rivetlua").join(profile);
+    build.include(if packaged.is_dir() { &packaged } else { &workspace });
+    if profile == "lua55" {
+        build.define("RV_LUA55_B2", None);
     }
     if target == "aarch64-apple-darwin" {
         // Rust 的 Apple arm64 基線為 macOS 11；避免新版 clang 預設較新 deployment target。

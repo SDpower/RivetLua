@@ -10,10 +10,12 @@
 
 - **P17～P21：** P17 已交付（[commit](https://github.com/SDpower/RivetLua/commit/f84b0d74ac743e26dd02e7749b37d8298b1c5be1)）；P18 已交付（[commit](https://github.com/SDpower/RivetLua/commit/fba6e4bbe94ddcc3916ceed21a1ac58eb87ff233)）；P19 B01～B04 已整合並 commit/push（[commit](https://github.com/SDpower/RivetLua/commit/e33e0cc14efee253771958a79a7b8c61f8ebf7bc)）；P20 B01～B04 實作與整合已完成並 commit/push（[commit](https://github.com/SDpower/RivetLua/commit/801a5ac900f53b5e2be13cf400db83d6b3fa10ba)）；P21 已交付（[commit](https://github.com/SDpower/RivetLua/commit/3abc12962e30a243a4ff1190756975597cc48bab)）。
 - **P22：** B01～B04 已交付並推送（[commit](https://github.com/SDpower/RivetLua/commit/916f56f1213d336c96b85ed2811eed94913b05a0)）。
-- **既有邊界：** 既有邊界：P19 的 luaL_openselectedlibs 仍缺；P20 native executed 為 0，無 JIT 加速證據；P21 desktop 為 Experimental、Thumb 為 BuildOnly、RV32 為 Unsupported，無 Supported target，也無已驗證實板／RAM／RSS 證據；P22 worker 未執行、Linux adapter 未 cross-compile、OS 隔離未實測，Windows Unsupported。
-- **P23：** B01～B04 來源實作與整合已完成，本階段提交將包含此進度更新。交付包括 strict 實驗 manifest、7 個 target 與有界 harness、6 個安全故障 seam 及 cleanup、手動 tools scope 與 negative SOURCE 路徑、重用 P20 raw perf／triage，以及 PR 每 target/profile 60 秒、nightly 600 秒、release 每 target/profile 總預算 3600 秒的排程。
+- **既有邊界：** P19 的 luaL_openselectedlibs 仍缺；P20 native executed 為 0，無 JIT 加速證據；P21 desktop 為 Experimental、Thumb 為 BuildOnly、RV32 為 Unsupported，無 Supported target，也無已驗證實板／RAM／RSS 證據；P22 worker 未執行、Linux adapter 未 cross-compile、OS 隔離未實測，Windows Unsupported。
+- **P23：** B01～B04 來源實作與整合已交付並推送（[commit](https://github.com/SDpower/RivetLua/commit/0198ca78b9c5f5d732d7da4d7534e443e115423d)）。交付包括 strict 實驗 manifest、7 個 target 與有界 harness、6 個安全故障 seam 及 cleanup、手動 tools scope 與 negative SOURCE 路徑、重用 P20 raw perf／triage，以及 PR 每 target/profile 60 秒、nightly 600 秒、release 每 target/profile 總預算 3600 秒的排程。
+- **P24：** B01～B03 來源實作與整合已完成，本狀態更新納入本次 P24 提交。B01 完成 release.py／identity／C API packaged include fallback；B02 完成 7 個公開 SOURCE consumers、3 個負例及 API migration；B03 完成 evidence.py、test sources 與發布文件整合。
+- **P24 開發檢查：** 僅編譯／語法檢查：`cargo check --offline --locked -p rivetlua-xtask --tests` 最終來源編譯檢查 exit 0；CAPI `--no-default-features --features lua54` exit 0（4.66 秒）、`--no-default-features --features lua55` exit 0（2.46 秒）；DOWN006 C host 兩 profile 的 `clang -std=c11 -fsyntax-only -Wall -Wextra -Werror` exit 0。Cargo.lock SHA 未變，保留既有 warnings；以上不代表功能測試或驗收。
 - **未執行與限制：** triage comparator 僅比較 `hot_ns_p50`，其他 raw 數據須人工評估；shared resident／RSS 未量測。Miri、動態工具、fuzz、perf、OS、JIT 與 C API 外部 jobs 均未執行；JIT、OS、FZ-006 仍需實際且已驗證的 jobs，不能宣稱通過或完整工具覆蓋。不宣稱 P23 fuzz、runtime、安全或效能實測，也不宣稱 release READY。
-- **驗收與後續：** P23 的測試、Basic／Complete、batch／phase gates、CI acceptance 與驗收紀錄均已取消，未執行或新增。P24 下一階段尚未開始。本摘要描述交付狀態，不表示驗收。
+- **驗收與後續：** P23／P24 的 Basic／Complete、batch／phase gates、CI acceptance 與驗收紀錄均已取消，未執行或新增；不宣稱 phase acceptance PASS。P24 release closure 未執行，故不宣稱 1.0 READY。P24 commit 後，依[Lua 實作與測試檢查計畫](LUA_IMPLEMENTATION_CHECK_PLAN.zh-TW.md)檢查既定 Lua 項目並修正問題；計畫已加入，功能檢查尚未執行，這不會恢復已取消的 P24 release acceptance。本摘要描述交付狀態，不表示驗收。
 
 ## 已實作並驗收
 
