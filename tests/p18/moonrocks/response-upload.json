@@ -1,0 +1,9 @@
+{
+  "is_new": true,
+  "manifests": ["localtest-rivetlua"],
+  "version": {
+    "id": 1,
+    "development": false
+  },
+  "module_url": "http://127.0.0.1:18018/modules/localtest-rivetlua/localtest-rivetlua-example"
+}

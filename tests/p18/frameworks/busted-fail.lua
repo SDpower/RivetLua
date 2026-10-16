@@ -1,0 +1,7 @@
+describe("example failing Busted package", function()
+   context("with a deliberate mismatch", function()
+      it("reports the failed assertion", function()
+         assert.are.equal("expected", "actual")
+      end)
+   end)
+end)

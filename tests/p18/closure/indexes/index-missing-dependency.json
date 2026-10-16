@@ -1,0 +1,25 @@
+{
+  "packages": [
+    {
+      "rockspec": "../rockspecs/root.rockspec",
+      "rockspec_sha256": "53bc2422cdbbfe58cca927a74e254359ace0049278fcc4202e75e6228dc3a5fd",
+      "source": "../sources/root",
+      "source_sha256": "25b0a242a06777483d5ba3044155395001fe56d431b52d035fbfcd1a0a723696",
+      "build_flags": []
+    },
+    {
+      "rockspec": "../rockspecs/left.rockspec",
+      "rockspec_sha256": "10b81896334204ed451c8bbfd27aae389a76bb00a98393913da57d1e50333e8f",
+      "source": "../sources/left",
+      "source_sha256": "c8c9c844776051f7b9f3c7fe1d800a8ea023bd37435d8704e01302d1fccec63f",
+      "build_flags": []
+    },
+    {
+      "rockspec": "../rockspecs/right.rockspec",
+      "rockspec_sha256": "11e172e63b4ddb5d9c899e9707a80ff45d387d59762cd68e12a9c0d8285891d6",
+      "source": "../sources/right",
+      "source_sha256": "313327c98dd2a3bed997d76e27068d6730fd72060f751ded71410ce3065e57c6",
+      "build_flags": []
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "metadata_only": true,
+  "sources": [
+    {
+      "name": "LuaRocks",
+      "version": "3.13.0",
+      "reference_type": "source_release",
+      "tag": "v3.13.0",
+      "url": "https://luarocks.org/releases/luarocks-3.13.0.tar.gz",
+      "source_archive_sha256": null
+    },
+    {
+      "name": "Moonrocks",
+      "version": "1.3.0-1",
+      "reference_type": "rockspec",
+      "url": "https://luarocks.org/manifests/leafo/moonrocks-1.3.0-1.rockspec",
+      "rockspec_sha256": "db8951843bc055dabd57ab673f05a69e77045cb264e84408c4883fb3c240d577",
+      "branch": "v1.3.0",
+      "source_archive_sha256": null
+    },
+    {
+      "name": "LuaUnit",
+      "version": "3.5",
+      "reference_type": "github_release",
+      "repository": "https://github.com/bluebird75/luaunit",
+      "tag": "LUAUNIT_V3_5",
+      "release_url": "https://github.com/bluebird75/luaunit/releases/tag/LUAUNIT_V3_5",
+      "source_archive_sha256": null
+    },
+    {
+      "name": "Busted",
+      "version": "2.3.0-1",
+      "reference_type": "rockspec",
+      "url": "https://luarocks.org/manifests/lunarmodules/busted-2.3.0-1.rockspec",
+      "rockspec_sha256": "242c883e122ab3c0cb3118e729a68b5056dea9c4dce3260c45de813cc00cc4b5",
+      "tag": "v2.3.0",
+      "source_archive_sha256": null
+    }
+  ]
+}

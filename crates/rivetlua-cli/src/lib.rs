@@ -3,6 +3,8 @@
 #[cfg(all(feature = "native-lua55", feature = "native-lua54"))]
 compile_error!("native-lua55 與 native-lua54 不可同時啟用");
 
+pub mod package_runner;
+
 #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
 mod native_grant;
 #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
@@ -20,9 +22,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
 use rivetlua::{ExternalCommand, ForeignNativeKind};
 #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
-use rivetlua_capi::native::{
-    self, AttestedNative, NativeLibrary, SymbolVisibility, VerifiedNative,
-};
+pub use rivetlua_capi::native::{AttestedNative, VerifiedNative};
+#[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
+use rivetlua_capi::native::{self, NativeLibrary, SymbolVisibility};
 #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
 use std::ffi::CString;
 use std::rc::Rc;
@@ -143,6 +145,7 @@ struct NativeBridge<'a> {
     grant: Option<native_grant::NativeGrant>,
     attestor: Option<&'a mut dyn FnMut(VerifiedNative) -> AttestedNative>,
     loaded: Vec<(PathBuf, Rc<NativeLibrary>)>,
+    cache_root: PathBuf,
 }
 
 #[cfg(not(any(feature = "native-lua55", feature = "native-lua54")))]
@@ -255,6 +258,7 @@ impl NativeBridge<'_> {
             grant,
             attestor,
             loaded: Vec::new(),
+            cache_root: std::env::temp_dir(),
         })
     }
 
@@ -303,7 +307,7 @@ impl NativeBridge<'_> {
         let result = native::load_and_bind(
             loan.state_owner(),
             attested,
-            &std::env::temp_dir(),
+            &self.cache_root,
             None,
             &dependencies,
         )
@@ -349,6 +353,89 @@ impl NativeBridge<'_> {
         loan.try_return()
             .map_err(|error| format!("native VM 歸還失敗：{error}"))?;
         value
+    }
+}
+
+/// 將已預檢的原生授權綁定至單一 VM，由宿主提供 CNoUnwind attestor。
+#[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
+pub struct NativeDriver<'a> {
+    bridge: NativeBridge<'a>,
+    profile: LuaProfile,
+    vm_root: Option<rivetlua::Root>,
+}
+
+#[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
+impl<'a> NativeDriver<'a> {
+    pub fn from_path(
+        profile: LuaProfile,
+        grant_path: &Path,
+        cache_root: &Path,
+        attestor: &'a mut dyn FnMut(VerifiedNative) -> AttestedNative,
+    ) -> Result<Self, String> {
+        let grant = native_grant::NativeGrant::read(grant_path, profile)?;
+        grant.preflight_all()?;
+        if !cache_root.is_absolute()
+            || !cache_root.is_dir()
+            || cache_root.as_os_str().as_encoded_bytes().len() > native::MAX_PATH_BYTES / 2
+        {
+            return Err("native cache root 必須是長度可接受的絕對目錄".into());
+        }
+        Ok(Self {
+            bridge: NativeBridge {
+                grant: Some(grant),
+                attestor: Some(attestor),
+                loaded: Vec::new(),
+                cache_root: cache_root.to_path_buf(),
+            },
+            profile,
+            vm_root: None,
+        })
+    }
+
+    pub fn initial_cpath(&self) -> Vec<u8> {
+        self.bridge.grant_cpath().unwrap_or_default()
+    }
+
+    pub(crate) fn check_tree(&self, profile: LuaProfile, tree: &Path) -> Result<(), String> {
+        if profile != self.profile {
+            return Err("native-grant: profile 與 runner 不符".into());
+        }
+        let lib = tree.join("lib/lua").join(match profile {
+            LuaProfile::Lua54 => "5.4",
+            LuaProfile::Lua55 => "5.5",
+        });
+        let meta = fs::symlink_metadata(&lib).map_err(|_| "native-grant: tree 原生目錄缺失")?;
+        if !meta.is_dir() || meta.file_type().is_symlink()
+            || fs::canonicalize(&lib).map_err(|_| "native-grant: tree 原生目錄不可讀")? != lib
+        {
+            return Err("native-grant: tree 原生目錄不安全".into());
+        }
+        let grant = self.bridge.grant.as_ref().ok_or("native grant 未授權")?;
+        if grant.modules.iter().any(|module| !module.path.starts_with(&lib)
+            || module.path.extension() != Some(OsStr::new("so")))
+            || grant.cpath.iter().any(|template| {
+                let path = Path::new(template);
+                !path.starts_with(&lib)
+                    || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+            })
+        {
+            return Err("native-grant: 模組或 cpath 不在指定 tree".into());
+        }
+        Ok(())
+    }
+
+    pub fn drive(&mut self, vm: &mut Vm, outcome: RunOutcome) -> Result<RunOutcome, String> {
+        if vm.profile() != self.profile {
+            return Err("native-grant: profile 與 VM 不符".into());
+        }
+        if let Some(root) = &self.vm_root {
+            root.value(vm)
+                .map_err(|_| "native driver 已綁定其他 VM".to_string())?;
+        } else {
+            let globals = vm.globals().value(vm).map_err(|error| error.to_string())?;
+            self.vm_root = Some(vm.root(globals).map_err(|error| error.to_string())?);
+        }
+        drive_native_external(vm, outcome, &mut self.bridge).map_err(|error| error.to_string())
     }
 }
 
@@ -2841,6 +2928,58 @@ mod cli_unit_tests {
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
+    #[test]
+    fn p18_native_driver_keeps_one_vm_affinity() {
+        let profile = if cfg!(feature = "native-lua55") {
+            LuaProfile::Lua55
+        } else {
+            LuaProfile::Lua54
+        };
+        let engine = Engine::new(profile);
+        let mut first = engine.new_vm().unwrap();
+        let mut second = engine.new_vm().unwrap();
+        let other_profile = if profile == LuaProfile::Lua55 {
+            LuaProfile::Lua54
+        } else {
+            LuaProfile::Lua55
+        };
+        let mut mismatched = Engine::new(other_profile).new_vm().unwrap();
+        let mut driver = super::NativeDriver {
+            bridge: super::NativeBridge {
+                grant: None,
+                attestor: None,
+                loaded: Vec::new(),
+                cache_root: std::env::temp_dir(),
+            },
+            profile,
+            vm_root: None,
+        };
+        assert_eq!(
+            driver
+                .drive(&mut mismatched, RunOutcome::Returned(Vec::new()))
+                .err()
+                .as_deref(),
+            Some("native-grant: profile 與 VM 不符")
+        );
+        assert!(driver.vm_root.is_none());
+        assert!(matches!(
+            driver.drive(&mut first, RunOutcome::Returned(Vec::new())),
+            Ok(RunOutcome::Returned(_))
+        ));
+        assert!(matches!(
+            driver.drive(&mut first, RunOutcome::Returned(Vec::new())),
+            Ok(RunOutcome::Returned(_))
+        ));
+        assert_eq!(
+            driver
+                .drive(&mut second, RunOutcome::Returned(Vec::new()))
+                .err()
+                .as_deref(),
+            Some("native driver 已綁定其他 VM")
+        );
+    }
+
     #[test]
     fn p17_standalone_signal_epoch_preserves_second_interrupt() {
         use super::{CURRENT_STANDALONE_SIGNAL, SignalEpochGuard, StandaloneSignal, StandaloneSignalSession};
@@ -3031,6 +3170,7 @@ mod cli_unit_tests {
             grant: None,
             attestor: None,
             loaded: Vec::new(),
+            cache_root: std::env::temp_dir(),
         };
         #[cfg(not(any(feature = "native-lua55", feature = "native-lua54")))]
         let mut bridge = super::NativeBridge(std::marker::PhantomData);
@@ -3154,6 +3294,7 @@ mod cli_unit_tests {
                 grant: None,
                 attestor: None,
                 loaded: Vec::new(),
+                cache_root: std::env::temp_dir(),
             };
             #[cfg(not(any(feature = "native-lua55", feature = "native-lua54")))]
             let mut bridge = super::NativeBridge(std::marker::PhantomData);
@@ -3582,6 +3723,7 @@ mod cli_unit_tests {
                 grant: None,
                 attestor: None,
                 loaded: Vec::new(),
+                cache_root: std::env::temp_dir(),
             };
             #[cfg(not(any(feature = "native-lua55", feature = "native-lua54")))]
             let mut bridge = super::NativeBridge(std::marker::PhantomData);

@@ -163,6 +163,10 @@ dependencies = [
 [[package]]
 name = "rivetlua-xtask"
 version = "0.0.0"
+dependencies = [
+ "rivetlua",
+ "rivetlua-cli",
+]
 
 [[package]]
 name = "shlex"

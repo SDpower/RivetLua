@@ -103,7 +103,7 @@ fn sha256_block(state: &mut [u32; 8], data: &[u8; 64]) {
     }
 }
 
-fn sha256_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
+pub(super) fn sha256_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
     let bit_length = u64::try_from(bytes.len()).ok()?.checked_mul(8)?;
     let mut state = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,

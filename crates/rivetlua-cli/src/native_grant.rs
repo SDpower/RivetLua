@@ -60,7 +60,7 @@ impl NativeGrant {
             })
     }
 
-    fn read(path: &Path, profile: LuaProfile) -> Result<Self, String> {
+    pub(super) fn read(path: &Path, profile: LuaProfile) -> Result<Self, String> {
         let path = canonical_file_path(path, MAX_PATH_BYTES, "native grant")?;
         let file = File::open(&path).map_err(|error| format!("native grant 開啟失敗：{error}"))?;
         if file.metadata().map_err(|error| error.to_string())?.len() > MAX_GRANT_BYTES as u64 {

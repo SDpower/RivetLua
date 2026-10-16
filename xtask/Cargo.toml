@@ -10,3 +10,7 @@ description = "RivetLua 的階段驗證工具。"
 [[bin]]
 name = "rivetlua-xtask"
 path = "src/main.rs"
+
+[dependencies]
+rivetlua = { path = "../crates/rivetlua", default-features = false }
+rivetlua-cli = { path = "../crates/rivetlua-cli", default-features = false }

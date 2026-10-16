@@ -8,6 +8,11 @@ mod runner;
 use report::{Check, Report};
 use std::path::Path;
 
+pub(crate) fn package_sha256_bytes(bytes: &[u8]) -> Result<String, String> {
+    let digest = manifest::sha256_bytes(bytes).ok_or("SHA-256 輸入長度溢位")?;
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 pub(super) fn gate(args: &[String]) -> Result<(), String> {
     let root = crate::root()?;
     let selection = match args {
