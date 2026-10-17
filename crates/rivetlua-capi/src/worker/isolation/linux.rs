@@ -542,7 +542,7 @@ fn check_mounts(text: &str, expected: &[(String, (u64, u64))]) -> Result<(), Pol
         {
             return Err(PolicyDenied::MissingEvidence);
         }
-        if seen.iter().any(|item| item == mount) {
+        if seen.contains(&mount) {
             return Err(PolicyDenied::MissingEvidence);
         }
         seen.push(mount);
