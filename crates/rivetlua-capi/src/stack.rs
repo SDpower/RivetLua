@@ -1427,7 +1427,10 @@ impl DebugState {
         if replace_coroutine.is_none() {
             self.reserve_token(vm)?;
         }
-        #[allow(deprecated, reason = "保留 Rust 1.94.1 相容性，try_update 自 1.95 才穩定")]
+        #[allow(
+            deprecated,
+            reason = "保留 Rust 1.94.1 相容性，try_update 自 1.95 才穩定"
+        )]
         let sequence = NEXT_DEBUG_TOKEN_B10
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
@@ -6027,7 +6030,10 @@ impl Drop for StateAllocation {
     }
 }
 
-#[allow(deprecated, reason = "保留 Rust 1.94.1 相容性，try_update 自 1.95 才穩定")]
+#[allow(
+    deprecated,
+    reason = "保留 Rust 1.94.1 相容性，try_update 自 1.95 才穩定"
+)]
 fn next_generation() -> Result<u64, StackError> {
     NEXT_STATE_GENERATION
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {

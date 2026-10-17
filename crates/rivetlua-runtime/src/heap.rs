@@ -11721,9 +11721,7 @@ mod capi_join_lazy_environment_a43_tests {
     };
     use rivetlua_core::{Generation, LuaProfile, ObjectRef, ProtoId, Value, VerifyLimits};
 
-    use super::{
-        FailPoint, GcAge, GcCycleKind, GcMode, GcPhase, RootKind, Slot, Vm, VmError,
-    };
+    use super::{FailPoint, GcAge, GcCycleKind, GcMode, GcPhase, RootKind, Slot, Vm, VmError};
     use crate::closure::Closure;
     use crate::vm::RunOutcome;
 
