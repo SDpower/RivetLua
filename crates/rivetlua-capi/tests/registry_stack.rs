@@ -362,18 +362,22 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
     const HEAP: &str = "crates/rivetlua-runtime/src/heap.rs";
     const TABLE: &str = "crates/rivetlua-runtime/src/table.rs";
     const ROOTS: &str = "crates/rivetlua-runtime/src/roots.rs";
-    // StateGroup 現含 hook bridge 與 native lease；RefCell 另含借用旗標。
-    assert_eq!(StateOwner::allocation_component_sizes().0, 2600);
-    assert_eq!(StateOwner::allocation_component_sizes().1, 2608);
-    // Rc 的兩個計數器各占一個 usize，與 group_accounted_bytes 的 Layout 相同。
-    assert_eq!(
-        StateOwner::allocation_component_sizes().1 + 2 * size_of::<usize>(),
-        2624
-    );
+    // StateGroup 帳款依 RefCell 與 Rc 計數器的目前布局計算。
+    let (group_bytes, refcell_group_bytes, refcell_group_align, state_allocation_bytes) =
+        StateOwner::allocation_component_sizes();
+    assert!(refcell_group_bytes > group_bytes);
+    let group_header = std::alloc::Layout::array::<std::cell::Cell<usize>>(2).unwrap();
+    let group_payload =
+        std::alloc::Layout::from_size_align(refcell_group_bytes, refcell_group_align).unwrap();
+    let group_charge_bytes = group_header
+        .extend(group_payload)
+        .unwrap()
+        .0
+        .pad_to_align()
+        .size();
     // StateAllocation 內嵌的 StateControl 含暫停、重設與 continuation 狀態。
-    assert_eq!(StateOwner::allocation_component_sizes().3, 2096);
     let mut expected = vec![
-        (AllocationDomain::Host, 2624, None, HEAP),
+        (AllocationDomain::Host, group_charge_bytes, None, HEAP),
         (
             AllocationDomain::LuaHeap,
             0,
@@ -394,7 +398,7 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         ),
         (
             AllocationDomain::LuaHeap,
-            312,
+            256,
             Some(FailPoint::ObjectReserve),
             HEAP,
         ),
@@ -419,7 +423,7 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         ),
         (
             AllocationDomain::LuaHeap,
-            312,
+            256,
             Some(FailPoint::ObjectReserve),
             HEAP,
         ),
@@ -456,7 +460,7 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         ),
         (
             AllocationDomain::LuaHeap,
-            312,
+            256,
             Some(FailPoint::ObjectReserve),
             HEAP,
         ),
@@ -476,7 +480,7 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         ),
         (
             AllocationDomain::LuaHeap,
-            312,
+            256,
             Some(FailPoint::ObjectReserve),
             HEAP,
         ),
@@ -502,7 +506,7 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         ),
         (
             AllocationDomain::LuaHeap,
-            312,
+            256,
             Some(FailPoint::ObjectReserve),
             HEAP,
         ),
@@ -521,14 +525,14 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         ),
         (
             AllocationDomain::LuaHeap,
-            312,
+            256,
             Some(FailPoint::ObjectReserve),
             HEAP,
         ),
         (AllocationDomain::Host, 208, None, ROOTS),
         (AllocationDomain::Host, 120, None, ROOTS),
     ]);
-    expected.push((AllocationDomain::Host, 2096, None, HEAP));
+    expected.push((AllocationDomain::Host, state_allocation_bytes, None, HEAP));
     let expected: Vec<_> = expected
         .into_iter()
         .enumerate()

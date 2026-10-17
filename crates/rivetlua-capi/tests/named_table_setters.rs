@@ -645,7 +645,6 @@ fn insertion_fault_matrix() {
             (LuaHeap, Some(FailPoint::StringBytesReserve)),
             (LuaHeap, Some(FailPoint::SlotReserve)),
             (LuaHeap, Some(FailPoint::ObjectReserve)),
-            (Host, Some(FailPoint::MarkReserve)),
             (Host, None),
             (Host, None),
             (Host, None),
@@ -664,6 +663,7 @@ fn insertion_fault_matrix() {
             (Host, Some(FailPoint::CallFrameReserve)),
             (Host, Some(FailPoint::WorkReserve)),
             (LuaHeap, Some(FailPoint::TableHashGrow)),
+            (Host, Some(FailPoint::RememberedReserve)),
         ]
     );
 

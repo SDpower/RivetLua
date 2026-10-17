@@ -4886,9 +4886,13 @@ fn temporary_call_layouts(
                     || register == usize::from(proto.frame.environment.0)
                     || register == usize::from(proto.global_environment.0)
                     || register == usize::from(base.0)
-                    || pending
+                    || (pending
                         .iter()
                         .any(|entry| usize::from(entry.register.0) == register)
+                        && !(span[register].0 <= pc
+                            && pc + 1 < span[register].1
+                            && live_at_pc(span, protected, live_at, register, pc)
+                            && live_at_pc(span, protected, live_at, register, pc + 1)))
             };
             let scan_work = span
                 .len()
@@ -4910,6 +4914,29 @@ fn temporary_call_layouts(
                     && live_at_pc(span, protected, live_at, register, pc)
                     && live_at_pc(span, protected, live_at, register, pc + 1)
             };
+            work_charge(work, span.len(), proto.id, pc)?;
+            let mut live_start = usize::MAX;
+            let mut live_end = 0usize;
+            for (register, range) in span.iter().enumerate() {
+                if live_across(register, range) {
+                    live_start = live_start.min(range.0);
+                    live_end = live_end.max(range.1);
+                }
+            }
+            let mut local_floor = active;
+            if live_start < live_end {
+                work_charge(work, storage.len(), proto.id, pc)?;
+                for local in storage {
+                    if (local.start_pc as usize) >= live_end
+                        || live_start >= local.end_pc as usize
+                    {
+                        continue;
+                    }
+                    let home =
+                        official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, pc)?;
+                    local_floor = local_floor.max(usize::from(home) + 1);
+                }
+            }
             let current = if !in_backedge {
                 span.iter()
                     .enumerate()
@@ -4965,8 +4992,18 @@ fn temporary_call_layouts(
                 0
             };
             if !in_backedge {
-                // callee 已佔 call_base，不再放進 pending 前綴。
-                current
+                // 跨 Call 的 pending 也須有不受開放結果覆寫的穩定 home。
+                local_floor
+                    .checked_add(current)
+                    .and_then(|frontier| frontier.checked_sub(active))
+                    .ok_or_else(|| {
+                        error(
+                            OfficialExportErrorKind::LimitExceeded,
+                            proto.id,
+                            pc,
+                            "native temporary frontier 數溢位",
+                        )
+                    })?
             } else {
                 let current_with_callee = open_call_frontier_with_callee(
                     current,
@@ -5005,7 +5042,7 @@ fn temporary_call_layouts(
                     )
                 })?;
                 work_charge(work, birth_work, proto.id, pc)?;
-                let mut frontier = active.checked_add(current).ok_or_else(|| {
+                let mut frontier = local_floor.checked_add(current).ok_or_else(|| {
                     error(
                         OfficialExportErrorKind::LimitExceeded,
                         proto.id,
@@ -5028,6 +5065,21 @@ fn temporary_call_layouts(
                             )
                         })?;
                     let active_at_birth = active_local_frontier(birth)?;
+                    let mut birth_floor = active_at_birth;
+                    for local in storage {
+                        if (local.start_pc as usize) >= span[register].1
+                            || span[register].0 >= local.end_pc as usize
+                        {
+                            continue;
+                        }
+                        let home = official_storage_slot(
+                            local.slot,
+                            anonymous_vararg_slot,
+                            proto.id,
+                            birth,
+                        )?;
+                        birth_floor = birth_floor.max(usize::from(home) + 1);
+                    }
                     let live_at_birth = span
                         .iter()
                         .enumerate()
@@ -5049,7 +5101,7 @@ fn temporary_call_layouts(
                                 usize::from(base.0),
                                 birth + 1,
                             ));
-                    let at_birth = active_at_birth
+                    let at_birth = birth_floor
                         .checked_add(live_at_birth)
                         .and_then(|value| value.checked_add(usize::from(callee_at_birth)))
                         .ok_or_else(|| {
@@ -5176,6 +5228,17 @@ fn temporary_call_layouts(
                     })?;
                 work_charge(work, scan, proto.id, pc)?;
                 let active_birth = active_local_frontier(birth)?;
+                let mut birth_floor = active_birth;
+                for local in storage {
+                    if (local.start_pc as usize) >= range.1
+                        || range.0 >= local.end_pc as usize
+                    {
+                        continue;
+                    }
+                    let home =
+                        official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, birth)?;
+                    birth_floor = birth_floor.max(usize::from(home) + 1);
+                }
                 let live_birth = span
                     .iter()
                     .enumerate()
@@ -5193,7 +5256,7 @@ fn temporary_call_layouts(
                             && live_at_pc(span, protected, live_at, *other, after_birth)
                     })
                     .count();
-                frontier = frontier.max(active_birth.checked_add(live_birth).ok_or_else(|| {
+                frontier = frontier.max(birth_floor.checked_add(live_birth).ok_or_else(|| {
                     error(
                         OfficialExportErrorKind::LimitExceeded,
                         proto.id,
@@ -7151,10 +7214,6 @@ fn compact_register_map(
                 }
             }
         }
-        #[cfg(feature = "std")]
-        let mut rejection_counts = [(0usize, u16::MAX, 0u16); 11];
-        #[cfg(feature = "std")]
-        let mut rejection_first = [None::<(u16, usize, usize, usize, usize)>; 11];
         let mut candidate_ok = |candidate_register: usize,
                                 candidate_start: usize,
                                 candidate_end: usize,
@@ -7162,30 +7221,9 @@ fn compact_register_map(
                                 check_prior: bool,
                                 work: &mut OfficialWorkBudget|
          -> Result<bool, OfficialExportError> {
-            macro_rules! reject {
-                ($reason:expr, $x:expr, $y:expr, $z:expr, $w:expr) => {{
-                    #[cfg(feature = "std")]
-                    if candidate_register == register && check_prior {
-                        let stats = &mut rejection_counts[$reason];
-                        if stats.0 == 0 {
-                            rejection_first[$reason] = Some((
-                                slot,
-                                ($x) as usize,
-                                ($y) as usize,
-                                ($z) as usize,
-                                ($w) as usize,
-                            ));
-                        }
-                        stats.0 += 1;
-                        stats.1 = stats.1.min(slot);
-                        stats.2 = stats.2.max(slot);
-                    }
-                    return Ok(false);
-                }};
-            }
             work_charge(work, 1, proto.id, candidate_start)?;
             if slot >= fixed.max(tuple_end) && slot < temp_base {
-                reject!(0, fixed.max(tuple_end), temp_base, 0, 0);
+                return Ok(false);
             }
             if slot >= tuple_base && slot < tuple_end {
                 work_charge(work, numeric.len(), proto.id, candidate_start)?;
@@ -7196,7 +7234,7 @@ fn compact_register_map(
                         && candidate_start <= pair.next_pc
                         && pair.prepare_pc < candidate_end
                 }) {
-                    reject!(1, tuple_base, tuple_end, numeric.len(), 0);
+                    return Ok(false);
                 }
             }
             work_charge(work, aliases.len(), proto.id, candidate_start)?;
@@ -7206,7 +7244,7 @@ fn compact_register_map(
                     && u16::from(alias.tuple) <= slot
                     && slot <= u16::from(alias.tuple) + u16::from(alias.width)
             }) {
-                reject!(2, aliases.len(), 0, 0, 0);
+                return Ok(false);
             }
             let (call_first, call_end) = call_layout_range(
                 &call_layouts,
@@ -7247,13 +7285,7 @@ fn compact_register_map(
                             .iter()
                             .any(|entry| usize::from(entry.register.0) == candidate_register)
                     {
-                        reject!(
-                            3,
-                            call.pc,
-                            call.call_base,
-                            call.window_start,
-                            call.window_end
-                        );
+                        return Ok(false);
                     }
                 }
                 let open_all_base = if call.open_chain {
@@ -7299,13 +7331,7 @@ fn compact_register_map(
                     && (survives || protected[candidate_register] != 0)
                     && !dead_open
                 {
-                    reject!(
-                        4,
-                        call.pc,
-                        call.call_base,
-                        call.window_start,
-                        call.window_end
-                    );
+                    return Ok(false);
                 }
                 if !call.open_chain && call.first_slot <= slot && slot < call.call_base {
                     let call_pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
@@ -7327,13 +7353,7 @@ fn compact_register_map(
                             && temporary.ordinal == ordinal
                     });
                     if !own && protected[candidate_register] != 0 {
-                        reject!(
-                            5,
-                            call.pc,
-                            call.call_base,
-                            call.window_start,
-                            call.window_end
-                        );
+                        return Ok(false);
                     }
                 }
                 if !(call.window_start <= slot && slot < call.window_end) {
@@ -7390,13 +7410,7 @@ fn compact_register_map(
                     result_mode,
                 } = proto.instructions[call.pc].instruction
                 else {
-                    reject!(
-                        6,
-                        call.pc,
-                        call.call_base,
-                        call.window_start,
-                        call.window_end
-                    );
+                    return Ok(false);
                 };
                 let relative = candidate_register.checked_sub(usize::from(base.0));
                 let is_result = match result_mode {
@@ -7414,13 +7428,7 @@ fn compact_register_map(
                     && !survives
                     && protected[candidate_register] == 0;
                 if !is_result && !dying_input && !(dead_open && slot >= call.call_base) {
-                    reject!(
-                        7,
-                        call.pc,
-                        call.call_base,
-                        call.window_start,
-                        call.window_end
-                    );
+                    return Ok(false);
                 }
             }
             let env_alias = env_cache_eligible
@@ -7456,7 +7464,7 @@ fn compact_register_map(
                             work,
                         )?
                     {
-                        reject!(8, owner, span[owner].0, span[owner].1, 0);
+                        return Ok(false);
                     }
                     owner = owner_next[owner];
                 }
@@ -7480,7 +7488,7 @@ fn compact_register_map(
                     continue;
                 }
                 if protected[candidate_register] != 0 {
-                    reject!(9, fixed_start, fixed_end, 0, 0);
+                    return Ok(false);
                 }
                 let overlap_start = candidate_start.max(fixed_start);
                 let overlap_end = candidate_end.min(fixed_end);
@@ -7507,7 +7515,7 @@ fn compact_register_map(
                         )?
                         || live_at_pc(&span, &protected, &live_at, candidate_register, pc)
                     {
-                        reject!(10, fixed_start, fixed_end, pc, 0);
+                        return Ok(false);
                     }
                 }
             }
@@ -7665,183 +7673,6 @@ fn compact_register_map(
             high = high.max(new_slot + 1);
         }
         let slot = chosen.ok_or_else(|| {
-            #[cfg(feature = "std")]
-            eprintln!(
-                "native slot failure proto={} register={} start={} end={} protected={} floor={} fixed={} tuple_end={} temp_base={} high={} occupied={} fixed_intervals={} overlapping_calls={} max_call_window={} rejection_counts={:?} rejection_first={:?}",
-                proto.id.0,
-                register,
-                start,
-                end,
-                protected[register],
-                floor,
-                fixed,
-                tuple_end,
-                temp_base,
-                high,
-                slot_head.iter().filter(|&&head| head != usize::MAX).count(),
-                fixed_intervals.len(),
-                call_layouts.iter().filter(|call| start <= call.pc && call.pc < end).count(),
-                call_layouts.iter().map(|call| call.window_end).max().unwrap_or(0),
-                rejection_counts,
-                rejection_first,
-            );
-            #[cfg(feature = "std")]
-            if let Some((_, call_pc, _, _, _)) = rejection_first[4].or(rejection_first[3]) {
-                if let Some(call) = call_layouts.iter().find(|call| call.pc == call_pc) {
-                    let pending = u32::try_from(call.pc)
-                        .ok()
-                        .and_then(|pc| {
-                            module.native_debug().and_then(|native| {
-                                native.temporaries_at(proto.id, InstructionOffset(pc))
-                            })
-                        })
-                        .unwrap_or(&[]);
-                    let (guest_base, fixed_results) = match proto.instructions[call.pc].instruction {
-                        Instruction::Call {
-                            base,
-                            result_mode: ResultMode::Fixed(results),
-                            ..
-                        } => (
-                            Some(usize::from(base.0)),
-                            Some((usize::from(base.0), usize::from(results))),
-                        ),
-                        Instruction::Call { base, .. } | Instruction::TailCall { base, .. } => {
-                            (Some(usize::from(base.0)), None)
-                        }
-                        _ => (None, None),
-                    };
-                    let is_env = register == usize::from(proto.frame.environment.0);
-                    let is_global_env = register == usize::from(proto.global_environment.0);
-                    let is_base = guest_base == Some(register);
-                    let pending_ordinal = pending
-                        .iter()
-                        .find(|entry| usize::from(entry.register.0) == register)
-                        .map(|entry| entry.ordinal);
-                    let is_fixed_result = fixed_results.is_some_and(|(first, count)| {
-                        register >= first && register - first < count
-                    });
-                    let excluded = mapped[register] != u8::MAX
-                        || is_env
-                        || is_global_env
-                        || is_base
-                        || pending_ordinal.is_some()
-                        || (!call.open_chain && is_fixed_result);
-                    let live_before = live_at_pc(&span, &protected, &live_at, register, call.pc);
-                    let live_after = live_at_pc(&span, &protected, &live_at, register, call.pc + 1);
-                    let crosses = span[register].0 <= call.pc
-                        && call.pc + 1 < span[register].1
-                        && live_before
-                        && live_after;
-                    let survivors_at_call = span
-                        .iter()
-                        .enumerate()
-                        .filter(|(other, range)| {
-                            let other = *other;
-                            let (begin, finish) = **range;
-                            let fixed_result = fixed_results.is_some_and(|(first, count)| {
-                                other >= first && other - first < count
-                            });
-                            mapped[other] == u8::MAX
-                                && other != usize::from(proto.frame.environment.0)
-                                && other != usize::from(proto.global_environment.0)
-                                && Some(other) != guest_base
-                                && !pending.iter().any(|entry| {
-                                    usize::from(entry.register.0) == other
-                                })
-                                && (call.open_chain || !fixed_result)
-                                && begin <= call.pc
-                                && call.pc + 1 < finish
-                                && live_at_pc(&span, &protected, &live_at, other, call.pc)
-                                && live_at_pc(&span, &protected, &live_at, other, call.pc + 1)
-                        })
-                        .count();
-                    let local_floor = debug.map_or(0, |entry| {
-                        entry
-                            .locals
-                            .iter()
-                            .zip(storage)
-                            .filter(|(local, home)| {
-                                local.start_pc as usize <= call.pc
-                                    && call.pc < local.end_pc as usize
-                                    && home.start_pc as usize <= call.pc
-                                    && call.pc < home.end_pc as usize
-                            })
-                            .filter_map(|(_, home)| {
-                                official_storage_slot(
-                                    home.slot,
-                                    anonymous_vararg_slot,
-                                    proto.id,
-                                    call.pc,
-                                )
-                                .ok()
-                            })
-                            .map(|slot| usize::from(slot) + 1)
-                            .max()
-                            .unwrap_or(0)
-                    });
-                    let mut active_frontier = local_floor.max(
-                        anonymous_vararg_slot.map_or(0, |slot| usize::from(slot) + 1),
-                    );
-                    if let Some(tuple_base) = low_tuple_base {
-                        for pair in numeric {
-                            if pair.prepare_pc <= call.pc && call.pc <= pair.next_pc {
-                                active_frontier = active_frontier.max(
-                                    usize::from(tuple_base) + (usize::from(pair.block) + 1) * 4,
-                                );
-                            }
-                        }
-                    }
-                    let span_storage_floor = storage
-                        .iter()
-                        .filter(|home| {
-                            (home.start_pc as usize) < end && start < home.end_pc as usize
-                        })
-                        .filter_map(|home| {
-                            official_storage_slot(
-                                home.slot,
-                                anonymous_vararg_slot,
-                                proto.id,
-                                call.pc,
-                            )
-                            .ok()
-                        })
-                        .map(|slot| usize::from(slot) + 1)
-                        .max()
-                        .unwrap_or(0);
-                    eprintln!(
-                        "native first rejecting call proto={} register={} pc={} instruction={:?} first_slot={} call_base={} window={}..{} open={} live_before={} live_after={} crosses={} excluded={} mapped={} env={} global_env={} guest_base={:?} is_base={} fixed_result={} pending_ordinal={:?} pending_len={} pending_first={:?} active_frontier={} span_storage_floor={} survivors_at_call={}",
-                        proto.id.0,
-                        register,
-                        call.pc,
-                        proto.instructions[call.pc].instruction,
-                        call.first_slot,
-                        call.call_base,
-                        call.window_start,
-                        call.window_end,
-                        call.open_chain,
-                        live_before,
-                        live_after,
-                        crosses,
-                        excluded,
-                        mapped[register] != u8::MAX,
-                        is_env,
-                        is_global_env,
-                        guest_base,
-                        is_base,
-                        is_fixed_result,
-                        pending_ordinal,
-                        pending.len(),
-                        pending
-                            .iter()
-                            .take(8)
-                            .map(|entry| (entry.register.0, entry.ordinal))
-                            .collect::<Vec<_>>(),
-                        active_frontier,
-                        span_storage_floor,
-                        survivors_at_call,
-                    );
-                }
-            }
             error(
                 OfficialExportErrorKind::LimitExceeded,
                 proto.id,
