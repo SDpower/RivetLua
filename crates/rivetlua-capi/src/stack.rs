@@ -5029,14 +5029,13 @@ extern "C" fn requiref_private_loaded(pointer: *mut lua_State) -> c_int {
             .checked_add(1)
             .ok_or(StackError::StackLimit)?;
         let mut prepared_capacity = None;
-        let (loaded, loaded_root, _) = group.vm.get_or_create_byte_named_subtable(
-            registry,
-            b"_LOADED",
-            |vm| {
-                prepared_capacity = stack.prepare_capacity(vm, required)?;
-                Ok::<(), StackError>(())
-            },
-        )?;
+        let (loaded, loaded_root, _) =
+            group
+                .vm
+                .get_or_create_byte_named_subtable(registry, b"_LOADED", |vm| {
+                    prepared_capacity = stack.prepare_capacity(vm, required)?;
+                    Ok::<(), StackError>(())
+                })?;
         stack.commit_capacity(prepared_capacity);
         stack.slots.push(StackSlot {
             value: StackValue::Core(Value::Object(loaded)),

@@ -307,7 +307,10 @@ fn shutdown_reverse_order_error_continues_without_new_work_b11() {
         assert_eq!(vm.gc_trace().finalizer_warnings, 1);
         assert_eq!(vm.finalizer_state(first), Ok(FinalizerState::Finalized));
         assert_eq!(vm.finalizer_state(second), Ok(FinalizerState::Finalized));
-        assert_eq!(vm.finalizer_state(new_object), Ok(FinalizerState::Unregistered));
+        assert_eq!(
+            vm.finalizer_state(new_object),
+            Ok(FinalizerState::Unregistered)
+        );
         vm.queue_shutdown_finalizers().unwrap();
         assert_eq!(vm.gc_trace().finalizer_pending, 0);
         assert_eq!(vm.ledger_snapshot().reserved, 0);

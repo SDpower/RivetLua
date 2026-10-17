@@ -182,7 +182,9 @@ fn real_host_compiler_lower_denial_refunds_and_same_vm_retries() {
         let lower_normal = successful.lower_work_claims[1];
         assert!(lower_normal > 100_000);
         let failure_fuel = overhead
-            + successful.work[..successful.lower_stage].iter().sum::<usize>()
+            + successful.work[..successful.lower_stage]
+                .iter()
+                .sum::<usize>()
             + lower_prepaid
             + lower_normal / 2;
 
@@ -195,7 +197,10 @@ fn real_host_compiler_lower_denial_refunds_and_same_vm_retries() {
         };
         assert_eq!(failure, RunOutcome::Aborted(AbortReason::FuelExhausted));
         let denied = traces.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(denied.completed_admissions, successful.lower_stage, "{profile:?} {denied:?}");
+        assert_eq!(
+            denied.completed_admissions, successful.lower_stage,
+            "{profile:?} {denied:?}"
+        );
         assert_eq!(denied.lower_work_claims.len(), 2, "{profile:?} {denied:?}");
         assert_eq!(vm.roots().total_count(), root_count);
         assert_eq!(vm.ledger_snapshot().reserved, 0);

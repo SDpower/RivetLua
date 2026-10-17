@@ -3108,8 +3108,8 @@ mod cli_unit_tests {
     use super::OsEntropy;
     use super::{
         CLI_EXECUTION_FUEL, CliOs, CliResourceDeadline, atomic_write, debug_capability,
-        dump_limits, load_limits, read_entropy_seed,
-        report_unsupported_run_outcome, unix_epoch_seconds,
+        dump_limits, load_limits, read_entropy_seed, report_unsupported_run_outcome,
+        unix_epoch_seconds,
     };
     use rivetlua::{
         DebugCapability, DebugPermission, Engine, HostEntropyError, HostOutput, HostOutputError,
@@ -4433,11 +4433,8 @@ mod cli_unit_tests {
             },
             CliResourceDeadline { expires_at: None },
         ] {
-            let outcome = run_resource_script(
-                b"return os.clock()",
-                deadline,
-                ResourceLimits::default(),
-            );
+            let outcome =
+                run_resource_script(b"return os.clock()", deadline, ResourceLimits::default());
             let RunOutcome::LuaError(error) = outcome else {
                 panic!("expired resource deadline 應拒絕 host operation: {outcome:?}");
             };

@@ -572,7 +572,12 @@ fn overwrite_failure_keeps_previous_value() {
     let entries = [reg(c"existing".as_ptr(), Some(callback)), sentinel()];
     let before = snapshot(&owner);
     assert_eq!(
-        protected_setfuncs_at_point(&owner, entries.as_ptr(), 1, FailPoint::ClosureCapturesReserve),
+        protected_setfuncs_at_point(
+            &owner,
+            entries.as_ptr(),
+            1,
+            FailPoint::ClosureCapturesReserve
+        ),
         -4
     );
     assert_eq!(unsafe { lua_gettop(owner.as_ptr()) }, 2);

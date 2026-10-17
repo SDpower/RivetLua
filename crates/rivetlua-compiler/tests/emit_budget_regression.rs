@@ -98,7 +98,11 @@ fn twenty_one_short_blocks_emit_verified_module_under_bounded_budget() {
                 sink.work, sink.temporary, sink.completed_admissions, sink.work_claims, sink.temporary_claims
             )
         });
-        assert_eq!(sink.completed_admissions, completed_admissions(profile), "{profile:?}");
+        assert_eq!(
+            sink.completed_admissions,
+            completed_admissions(profile),
+            "{profile:?}"
+        );
         assert!(sink.retained > 0);
         assert!(module.native_debug().is_some());
         assert_eq!(module.module().prototypes.len(), 1);
@@ -226,7 +230,10 @@ fn emit_exact_and_one_below_limits_are_typed_before_emission() {
             run(&mut short_work),
             Err(BudgetedCompileError::Budget(Limit::Work))
         ));
-        assert_eq!(short_work.completed_admissions, completed_admissions(profile) - 1);
+        assert_eq!(
+            short_work.completed_admissions,
+            completed_admissions(profile) - 1
+        );
         assert_eq!(short_work.module_claims, 0);
         let before_emit: usize = ample.work_claims[..ample.work_claims.len() - 3]
             .iter()
@@ -236,7 +243,10 @@ fn emit_exact_and_one_below_limits_are_typed_before_emission() {
             run(&mut denied_metadata),
             Err(BudgetedCompileError::Budget(Limit::Work))
         ));
-        assert_eq!(denied_metadata.completed_admissions, completed_admissions(profile) - 1);
+        assert_eq!(
+            denied_metadata.completed_admissions,
+            completed_admissions(profile) - 1
+        );
         assert_eq!(denied_metadata.module_claims, 0);
         let after_shape_prepay = before_emit + ample.work_claims[ample.work_claims.len() - 3];
         let mut denied_name = BoundedSink::with_limits(after_shape_prepay, usize::MAX, usize::MAX);
@@ -244,7 +254,10 @@ fn emit_exact_and_one_below_limits_are_typed_before_emission() {
             run(&mut denied_name),
             Err(BudgetedCompileError::Budget(Limit::Work))
         ));
-        assert_eq!(denied_name.completed_admissions, completed_admissions(profile) - 1);
+        assert_eq!(
+            denied_name.completed_admissions,
+            completed_admissions(profile) - 1
+        );
         assert_eq!(denied_name.module_claims, 0);
         assert_eq!(denied_name.work_claims.len(), ample.work_claims.len() - 1);
 
@@ -253,7 +266,10 @@ fn emit_exact_and_one_below_limits_are_typed_before_emission() {
             run(&mut short_temp),
             Err(BudgetedCompileError::Budget(Limit::Temporary))
         ));
-        assert_eq!(short_temp.completed_admissions, completed_admissions(profile) - 1);
+        assert_eq!(
+            short_temp.completed_admissions,
+            completed_admissions(profile) - 1
+        );
         assert_eq!(short_temp.module_claims, 0);
         let mut short_retained =
             BoundedSink::with_limits(usize::MAX, usize::MAX, ample.retained - 1);
@@ -261,7 +277,10 @@ fn emit_exact_and_one_below_limits_are_typed_before_emission() {
             run(&mut short_retained),
             Err(BudgetedCompileError::Budget(Limit::Retained))
         ));
-        assert_eq!(short_retained.completed_admissions, completed_admissions(profile));
+        assert_eq!(
+            short_retained.completed_admissions,
+            completed_admissions(profile)
+        );
         assert_eq!(short_retained.module_claims, 1);
     }
 }
