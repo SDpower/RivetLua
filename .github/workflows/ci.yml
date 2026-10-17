@@ -61,6 +61,8 @@ jobs:
           else
             build_exit=$?
             printf '%s\n' "$build_exit" > "$bootstrap_dir/build-exit.txt"
+            cat "$bootstrap_dir/build.stderr.log" >&2
+            cat "$bootstrap_dir/build.jsonl"
             exit "$build_exit"
           fi
           python3 - <<'PY'
