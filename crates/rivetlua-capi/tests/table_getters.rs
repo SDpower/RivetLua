@@ -777,7 +777,10 @@ fn named_getter_fault_matrix(global_getter: bool) {
         assert_eq!(only_added_host(&before.3, &snapshot(&owner).3), value);
     }
     assert!(domains.contains(&AllocationDomain::Host));
-    assert!(domains.contains(&AllocationDomain::LuaHeap));
+    assert!(
+        !domains.contains(&AllocationDomain::LuaHeap),
+        "既有欄位名稱已 intern，查詢不應配置 Lua 字串"
+    );
 
     let owner = StateOwner::new().unwrap();
     let state = owner.as_ptr();

@@ -59,6 +59,7 @@ let services = HostServices::deny_all()
         max_work_units: 100_000,
     });
 let mut vm = engine.new_vm_with_services(services)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 輸出額度是同一 VM 的累積帳本，不會在不同 `Execution` 間重設；callback、`print`、錯誤輸出與 module export 共用。scalar 深度為 0，每個 return tuple 算一個 event；數字按 Lua 顯示形式計 bytes，字串按原始 bytes 計。受限輸出不接受 table、closure 或 opaque 資料；錯誤診斷以 `RunOutcome::SafeDiagnostic(diagnostic)` 回傳，`diagnostic` 只含 `public_code` 與 `correlation_id`，超額則為 `RunOutcome::Aborted(AbortReason::OutputLimit)`。
@@ -83,14 +84,26 @@ P22 OS worker 的 host-side Rust API 是 unsafe `rivetlua_capi::worker::run_work
 
 `rivetlua-runtime` 預設使用 `std`；以 `--no-default-features` 建置時採 `no_std + alloc`，嵌入端須提供 allocator、`panic=abort`、程式入口，並確認目標支援 pointer atomics。runtime 的 `aot` feature 提供 AOT artifact 載入；SDK 的 `aot` 僅提供載入，`aot-builder` 才提供建置與載入。SDK 預設仍包含 source compiler，因此 SDK 依賴圖不能稱為 runtime-only；runtime 的 AOT normal dependency graph 不含 compiler 或 Cranelift。使用 `Module::build_aot` 建置，再由 `Vm::install_aot` 驗證及載入：
 
-```rust
-let artifact = module.build_aot(&target, proto_index, entry_pc)?;
-vm.install_aot(
-    &module,
-    artifact.bytes(),
-    &target,
-    &artifact.trusted_build(),
-)?;
+此例需啟用 SDK 的 `aot-builder` feature，並提供受支援且符合目標平台的 target/runtime。
+
+```rust,no_run
+#[cfg(feature = "aot-builder")]
+fn build_and_install_aot(
+    module: &rivetlua::Module,
+    vm: &mut rivetlua::Vm,
+    target: &rivetlua::TargetDescriptor,
+    prototype_index: usize,
+    entry_pc: usize,
+) -> Result<(), rivetlua::AotError> {
+    let artifact = module.build_aot(target, prototype_index, entry_pc)?;
+    vm.install_aot(
+        module,
+        artifact.bytes(),
+        target,
+        &artifact.trusted_build(),
+    )?;
+    Ok(())
+}
 ```
 
 載入前會核對 trusted-build digest 與完整 target／profile／module／entry identity，再映射 bytes。若以 unsafe external attestation 載入外部 artifact，必須由帶外流程保證它來自正確 builder；檔案自帶的 hash 只能核對內容，不能建立信任。macOS entitlement 不足、Linux AArch64 instruction-cache 條件不滿足，或 Windows native backend 尚不支援時，應拒絕載入或回退 interpreter；目前不宣稱已在目標平台執行 AOT native code。

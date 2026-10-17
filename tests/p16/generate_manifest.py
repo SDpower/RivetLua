@@ -4204,6 +4204,18 @@ def render_c_abi_header() -> bytes:
         "  };",
         "  return identity;",
         "}",
+        "",
+        "/* VM 建立前固定政策；非法值回傳 NULL。 */",
+        "#define RIVETLUA_VM_POLICY_COMPATIBILITY 0",
+        "#define RIVETLUA_VM_POLICY_SANDBOX 1",
+        "#define RIVETLUA_VM_POLICY_PRIVATE_SERVICE 2",
+        "#ifdef __cplusplus",
+        'extern "C" {',
+        "#endif",
+        "extern lua_State *rivetlua_capi_newstate_with_policy_b22(int policy);",
+        "#ifdef __cplusplus",
+        "}",
+        "#endif",
         "#endif",
     ])
     return ("\n".join(lines) + "\n").encode()

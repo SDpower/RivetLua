@@ -12,7 +12,8 @@ fn capi_raw_next_adapter_is_pure_content_equal_and_roots_objects() {
         let mut vm = Vm::new_with_profile(profile).unwrap();
         let table = vm.allocate_table().unwrap();
         let table_root = HostHandle::<Value>::new(&mut vm, table).unwrap();
-        let key = vm.allocate_byte_string(b"same\0\xff").unwrap();
+        let equal_bytes = b"same\0\xff".repeat(7);
+        let key = vm.allocate_byte_string(&equal_bytes).unwrap();
         let key_root = HostHandle::<Value>::new(&mut vm, key).unwrap();
         let value = vm.allocate_table().unwrap();
         let value_root = HostHandle::<Value>::new(&mut vm, value).unwrap();
@@ -65,7 +66,7 @@ fn capi_raw_next_adapter_is_pure_content_equal_and_roots_objects() {
         assert_eq!(vm.gc_trace(), gc);
         assert_eq!(vm.roots().total_count(), roots);
 
-        let same_content = vm.allocate_byte_string(b"same\0\xff").unwrap();
+        let same_content = vm.allocate_byte_string(&equal_bytes).unwrap();
         let same_root = HostHandle::<Value>::new(&mut vm, same_content).unwrap();
         assert_ne!(same_content, key);
         let ledger = vm.ledger_snapshot();
@@ -166,9 +167,11 @@ fn capi_raw_next_deleted_current_key_b13() {
 
         let strings = vm.allocate_table().unwrap();
         let _strings_root = HostHandle::<Value>::new(&mut vm, strings).unwrap();
-        let first_string = vm.allocate_byte_string(b"first\0key").unwrap();
+        let first_bytes = b"first\0key".repeat(5);
+        let second_bytes = b"second\0key".repeat(5);
+        let first_string = vm.allocate_byte_string(&first_bytes).unwrap();
         let first_root = HostHandle::<Value>::new(&mut vm, first_string).unwrap();
-        let second_string = vm.allocate_byte_string(b"second\0key").unwrap();
+        let second_string = vm.allocate_byte_string(&second_bytes).unwrap();
         let second_root = HostHandle::<Value>::new(&mut vm, second_string).unwrap();
         vm.raw_set(strings, Value::Object(first_string), Value::Integer(41))
             .unwrap();
@@ -181,9 +184,9 @@ fn capi_raw_next_deleted_current_key_b13() {
         let successor = vm.raw_next_value(strings, current).unwrap();
         let equal_string = vm
             .allocate_byte_string(if dead_string == first_string {
-                b"first\0key"
+                &first_bytes
             } else {
-                b"second\0key"
+                &second_bytes
             })
             .unwrap();
         assert_ne!(equal_string, dead_string);
@@ -275,7 +278,7 @@ fn capi_deleted_long_key_charge_rehash_and_drop_b13() {
         vm.raw_set(table, Value::Object(key), Value::Integer(1))
             .unwrap();
         let key_backing_bytes =
-            vm.ledger_snapshot().lua_heap_bytes - before_key_insert - bytes.len() - bucket_size;
+            vm.ledger_snapshot().lua_heap_bytes - before_key_insert - bucket_size;
         assert!(key_backing_bytes >= std::mem::size_of::<rivetlua_runtime::CanonicalKey>());
         vm.raw_set(table, Value::Boolean(true), Value::Integer(2))
             .unwrap();
@@ -291,7 +294,8 @@ fn capi_deleted_long_key_charge_rehash_and_drop_b13() {
         vm.collect_major().unwrap();
         assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
         let before_rehash = vm.ledger_snapshot().lua_heap_bytes;
-        assert!(before_rehash + bytes.len() <= before_delete);
+        assert!(before_rehash < before_delete);
+        assert!(before_rehash >= baseline + bytes.len());
         assert_eq!(
             vm.raw_get(table, Value::Boolean(true)),
             Ok(Value::Integer(2))
@@ -331,7 +335,7 @@ fn capi_final_long_deleted_key_charge_releases_on_insert_b13() {
         vm.raw_set(table, Value::Object(key), Value::Integer(1))
             .unwrap();
         let key_backing_bytes =
-            vm.ledger_snapshot().lua_heap_bytes - before_key_insert - bytes.len() - bucket_size;
+            vm.ledger_snapshot().lua_heap_bytes - before_key_insert - bucket_size;
         assert!(key_backing_bytes >= std::mem::size_of::<rivetlua_runtime::CanonicalKey>());
         let before_delete = vm.ledger_snapshot().lua_heap_bytes;
         vm.raw_set(table, Value::Object(key), Value::Nil).unwrap();
@@ -380,12 +384,18 @@ fn capi_weak_value_cleanup_keeps_deleted_current_position_b13() {
             .unwrap();
         let expected = vm.raw_next_value(table, Value::Boolean(false)).unwrap();
         vm.collect().unwrap();
-        vm.collect_major().unwrap();
         assert_eq!(vm.object_kind(value), Err(VmError::StaleObject));
         assert_eq!(vm.raw_get(table, Value::Boolean(false)), Ok(Value::Nil));
         assert_eq!(
             vm.raw_next_value(table, Value::Boolean(false)).unwrap(),
             expected
+        );
+        vm.collect_major().unwrap();
+        assert_eq!(
+            vm.raw_next_value(table, Value::Boolean(false))
+                .unwrap_err()
+                .kind,
+            RuntimeErrorKind::InvalidNextKey
         );
     }
 }
@@ -521,6 +531,7 @@ fn capi_weak_value_all_clear_keeps_first_position_b13() {
         }
         let (current, _) = vm.raw_next_value(table, Value::Nil).unwrap().unwrap();
         vm.collect().unwrap();
+        assert_eq!(vm.raw_next_value(table, current).unwrap(), None);
         vm.collect_major().unwrap();
         for value in values {
             assert_eq!(vm.object_kind(value), Err(VmError::StaleObject));
@@ -528,7 +539,10 @@ fn capi_weak_value_all_clear_keeps_first_position_b13() {
         for key in keys {
             assert_eq!(vm.raw_get(table, key), Ok(Value::Nil));
         }
-        assert_eq!(vm.raw_next_value(table, current).unwrap(), None);
+        assert_eq!(
+            vm.raw_next_value(table, current).unwrap_err().kind,
+            RuntimeErrorKind::InvalidNextKey
+        );
         assert_eq!(
             vm.raw_next_value(table, Value::Integer(999))
                 .unwrap_err()

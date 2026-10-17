@@ -316,7 +316,6 @@ mod tests {
             FailPoint::SlotReserve,
             FailPoint::ObjectReserve,
             FailPoint::ObjectInitialize,
-            FailPoint::MarkReserve,
             FailPoint::WorkReserve,
         ] {
             vm.inject_failure_once(point);
@@ -330,6 +329,27 @@ mod tests {
             vm.with_byte_string(source, |s| assert_eq!(s.as_bytes(), [0, 0x80, 0xff]))
                 .unwrap();
         }
+        let mut page_vm = Vm::new().unwrap();
+        page_vm.stop_automatic_gc();
+        let page_source = page_vm.allocate_byte_string(&[0, 0x80, 0xff]).unwrap();
+        for _ in 0..63 {
+            page_vm.allocate(Value::Nil).unwrap();
+        }
+        assert!(page_vm.slot_state(SlotId::new(63)).is_some());
+        assert_eq!(page_vm.slot_state(SlotId::new(64)), None);
+        let page_before = page_vm.ledger_snapshot();
+        page_vm.inject_failure_once(FailPoint::MarkReserve);
+        assert_eq!(
+            page_vm.clone_byte_string(page_source),
+            Err(VmError::InjectedFailure(FailPoint::MarkReserve))
+        );
+        assert_eq!(page_vm.ledger_snapshot(), page_before);
+        assert_eq!(page_vm.roots().total_count(), 0);
+        assert_eq!(page_vm.slot_state(SlotId::new(64)), None);
+        page_vm
+            .with_byte_string(page_source, |s| assert_eq!(s.as_bytes(), [0, 0x80, 0xff]))
+            .unwrap();
+
         vm.set_allocation_limit(before.committed);
         assert_eq!(vm.clone_byte_string(source), Err(VmError::AllocationFailed));
         assert_eq!(vm.ledger_snapshot().committed, before.committed);

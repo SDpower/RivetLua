@@ -314,6 +314,8 @@ fn table_stack_create_publication_failures_active_gc_are_atomic() {
         }
         owner.with_vm(|vm| vm.remove_root(anchor).unwrap()).unwrap();
     }
+    // SlotReserve 依 Slot 大小計 LuaHeap，ObjectReserve 依 HeapObject 向量元素大小計費。
+    // 此候選仍在既有 bitmap page，沒有只於新增 page 發生的 MarkReserve（Host 1 byte）。
     assert_eq!(
         failed,
         vec![
@@ -338,36 +340,30 @@ fn table_stack_create_publication_failures_active_gc_are_atomic() {
             (
                 3,
                 AllocationDomain::LuaHeap,
-                312,
+                256,
                 "crates/rivetlua-runtime/src/heap.rs"
             ),
             (
                 4,
                 AllocationDomain::Host,
-                1,
+                32,
                 "crates/rivetlua-runtime/src/heap.rs"
             ),
             (
                 5,
                 AllocationDomain::Host,
-                32,
-                "crates/rivetlua-runtime/src/heap.rs"
-            ),
-            (
-                6,
-                AllocationDomain::Host,
                 208,
                 "crates/rivetlua-runtime/src/roots.rs"
             ),
             (
-                7,
+                6,
                 AllocationDomain::Host,
                 36864,
                 "crates/rivetlua-runtime/src/heap.rs"
             ),
         ]
     );
-    assert_eq!(succeeded, (8..24).collect::<Vec<_>>());
+    assert_eq!(succeeded, (7..24).collect::<Vec<_>>());
 }
 
 #[test]

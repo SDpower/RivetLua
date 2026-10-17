@@ -116,7 +116,20 @@ fn relocate_official_iterator_nil(chunk: &mut rivetlua_core::OfficialChunk) {
     assert_eq!(
         candidates.len(),
         1,
-        "須有唯一的官方 iterator CALL/MOVE/LOADNIL/EQ"
+        "須有唯一的官方 iterator CALL/MOVE/LOADNIL/EQ；前 64 字={:?}；CALL={:?}",
+        &code[..code.len().min(64)],
+        code.iter()
+            .enumerate()
+            .filter(|(_, word)| opcode(**word) == 68)
+            .take(8)
+            .map(|(pc, &word)| (
+                pc,
+                a(word),
+                b(word),
+                (word >> 24) & 0xff,
+                &code[pc + 1..(pc + 4).min(code.len())],
+            ))
+            .collect::<Vec<_>>(),
     );
     let (nil_pc, comparison_pc, old_nil) = candidates[0];
     let spare = u32::from(chunk.main.max_stack_size);

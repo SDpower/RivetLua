@@ -346,7 +346,7 @@ fn limits_and_failure_atomicity() {
         }
     }
     let first_success = first_success.expect("ordinal sweep 必須到達首個成功");
-    assert_eq!(first_success, 6, "{observed:?}");
+    assert_eq!(first_success, 7, "{observed:?}");
     let expected = [
         (
             AllocationDomain::LuaHeap,
@@ -356,6 +356,11 @@ fn limits_and_failure_atomicity() {
         (
             AllocationDomain::LuaHeap,
             Some(FailPoint::UserdataUservaluesReserve),
+            "heap.rs",
+        ),
+        (
+            AllocationDomain::LuaHeap,
+            Some(FailPoint::ObjectReserve),
             "heap.rs",
         ),
         (

@@ -3107,8 +3107,8 @@ mod cli_unit_tests {
     #[cfg(not(unix))]
     use super::OsEntropy;
     use super::{
-        CLI_EXECUTION_FUEL, CliResourceDeadline, atomic_write, cli_resource_capability,
-        debug_capability, dump_limits, load_limits, read_entropy_seed,
+        CLI_EXECUTION_FUEL, CliOs, CliResourceDeadline, atomic_write, debug_capability,
+        dump_limits, load_limits, read_entropy_seed,
         report_unsupported_run_outcome, unix_epoch_seconds,
     };
     use rivetlua::{
@@ -4407,9 +4407,18 @@ mod cli_unit_tests {
         }
     }
 
-    fn run_resource_script(source: &[u8], resource: ResourceCapability) -> RunOutcome {
+    fn run_resource_script(
+        source: &[u8],
+        deadline: CliResourceDeadline,
+        limits: ResourceLimits,
+    ) -> RunOutcome {
         let engine = Engine::new(LuaProfile::Lua55);
         let module = engine.compile(source).unwrap();
+        // 這些測試只呼叫 os；略過無關的標準 IO lease 初始化，避免先消耗受測額度。
+        let resource = ResourceCapability::deny_all()
+            .and_os(CliOs)
+            .and_deadline(deadline)
+            .with_limits(limits);
         let mut vm = engine
             .new_vm_with_services(HostServices::deny_all().and_resource(resource))
             .unwrap();
@@ -4424,8 +4433,11 @@ mod cli_unit_tests {
             },
             CliResourceDeadline { expires_at: None },
         ] {
-            let outcome =
-                run_resource_script(b"return os.clock()", cli_resource_capability(deadline));
+            let outcome = run_resource_script(
+                b"return os.clock()",
+                deadline,
+                ResourceLimits::default(),
+            );
             let RunOutcome::LuaError(error) = outcome else {
                 panic!("expired resource deadline 應拒絕 host operation: {outcome:?}");
             };
@@ -4442,8 +4454,7 @@ mod cli_unit_tests {
             };
             let deadline = CliResourceDeadline::from_now();
             assert!(deadline.expires_at.is_some());
-            let resource = cli_resource_capability(deadline).with_limits(limits);
-            let outcome = run_resource_script(b"return os.time()", resource);
+            let outcome = run_resource_script(b"return os.time()", deadline, limits);
             let RunOutcome::LuaError(error) = outcome else {
                 panic!("work_units={work_units} 應在 host effect 前耗盡: {outcome:?}");
             };
@@ -4459,7 +4470,8 @@ mod cli_unit_tests {
         };
         let outcome = run_resource_script(
             b"return os.setlocale() == 'C'",
-            cli_resource_capability(CliResourceDeadline::from_now()).with_limits(limited),
+            CliResourceDeadline::from_now(),
+            limited,
         );
         let RunOutcome::LuaError(error) = outcome else {
             panic!("zero temporary bytes 應在建立 C locale 回應前耗盡: {outcome:?}");
@@ -4472,7 +4484,8 @@ mod cli_unit_tests {
         };
         let outcome = run_resource_script(
             b"return os.setlocale() == 'C'",
-            cli_resource_capability(CliResourceDeadline::from_now()).with_limits(admitted),
+            CliResourceDeadline::from_now(),
+            admitted,
         );
         assert!(matches!(
             outcome,

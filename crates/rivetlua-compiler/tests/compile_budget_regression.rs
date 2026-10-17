@@ -64,7 +64,10 @@ fn repeated_locals_record_each_prepaid_stage_and_retained_size() {
                 sink.temporary,
                 sink.retained
             );
-            assert_eq!(sink.temporary.len(), 6);
+            assert_eq!(
+                sink.temporary.len(),
+                6 + usize::from(profile == LanguageProfile::Lua55)
+            );
             assert_eq!(sink.retained.len(), 1);
             assert!(actual_retained <= sink.retained[0]);
             if prepaid + 128 > 768 * 1024 * 1024 {

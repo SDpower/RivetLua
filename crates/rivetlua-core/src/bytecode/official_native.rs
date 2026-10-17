@@ -7610,6 +7610,24 @@ fn compact_register_map(
             high = high.max(new_slot + 1);
         }
         let slot = chosen.ok_or_else(|| {
+            #[cfg(feature = "std")]
+            eprintln!(
+                "native slot failure proto={} register={} start={} end={} protected={} floor={} fixed={} tuple_end={} temp_base={} high={} occupied={} fixed_intervals={} overlapping_calls={} max_call_window={}",
+                proto.id.0,
+                register,
+                start,
+                end,
+                protected[register],
+                floor,
+                fixed,
+                tuple_end,
+                temp_base,
+                high,
+                slot_head.iter().filter(|&&head| head != usize::MAX).count(),
+                fixed_intervals.len(),
+                call_layouts.iter().filter(|call| start <= call.pc && call.pc < end).count(),
+                call_layouts.iter().map(|call| call.window_end).max().unwrap_or(0),
+            );
             error(
                 OfficialExportErrorKind::LimitExceeded,
                 proto.id,

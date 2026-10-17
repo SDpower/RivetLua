@@ -1945,6 +1945,7 @@ mod tests {
         let different_bytes = [0, 0x80, 0xff, 1, 2, 3, 4, 5, 7];
         let first = a.allocate_byte_string(&bytes).unwrap();
         let second = a.allocate_byte_string(&bytes).unwrap();
+        assert_eq!(first, second);
         let different = a.allocate_byte_string(&different_bytes).unwrap();
         let foreign = b.allocate_byte_string(&bytes).unwrap();
         assert_eq!(a.object_kind(first), Ok(ObjectKind::ByteString));
@@ -2020,7 +2021,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(original_key != new_key);
-        assert_eq!(a.collect().unwrap(), 5);
+        assert_eq!(a.collect().unwrap(), 4);
         assert_eq!(
             a.canonical_key(Value::Object(old)),
             Err(VmError::StaleObject)
@@ -2584,13 +2585,14 @@ mod tests {
             .unwrap();
         assert_eq!(vm.collect().unwrap(), 0);
         let equal_bytes = vm.allocate_byte_string(&[0, 0x80]).unwrap();
+        assert_eq!(string_key, equal_bytes);
         assert_eq!(
             vm.raw_get(table, Value::Object(equal_bytes)),
             Ok(Value::Integer(4))
         );
         vm.raw_set(table, Value::Object(equal_bytes), Value::Nil)
             .unwrap();
-        assert_eq!(vm.collect().unwrap(), 2);
+        assert_eq!(vm.collect().unwrap(), 1);
         vm.remove_root(root).unwrap();
         assert_eq!(vm.collect().unwrap(), 1);
     }
@@ -2889,7 +2891,6 @@ mod tests {
             FailPoint::ObjectReserve,
             FailPoint::ObjectInitialize,
             FailPoint::RootReserve,
-            FailPoint::MarkReserve,
             FailPoint::WorkReserve,
         ] {
             let snapshot = vm.ledger_snapshot();
@@ -2902,6 +2903,23 @@ mod tests {
             assert_eq!(vm.roots().total_count(), roots);
             assert_eq!(vm.collect().unwrap(), 0);
         }
+        let mut page_vm = Vm::new().unwrap();
+        page_vm.stop_automatic_gc();
+        for _ in 0..64 {
+            page_vm.allocate(Value::Nil).unwrap();
+        }
+        assert!(page_vm.slot_state(SlotId::new(63)).is_some());
+        assert_eq!(page_vm.slot_state(SlotId::new(64)), None);
+        let page_before = page_vm.ledger_snapshot();
+        page_vm.inject_failure_once(FailPoint::MarkReserve);
+        assert_eq!(
+            page_vm.allocate_table_with_capacity(2, 3),
+            Err(VmError::InjectedFailure(FailPoint::MarkReserve))
+        );
+        assert_eq!(page_vm.ledger_snapshot(), page_before);
+        assert_eq!(page_vm.roots().total_count(), 0);
+        assert_eq!(page_vm.slot_state(SlotId::new(64)), None);
+
         let string_key = vm
             .allocate_byte_string(&[0, 0x80, 1, 2, 3, 4, 5, 6, 7])
             .unwrap();
@@ -3042,12 +3060,13 @@ mod tests {
         vm.set_gc_promotion_survivals(1).unwrap();
         let table = vm.allocate_table().unwrap();
         let root = vm.add_root(RootKind::Host, table).unwrap();
-        let stored_key = vm.allocate_byte_string(b"same").unwrap();
+        let stored_key = vm.allocate_byte_string(&[b's'; 41]).unwrap();
         vm.raw_set(table, Value::Object(stored_key), Value::Integer(1))
             .unwrap();
         vm.collect().unwrap();
         assert_eq!(vm.gc_age(table), Ok(GcAge::Old));
-        let temporary_source = vm.allocate_byte_string(b"same").unwrap();
+        let temporary_source = vm.allocate_byte_string(&[b's'; 41]).unwrap();
+        assert_ne!(stored_key, temporary_source);
         let remembered = vm.gc_trace().remembered_len;
         vm.raw_set(table, Value::Object(temporary_source), Value::Integer(2))
             .unwrap();

@@ -31,7 +31,8 @@ impl CompileBudgetSink for Unlimited {
 
 #[derive(Clone, Debug, Default)]
 struct StageTrace {
-    work: [usize; 6],
+    work: [usize; 7],
+    lower_stage: usize,
     completed_admissions: usize,
     lower_work_claims: Vec<usize>,
 }
@@ -49,9 +50,9 @@ impl CompileBudgetSink for RecordingSink<'_, '_> {
     type Error = HostLoadError;
 
     fn spend_work(&mut self, units: usize) -> Result<(), Self::Error> {
-        let stage = self.trace.completed_admissions.min(5);
+        let stage = self.trace.completed_admissions.min(6);
         self.trace.work[stage] = self.trace.work[stage].checked_add(units).unwrap();
-        if stage == 3 {
+        if stage == self.trace.lower_stage {
             self.trace.lower_work_claims.push(units);
         }
         self.budget.spend_work(units)
@@ -76,7 +77,10 @@ impl HostLoadCompiler for RecordingCompiler {
         profile: LuaProfile,
         budget: &mut rivetlua::LoadBudget<'_>,
     ) -> Result<VerifiedModule, HostLoadError> {
-        let mut trace = StageTrace::default();
+        let mut trace = StageTrace {
+            lower_stage: 3 + usize::from(profile == LuaProfile::Lua55),
+            ..StageTrace::default()
+        };
         let language = match profile {
             LuaProfile::Lua54 => LanguageProfile::Lua54,
             LuaProfile::Lua55 => LanguageProfile::Lua55,
@@ -167,7 +171,7 @@ fn real_host_compiler_lower_denial_refunds_and_same_vm_retries() {
         };
         assert!(matches!(calibration, RunOutcome::Returned(_)));
         let successful = traces.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(successful.completed_admissions, 6);
+        assert_eq!(successful.completed_admissions, successful.lower_stage + 3);
         assert_eq!(successful.lower_work_claims.len(), 2);
         let compile_work: usize = successful.work.iter().sum();
         let overhead = usize::try_from(HIGH_FUEL - remaining)
@@ -178,7 +182,7 @@ fn real_host_compiler_lower_denial_refunds_and_same_vm_retries() {
         let lower_normal = successful.lower_work_claims[1];
         assert!(lower_normal > 100_000);
         let failure_fuel = overhead
-            + successful.work[..3].iter().sum::<usize>()
+            + successful.work[..successful.lower_stage].iter().sum::<usize>()
             + lower_prepaid
             + lower_normal / 2;
 
@@ -191,7 +195,7 @@ fn real_host_compiler_lower_denial_refunds_and_same_vm_retries() {
         };
         assert_eq!(failure, RunOutcome::Aborted(AbortReason::FuelExhausted));
         let denied = traces.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(denied.completed_admissions, 3, "{profile:?} {denied:?}");
+        assert_eq!(denied.completed_admissions, successful.lower_stage, "{profile:?} {denied:?}");
         assert_eq!(denied.lower_work_claims.len(), 2, "{profile:?} {denied:?}");
         assert_eq!(vm.roots().total_count(), root_count);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
@@ -232,7 +236,7 @@ fn real_host_compiler_lower_denial_refunds_and_same_vm_retries() {
         assert!(matches!(limited, RunOutcome::LuaError(error)
             if error.kind == RuntimeErrorKind::HostLoadBudget));
         let budget_denied = budget_traces.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(budget_denied.completed_admissions, 3);
+        assert_eq!(budget_denied.completed_admissions, successful.lower_stage);
         assert_eq!(budget_denied.lower_work_claims.len(), 2);
         assert_eq!(budget_vm.roots().total_count(), budget_roots);
         assert_eq!(budget_vm.ledger_snapshot().reserved, 0);

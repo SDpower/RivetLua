@@ -151,4 +151,8 @@ jobs:
           PY
 
       - name: Test workspace
-        run: cargo test --locked --workspace --no-fail-fast
+        run: cargo test --locked --workspace --exclude rivetlua-xtask --no-fail-fast
+
+      - name: Test rivetlua AOT doctest
+        if: ${{ !cancelled() && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: cargo test --locked -p rivetlua --features aot-builder --doc

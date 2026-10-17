@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
-const USAGE: &str = "用法：rivetlua [--profile lua55|lua54] [-E] [-v] [-i] [-e 程式] [-l 模組] [--] [檔案 [參數...]]";
+const USAGE: &str = "用法：rivetlua [--profile lua55|lua54] [--vm-policy compatibility|sandbox|private-service] [-E] [-v] [-i] [-e 程式] [-l 模組] [--] [檔案 [參數...]]\n       rivetlua [--profile lua55|lua54] --compatibility [--gaps]";
 
 struct ScratchDir {
     path: PathBuf,

@@ -679,7 +679,7 @@ fn direct_gc_external_finalizer_aborts_once_b4() {
             vm.raw_set(metatable, Value::Object(key), callback).unwrap();
             let object = vm.allocate_table().unwrap();
             vm.set_metatable(object, Some(metatable)).unwrap();
-            vm.collect_major().unwrap();
+            assert_eq!(vm.collect_major(), Err(VmError::HostConfigurationBusy));
             assert_eq!(vm.finalizer_state(object), Ok(FinalizerState::Finalized));
             assert_eq!(vm.gc_trace().finalizer_pending, 0);
             assert_eq!(vm.gc_trace().finalizer_warnings, 1);

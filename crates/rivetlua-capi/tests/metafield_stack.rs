@@ -374,7 +374,14 @@ fn registry_and_invalid_inputs() {
     owner.push_value(coroutine_value).unwrap();
     drop(coroutine);
     let top = unsafe { lua_gettop(state) };
-    owner.with_vm(|vm| vm.collect().unwrap()).unwrap();
+    // 回收一個預熱物件，讓後續錯誤字串重用 slot，不擴張 LuaHeap arena。
+    owner
+        .with_vm(|vm| {
+            let prewarm = vm.allocate_table().unwrap();
+            vm.collect().unwrap();
+            assert_eq!(vm.object_kind(prewarm), Err(VmError::StaleObject));
+        })
+        .unwrap();
     let before = snapshot(&owner);
     for index in [2, 3, 4, 5, 6, 7, 8, 9] {
         assert_eq!(

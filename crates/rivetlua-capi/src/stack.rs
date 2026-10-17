@@ -5016,26 +5016,33 @@ impl Drop for StateOwner {
 // C checkpoint 後才放入私有表，因此 closure 配置失敗不會留下額外 stack slot。
 extern "C" fn requiref_private_loaded(pointer: *mut lua_State) -> c_int {
     with_state(pointer, 0, |state| {
-        let loaded = {
-            let group_owner = state.group.upgrade().ok_or(StackError::InvalidState)?;
-            let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
-            if group.vm.policy() == VmPolicy::Compatibility {
-                return Err(StackError::PolicyDenied);
-            }
-            let registry = group.registry_table()?;
-            let Value::Object(loaded) =
-                group.vm.with_temporary_byte_string(b"_LOADED", |vm, key| {
-                    vm.raw_get(registry, Value::Object(key))
-                })?
-            else {
-                return Err(StackError::InvalidState);
-            };
-            if group.vm.object_kind(loaded)? != ObjectKind::Table {
-                return Err(StackError::InvalidState);
-            }
-            loaded
-        };
-        state.push(StackValue::Core(Value::Object(loaded)))?;
+        let group_owner = state.group.upgrade().ok_or(StackError::InvalidState)?;
+        let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
+        if group.vm.policy() == VmPolicy::Compatibility {
+            return Err(StackError::PolicyDenied);
+        }
+        let registry = group.registry_table()?;
+        let mut stack = state.stack.try_borrow_mut().map_err(|_| StackError::Busy)?;
+        let required = stack
+            .slots
+            .len()
+            .checked_add(1)
+            .ok_or(StackError::StackLimit)?;
+        let mut prepared_capacity = None;
+        let (loaded, loaded_root, _) = group.vm.get_or_create_byte_named_subtable(
+            registry,
+            b"_LOADED",
+            |vm| {
+                prepared_capacity = stack.prepare_capacity(vm, required)?;
+                Ok::<(), StackError>(())
+            },
+        )?;
+        stack.commit_capacity(prepared_capacity);
+        stack.slots.push(StackSlot {
+            value: StackValue::Core(Value::Object(loaded)),
+            root: Some(loaded_root),
+            string_view: None,
+        });
         Ok(1)
     })
 }

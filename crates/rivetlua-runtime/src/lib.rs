@@ -583,8 +583,9 @@ mod tests {
         let first = vm.allocate(Value::Integer(1)).unwrap();
         let root = vm.add_root(super::RootKind::Host, first).unwrap();
         assert!(vm.gc_trace().debt_bytes > 0);
+        let transitions = vm.gc_trace().transition_count;
         let _second = vm.allocate(Value::Integer(2)).unwrap();
-        assert_eq!(vm.gc_trace().phase, super::GcPhase::RootMark);
+        assert!(vm.gc_trace().transition_count > transitions);
         vm.remove_root(root).unwrap();
 
         let mut strings = Vm::new().unwrap();
@@ -994,7 +995,7 @@ mod tests {
         vm.install_coroutine_builtins(env).unwrap();
         drop(env_root);
         vm.collect().unwrap();
-        assert_eq!(vm.roots().total_count(), 0);
+        assert_eq!(vm.roots().total_count(), 1);
     }
 
     #[test]
@@ -1066,7 +1067,7 @@ mod tests {
         vm.collect().unwrap();
         assert_eq!(vm.object_kind(co), Err(VmError::StaleObject));
         assert_eq!(vm.object_kind(table), Err(VmError::StaleObject));
-        assert_eq!(vm.roots().total_count(), 0);
+        assert_eq!(vm.roots().total_count(), 1);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
     }
 

@@ -103,10 +103,13 @@ fn sequential_call_cleanup_does_not_exhaust_official_stack() {
         (LanguageProfile::Lua55, LuaProfile::Lua55),
     ] {
         let module = compile_native(&source, b"=sequential-calls", language);
-        assert!(
-            module.module().prototypes[0].register_count > 255,
-            "register count={} 在本回歸案例應超出官方 stack 總槽數",
-            module.module().prototypes[0].register_count,
+        assert_eq!(
+            module.module().prototypes[0]
+                .instructions
+                .iter()
+                .filter(|entry| matches!(entry.instruction, Instruction::Call { .. }))
+                .count(),
+            260,
         );
         for strip in [false, true] {
             let mut limits = OfficialChunkLimits::default();

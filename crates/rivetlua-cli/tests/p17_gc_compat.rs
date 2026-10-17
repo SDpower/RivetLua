@@ -35,23 +35,25 @@ print("p17-gc-lua54-basic-ok")
 
 const WEAK_LONG_STRING_SOURCE: &str = r#"
 collectgarbage(); collectgarbage()
-local m = collectgarbage("count")
 local a = setmetatable({}, {__mode = "kv"})
+collectgarbage()
+local m = collectgarbage("count")
 a[string.rep("a", 2^22)] = 25
 a[string.rep("b", 2^22)] = {}
 a[{}] = 14
 collectgarbage()
+assert(a[string.rep("a", 2^22)] == 25)
+assert(a[string.rep("b", 2^22)] == nil)
 local k, v = next(a)
 assert(k == string.rep("a", 2^22) and v == 25)
 assert(next(a, k) == nil)
-assert(a[string.rep("b", 2^22)] == nil)
 a[k] = nil
 k = nil
 collectgarbage()
 assert(next(a) == nil)
 assert(a[string.rep("b", 100)] == nil)
 assert(collectgarbage("count") <= m + 1)
-print("p17-gc-weak-long-strings-ok")
+print("p17-gc-weak-long-strings-retained-ok")
 "#;
 
 fn read_pipe<R: Read + Send + 'static>(mut pipe: R) -> JoinHandle<io::Result<Vec<u8>>> {
@@ -178,9 +180,9 @@ fn p17_gc_lua54_basic_mode_and_parameters() {
 }
 
 #[test]
-fn p17_gc_weak_long_string_keys_are_collected() {
+fn p17_gc_weak_long_string_keys_are_retained() {
     for profile in ["lua55", "lua54"] {
         let output = run_lua(profile, WEAK_LONG_STRING_SOURCE);
-        assert_output(&output, b"p17-gc-weak-long-strings-ok\n", profile);
+        assert_output(&output, b"p17-gc-weak-long-strings-retained-ok\n", profile);
     }
 }

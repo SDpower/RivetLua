@@ -105,7 +105,7 @@ fn registry_stack_pseudo_index_is_permanent_table_and_globals_are_real() {
             owner
                 .with_vm(|vm| vm.roots().count(RootKind::Registry))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             owner

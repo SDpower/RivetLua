@@ -171,7 +171,7 @@ fn capi_named_subtable_ordinal_and_named_failures() {
         }
         println!("A24_SUBTABLE {profile:?} failed={failed:?} passed={passed:?}");
         // B14 短鍵內嵌後，兩次 canonical key 都不再複製 5-byte payload。
-        assert_eq!(failed.len(), 17);
+        assert_eq!(failed.len(), 18);
         assert_eq!(
             failed.iter().map(|entry| entry.1).collect::<Vec<_>>(),
             vec![
@@ -187,6 +187,7 @@ fn capi_named_subtable_ordinal_and_named_failures() {
                 None,
                 None,
                 None,
+                Some(FailPoint::WorkReserve),
                 Some(FailPoint::StringBytesReserve),
                 Some(FailPoint::SlotReserve),
                 Some(FailPoint::ObjectReserve),

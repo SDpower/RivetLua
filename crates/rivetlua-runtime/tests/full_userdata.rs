@@ -316,7 +316,17 @@ fn allocation_failures() {
                 panic!("{profile:?} ordinal {ordinal}: {error:?}");
             };
             assert_eq!(attempt.ordinal, ordinal);
-            assert_eq!(attempt.domain, AllocationDomain::LuaHeap);
+            let expected_domain = match attempt.point {
+                Some(
+                    FailPoint::UserdataBytesReserve
+                    | FailPoint::UserdataUservaluesReserve
+                    | FailPoint::SlotReserve
+                    | FailPoint::ObjectReserve,
+                ) => AllocationDomain::LuaHeap,
+                Some(FailPoint::MarkReserve) => AllocationDomain::Host,
+                other => panic!("{profile:?} ordinal {ordinal}: 非預期配置點 {other:?}"),
+            };
+            assert_eq!(attempt.domain, expected_domain);
             assert_eq!(snapshot(&vm), before, "{profile:?} ordinal={ordinal}");
             let object = vm.allocate_userdata(17, 3).unwrap();
             assert_eq!(vm.object_kind(object), Ok(ObjectKind::Userdata));

@@ -4,7 +4,7 @@ use rivetlua_compiler::{
 };
 use rivetlua_core::{VerifyLimits, encode_module, verified_module_allocation_bytes};
 
-const WORK: usize = 100_000;
+const WORK: usize = 128 * 1024;
 const TEMPORARY: usize = 1024 * 1024;
 const MODULE: usize = 8 * 1024 * 1024;
 

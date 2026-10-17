@@ -532,10 +532,17 @@ fn ordinal_fault_matrix() {
             domains.contains(&AllocationDomain::Host),
             "action={action}: Host 邊界"
         );
-        assert!(
-            domains.contains(&AllocationDomain::LuaHeap),
-            "action={action}: Lua heap 邊界"
-        );
+        if action == 1 {
+            assert!(
+                !domains.contains(&AllocationDomain::LuaHeap),
+                "action={action}: 已存在子表應重用，不得配置 Lua heap"
+            );
+        } else {
+            assert!(
+                domains.contains(&AllocationDomain::LuaHeap),
+                "action={action}: Lua heap 邊界"
+            );
+        }
     }
 }
 

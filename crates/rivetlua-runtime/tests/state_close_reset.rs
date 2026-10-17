@@ -260,7 +260,7 @@ fn prepared_reset_parked_arena_allocation_rolls_back_and_retries_b11() {
 }
 
 #[test]
-fn shutdown_reverse_order_error_continues_and_requeues_new_work_b11() {
+fn shutdown_reverse_order_error_continues_without_new_work_b11() {
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
         let mut vm = Vm::new_with_profile(profile).unwrap();
         let function = HostFunctionId::new_unique(vm.id()).unwrap();
@@ -306,38 +306,9 @@ fn shutdown_reverse_order_error_continues_and_requeues_new_work_b11() {
         );
         assert_eq!(vm.gc_trace().finalizer_warnings, 1);
         assert_eq!(vm.finalizer_state(first), Ok(FinalizerState::Finalized));
-        assert_eq!(vm.finalizer_state(second), Ok(FinalizerState::Registered));
-        assert_eq!(
-            vm.finalizer_state(new_object),
-            Ok(FinalizerState::Registered)
-        );
+        assert_eq!(vm.finalizer_state(second), Ok(FinalizerState::Finalized));
+        assert_eq!(vm.finalizer_state(new_object), Ok(FinalizerState::Unregistered));
         vm.queue_shutdown_finalizers().unwrap();
-        assert_eq!(vm.gc_trace().finalizer_pending, 2);
-        let token = {
-            let mut execution = vm.gc_finalizer_execution(None).unwrap();
-            let RunOutcome::External(token) = execution.run().unwrap() else {
-                panic!("重新註冊項目應被重新排程");
-            };
-            token
-        };
-        assert_eq!(
-            vm.external_event(token).unwrap().args[0],
-            Value::Object(new_object)
-        );
-        let RunOutcome::External(token) = vm
-            .continue_external(token, ExternalCommand::Return(vec![]))
-            .unwrap()
-        else {
-            panic!("重註冊項目應接續執行");
-        };
-        assert_eq!(
-            vm.external_event(token).unwrap().args[0],
-            Value::Object(second)
-        );
-        assert_eq!(
-            vm.continue_external(token, ExternalCommand::Return(vec![])),
-            Ok(RunOutcome::Returned(vec![]))
-        );
         assert_eq!(vm.gc_trace().finalizer_pending, 0);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
     }

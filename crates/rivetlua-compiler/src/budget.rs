@@ -3569,12 +3569,11 @@ mod tests {
 
             let source = b"return 1e999999999999999999999999";
             let limits = CompileLimits::default();
+            let lexed = crate::lex(source, profile, &limits).unwrap();
             assert!(matches!(
-                crate::lex(source, profile, &limits),
-                Err(Diagnostic {
-                    code: crate::DiagnosticCode::Lex,
-                    ..
-                })
+                lexed.tokens[1].literal.as_ref(),
+                Some(crate::lexer::Literal::Float(rivetlua_core::Number::Float(value)))
+                    if value.is_infinite() && value.is_sign_positive()
             ));
             let mut denied = Probe::unlimited();
             let (base, temporary) = lex_admission::<()>(source.len(), &limits).unwrap();
@@ -3871,7 +3870,7 @@ mod tests {
             ));
 
             for source in [
-                b"goto L; local x=1; ::L::".as_slice(),
+                b"goto L; local x=1; ::L:: return x".as_slice(),
                 b"local x<const> = 1; x=2",
             ] {
                 let mut sink = Probe::unlimited();

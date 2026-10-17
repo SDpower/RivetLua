@@ -79,8 +79,8 @@ fn assert_same_lua_error(
             let second_root = second.root(Value::Object(second_value)).unwrap();
             let first_bytes = first.read_byte_string(&first_root).unwrap();
             let second_bytes = second.read_byte_string(&second_root).unwrap();
-            assert_eq!(first_bytes, b"same failure");
-            assert_eq!(second_bytes, b"same failure");
+            assert_eq!(first_bytes, b"(rivetlua-sdk):1: same failure");
+            assert_eq!(second_bytes, b"(rivetlua-sdk):1: same failure");
             assert_eq!(first_bytes, second_bytes);
         }
         (first_value, second_value) => {

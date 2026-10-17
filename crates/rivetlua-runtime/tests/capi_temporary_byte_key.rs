@@ -81,7 +81,7 @@ fn capi_temporary_byte_key_cleanup_and_rooted_callback() {
                 passed.push(offset);
             }
         }
-        assert_eq!(failed.len(), 4);
+        assert_eq!(failed.len(), 5);
         assert_eq!(
             failed.iter().map(|entry| entry.1).collect::<Vec<_>>(),
             vec![
@@ -89,9 +89,10 @@ fn capi_temporary_byte_key_cleanup_and_rooted_callback() {
                 Some(FailPoint::SlotReserve),
                 Some(FailPoint::ObjectReserve),
                 None,
+                Some(FailPoint::MarkReserve),
             ]
         );
-        assert_eq!(passed, (4..16).collect::<Vec<_>>());
+        assert_eq!(passed, (5..16).collect::<Vec<_>>());
         println!("A20_TEMP_KEY {profile:?} failed={failed:?} passed={passed:?}");
     }
 }
@@ -178,19 +179,21 @@ fn capi_published_byte_key_ordinal_and_named_failures() {
                 &[
                     None,
                     None,
+                    Some(FailPoint::WorkReserve),
                     Some(FailPoint::StringBytesReserve),
                     Some(FailPoint::SlotReserve),
                     Some(FailPoint::ObjectReserve),
                     None,
                     Some(FailPoint::TableHashGrow),
                 ],
-                7,
+                8,
             ),
             (
                 b"fault-key",
                 &[
                     None,
                     None,
+                    Some(FailPoint::WorkReserve),
                     Some(FailPoint::StringBytesReserve),
                     Some(FailPoint::SlotReserve),
                     Some(FailPoint::ObjectReserve),
@@ -199,7 +202,7 @@ fn capi_published_byte_key_ordinal_and_named_failures() {
                     Some(FailPoint::TableKeyReserve),
                     Some(FailPoint::TableHashGrow),
                 ],
-                9,
+                10,
             ),
         ];
         for &(key, expected_points, first_passing) in ordinal_cases {

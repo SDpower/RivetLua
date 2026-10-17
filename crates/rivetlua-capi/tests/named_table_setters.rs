@@ -411,7 +411,14 @@ fn publication_and_immediate_cleanup() {
     assert_eq!(unsafe { lua_gettop(state) }, 2);
     unsafe { lua_settop(state, 1) };
 
-    owner.with_vm(|vm| vm.collect().unwrap()).unwrap();
+    // 回收一個預熱物件，讓空鍵字串重用 slot，帳本斷言仍須完全相等。
+    owner
+        .with_vm(|vm| {
+            let prewarm = vm.allocate_table().unwrap();
+            vm.collect().unwrap();
+            assert_eq!(vm.object_kind(prewarm), Err(VmError::StaleObject));
+        })
+        .unwrap();
     let before = snapshot(&owner);
     owner.push_value(Value::Object(value)).unwrap();
     field(&owner, 1, &name);

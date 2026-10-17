@@ -444,8 +444,9 @@ fn private_lua_fixture_probe_failure_is_atomic_and_retriable_b4() {
                     .iter()
                     .all(|state| *state == SlotState::Free)
             );
-            // B10b2 的 hidden hook bridge 占一個 Registry root；B12 的主 thread 另有 Coroutine root。
-            assert_eq!(before.3, (3, 1));
+            // Registry、emergency error、hook bridge、warning bridge 共四個 Registry root；
+            // B12 的主 thread 另有一個 Coroutine root。
+            assert_eq!(before.3, (4, 1));
             assert_eq!(after.3, before.3, "mode={mode:?} offset={offset}");
             assert_eq!(
                 after.0.lua_heap_bytes,

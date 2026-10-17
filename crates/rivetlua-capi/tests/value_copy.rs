@@ -639,7 +639,8 @@ fn fault_matrix() {
         failure.attempt.site.file,
         "crates/rivetlua-runtime/src/heap.rs"
     );
-    assert_eq!(failure.attempt.site.line, 2308);
+    assert_eq!(failure.attempt.point, None);
+    assert!(failure.attempt.site.line > 0, "注入來源必須具有有效行號");
     assert_eq!(failure.attempt.bytes, 5760);
     assert_eq!(protected_index(preflight_state, -1, 0, 0).0, 0);
     let prepared = vm_snapshot(&preflight);

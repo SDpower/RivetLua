@@ -235,7 +235,19 @@ fn generic_for_fourth_value_keeps_native_debug_cfg_valid() {
             );
             if *name == "minimal" {
                 let root = &ir.prototypes[0];
-                let visible = &root.native_debug.as_ref().unwrap().locals[0];
+                let binding = resolved.functions[0]
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.name.as_slice() == b"x")
+                    .unwrap();
+                let visible = root
+                    .native_debug
+                    .as_ref()
+                    .unwrap()
+                    .locals
+                    .iter()
+                    .find(|local| local.binding == binding.id)
+                    .unwrap();
                 let register = visible.register;
                 let initialized = visible.initialized_pc as usize;
                 let start = visible.start_pc as usize;

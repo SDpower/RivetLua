@@ -1124,9 +1124,7 @@ mod gc_running_tests {
             assert_eq!(vm.gc_mode(), GcMode::Generational);
             vm.stop_automatic_gc();
             let incremental = vm.allocate_byte_string(b"incremental").unwrap();
-            let generational = vm.allocate_byte_string(b"generational").unwrap();
             let _incremental_root = HostHandle::<Value>::new(&mut vm, incremental).unwrap();
-            let _generational_root = HostHandle::<Value>::new(&mut vm, generational).unwrap();
             let roots = vm.roots().total_count();
             let trace = vm.gc_trace();
             let ledger = vm.ledger_snapshot();
@@ -1185,9 +1183,11 @@ mod gc_running_tests {
                 vm.with_byte_string(*old, |bytes| bytes.as_bytes() == b"generational")
                     .unwrap()
             );
+            let generational = *old;
+            let _generational_root = HostHandle::<Value>::new(&mut vm, generational).unwrap();
             drop(ticket);
             assert_eq!(vm.gc_mode(), GcMode::Incremental);
-            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.roots().total_count(), roots + 1);
             assert_eq!(vm.ledger_snapshot().reserved, 0);
 
             let (values, ticket) = execute(
@@ -1207,7 +1207,7 @@ mod gc_running_tests {
             drop(ticket);
             assert_eq!(vm.gc_mode(), GcMode::Generational);
             assert!(!vm.automatic_gc_running());
-            assert_eq!(vm.roots().total_count(), roots);
+            assert_eq!(vm.roots().total_count(), roots + 1);
             assert_eq!(vm.ledger_snapshot().reserved, 0);
         }
     }
@@ -1368,7 +1368,7 @@ mod gc_running_tests {
     }
 
     #[test]
-    fn explicit_collect_reserves_result_before_gc_and_retries_after_mark_failure() {
+    fn explicit_collect_reserves_result_before_gc_and_retries_after_work_failure() {
         for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
             let mut vm = Vm::new_with_profile(profile).unwrap();
             vm.stop_automatic_gc();
@@ -1402,12 +1402,12 @@ mod gc_running_tests {
                 assert!(!vm.automatic_gc_running());
                 assert_eq!(vm.object_kind(victim), Ok(ObjectKind::ByteString));
 
-                vm.inject_failure_once(FailPoint::MarkReserve);
+                vm.inject_failure_once(FailPoint::WorkReserve);
                 assert!(matches!(
                     execute(&mut vm, BasicBuiltin::CollectGarbage, &args, 0),
                     Err(RuntimeError {
                         kind: RuntimeErrorKind::Heap(VmError::InjectedFailure(
-                            FailPoint::MarkReserve
+                            FailPoint::WorkReserve
                         )),
                         ..
                     })

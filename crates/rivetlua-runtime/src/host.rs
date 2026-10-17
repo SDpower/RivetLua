@@ -56,7 +56,8 @@ impl Default for LoadLimits {
             max_encoded_bytes: 4 * 1024 * 1024,
             max_module_allocation_bytes: 8 * 1024 * 1024,
             max_temporary_bytes: 1024 * 1024,
-            max_work_units: 100_000,
+            // Lua 5.5 的獨立 global 名稱預付後，短來源仍須能在預設額度內編譯。
+            max_work_units: 128 * 1024,
             max_reader_chunks: 256,
             max_path_candidates: 256,
         }

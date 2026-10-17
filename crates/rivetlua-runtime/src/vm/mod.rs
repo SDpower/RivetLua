@@ -29852,17 +29852,30 @@ mod tests {
             })
         ));
         let pc = execution.frame.pc;
-        assert!(matches!(
-            execution.debug_builtin(
-                DebugBuiltin::GetUpvalue,
-                &[Value::Object(open_function), Value::Integer(1)],
-                Register(0),
-                ResultMode::Fixed(2),
-                false,
-                pc,
+        let actual = execution.debug_builtin(
+            DebugBuiltin::GetUpvalue,
+            &[Value::Object(open_function), Value::Integer(1)],
+            Register(0),
+            ResultMode::Fixed(2),
+            false,
+            pc,
+        );
+        let actual_tag = match &actual {
+            Ok(RegularCallAction::Entered) => "Ok(Entered)",
+            Ok(RegularCallAction::Aborted) => "Ok(Aborted)",
+            Ok(RegularCallAction::Completed(DispatchResult::Continue)) => "Ok(Completed(Continue))",
+            Ok(RegularCallAction::Completed(DispatchResult::Aborted)) => "Ok(Completed(Aborted))",
+            Ok(RegularCallAction::Completed(_)) => "Ok(Completed(other))",
+            Err(_) => "Err",
+        };
+        assert!(
+            matches!(
+                &actual,
+                Ok(RegularCallAction::Completed(DispatchResult::Continue))
             ),
-            Ok(RegularCallAction::Completed(DispatchResult::Continue)),
-        ));
+            "debug.getupvalue 實際結果：{actual_tag}，錯誤：{:?}",
+            actual.as_ref().err().map(|error| &error.kind)
+        );
         assert_eq!(
             execution.frame.read(Register(1)).unwrap(),
             Value::Object(environment)
@@ -30125,7 +30138,7 @@ mod tests {
     }
 
     #[test]
-    fn p13_a_recursive_builtin_exhausts_fuel_and_clears_roots() {
+    fn p13_a_tostring_callback_zero_fuel_aborts_and_clears_roots() {
         let mut vm = Vm::new().unwrap();
         let table = vm.allocate_table().unwrap();
         let metatable = vm.allocate_table().unwrap();
@@ -30143,7 +30156,7 @@ mod tests {
                 vec![],
             ))
             .unwrap();
-        execution.set_fuel(3).unwrap();
+        execution.set_fuel(0).unwrap();
         let action = execution
             .basic_builtin(
                 BasicBuiltin::ToString,
@@ -30856,8 +30869,9 @@ mod tests {
         };
         assert_eq!(error.kind, RuntimeErrorKind::Thrown);
         assert_eq!(error.value, Value::Object(target));
+        assert!(execution.faulting_native_call.is_some());
         assert!(execution.pending_ops.is_empty());
-        assert_eq!(execution.vm.roots().total_count(), baseline);
+        assert_eq!(execution.vm.roots().total_count(), baseline + 1);
         execution.vm.inject_failure_once(FailPoint::WorkReserve);
         let Err(error) = execution.invoke_event(
             PendingKind::Value,
@@ -30877,7 +30891,7 @@ mod tests {
             RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::WorkReserve))
         );
         assert!(execution.pending_ops.is_empty());
-        assert_eq!(execution.vm.roots().total_count(), baseline);
+        assert_eq!(execution.vm.roots().total_count(), baseline + 1);
         drop(execution);
         drop(target_root);
         drop(env_root);
@@ -30905,7 +30919,7 @@ mod tests {
         }
         drop(host);
         vm.collect().unwrap();
-        assert_eq!(vm.roots().total_count(), 0);
+        assert_eq!(vm.roots().total_count(), 1);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
     }
 
@@ -30966,7 +30980,7 @@ mod tests {
         execution.finish().unwrap();
         drop(host);
         execution.vm.collect().unwrap();
-        assert_eq!(execution.vm.roots().total_count(), 0);
+        assert_eq!(execution.vm.roots().total_count(), 1);
         assert_eq!(execution.vm.ledger_snapshot().reserved, 0);
     }
 
@@ -31010,7 +31024,7 @@ mod tests {
                         RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::ReturnReserve))
                     );
                     drop(execution);
-                    assert_eq!(vm.roots().total_count(), 1);
+                    assert_eq!(vm.roots().total_count(), 2);
                     assert_eq!(vm.ledger_snapshot().reserved, 0);
                     drop(host);
                     vm.collect().unwrap();
@@ -31287,7 +31301,7 @@ mod tests {
                         RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::ReturnReserve))
                     );
                     drop(execution);
-                    assert_eq!(vm.roots().total_count(), 1);
+                    assert_eq!(vm.roots().total_count(), 2);
                     assert_eq!(vm.ledger_snapshot().reserved, 0);
                     drop(env_root);
                     vm.collect().unwrap();
@@ -31364,7 +31378,7 @@ mod tests {
         drop(co_root);
         drop(env_root);
         vm.collect().unwrap();
-        assert_eq!(vm.roots().total_count(), 0);
+        assert_eq!(vm.roots().total_count(), 1);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
     }
 
@@ -33398,7 +33412,7 @@ mod tests {
                 .kind,
             RuntimeErrorKind::Heap(VmError::WrongObjectType)
         );
-        for _ in 0..8 {
+        for _ in 0..16 {
             vm.allocate(Value::Nil).unwrap();
         }
         vm.collect().unwrap();
@@ -34122,7 +34136,7 @@ mod tests {
             vm.ledger_snapshot().host_allocation_bytes >= before.host_allocation_bytes + retained
         );
         vm.remove_root(root).unwrap();
-        vm.collect().unwrap();
+        vm.collect_major().unwrap();
         assert_eq!(vm.ledger_snapshot().reserved, 0);
         assert_eq!(
             vm.ledger_snapshot().host_allocation_bytes,
@@ -34670,7 +34684,7 @@ mod tests {
         vm.remove_root(root).unwrap();
         assert_eq!(vm.roots().count(RootKind::Host), 1);
         drop(error);
-        assert_eq!(vm.collect().unwrap(), 5);
+        assert_eq!(vm.collect().unwrap(), 4);
         assert_eq!(vm.roots().total_count(), 0);
     }
 
@@ -37194,7 +37208,11 @@ mod tests {
                 ],
             ),
         ] {
-            let mut vm = Vm::new().unwrap();
+            let mut vm = Vm::new_with_profile(match profile {
+                LanguageProfile::Lua54 => LuaProfile::Lua54,
+                LanguageProfile::Lua55 => LuaProfile::Lua55,
+            })
+            .unwrap();
             for (source, bytes) in [
                 b"return 1.2345678901234567 .. 'x'".as_slice(),
                 b"return 1e20 .. 'x'",

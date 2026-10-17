@@ -148,10 +148,10 @@ fn gc_control_allocation_failure_rolls_back_and_retries_b8() {
         let mut vm = Vm::new_with_profile(profile).unwrap();
         let held = vm.allocate_table().unwrap();
         vm.add_root(RootKind::Host, held).unwrap();
-        vm.inject_failure_once(FailPoint::MarkReserve);
+        vm.inject_failure_once(FailPoint::WorkReserve);
         assert_eq!(
             vm.gc_control(GcControl::Collect),
-            Err(VmError::InjectedFailure(FailPoint::MarkReserve))
+            Err(VmError::InjectedFailure(FailPoint::WorkReserve))
         );
         assert_eq!(vm.gc_trace().phase, GcPhase::Pause);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
