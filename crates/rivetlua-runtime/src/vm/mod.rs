@@ -14295,7 +14295,10 @@ impl Execution<'_> {
         if proto.upvalues.get(index).is_none() {
             return Ok(false);
         }
-        Ok(self.vm.with_closure(function, |closure| closure.upvalue(index))? == Some(cell))
+        Ok(self
+            .vm
+            .with_closure(function, |closure| closure.upvalue(index))?
+            == Some(cell))
     }
 
     fn debug_upvalue_slot(

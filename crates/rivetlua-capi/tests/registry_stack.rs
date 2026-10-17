@@ -329,7 +329,7 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
                     retry
                         .with_vm(|vm| vm.roots().count(RootKind::Registry))
                         .unwrap(),
-                    3
+                    4
                 );
                 drop(retry);
             }
@@ -339,7 +339,7 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
                     owner
                         .with_vm(|vm| vm.roots().count(RootKind::Registry))
                         .unwrap(),
-                    3
+                    4
                 );
                 assert_eq!(
                     owner

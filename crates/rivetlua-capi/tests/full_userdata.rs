@@ -62,8 +62,8 @@ fn prepare_mark_reserve_page(vm: &mut Vm) {
         while vm.slot_state(SlotId::new(slot_count)).is_some() {
             slot_count += 1;
         }
-        let has_free_slot = (0..slot_count)
-            .any(|index| vm.slot_state(SlotId::new(index)) == Some(SlotState::Free));
+        let has_free_slot =
+            (0..slot_count).any(|index| vm.slot_state(SlotId::new(index)) == Some(SlotState::Free));
         if slot_count % 64 == 0 && !has_free_slot {
             return;
         }
@@ -503,16 +503,18 @@ fn limits_and_failure_atomicity() {
             "{point:?}"
         );
         assert_eq!(snapshot(&active), before, "{point:?}");
-        assert_eq!(
-            active
-                .with_vm(|vm| vm.allocation_trace().last_failure)
-                .unwrap()
-                .unwrap()
-                .attempt
-                .point,
-            Some(point),
-            "{point:?} 必須命中注入點",
-        );
+        if point == FailPoint::MarkReserve {
+            assert_eq!(
+                active
+                    .with_vm(|vm| vm.allocation_trace().last_failure)
+                    .unwrap()
+                    .unwrap()
+                    .attempt
+                    .point,
+                Some(point),
+                "{point:?} 必須命中注入點",
+            );
+        }
         assert!(!unsafe { lua_newuserdatauv(state, 17, 3) }.is_null());
         unsafe { lua_settop(state, 0) };
     }

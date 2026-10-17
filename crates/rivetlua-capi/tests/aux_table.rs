@@ -552,8 +552,8 @@ fn prepare_mark_reserve_page(vm: &mut Vm) {
         while vm.slot_state(SlotId::new(slot_count)).is_some() {
             slot_count += 1;
         }
-        let has_free_slot = (0..slot_count)
-            .any(|index| vm.slot_state(SlotId::new(index)) == Some(SlotState::Free));
+        let has_free_slot =
+            (0..slot_count).any(|index| vm.slot_state(SlotId::new(index)) == Some(SlotState::Free));
         if slot_count % 64 == 0 && !has_free_slot {
             return;
         }

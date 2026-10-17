@@ -595,10 +595,7 @@ fn check_fault_prefix(
         FaultOperation::CopyObjectReal | FaultOperation::CopyRegistrySource => &[roots_site],
     };
     assert_eq!(
-        failures
-            .iter()
-            .map(|entry| entry.2)
-            .collect::<Vec<_>>(),
+        failures.iter().map(|entry| entry.2).collect::<Vec<_>>(),
         expected_sites,
         "{operation:?}: trace 必須對應完整 root／capacity 配置前綴"
     );

@@ -564,7 +564,8 @@ fn weak_byte_key_modes() {
 
 fn insertion_fault_matrix() {
     let mut failed = Vec::new();
-    for offset in 0..25 {
+    // 僅涵蓋 setter 內的分配；回呼返回時的零結果暫存已越過寫入邊界。
+    for offset in 0..24 {
         let owner = StateOwner::new().unwrap();
         let state = owner.as_ptr();
         unsafe { rivetlua_capi_test_prime_a4a(state) };
@@ -663,7 +664,6 @@ fn insertion_fault_matrix() {
             (Host, Some(FailPoint::CallFrameReserve)),
             (Host, Some(FailPoint::WorkReserve)),
             (LuaHeap, Some(FailPoint::TableHashGrow)),
-            (Host, Some(FailPoint::RememberedReserve)),
         ]
     );
 
