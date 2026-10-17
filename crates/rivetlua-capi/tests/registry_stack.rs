@@ -362,6 +362,9 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
     const HEAP: &str = "crates/rivetlua-runtime/src/heap.rs";
     const TABLE: &str = "crates/rivetlua-runtime/src/table.rs";
     const ROOTS: &str = "crates/rivetlua-runtime/src/roots.rs";
+    // IndirectPayload::<Coroutine> 依 size_of::<Coroutine>() 計費；CI33 各平台實測為 3336 bytes。
+    // GcSlotBits 由四個 u64 組成；MarkReserve 每次配置一頁。
+    let mark_page_bytes = 4 * std::mem::size_of::<u64>();
     // StateGroup 帳款依 RefCell 與 Rc 計數器的目前布局計算。
     let (group_bytes, refcell_group_bytes, refcell_group_align, state_allocation_bytes) =
         StateOwner::allocation_component_sizes();
@@ -400,6 +403,12 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
             AllocationDomain::LuaHeap,
             256,
             Some(FailPoint::ObjectReserve),
+            HEAP,
+        ),
+        (
+            AllocationDomain::Host,
+            mark_page_bytes,
+            Some(FailPoint::MarkReserve),
             HEAP,
         ),
         (AllocationDomain::Host, 208, None, ROOTS),
@@ -446,6 +455,13 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         (AllocationDomain::Host, 120, None, ROOTS),
         (AllocationDomain::Host, 18, None, HEAP),
         (AllocationDomain::Host, 216, None, HEAP),
+        // 17 bytes 的緊急錯誤字串首次建立短字串索引，先配置 16 個 bucket。
+        (
+            AllocationDomain::Host,
+            768,
+            Some(FailPoint::WorkReserve),
+            HEAP,
+        ),
         (
             AllocationDomain::LuaHeap,
             17,
@@ -465,10 +481,10 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
             HEAP,
         ),
         (AllocationDomain::Host, 120, None, ROOTS),
-        // Coroutine 現含暫停執行與 host attachment，main thread payload 依目前布局計費。
+        // Coroutine payload 由 IndirectPayload 依目前型別大小計費。
         (
             AllocationDomain::LuaHeap,
-            3232,
+            3336,
             Some(FailPoint::ObjectReserve),
             HEAP,
         ),
@@ -486,52 +502,46 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         ),
         (AllocationDomain::Host, 208, None, ROOTS),
     ]);
-    #[cfg(feature = "lua54")]
-    expected.push((
-        AllocationDomain::LuaHeap,
-        160,
-        Some(FailPoint::TableArrayGrow),
-        TABLE,
-    ));
     // B12 的 main coroutine 專用 root 在 registry 陣列邊發布後建立。
     expected.push((AllocationDomain::Host, 120, None, ROOTS));
-    // B10b2 建構時預先建立且 Registry-rooted 的 hidden CClosure：nil capture、
-    // closure object、暫存 Host root 及永久 Registry root 均有精確配置序列。
-    expected.extend([
-        (
-            AllocationDomain::LuaHeap,
-            136,
-            Some(FailPoint::SlotReserve),
-            HEAP,
-        ),
-        (
-            AllocationDomain::LuaHeap,
-            256,
-            Some(FailPoint::ObjectReserve),
-            HEAP,
-        ),
-        (AllocationDomain::Host, 120, None, ROOTS),
-        (
-            AllocationDomain::LuaHeap,
-            32,
-            Some(FailPoint::ClosureCapturesReserve),
-            "crates/rivetlua-runtime/src/closure.rs",
-        ),
-        (
-            AllocationDomain::LuaHeap,
-            136,
-            Some(FailPoint::SlotReserve),
-            HEAP,
-        ),
-        (
-            AllocationDomain::LuaHeap,
-            256,
-            Some(FailPoint::ObjectReserve),
-            HEAP,
-        ),
-        (AllocationDomain::Host, 208, None, ROOTS),
-        (AllocationDomain::Host, 120, None, ROOTS),
-    ]);
+    // 建構時預先建立並以 Registry 持有的 hook / warning CClosure，各自保留精確配置序列。
+    for _ in 0..2 {
+        expected.extend([
+            (
+                AllocationDomain::LuaHeap,
+                136,
+                Some(FailPoint::SlotReserve),
+                HEAP,
+            ),
+            (
+                AllocationDomain::LuaHeap,
+                256,
+                Some(FailPoint::ObjectReserve),
+                HEAP,
+            ),
+            (AllocationDomain::Host, 120, None, ROOTS),
+            (
+                AllocationDomain::LuaHeap,
+                32,
+                Some(FailPoint::ClosureCapturesReserve),
+                "crates/rivetlua-runtime/src/closure.rs",
+            ),
+            (
+                AllocationDomain::LuaHeap,
+                136,
+                Some(FailPoint::SlotReserve),
+                HEAP,
+            ),
+            (
+                AllocationDomain::LuaHeap,
+                256,
+                Some(FailPoint::ObjectReserve),
+                HEAP,
+            ),
+            (AllocationDomain::Host, 208, None, ROOTS),
+            (AllocationDomain::Host, 120, None, ROOTS),
+        ]);
+    }
     expected.push((AllocationDomain::Host, state_allocation_bytes, None, HEAP));
     let expected: Vec<_> = expected
         .into_iter()
@@ -539,7 +549,10 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         .map(|(ordinal, (domain, bytes, point, site))| (ordinal as u64, domain, bytes, point, site))
         .collect();
     assert_eq!(failures, expected);
-    assert_eq!(successes, (34..46).collect::<Vec<_>>());
+    #[cfg(feature = "lua54")]
+    assert_eq!(successes, (43..46).collect::<Vec<_>>());
+    #[cfg(feature = "lua55")]
+    assert_eq!(successes, (44..46).collect::<Vec<_>>());
 }
 
 fn registry_stack_constructor_active_gc_publishes_live_tables() {

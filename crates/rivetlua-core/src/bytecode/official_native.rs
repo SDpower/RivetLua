@@ -4886,13 +4886,9 @@ fn temporary_call_layouts(
                     || register == usize::from(proto.frame.environment.0)
                     || register == usize::from(proto.global_environment.0)
                     || register == usize::from(base.0)
-                    || (pending
+                    || pending
                         .iter()
                         .any(|entry| usize::from(entry.register.0) == register)
-                        && !(span[register].0 <= pc
-                            && pc + 1 < span[register].1
-                            && live_at_pc(span, protected, live_at, register, pc)
-                            && live_at_pc(span, protected, live_at, register, pc + 1)))
             };
             let scan_work = span
                 .len()
@@ -4927,8 +4923,7 @@ fn temporary_call_layouts(
             if live_start < live_end {
                 work_charge(work, storage.len(), proto.id, pc)?;
                 for local in storage {
-                    if (local.start_pc as usize) >= live_end
-                        || live_start >= local.end_pc as usize
+                    if (local.start_pc as usize) >= live_end || live_start >= local.end_pc as usize
                     {
                         continue;
                     }
@@ -4992,7 +4987,6 @@ fn temporary_call_layouts(
                 0
             };
             if !in_backedge {
-                // 跨 Call 的 pending 也須有不受開放結果覆寫的穩定 home。
                 local_floor
                     .checked_add(current)
                     .and_then(|frontier| frontier.checked_sub(active))
@@ -5135,12 +5129,14 @@ fn temporary_call_layouts(
                 } => Some((usize::from(base.0), usize::from(results))),
                 _ => None,
             };
+            // Fixed(0) 不寫回 callee；若舊值在 Call 後仍存活，須保留低槽。
+            let preserves_callee = fixed_results.is_some_and(|(_, results)| results == 0);
             let crosses_call = |register: usize, range: &(usize, usize)| {
                 let (start, end) = *range;
                 mapped[register] == u8::MAX
                     && register != usize::from(proto.frame.environment.0)
                     && register != usize::from(proto.global_environment.0)
-                    && register != usize::from(base.0)
+                    && (register != usize::from(base.0) || preserves_callee)
                     && !fixed_results
                         .is_some_and(|(first, count)| register >= first && register - first < count)
                     && !pending
@@ -5230,9 +5226,7 @@ fn temporary_call_layouts(
                 let active_birth = active_local_frontier(birth)?;
                 let mut birth_floor = active_birth;
                 for local in storage {
-                    if (local.start_pc as usize) >= range.1
-                        || range.0 >= local.end_pc as usize
-                    {
+                    if (local.start_pc as usize) >= range.1 || range.0 >= local.end_pc as usize {
                         continue;
                     }
                     let home =
@@ -5247,7 +5241,7 @@ fn temporary_call_layouts(
                         mapped[*other] == u8::MAX
                             && *other != usize::from(proto.frame.environment.0)
                             && *other != usize::from(proto.global_environment.0)
-                            && *other != usize::from(base.0)
+                            && (*other != usize::from(base.0) || preserves_callee)
                             && !pending
                                 .iter()
                                 .any(|entry| usize::from(entry.register.0) == *other)
@@ -7214,6 +7208,8 @@ fn compact_register_map(
                 }
             }
         }
+        #[cfg(feature = "std")]
+        let mut first_reject = [None::<(u8, usize)>; 255];
         let mut candidate_ok = |candidate_register: usize,
                                 candidate_start: usize,
                                 candidate_end: usize,
@@ -7221,9 +7217,18 @@ fn compact_register_map(
                                 check_prior: bool,
                                 work: &mut OfficialWorkBudget|
          -> Result<bool, OfficialExportError> {
+            macro_rules! reject {
+                ($reason:expr, $at:expr) => {{
+                    #[cfg(feature = "std")]
+                    if candidate_register == register && check_prior {
+                        first_reject[usize::from(slot)].get_or_insert(($reason, $at));
+                    }
+                    return Ok(false);
+                }};
+            }
             work_charge(work, 1, proto.id, candidate_start)?;
             if slot >= fixed.max(tuple_end) && slot < temp_base {
-                return Ok(false);
+                reject!(1, candidate_start);
             }
             if slot >= tuple_base && slot < tuple_end {
                 work_charge(work, numeric.len(), proto.id, candidate_start)?;
@@ -7234,7 +7239,7 @@ fn compact_register_map(
                         && candidate_start <= pair.next_pc
                         && pair.prepare_pc < candidate_end
                 }) {
-                    return Ok(false);
+                    reject!(2, candidate_start);
                 }
             }
             work_charge(work, aliases.len(), proto.id, candidate_start)?;
@@ -7244,7 +7249,7 @@ fn compact_register_map(
                     && u16::from(alias.tuple) <= slot
                     && slot <= u16::from(alias.tuple) + u16::from(alias.width)
             }) {
-                return Ok(false);
+                reject!(3, candidate_start);
             }
             let (call_first, call_end) = call_layout_range(
                 &call_layouts,
@@ -7285,7 +7290,7 @@ fn compact_register_map(
                             .iter()
                             .any(|entry| usize::from(entry.register.0) == candidate_register)
                     {
-                        return Ok(false);
+                        reject!(4, call.pc);
                     }
                 }
                 let open_all_base = if call.open_chain {
@@ -7331,7 +7336,7 @@ fn compact_register_map(
                     && (survives || protected[candidate_register] != 0)
                     && !dead_open
                 {
-                    return Ok(false);
+                    reject!(5, call.pc);
                 }
                 if !call.open_chain && call.first_slot <= slot && slot < call.call_base {
                     let call_pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
@@ -7353,7 +7358,7 @@ fn compact_register_map(
                             && temporary.ordinal == ordinal
                     });
                     if !own && protected[candidate_register] != 0 {
-                        return Ok(false);
+                        reject!(6, call.pc);
                     }
                 }
                 if !(call.window_start <= slot && slot < call.window_end) {
@@ -7410,7 +7415,7 @@ fn compact_register_map(
                     result_mode,
                 } = proto.instructions[call.pc].instruction
                 else {
-                    return Ok(false);
+                    reject!(7, call.pc);
                 };
                 let relative = candidate_register.checked_sub(usize::from(base.0));
                 let is_result = match result_mode {
@@ -7428,7 +7433,7 @@ fn compact_register_map(
                     && !survives
                     && protected[candidate_register] == 0;
                 if !is_result && !dying_input && !(dead_open && slot >= call.call_base) {
-                    return Ok(false);
+                    reject!(8, call.pc);
                 }
             }
             let env_alias = env_cache_eligible
@@ -7464,7 +7469,7 @@ fn compact_register_map(
                             work,
                         )?
                     {
-                        return Ok(false);
+                        reject!(9, candidate_start);
                     }
                     owner = owner_next[owner];
                 }
@@ -7488,7 +7493,7 @@ fn compact_register_map(
                     continue;
                 }
                 if protected[candidate_register] != 0 {
-                    return Ok(false);
+                    reject!(10, candidate_start);
                 }
                 let overlap_start = candidate_start.max(fixed_start);
                 let overlap_end = candidate_end.min(fixed_end);
@@ -7515,7 +7520,7 @@ fn compact_register_map(
                         )?
                         || live_at_pc(&span, &protected, &live_at, candidate_register, pc)
                     {
-                        return Ok(false);
+                        reject!(11, pc);
                     }
                 }
             }
@@ -7673,6 +7678,82 @@ fn compact_register_map(
             high = high.max(new_slot + 1);
         }
         let slot = chosen.ok_or_else(|| {
+            #[cfg(feature = "std")]
+            {
+                std::eprintln!(
+                    "native slot failure proto={} reg={} span={start}..{end} floor={floor} fixed={fixed} tuple_end={tuple_end} temp_base={temp_base} high={high}",
+                    proto.id.0,
+                    register,
+                );
+                for call in call_layouts
+                    .iter()
+                    .filter(|call| start <= call.pc && call.pc < end)
+                {
+                    let call_pc = InstructionOffset(call.pc as u32);
+                    let pending = module
+                        .native_debug()
+                        .and_then(|debug| debug.temporaries_at(proto.id, call_pc))
+                        .unwrap_or(&[]);
+                    let ordinal = pending
+                        .iter()
+                        .find(|item| usize::from(item.register.0) == register)
+                        .map(|item| item.ordinal);
+                    std::eprintln!(
+                        "  call pc={} first={} base={} window={}..{} open={} live={}/{} pending={ordinal:?} own_slot={:?}",
+                        call.pc,
+                        call.first_slot,
+                        call.call_base,
+                        call.window_start,
+                        call.window_end,
+                        call.open_chain,
+                        live_at_pc(&span, &protected, &live_at, register, call.pc),
+                        live_at_pc(&span, &protected, &live_at, register, call.pc + 1),
+                        ordinal
+                            .and_then(|n| n.checked_sub(1))
+                            .and_then(|n| call.first_slot.checked_add(n)),
+                    );
+                }
+                let mut at = usize::from(floor);
+                while at < first_reject.len() {
+                    let reason = first_reject[at];
+                    let mut next = at + 1;
+                    while next < first_reject.len() && first_reject[next] == reason {
+                        next += 1;
+                    }
+                    std::eprintln!("  slot {at}..{next}: first_reject={reason:?}");
+                    at = next;
+                }
+                let prefix_end = call_layouts
+                    .iter()
+                    .filter(|call| start <= call.pc && call.pc < end)
+                    .map(|call| usize::from(call.call_base))
+                    .max()
+                    .unwrap_or(0)
+                    .min(255);
+                for slot in 0..prefix_end {
+                    let fixed = &fixed_intervals
+                        [fixed_boundaries[slot]..fixed_boundaries[slot + 1]];
+                    let overlapping = fixed
+                        .iter()
+                        .filter(|(_, fixed_start, fixed_end)| {
+                            *fixed_start < end && start < *fixed_end
+                        })
+                        .count();
+                    let mut owner = slot_head[slot];
+                    let mut owner_count = 0usize;
+                    let mut first_owner = None;
+                    while owner != usize::MAX && owner_count < count {
+                        owner_count += 1;
+                        first_owner.get_or_insert(owner);
+                        owner = owner_next[owner];
+                    }
+                    if overlapping != 0 || owner_count != 0 {
+                        std::eprintln!(
+                            "  low_slot={slot} fixed_intervals={overlapping} owners={owner_count} first_owner={first_owner:?}"
+                        );
+                    }
+                }
+            }
             error(
                 OfficialExportErrorKind::LimitExceeded,
                 proto.id,
@@ -15170,6 +15251,122 @@ mod tests {
             }
         }
         assert_eq!(slots, [Some(22), Some(11), None]);
+    }
+
+    #[test]
+    fn fixed_zero_result_call_preserves_live_callee_below_window() {
+        use crate::bytecode::{
+            BytecodeBindingId, BytecodeModule, BytecodeSpan, ConstId, FrameLayout,
+            NativeDebugCandidate, RVLU_NUMERIC_I64_F64, RVLU_V2, VerifyLimits, encode_module,
+        };
+
+        let span = BytecodeSpan {
+            start_byte: 0,
+            end_byte: 1,
+        };
+        let binding = BytecodeBindingId {
+            function: 0,
+            ordinal: 0,
+        };
+        let check = |result_mode| {
+            let instructions = [
+                Instruction::LoadConst {
+                    dest: Register(2),
+                    constant: ConstId(0),
+                },
+                Instruction::Call {
+                    base: Register(2),
+                    arg_count: 0,
+                    result_mode,
+                },
+                Instruction::Return {
+                    base: Register(2),
+                    result_mode: ResultMode::Fixed(1),
+                },
+            ]
+            .into_iter()
+            .map(|instruction| BytecodeInstruction {
+                instruction,
+                span,
+                close_path: None,
+            })
+            .collect();
+            let raw = BytecodeModule {
+                format_version: RVLU_V2,
+                profile: LuaProfile::Lua55,
+                numeric_config: RVLU_NUMERIC_I64_F64,
+                span,
+                function_prototypes: vec![(0, ProtoId(0))],
+                prototypes: vec![BytecodePrototype {
+                    id: ProtoId(0),
+                    function: 0,
+                    parent: None,
+                    span,
+                    register_count: 3,
+                    parameter_count: 0,
+                    is_variadic: false,
+                    named_vararg: None,
+                    frame: FrameLayout {
+                        register_limit: 3,
+                        initial_top: Register(3),
+                        dynamic_top: Register(3),
+                        return_base: Register(0),
+                        environment: Register(1),
+                        environment_source: EnvironmentSource::RootExternal,
+                        registers_start_as_nil: true,
+                    },
+                    global_environment: Register(1),
+                    global_environment_binding: binding,
+                    binding_registers: vec![(binding, Register(1))],
+                    constants: vec![BytecodeConstant::Integer(1)],
+                    upvalues: vec![],
+                    instructions,
+                    close_paths: vec![],
+                }],
+            };
+            let debug = NativeDebugCandidate {
+                source_name: b"@fixed-zero-callee.lua".to_vec(),
+                prototypes: vec![NativePrototypeDebug {
+                    prototype: ProtoId(0),
+                    line_defined: 0,
+                    last_line_defined: 0,
+                    lines: vec![1; 3],
+                    locals: vec![],
+                    upvalue_names: vec![],
+                    max_active_locals: 0,
+                }],
+                temporaries: vec![],
+                initializer_temporaries: vec![],
+                non_counted_pcs: vec![],
+            };
+            let limits = VerifyLimits::default();
+            let mut work = OfficialWorkBudget::new(u64::MAX);
+            let encoded = encode_module(raw, LuaProfile::Lua55, &limits)
+                .unwrap()
+                .with_native_debug(debug, &limits, &mut work)
+                .unwrap();
+            let module = encoded.verified();
+            let proto = &module.module().prototypes[0];
+            let spans = [(usize::MAX, 0), (usize::MAX, 0), (0, 3)];
+            let live_at = [LiveRow::Uncomputed, LiveRow::Uncomputed, LiveRow::Uncomputed];
+            let calls = temporary_call_layouts(
+                module,
+                proto,
+                None,
+                &[],
+                None,
+                &[u8::MAX; 3],
+                &spans,
+                &[0; 3],
+                &live_at,
+                &mut work,
+            )
+            .unwrap();
+            assert_eq!(calls.len(), 1);
+            calls[0].first_slot
+        };
+        assert_eq!(check(ResultMode::Fixed(0)), 1);
+        assert_eq!(check(ResultMode::Fixed(1)), 0);
     }
 
     #[test]

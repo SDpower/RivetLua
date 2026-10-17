@@ -775,30 +775,36 @@ fn replacement_delete_noop_fault_matrix() {
                 }
             );
         }
-        assert_eq!(attempts, 19, "action={action}");
-        assert_eq!(
-            failed.iter().map(|(_, point)| *point).collect::<Vec<_>>(),
-            vec![
-                None,
-                None,
+        assert_eq!(attempts, if action == 2 { 19 } else { 16 }, "action={action}");
+        let mut expected = vec![None, None];
+        // action 0/1 已持有同名短字串；action 2 首次建立它，須多三筆物件配置。
+        if action == 2 {
+            expected.extend([
                 Some(FailPoint::StringBytesReserve),
                 Some(FailPoint::SlotReserve),
                 Some(FailPoint::ObjectReserve),
-                None,
-                None,
-                Some(FailPoint::WorkReserve),
-                Some(FailPoint::WorkReserve),
-                None,
-                None,
-                Some(FailPoint::FrameRegistersReserve),
-                Some(FailPoint::FrameRootsReserve),
-                Some(FailPoint::FrameRegistersReserve),
-                Some(FailPoint::FrameRootsReserve),
-                None,
-                None,
-                Some(FailPoint::CallFrameReserve),
-                Some(FailPoint::WorkReserve),
-            ]
+            ]);
+        }
+        expected.extend([
+            None,
+            None,
+            Some(FailPoint::WorkReserve),
+            Some(FailPoint::WorkReserve),
+            None,
+            None,
+            Some(FailPoint::FrameRegistersReserve),
+            Some(FailPoint::FrameRootsReserve),
+            Some(FailPoint::FrameRegistersReserve),
+            Some(FailPoint::FrameRootsReserve),
+            None,
+            None,
+            Some(FailPoint::CallFrameReserve),
+            Some(FailPoint::WorkReserve),
+        ]);
+        assert_eq!(
+            failed.iter().map(|(_, point)| *point).collect::<Vec<_>>(),
+            expected,
+            "action={action}"
         );
     }
 }
