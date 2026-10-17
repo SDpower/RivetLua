@@ -596,15 +596,16 @@ fn insertion_fault_matrix() {
             assert_eq!(unsafe { lua_gettop(state) }, 2);
             assert_eq!(snapshot(&owner).2, before.2);
             assert_eq!(unsafe { lua_type(state, -1) }, 5);
+            let failure = owner
+                .with_vm(|vm| vm.allocation_trace().last_failure.unwrap())
+                .unwrap();
             assert_eq!(
                 owner
                     .with_vm(|vm| vm.with_table(table, |stored| stored.is_empty()))
                     .unwrap(),
-                Ok(true)
+                Ok(true),
+                "offset={offset}; start={start}; failure={failure:?}"
             );
-            let failure = owner
-                .with_vm(|vm| vm.allocation_trace().last_failure.unwrap())
-                .unwrap();
             assert_eq!(failure.attempt.ordinal, start + offset);
             failed.push((
                 offset,

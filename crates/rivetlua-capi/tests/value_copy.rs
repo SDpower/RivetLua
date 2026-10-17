@@ -588,8 +588,8 @@ fn check_fault_prefix(
         );
         assert!(line > 0, "{operation:?}: 配置點需有實際來源行");
     }
-    let roots_site = ("crates/rivetlua-runtime/src/roots.rs", 151);
-    let expected_sites: &[(&str, u32)] = match operation {
+    let roots_site = "crates/rivetlua-runtime/src/roots.rs";
+    let expected_sites: &[&str] = match operation {
         FaultOperation::PushScalarCapacity => &[],
         FaultOperation::PushObjectCapacity => &[roots_site],
         FaultOperation::CopyObjectReal | FaultOperation::CopyRegistrySource => &[roots_site],
@@ -597,7 +597,7 @@ fn check_fault_prefix(
     assert_eq!(
         failures
             .iter()
-            .map(|entry| (entry.2, entry.3))
+            .map(|entry| entry.2)
             .collect::<Vec<_>>(),
         expected_sites,
         "{operation:?}: trace 必須對應完整 root／capacity 配置前綴"

@@ -10,7 +10,7 @@ type Snapshot = (LedgerSnapshot, GcTrace, Roots, Vec<Option<SlotState>>);
 fn snapshot(vm: &Vm) -> Snapshot {
     let mut roots = Vec::new();
     vm.visit_roots(|kind, id, object| roots.push((kind, id, object)));
-    let slots = (0..64)
+    let slots = (0..=64)
         .map(|index| vm.slot_state(SlotId::new(index)))
         .collect();
     (vm.ledger_snapshot(), vm.gc_trace(), roots, slots)
@@ -361,6 +361,15 @@ fn allocation_failures() {
             vm.set_gc_debt_threshold(usize::MAX);
             let anchor = vm.allocate_table().unwrap();
             let _root = vm.add_root(RootKind::Host, anchor).unwrap();
+            if point == FailPoint::MarkReserve {
+                // MarkReserve 只在新增 64-slot GC page 時觸發；填滿第一頁再注入。
+                for _ in 1..64 {
+                    let live = vm.allocate_table().unwrap();
+                    vm.add_root(RootKind::Host, live).unwrap();
+                }
+                assert!(vm.slot_state(SlotId::new(63)).is_some());
+                assert_eq!(vm.slot_state(SlotId::new(64)), None);
+            }
             vm.incremental_step(1).unwrap();
             assert_ne!(vm.gc_trace().phase, GcPhase::Pause);
             let before = snapshot(&vm);

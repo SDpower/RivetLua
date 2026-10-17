@@ -6,6 +6,29 @@ use rivetlua_runtime::{
 use std::cell::Cell;
 use std::rc::Rc;
 
+fn managed_long_string_backing_charge(profile: LuaProfile, bytes: &[u8]) -> usize {
+    let mut control_vm = Vm::new_with_profile(profile).unwrap();
+    let mut string_vm = Vm::new_with_profile(profile).unwrap();
+    control_vm.set_gc_debt_threshold(usize::MAX);
+    string_vm.set_gc_debt_threshold(usize::MAX);
+    control_vm.allocate(Value::Nil).unwrap();
+    string_vm.allocate(Value::Nil).unwrap();
+    let control_before = control_vm.ledger_snapshot().lua_heap_bytes;
+    let string_before = string_vm.ledger_snapshot().lua_heap_bytes;
+    control_vm.allocate(Value::Nil).unwrap();
+    string_vm.allocate_byte_string(bytes).unwrap();
+    let control_charge = control_vm.ledger_snapshot().lua_heap_bytes - control_before;
+    let string_charge = string_vm.ledger_snapshot().lua_heap_bytes - string_before;
+    let backing_charge = string_charge
+        .checked_sub(control_charge)
+        .expect("長字串 backing charge 應大於一般物件配置");
+    assert!(
+        backing_charge > bytes.len(),
+        "長字串須計入共享 backing metadata"
+    );
+    backing_charge
+}
+
 #[test]
 fn capi_raw_next_adapter_is_pure_content_equal_and_roots_objects() {
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
@@ -271,6 +294,7 @@ fn capi_deleted_long_key_charge_rehash_and_drop_b13() {
         let table = vm.allocate_table().unwrap();
         let table_root = HostHandle::<Value>::new(&mut vm, table).unwrap();
         let bytes = vec![0x91; 64 * 1024];
+        let backing_charge = managed_long_string_backing_charge(profile, &bytes);
         let key = vm.allocate_byte_string(&bytes).unwrap();
         let key_root = HostHandle::<Value>::new(&mut vm, key).unwrap();
         let bucket_size = std::mem::size_of::<Option<(rivetlua_runtime::CanonicalKey, Value)>>();
@@ -295,7 +319,7 @@ fn capi_deleted_long_key_charge_rehash_and_drop_b13() {
         assert_eq!(vm.object_kind(key), Err(VmError::StaleObject));
         let before_rehash = vm.ledger_snapshot().lua_heap_bytes;
         assert!(before_rehash < before_delete);
-        assert!(before_rehash >= baseline + bytes.len());
+        assert!(before_rehash >= baseline + backing_charge);
         assert_eq!(
             vm.raw_get(table, Value::Boolean(true)),
             Ok(Value::Integer(2))
@@ -309,7 +333,7 @@ fn capi_deleted_long_key_charge_rehash_and_drop_b13() {
         assert!(new_bucket_bytes > old_bucket_bytes);
         assert_eq!(
             vm.ledger_snapshot().lua_heap_bytes
-                + bytes.len()
+                + backing_charge
                 + key_backing_bytes
                 + old_bucket_bytes,
             before_rehash + new_bucket_bytes
@@ -328,6 +352,7 @@ fn capi_final_long_deleted_key_charge_releases_on_insert_b13() {
         let table = vm.allocate_table().unwrap();
         let _table_root = HostHandle::<Value>::new(&mut vm, table).unwrap();
         let bytes = vec![0x94; 4096];
+        let backing_charge = managed_long_string_backing_charge(profile, &bytes);
         let key = vm.allocate_byte_string(&bytes).unwrap();
         let key_root = HostHandle::<Value>::new(&mut vm, key).unwrap();
         let bucket_size = std::mem::size_of::<Option<(rivetlua_runtime::CanonicalKey, Value)>>();
@@ -355,7 +380,7 @@ fn capi_final_long_deleted_key_charge_releases_on_insert_b13() {
         vm.raw_set(table, Value::Boolean(true), Value::Integer(2))
             .unwrap();
         assert_eq!(
-            vm.ledger_snapshot().lua_heap_bytes + bytes.len() + key_backing_bytes,
+            vm.ledger_snapshot().lua_heap_bytes + backing_charge + key_backing_bytes,
             before_insert + bucket_size
         );
         assert_eq!(

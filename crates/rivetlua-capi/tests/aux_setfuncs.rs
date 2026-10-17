@@ -5,10 +5,10 @@ use rivetlua_capi::stack::{
     StateOwner, lua_State, lua_getfield, lua_gettop, lua_pushinteger, lua_settop, lua_toboolean,
     lua_tointegerx, lua_type,
 };
-use rivetlua_core::{ObjectRef, Value};
+use rivetlua_core::{ObjectRef, SlotId, Value};
 use rivetlua_runtime::{
     FailPoint, GcAge, GcMode, GcPhase, GcTrace, LedgerSnapshot, ObjectKind, RootId, RootKind,
-    VmError,
+    SlotState, Vm, VmError,
 };
 
 type LuaCFunction = unsafe extern "C" fn(*mut lua_State) -> c_int;
@@ -133,6 +133,23 @@ fn raw_name(owner: &StateOwner, table: ObjectRef, name: &[u8]) -> Value {
                 .unwrap()
         })
         .unwrap()
+}
+
+fn prepare_mark_reserve_page(vm: &mut Vm) {
+    loop {
+        let mut slot_count = 0;
+        while vm.slot_state(SlotId::new(slot_count)).is_some() {
+            slot_count += 1;
+        }
+        let has_free_slot = (0..slot_count)
+            .any(|index| vm.slot_state(SlotId::new(index)) == Some(SlotState::Free));
+        if slot_count % 64 == 0 && !has_free_slot {
+            return;
+        }
+        // MarkReserve 僅在新 64 格 GC bitmap 頁配置時觸發；保留 filler 以填滿目前頁。
+        let table = vm.allocate_table().unwrap();
+        vm.add_root(RootKind::Host, table).unwrap();
+    }
 }
 
 fn normal_cases() {
@@ -618,6 +635,9 @@ fn named_failures() {
                     vm.collect().unwrap();
                     assert_eq!(vm.gc_age(table), Ok(GcAge::Old));
                 } else if matches!(point, FailPoint::MarkReserve | FailPoint::WorkReserve) {
+                    if point == FailPoint::MarkReserve {
+                        prepare_mark_reserve_page(vm);
+                    }
                     vm.incremental_step(1).unwrap();
                     assert_ne!(vm.gc_trace().phase, GcPhase::Pause);
                 }
@@ -630,7 +650,9 @@ fn named_failures() {
             .with_vm(|vm| vm.allocation_trace().last_failure)
             .unwrap();
         assert_eq!(unsafe { lua_gettop(owner.as_ptr()) }, 3, "{point:?}");
-        if let Some(failure) = failure {
+        if point == FailPoint::MarkReserve {
+            assert_eq!(failure.unwrap().attempt.point, Some(point), "{point:?}");
+        } else if let Some(failure) = failure {
             assert_eq!(failure.attempt.point, Some(point), "{point:?}");
         }
         assert_eq!(snapshot(&owner).2, before.2, "{point:?}: roots");

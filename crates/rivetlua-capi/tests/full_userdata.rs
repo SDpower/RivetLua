@@ -8,7 +8,7 @@ use rivetlua_capi::stack::{
 use rivetlua_core::{ObjectRef, SlotId, Value};
 use rivetlua_runtime::{
     AllocationDomain, FailPoint, GcPhase, GcTrace, HostHandle, LedgerSnapshot, ObjectKind, RootId,
-    RootKind, SlotState, VmError,
+    RootKind, SlotState, Vm, VmError,
 };
 
 #[cfg(feature = "lua55")]
@@ -47,13 +47,30 @@ fn snapshot(owner: &StateOwner) -> Snapshot {
         .with_vm(|vm| {
             let mut roots = Vec::new();
             vm.visit_roots(|kind, id, object| roots.push((kind, id, object)));
-            let slots = (0..64)
+            let slots = (0..=64)
                 .map(|index| vm.slot_state(SlotId::new(index)))
                 .collect();
             (vm.ledger_snapshot(), vm.gc_trace(), roots, slots)
         })
         .unwrap();
     (vm.0, vm.1, vm.2, vm.3, stack)
+}
+
+fn prepare_mark_reserve_page(vm: &mut Vm) {
+    loop {
+        let mut slot_count = 0;
+        while vm.slot_state(SlotId::new(slot_count)).is_some() {
+            slot_count += 1;
+        }
+        let has_free_slot = (0..slot_count)
+            .any(|index| vm.slot_state(SlotId::new(index)) == Some(SlotState::Free));
+        if slot_count % 64 == 0 && !has_free_slot {
+            return;
+        }
+        // MarkReserve 僅在新 64 格 GC bitmap 頁配置時觸發；保留 filler 以填滿目前頁。
+        let table = vm.allocate_table().unwrap();
+        vm.add_root(RootKind::Host, table).unwrap();
+    }
 }
 
 fn rooted_userdata(owner: &StateOwner) -> ObjectRef {
@@ -461,21 +478,24 @@ fn limits_and_failure_atomicity() {
     .join()
     .unwrap();
 
-    let active = StateOwner::new().unwrap();
-    let state = active.as_ptr();
-    active
-        .with_vm(|vm| {
-            vm.set_gc_debt_threshold(usize::MAX);
-            for _ in 0..128 {
-                vm.incremental_step(1).unwrap();
-                if vm.gc_trace().phase != GcPhase::Pause {
-                    break;
-                }
-            }
-            assert_ne!(vm.gc_trace().phase, GcPhase::Pause);
-        })
-        .unwrap();
     for point in [FailPoint::MarkReserve, FailPoint::WorkReserve] {
+        let active = StateOwner::new().unwrap();
+        let state = active.as_ptr();
+        active
+            .with_vm(|vm| {
+                vm.set_gc_debt_threshold(usize::MAX);
+                if point == FailPoint::MarkReserve {
+                    prepare_mark_reserve_page(vm);
+                }
+                for _ in 0..128 {
+                    vm.incremental_step(1).unwrap();
+                    if vm.gc_trace().phase != GcPhase::Pause {
+                        break;
+                    }
+                }
+                assert_ne!(vm.gc_trace().phase, GcPhase::Pause);
+            })
+            .unwrap();
         let before = snapshot(&active);
         active.with_vm(|vm| vm.inject_failure_once(point)).unwrap();
         assert!(
@@ -483,17 +503,16 @@ fn limits_and_failure_atomicity() {
             "{point:?}"
         );
         assert_eq!(snapshot(&active), before, "{point:?}");
-        if point == FailPoint::MarkReserve {
-            assert_eq!(
-                active
-                    .with_vm(|vm| vm.allocation_trace().last_failure)
-                    .unwrap()
-                    .unwrap()
-                    .attempt
-                    .point,
-                Some(point)
-            );
-        }
+        assert_eq!(
+            active
+                .with_vm(|vm| vm.allocation_trace().last_failure)
+                .unwrap()
+                .unwrap()
+                .attempt
+                .point,
+            Some(point),
+            "{point:?} 必須命中注入點",
+        );
         assert!(!unsafe { lua_newuserdatauv(state, 17, 3) }.is_null());
         unsafe { lua_settop(state, 0) };
     }

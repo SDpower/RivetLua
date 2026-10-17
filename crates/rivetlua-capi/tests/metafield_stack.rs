@@ -695,7 +695,7 @@ fn allocation_failure_matrix() {
             AllocationDomain::LuaHeap,
             Some(FailPoint::ObjectReserve),
             "crates/rivetlua-runtime/src/heap.rs",
-            312,
+            256,
         ),
         (
             AllocationDomain::Host,

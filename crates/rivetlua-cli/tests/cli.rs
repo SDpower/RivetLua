@@ -2417,7 +2417,7 @@ print('retry-ok')"#;
 
         let setcstack_source = match profile {
             "lua54" => {
-                "assert(type(debug.setcstacklimit) == 'function'); local ok, err = pcall(debug.setcstacklimit, 1024); assert(not ok and err == 'E_HOST_POLICY_DEBUG')"
+                "assert(type(debug.setcstacklimit) == 'function'); local ok, limit = pcall(debug.setcstacklimit, 1024); assert(ok and limit == 200)"
             }
             "lua55" => {
                 "assert(debug.setcstacklimit == nil); local ok, err = pcall(debug.setcstacklimit, 1024); assert(not ok and err == 'E_CALL_NON_FUNCTION')"

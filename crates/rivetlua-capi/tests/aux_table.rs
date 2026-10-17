@@ -4,10 +4,10 @@ use rivetlua_capi::stack::{
     StateOwner, lua_State, lua_createtable, lua_gettop, lua_pushinteger, lua_settop,
     luaL_getsubtable,
 };
-use rivetlua_core::{ObjectRef, Value};
+use rivetlua_core::{ObjectRef, SlotId, Value};
 use rivetlua_runtime::{
     AllocationDomain, FailPoint, GcAge, GcColor, GcMode, GcPhase, GcTrace, LedgerSnapshot,
-    ObjectKind, RootId, RootKind, Vm, VmError,
+    ObjectKind, RootId, RootKind, SlotState, Vm, VmError,
 };
 
 unsafe extern "C" {
@@ -546,6 +546,23 @@ fn ordinal_fault_matrix() {
     }
 }
 
+fn prepare_mark_reserve_page(vm: &mut Vm) {
+    loop {
+        let mut slot_count = 0;
+        while vm.slot_state(SlotId::new(slot_count)).is_some() {
+            slot_count += 1;
+        }
+        let has_free_slot = (0..slot_count)
+            .any(|index| vm.slot_state(SlotId::new(index)) == Some(SlotState::Free));
+        if slot_count % 64 == 0 && !has_free_slot {
+            return;
+        }
+        // MarkReserve 僅在新 64 格 GC bitmap 頁配置時觸發；保留 filler 以填滿目前頁。
+        let table = vm.allocate_table().unwrap();
+        vm.add_root(RootKind::Host, table).unwrap();
+    }
+}
+
 fn named_faults_and_retry() {
     for point in [
         FailPoint::RootReserve,
@@ -572,6 +589,9 @@ fn named_faults_and_retry() {
                 vm.set_gc_mode(GcMode::Generational).unwrap();
                 vm.collect().unwrap();
                 assert_eq!(vm.gc_age(parent), Ok(GcAge::Old));
+                if point == FailPoint::MarkReserve {
+                    prepare_mark_reserve_page(vm);
+                }
                 for _ in 0..128 {
                     vm.incremental_step(1).unwrap();
                     if vm.gc_trace().phase != GcPhase::Pause
@@ -606,10 +626,12 @@ fn named_faults_and_retry() {
         );
         assert_eq!(unsafe { lua_gettop(state) }, 1, "{point:?}");
         assert_eq!(snapshot(&owner).2, before.2, "{point:?}: roots");
-        if let Some(failure) = owner
+        let failure = owner
             .with_vm(|vm| vm.allocation_trace().last_failure)
-            .unwrap()
-        {
+            .unwrap();
+        if point == FailPoint::MarkReserve {
+            assert_eq!(failure.unwrap().attempt.point, Some(point), "{point:?}");
+        } else if let Some(failure) = failure {
             assert_eq!(failure.attempt.point, Some(point), "{point:?}");
         }
         assert_eq!(named(&owner, parent, b"retry"), Value::Nil);

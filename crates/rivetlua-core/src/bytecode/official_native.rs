@@ -7151,6 +7151,10 @@ fn compact_register_map(
                 }
             }
         }
+        #[cfg(feature = "std")]
+        let mut rejection_counts = [(0usize, u16::MAX, 0u16); 11];
+        #[cfg(feature = "std")]
+        let mut rejection_first = [None::<(u16, usize, usize, usize, usize)>; 11];
         let mut candidate_ok = |candidate_register: usize,
                                 candidate_start: usize,
                                 candidate_end: usize,
@@ -7158,9 +7162,30 @@ fn compact_register_map(
                                 check_prior: bool,
                                 work: &mut OfficialWorkBudget|
          -> Result<bool, OfficialExportError> {
+            macro_rules! reject {
+                ($reason:expr, $x:expr, $y:expr, $z:expr, $w:expr) => {{
+                    #[cfg(feature = "std")]
+                    if candidate_register == register && check_prior {
+                        let stats = &mut rejection_counts[$reason];
+                        if stats.0 == 0 {
+                            rejection_first[$reason] = Some((
+                                slot,
+                                ($x) as usize,
+                                ($y) as usize,
+                                ($z) as usize,
+                                ($w) as usize,
+                            ));
+                        }
+                        stats.0 += 1;
+                        stats.1 = stats.1.min(slot);
+                        stats.2 = stats.2.max(slot);
+                    }
+                    return Ok(false);
+                }};
+            }
             work_charge(work, 1, proto.id, candidate_start)?;
             if slot >= fixed.max(tuple_end) && slot < temp_base {
-                return Ok(false);
+                reject!(0, fixed.max(tuple_end), temp_base, 0, 0);
             }
             if slot >= tuple_base && slot < tuple_end {
                 work_charge(work, numeric.len(), proto.id, candidate_start)?;
@@ -7171,7 +7196,7 @@ fn compact_register_map(
                         && candidate_start <= pair.next_pc
                         && pair.prepare_pc < candidate_end
                 }) {
-                    return Ok(false);
+                    reject!(1, tuple_base, tuple_end, numeric.len(), 0);
                 }
             }
             work_charge(work, aliases.len(), proto.id, candidate_start)?;
@@ -7181,7 +7206,7 @@ fn compact_register_map(
                     && u16::from(alias.tuple) <= slot
                     && slot <= u16::from(alias.tuple) + u16::from(alias.width)
             }) {
-                return Ok(false);
+                reject!(2, aliases.len(), 0, 0, 0);
             }
             let (call_first, call_end) = call_layout_range(
                 &call_layouts,
@@ -7222,7 +7247,7 @@ fn compact_register_map(
                             .iter()
                             .any(|entry| usize::from(entry.register.0) == candidate_register)
                     {
-                        return Ok(false);
+                        reject!(3, call.pc, call.call_base, call.window_start, call.window_end);
                     }
                 }
                 let open_all_base = if call.open_chain {
@@ -7268,7 +7293,7 @@ fn compact_register_map(
                     && (survives || protected[candidate_register] != 0)
                     && !dead_open
                 {
-                    return Ok(false);
+                    reject!(4, call.pc, call.call_base, call.window_start, call.window_end);
                 }
                 if !call.open_chain && call.first_slot <= slot && slot < call.call_base {
                     let call_pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
@@ -7290,7 +7315,7 @@ fn compact_register_map(
                             && temporary.ordinal == ordinal
                     });
                     if !own && protected[candidate_register] != 0 {
-                        return Ok(false);
+                        reject!(5, call.pc, call.call_base, call.window_start, call.window_end);
                     }
                 }
                 if !(call.window_start <= slot && slot < call.window_end) {
@@ -7347,7 +7372,7 @@ fn compact_register_map(
                     result_mode,
                 } = proto.instructions[call.pc].instruction
                 else {
-                    return Ok(false);
+                    reject!(6, call.pc, call.call_base, call.window_start, call.window_end);
                 };
                 let relative = candidate_register.checked_sub(usize::from(base.0));
                 let is_result = match result_mode {
@@ -7365,7 +7390,7 @@ fn compact_register_map(
                     && !survives
                     && protected[candidate_register] == 0;
                 if !is_result && !dying_input && !(dead_open && slot >= call.call_base) {
-                    return Ok(false);
+                    reject!(7, call.pc, call.call_base, call.window_start, call.window_end);
                 }
             }
             let env_alias = env_cache_eligible
@@ -7401,7 +7426,7 @@ fn compact_register_map(
                             work,
                         )?
                     {
-                        return Ok(false);
+                        reject!(8, owner, span[owner].0, span[owner].1, 0);
                     }
                     owner = owner_next[owner];
                 }
@@ -7425,7 +7450,7 @@ fn compact_register_map(
                     continue;
                 }
                 if protected[candidate_register] != 0 {
-                    return Ok(false);
+                    reject!(9, fixed_start, fixed_end, 0, 0);
                 }
                 let overlap_start = candidate_start.max(fixed_start);
                 let overlap_end = candidate_end.min(fixed_end);
@@ -7452,7 +7477,7 @@ fn compact_register_map(
                         )?
                         || live_at_pc(&span, &protected, &live_at, candidate_register, pc)
                     {
-                        return Ok(false);
+                        reject!(10, fixed_start, fixed_end, pc, 0);
                     }
                 }
             }
@@ -7612,7 +7637,7 @@ fn compact_register_map(
         let slot = chosen.ok_or_else(|| {
             #[cfg(feature = "std")]
             eprintln!(
-                "native slot failure proto={} register={} start={} end={} protected={} floor={} fixed={} tuple_end={} temp_base={} high={} occupied={} fixed_intervals={} overlapping_calls={} max_call_window={}",
+                "native slot failure proto={} register={} start={} end={} protected={} floor={} fixed={} tuple_end={} temp_base={} high={} occupied={} fixed_intervals={} overlapping_calls={} max_call_window={} rejection_counts={:?} rejection_first={:?}",
                 proto.id.0,
                 register,
                 start,
@@ -7627,6 +7652,8 @@ fn compact_register_map(
                 fixed_intervals.len(),
                 call_layouts.iter().filter(|call| start <= call.pc && call.pc < end).count(),
                 call_layouts.iter().map(|call| call.window_end).max().unwrap_or(0),
+                rejection_counts,
+                rejection_first,
             );
             error(
                 OfficialExportErrorKind::LimitExceeded,

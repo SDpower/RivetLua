@@ -45,9 +45,12 @@ jobs:
           printf '%s\n' "CARGO_TARGET_DIR=$phase_target" "TMPDIR=$phase_tmp" "RIVETLUA_P16_EVIDENCE_DIR=$phase_evidence" >> "$GITHUB_ENV"
 
       - name: Check formatting
+        id: formatting
         run: cargo fmt --all -- --check
 
       - name: Prepare fixed Lua 5.5 worker for workspace tests
+        id: native_worker
+        if: ${{ !cancelled() && (success() || steps.formatting.outcome == 'failure') }}
         env:
           RIVETLUA_P16_CI_TARGET: ${{ matrix.target }}
         run: |
@@ -151,6 +154,7 @@ jobs:
           PY
 
       - name: Test workspace
+        if: ${{ !cancelled() && steps.native_worker.outcome == 'success' }}
         run: cargo test --locked --workspace --exclude rivetlua-xtask --no-fail-fast
 
       - name: Test rivetlua AOT doctest

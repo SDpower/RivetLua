@@ -134,10 +134,10 @@ fn registry_stack_pseudo_index_is_permanent_table_and_globals_are_real() {
     }
     owner
         .with_vm(|vm| {
-            assert_eq!(vm.roots().count(RootKind::Registry), 3);
+            assert_eq!(vm.roots().count(RootKind::Registry), 4);
             assert_eq!(vm.roots().count(RootKind::Host), 0);
             assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
-            assert_eq!(vm.roots().total_count(), 4);
+            assert_eq!(vm.roots().total_count(), 5);
         })
         .unwrap();
 }
@@ -195,7 +195,7 @@ fn registry_stack_raw_variants_and_failure_preserve_stack() {
                 vm.raw_get(table, Value::Integer(8)).unwrap(),
                 Value::Integer(52)
             );
-            assert_eq!(vm.roots().count(RootKind::Registry), 3);
+            assert_eq!(vm.roots().count(RootKind::Registry), 4);
             assert_eq!(vm.roots().count(RootKind::Host), 0);
         })
         .unwrap();
@@ -229,13 +229,13 @@ fn registry_stack_siblings_share_identity_and_vm_isolation_holds() {
         assert_eq!(lua_rawgeti(sibling.as_ptr(), REGISTRY_INDEX, 2), 5);
     }
     owner
-        .with_vm(|vm| assert_eq!(vm.roots().count(RootKind::Registry), 3))
+        .with_vm(|vm| assert_eq!(vm.roots().count(RootKind::Registry), 4))
         .unwrap();
     let probe = owner.with_vm(|vm| vm.ledger_probe()).unwrap();
     drop(owner);
     sibling
         .with_vm(|vm| {
-            assert_eq!(vm.roots().count(RootKind::Registry), 3);
+            assert_eq!(vm.roots().count(RootKind::Registry), 4);
             assert_eq!(vm.object_kind(global), Ok(ObjectKind::Table));
         })
         .unwrap();
@@ -282,12 +282,12 @@ fn registry_stack_gc_and_stack_mutators_keep_permanent_registry() {
     owner
         .with_vm(|vm| {
             assert_eq!(vm.roots().count(RootKind::Host), 0);
-            assert_eq!(vm.roots().count(RootKind::Registry), 3);
+            assert_eq!(vm.roots().count(RootKind::Registry), 4);
             vm.collect().unwrap();
             vm.collect().unwrap();
             assert_eq!(vm.object_kind(reg), Ok(ObjectKind::Table));
             assert_eq!(vm.object_kind(global), Ok(ObjectKind::Table));
-            assert_eq!(vm.roots().count(RootKind::Registry), 3);
+            assert_eq!(vm.roots().count(RootKind::Registry), 4);
             assert_eq!(vm.roots().count(RootKind::Host), 0);
         })
         .unwrap();
@@ -552,17 +552,17 @@ fn registry_stack_constructor_active_gc_publishes_live_tables() {
     owner
         .with_vm(|vm| {
             assert!(vm.gc_trace().transition_count > before_transitions.unwrap());
-            assert_eq!(vm.roots().count(RootKind::Registry), 3);
+            assert_eq!(vm.roots().count(RootKind::Registry), 4);
             assert_eq!(vm.roots().count(RootKind::Host), 0);
             assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
-            assert_eq!(vm.roots().total_count(), 4);
+            assert_eq!(vm.roots().total_count(), 5);
             assert_eq!(vm.object_kind(registry), Ok(ObjectKind::Table));
             assert_eq!(vm.object_kind(globals), Ok(ObjectKind::Table));
             vm.collect().unwrap();
             vm.collect().unwrap();
             assert_eq!(vm.object_kind(registry), Ok(ObjectKind::Table));
             assert_eq!(vm.object_kind(globals), Ok(ObjectKind::Table));
-            assert_eq!(vm.roots().count(RootKind::Registry), 3);
+            assert_eq!(vm.roots().count(RootKind::Registry), 4);
             assert_eq!(vm.roots().count(RootKind::Host), 0);
         })
         .unwrap();

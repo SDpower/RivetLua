@@ -88,8 +88,8 @@ fn capi_temporary_byte_key_cleanup_and_rooted_callback() {
                 Some(FailPoint::StringBytesReserve),
                 Some(FailPoint::SlotReserve),
                 Some(FailPoint::ObjectReserve),
-                None,
                 Some(FailPoint::MarkReserve),
+                None,
             ]
         );
         assert_eq!(passed, (5..16).collect::<Vec<_>>());

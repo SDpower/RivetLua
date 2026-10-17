@@ -98,7 +98,7 @@ fn relocate_official_iterator_nil(chunk: &mut rivetlua_core::OfficialChunk) {
                 || b(result_move) != a(call)
                 || opcode(nil_load) != 8
                 || b(nil_load) != 0
-                || a(nil_load) != a(call)
+                || a(nil_load) == a(result_move)
             {
                 return None;
             }

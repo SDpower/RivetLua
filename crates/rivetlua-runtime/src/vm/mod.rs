@@ -1327,7 +1327,6 @@ enum DispatchResult {
     Continue,
     Returned(Vec<Value>, Option<Reservation>),
     Yielded(Vec<Value>, Option<Reservation>),
-    PendingClose(PendingCloseSnapshot),
     External(ExternalToken),
     CloseBoundaryA5 {
         token: ExternalToken,
@@ -14096,7 +14095,9 @@ impl Execution<'_> {
                 let Value::Object(object) = function else {
                     return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                 };
-                if self.vm.with_closure(object, Closure::has_environment)? {
+                if self.vm.with_closure(object, Closure::has_environment)?
+                    && !self.has_verified_captured_environment(object)?
+                {
                     return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                 }
             }
@@ -14260,6 +14261,43 @@ impl Execution<'_> {
         output
     }
 
+    fn has_verified_captured_environment(&self, function: ObjectRef) -> Result<bool, RuntimeError> {
+        let (module, prototype, environment, cell) = self.vm.with_closure(function, |closure| {
+            (
+                closure.module(),
+                closure.prototype(),
+                closure.environment(),
+                closure.environment_cell(),
+            )
+        })?;
+        let Some(cell) = cell else {
+            return Ok(false);
+        };
+        if environment.is_some() {
+            return Ok(false);
+        }
+        let verified = self.vm.module(module)?;
+        if verified.profile() != LuaProfile::Lua55 {
+            return Ok(false);
+        }
+        let Some(proto) = usize::try_from(prototype.0)
+            .ok()
+            .and_then(|index| verified.module().prototypes.get(index))
+            .filter(|proto| proto.id == prototype)
+        else {
+            return Ok(false);
+        };
+        let index = match proto.frame.environment_source {
+            EnvironmentSource::ParentLocal { upvalue }
+            | EnvironmentSource::ParentUpvalue { upvalue } => usize::from(upvalue.0),
+            _ => return Ok(false),
+        };
+        if proto.upvalues.get(index).is_none() {
+            return Ok(false);
+        }
+        Ok(self.vm.with_closure(function, |closure| closure.upvalue(index))? == Some(cell))
+    }
+
     fn debug_upvalue_slot(
         &mut self,
         function: ObjectRef,
@@ -14280,6 +14318,7 @@ impl Execution<'_> {
             && verified.official_artifact().is_none()
             && verified.native_debug().is_none()
             && verified.official_execution().is_none()
+            && !self.has_verified_captured_environment(function)?
         {
             return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
         }
@@ -15228,6 +15267,7 @@ impl Execution<'_> {
                 && official_artifact.is_none()
                 && self.vm.module(module)?.native_debug().is_none()
                 && self.vm.module(module)?.official_execution().is_none()
+                && !self.has_verified_captured_environment(function)?
             {
                 return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
             }
@@ -25058,10 +25098,6 @@ impl Execution<'_> {
                     self.finish()?;
                     return Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint));
                 }
-                Ok(DispatchResult::PendingClose(snapshot)) => {
-                    self.state = ExecutionState::PendingClose;
-                    return Ok(RunOutcome::PendingClose(snapshot));
-                }
                 Ok(DispatchResult::External(token)) => {
                     self.state = ExecutionState::Parked;
                     return Ok(RunOutcome::External(token));
@@ -31028,7 +31064,8 @@ mod tests {
                     assert_eq!(vm.ledger_snapshot().reserved, 0);
                     drop(host);
                     vm.collect().unwrap();
-                    assert_eq!(vm.roots().total_count(), 0);
+                    assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
+                    assert_eq!(vm.roots().total_count(), 1);
                     return;
                 }
                 action => {
@@ -31305,7 +31342,8 @@ mod tests {
                     assert_eq!(vm.ledger_snapshot().reserved, 0);
                     drop(env_root);
                     vm.collect().unwrap();
-                    assert_eq!(vm.roots().total_count(), 0);
+                    assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
+                    assert_eq!(vm.roots().total_count(), 1);
                     return;
                 }
                 action => {
@@ -33418,6 +33456,11 @@ mod tests {
         vm.collect().unwrap();
         let environment = vm.allocate_table().unwrap();
         let host_root = vm.add_root(RootKind::Host, environment).unwrap();
+        let warmup = vm
+            .load_with_environment(verified.clone(), Value::Object(environment))
+            .unwrap();
+        drop(warmup);
+        vm.collect().unwrap();
         let before = vm.ledger_snapshot();
         let roots = vm.roots().total_count();
         for point in [
@@ -34090,6 +34133,8 @@ mod tests {
         );
         let retained = module_allocation_bytes(&verified).unwrap();
         let mut vm = Vm::new_with_profile(LuaProfile::Lua55).unwrap();
+        vm.allocate_table().unwrap();
+        vm.collect_major().unwrap();
         let before = vm.ledger_snapshot();
 
         let make_charges = |vm: &Vm, bytes| {

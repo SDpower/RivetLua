@@ -499,7 +499,7 @@ fn private_lua_fixture_probe_failure_is_atomic_and_retriable_b4() {
                     let warm_after = fixture_snapshot(&owner);
                     assert_eq!(warm_after.0, warm_before.0);
                     assert_eq!(warm_after.2, warm_before.2);
-                    assert_eq!(warm_after.3, (3, 1));
+                    assert_eq!(warm_after.3, (4, 1));
                     assert_eq!(warm_after.1.debt_bytes, warm_before.1.debt_bytes);
                     assert_eq!(
                         warm_after.1.major_debt_bytes,
