@@ -27,7 +27,7 @@ fn append_fixed(target: &mut [u8], at: usize, bytes: &[u8]) -> Result<usize, Rej
 }
 
 fn lua_decimal_point() -> Result<u8, Reject> {
-    let mut decimal = [0_i8; 8];
+    let mut decimal: [c_char; 8] = [0; 8];
     // SAFETY：固定格式與有效 stack buffer；snprintf 最多寫入 8 bytes。
     let len = unsafe {
         snprintf(
@@ -44,7 +44,7 @@ fn lua_decimal_point() -> Result<u8, Reject> {
 }
 
 fn lua_number_bytes(number: f64, target: &mut [u8]) -> Result<usize, Reject> {
-    let mut number_bytes = [0_i8; 64];
+    let mut number_bytes: [c_char; 64] = [0; 64];
     let format = if cfg!(feature = "lua55") {
         c"%.15g"
     } else {

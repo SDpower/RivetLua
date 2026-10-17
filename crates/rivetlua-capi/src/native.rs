@@ -2,7 +2,7 @@
 
 mod sha256;
 
-use std::ffi::{CStr, CString, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
@@ -269,11 +269,11 @@ impl AttestedOpener {
 }
 
 unsafe extern "C" {
-    fn rivetlua_native_open_candidate(path: *const i8) -> c_int;
-    fn rivetlua_native_open(path: *const i8, global: c_int) -> *mut c_void;
+    fn rivetlua_native_open_candidate(path: *const c_char) -> c_int;
+    fn rivetlua_native_open(path: *const c_char, global: c_int) -> *mut c_void;
     fn rivetlua_native_symbol(
         handle: *mut c_void,
-        name: *const i8,
+        name: *const c_char,
         out: *mut Option<NativeOpener>,
     ) -> c_int;
     fn rivetlua_native_close(handle: *mut c_void);
