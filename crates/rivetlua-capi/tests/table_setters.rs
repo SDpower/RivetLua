@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 
 use rivetlua_capi::stack::{
     StateOwner, lua_State, lua_createtable, lua_gettop, lua_pushboolean, lua_pushinteger,
@@ -17,7 +17,7 @@ unsafe extern "C" {
         state: *mut lua_State,
         operation: i32,
         index: i32,
-        name: *const i8,
+        name: *const c_char,
         key: i64,
         entries: *const c_void,
         nup: i32,

@@ -1,4 +1,4 @@
-use std::ffi::{CString, c_void};
+use std::ffi::{CString, c_char, c_void};
 
 use rivetlua_capi::stack::{
     StateOwner, lua_State, lua_createtable, lua_getfield, lua_getglobal, lua_gettop,
@@ -18,7 +18,7 @@ unsafe extern "C" {
         state: *mut lua_State,
         operation: i32,
         index: i32,
-        name: *const i8,
+        name: *const c_char,
         key: i64,
         entries: *const c_void,
         nup: i32,
@@ -31,7 +31,7 @@ fn protected_set(
     owner: &StateOwner,
     operation: i32,
     index: i32,
-    name: *const i8,
+    name: *const c_char,
     inject_offset: i32,
 ) -> (i32, u64) {
     let mut start = 0;

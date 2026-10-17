@@ -407,7 +407,7 @@ fn registry_and_invalid_inputs() {
     let event_pointer = event.as_ptr() as usize;
     assert_eq!(
         std::thread::spawn(move || {
-            protected_metafield(pointer as *mut lua_State, 1, event_pointer as *const i8)
+            protected_metafield(pointer as *mut lua_State, 1, event_pointer as *const c_char)
         })
         .join()
         .unwrap(),

@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CString, c_char};
 
 use rivetlua_capi::stack::{
     StateOwner, lua_State, lua_createtable, lua_gettop, lua_pushinteger, lua_settop,
@@ -239,7 +239,7 @@ fn existing_nonnil_and_fail_closed() {
         // SAFETY：有效 state 指標由入口執行緒檢查拒絕，不解參 C 字串。
         unsafe {
             assert_eq!(
-                luaL_newmetatable(pointer as *mut lua_State, name_pointer as *const i8),
+                luaL_newmetatable(pointer as *mut lua_State, name_pointer as *const c_char),
                 -1
             );
         }
@@ -722,7 +722,7 @@ fn set_named_fail_closed() {
     std::thread::spawn(move || {
         // SAFETY：入口會先檢查執行緒，不會解參跨執行緒的 state。
         unsafe {
-            luaL_setmetatable(pointer as *mut lua_State, name_pointer as *const i8);
+            luaL_setmetatable(pointer as *mut lua_State, name_pointer as *const c_char);
         }
     })
     .join()
