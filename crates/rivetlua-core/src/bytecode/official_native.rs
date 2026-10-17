@@ -7691,8 +7691,8 @@ fn compact_register_map(
                     let pending = u32::try_from(call.pc)
                         .ok()
                         .and_then(|pc| {
-                            debug.and_then(|debug| {
-                                debug.temporaries_at(proto.id, InstructionOffset(pc))
+                            module.native_debug().and_then(|native| {
+                                native.temporaries_at(proto.id, InstructionOffset(pc))
                             })
                         })
                         .unwrap_or(&[]);
@@ -7755,32 +7755,30 @@ fn compact_register_map(
                                 && live_at_pc(&span, &protected, &live_at, other, call.pc + 1)
                         })
                         .count();
-                    let local_floor = debug
-                        .and_then(|debug| debug.prototype(proto.id))
-                        .map_or(0, |entry| {
-                            entry
-                                .locals
-                                .iter()
-                                .zip(storage)
-                                .filter(|(local, home)| {
-                                    local.start_pc as usize <= call.pc
-                                        && call.pc < local.end_pc as usize
-                                        && home.start_pc as usize <= call.pc
-                                        && call.pc < home.end_pc as usize
-                                })
-                                .filter_map(|(_, home)| {
-                                    official_storage_slot(
-                                        home.slot,
-                                        anonymous_vararg_slot,
-                                        proto.id,
-                                        call.pc,
-                                    )
-                                    .ok()
-                                })
-                                .map(|slot| usize::from(slot) + 1)
-                                .max()
-                                .unwrap_or(0)
-                        });
+                    let local_floor = debug.map_or(0, |entry| {
+                        entry
+                            .locals
+                            .iter()
+                            .zip(storage)
+                            .filter(|(local, home)| {
+                                local.start_pc as usize <= call.pc
+                                    && call.pc < local.end_pc as usize
+                                    && home.start_pc as usize <= call.pc
+                                    && call.pc < home.end_pc as usize
+                            })
+                            .filter_map(|(_, home)| {
+                                official_storage_slot(
+                                    home.slot,
+                                    anonymous_vararg_slot,
+                                    proto.id,
+                                    call.pc,
+                                )
+                                .ok()
+                            })
+                            .map(|slot| usize::from(slot) + 1)
+                            .max()
+                            .unwrap_or(0)
+                    });
                     let mut active_frontier = local_floor.max(
                         anonymous_vararg_slot.map_or(0, |slot| usize::from(slot) + 1),
                     );
