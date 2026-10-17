@@ -206,7 +206,7 @@ fn p17_binary_file_prefix_loads_dumped_chunk() {
 #[test]
 fn p17_binary_file_prefix_keeps_source_and_binary_errors() {
     let scratch = ScratchDir::new();
-    let (profile, sdk_profile, version) = current_profile();
+    let (profile, _, version) = current_profile();
 
     let source_line_path = scratch.path.join("source-line.lua");
     fs::write(

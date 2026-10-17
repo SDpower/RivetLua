@@ -1490,9 +1490,9 @@ fn run(module: VerifiedModule, profile: LuaProfile, hooks: bool) -> (Vec<Value>,
 
 #[derive(Debug)]
 struct CountObservation {
-    one: i64,
-    four: i64,
-    many: i64,
+    _one: i64,
+    _four: i64,
+    _many: i64,
     mask: Vec<u8>,
     count: i64,
     nested: i64,
@@ -1520,9 +1520,9 @@ fn observe(module: VerifiedModule, profile: LuaProfile) -> CountObservation {
     let (values, mask) = run(module, profile, true);
     assert_eq!(values.len(), 10);
     CountObservation {
-        one: integer(values[0]),
-        four: integer(values[1]),
-        many: integer(values[2]),
+        _one: integer(values[0]),
+        _four: integer(values[1]),
+        _many: integer(values[2]),
         mask: mask.unwrap(),
         count: integer(values[4]),
         nested: integer(values[5]),

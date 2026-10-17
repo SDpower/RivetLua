@@ -9,6 +9,7 @@ const HARD_CODE_LIMIT: usize = 16 * 1024 * 1024;
 
 struct PagePlan {
     allocation: usize,
+    #[cfg(target_os = "macos")]
     capacity: usize,
 }
 
@@ -120,6 +121,7 @@ fn page_plan(code: &ValidatedCode, code_limit_bytes: usize) -> Result<PagePlan, 
     }
     Ok(PagePlan {
         allocation,
+        #[cfg(target_os = "macos")]
         capacity,
     })
 }

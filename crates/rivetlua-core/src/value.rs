@@ -15,6 +15,7 @@ static NEXT_VM_ID: IdAtomic = IdAtomic::new(1);
 static NEXT_RUNTIME_TOKEN: IdAtomic = IdAtomic::new(1);
 static NEXT_HOST_FUNCTION_ID: IdAtomic = IdAtomic::new(1);
 
+#[allow(deprecated, reason = "保留 Rust 1.94.1 相容性；try_update 自 1.95.0 才穩定")]
 fn next_unique_id(counter: &IdAtomic) -> Option<NonZeroU64> {
     let id = counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))

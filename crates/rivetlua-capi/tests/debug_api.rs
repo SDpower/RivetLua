@@ -85,12 +85,12 @@ impl LuaDebug {
         ar.lastlinedefined = -99;
         ar.nups = 250;
         ar.nparams = 251;
-        ar.isvararg = -1;
+        ar.isvararg = c_char::MAX;
         #[cfg(feature = "lua55")]
         {
             ar.extraargs = 252;
         }
-        ar.istailcall = -1;
+        ar.istailcall = c_char::MAX;
         ar.ftransfer = !0;
         ar.ntransfer = !0;
         ar.short_src.fill(b'Q' as c_char);
@@ -1545,8 +1545,8 @@ fn suspended_coroutine_local_vararg_write_and_revision_b10b1() {
         ar.currentline = -77;
         ar.nups = u8::MAX;
         ar.nparams = u8::MAX;
-        ar.isvararg = -1;
-        ar.istailcall = -1;
+        ar.isvararg = c_char::MAX;
+        ar.istailcall = c_char::MAX;
         ar.ftransfer = !0;
         ar.ntransfer = !0;
         #[cfg(feature = "lua55")]
@@ -1664,8 +1664,8 @@ fn getinfo_function_only_selectors_and_failure_are_atomic_b10b1() {
     ar.currentline = -77;
     ar.nups = u8::MAX;
     ar.nparams = u8::MAX;
-    ar.isvararg = -1;
-    ar.istailcall = -1;
+    ar.isvararg = c_char::MAX;
+    ar.istailcall = c_char::MAX;
     ar.ftransfer = !0;
     ar.ntransfer = !0;
     #[cfg(feature = "lua55")]

@@ -362,6 +362,7 @@ pub(crate) struct ModuleCharge {
 }
 
 impl ModuleCharge {
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             charges: AllocationCharges::new(),

@@ -634,8 +634,8 @@ impl Table {
                     .checked_mul(2)
                     .map(|doubled| doubled.max(4))
                     .ok_or(VmError::ArithmeticOverflow)?;
-                let new_bytes = checked_bytes(new_capacity, size_of::<Option<Value>>())?;
-                let old_bytes = checked_bytes(old_capacity, size_of::<Option<Value>>())?;
+                checked_bytes(new_capacity, size_of::<Option<Value>>())?;
+                checked_bytes(old_capacity, size_of::<Option<Value>>())?;
                 let mut next = Vec::new();
                 let ticket =
                     reserve_vec(ledger, &mut next, new_capacity, FailPoint::TableArrayGrow)?;
@@ -647,8 +647,6 @@ impl Table {
                     next,
                     ticket: Some(ticket),
                     charge: None,
-                    old_bytes,
-                    new_bytes,
                     value,
                 });
             }
@@ -666,8 +664,8 @@ impl Table {
                 return Err(VmError::LedgerInvariant);
             }
             let bucket_size = size_of::<Option<(CanonicalKey, Value)>>();
-            let new_bytes = checked_bytes(new_capacity, bucket_size)?;
-            let old_bytes = checked_bytes(capacity, bucket_size)?;
+            checked_bytes(new_capacity, bucket_size)?;
+            checked_bytes(capacity, bucket_size)?;
             let mut next = Vec::new();
             let ticket = reserve_vec(ledger, &mut next, new_capacity, FailPoint::TableHashGrow)?;
             next.resize_with(new_capacity, || None);
@@ -677,8 +675,6 @@ impl Table {
                 next,
                 ticket: Some(ticket),
                 charge: None,
-                old_bytes,
-                new_bytes,
                 existing_count: count,
                 key,
                 value,
@@ -933,16 +929,12 @@ pub(crate) enum PreparedTableMutation {
         next: Vec<Option<Value>>,
         ticket: Option<Reservation>,
         charge: Option<AllocationCharge>,
-        old_bytes: usize,
-        new_bytes: usize,
         value: Value,
     },
     GrowHash {
         next: Vec<Option<(CanonicalKey, Value)>>,
         ticket: Option<Reservation>,
         charge: Option<AllocationCharge>,
-        old_bytes: usize,
-        new_bytes: usize,
         existing_count: usize,
         key: CanonicalKey,
         value: Value,

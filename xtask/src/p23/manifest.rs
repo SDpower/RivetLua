@@ -343,6 +343,7 @@ impl ExperimentManifest {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn comparable_to(&self, other: &Self) -> bool {
         if self.validate().is_err() || other.validate().is_err() {
             return false;
@@ -424,28 +425,6 @@ pub fn target_registry() -> &'static [FuzzTarget; 7] {
 
 pub fn select_target(id: &str) -> Option<&'static FuzzTarget> {
     TARGETS.iter().find(|target| target.id == id)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReportKind {
-    Fuzz,
-    Fault,
-    Tool,
-    Performance,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Finding {
-    pub public_code: String,
-    pub target_id: String,
-    pub input_sha256: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExperimentReport {
-    pub kind: ReportKind,
-    pub manifest: ExperimentManifest,
-    pub findings: Vec<Finding>,
 }
 
 fn exact_object(value: &StrictJsonValue, expected: &[&str]) -> Result<(), String> {

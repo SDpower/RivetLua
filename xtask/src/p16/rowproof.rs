@@ -436,6 +436,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 pub(super) fn required(root: &Path, row: &Row) -> Result<Vec<ProofKey>, String> {
     let observed =
         if row.status == "HEADER_ONLY" && matches!(row.kind.as_str(), "macro" | "constant") {

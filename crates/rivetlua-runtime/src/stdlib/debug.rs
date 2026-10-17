@@ -33,6 +33,7 @@ pub(crate) struct DebugHook {
 }
 
 impl DebugHook {
+    #[cfg(test)]
     pub(crate) fn new(function: ObjectRef, count: usize) -> Self {
         Self::with_line(function, count, false)
     }

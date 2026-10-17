@@ -4688,6 +4688,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     ))
 }
 
+#[cfg(test)]
 fn run_interpreter(
     args: &[OsString],
     stdin: &mut dyn Read,

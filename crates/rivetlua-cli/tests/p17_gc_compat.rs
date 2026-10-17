@@ -71,7 +71,7 @@ struct CliProcess {
 
 impl CliProcess {
     fn spawn(profile: &str, source: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_rivetlua"))
+        let child = Command::new(env!("CARGO_BIN_EXE_rivetlua"))
             .env_remove("LUA_INIT")
             .env_remove("LUA_INIT_5_4")
             .env_remove("LUA_INIT_5_5")

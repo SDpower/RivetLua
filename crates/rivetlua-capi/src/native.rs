@@ -143,7 +143,7 @@ pub fn preflight(
         return Err(NativeError::Io(std::io::Error::last_os_error()));
     }
     // SAFETY：fd 是上方成功 open 的唯一 ownership；File 關閉後不再使用。
-    let mut file = unsafe { File::from_raw_fd(fd) };
+    let file = unsafe { File::from_raw_fd(fd) };
     if !file.metadata()?.is_file() {
         return Err(NativeError::Limit);
     }

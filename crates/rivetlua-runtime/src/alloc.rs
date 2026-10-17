@@ -345,12 +345,6 @@ impl AllocationLedger {
         self.inner.set(state);
     }
 
-    pub(crate) fn poison(&self) {
-        let mut state = self.inner.get();
-        state.poisoned = true;
-        self.inner.set(state);
-    }
-
     pub fn set_limit(&self, limit: usize) {
         let mut state = self.inner.get();
         state.snapshot.limit = limit;
@@ -513,6 +507,7 @@ impl AllocationLedger {
         self.refund_domain(bytes, AllocationDomain::Host)
     }
 
+    #[cfg(test)]
     pub(crate) fn refund_lua(&self, bytes: usize) -> Result<(), VmError> {
         self.refund_domain(bytes, AllocationDomain::LuaHeap)
     }
@@ -543,14 +538,6 @@ impl AllocationLedger {
     }
 
     /// Drop 不可回傳錯誤；若內部帳本已損壞，標記後續操作為可檢查失敗。
-    pub(crate) fn refund_on_drop(&self, bytes: usize) {
-        self.refund_on_drop_domain(bytes, AllocationDomain::Host);
-    }
-
-    pub(crate) fn refund_lua_on_drop(&self, bytes: usize) {
-        self.refund_on_drop_domain(bytes, AllocationDomain::LuaHeap);
-    }
-
     fn refund_on_drop_domain(&self, bytes: usize, domain: AllocationDomain) {
         let mut state = self.inner.get();
         let domain_balance = match domain {

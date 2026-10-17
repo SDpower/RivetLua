@@ -43,7 +43,7 @@ pub enum Outcome {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct RawAction {
+pub(crate) struct RawAction {
     kind: i32,
     value: i32,
 }

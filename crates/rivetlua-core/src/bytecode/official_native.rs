@@ -5863,6 +5863,7 @@ fn pending_open_result_local_alias(
 
 /// open Call 的動態結果可覆蓋已死亡的固定值；證明只接受到下一次定義或
 /// 函式退出前無讀取、無分支的區間。
+#[cfg(test)]
 fn dead_after_open_call(
     proto: &BytecodePrototype,
     call_pc: usize,

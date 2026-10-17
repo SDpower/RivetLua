@@ -75,13 +75,6 @@ unsafe extern "C" {
         index: c_int,
         n: c_int,
     ) -> *mut c_void;
-    fn lua_upvaluejoin(
-        state: *mut rivetlua_capi::stack::lua_State,
-        first_index: c_int,
-        first_n: c_int,
-        second_index: c_int,
-        second_n: c_int,
-    );
 }
 
 #[test]

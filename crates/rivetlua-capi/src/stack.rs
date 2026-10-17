@@ -257,7 +257,6 @@ const LUA_RIDX_GLOBALS: i64 = 2;
 const LUA_RIDX_MAINTHREAD: i64 = 1;
 #[cfg(feature = "lua55")]
 const LUA_RIDX_MAINTHREAD: i64 = 3;
-const LUA_NOREF: c_int = -2;
 const LUA_REFNIL: c_int = -1;
 type LuaCFunction = unsafe extern "C" fn(*mut lua_State) -> c_int;
 type LuaKFunction = unsafe extern "C" fn(*mut lua_State, c_int, isize) -> c_int;
@@ -1428,6 +1427,7 @@ impl DebugState {
         if replace_coroutine.is_none() {
             self.reserve_token(vm)?;
         }
+        #[allow(deprecated, reason = "保留 Rust 1.94.1 相容性，try_update 自 1.95 才穩定")]
         let sequence = NEXT_DEBUG_TOKEN_B10
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
@@ -2978,105 +2978,6 @@ impl StateControl {
         Ok(())
     }
 
-    /// # Safety
-    /// `entries` 為有效且以 null name 結尾的唯讀 luaL_Reg 陣列；每個非空
-    /// name 指向呼叫期間有效、以 NUL 結尾的 C 字串。
-    unsafe fn set_functions(&self, entries: *const luaL_Reg, nup: c_int) -> Result<(), StackError> {
-        let n = usize::try_from(nup)
-            .ok()
-            .filter(|&n| n <= 255)
-            .ok_or(StackError::InvalidIndex)?;
-        self.check_stack(nup)?;
-        if entries.is_null() {
-            return Err(StackError::InvalidIndex);
-        }
-        let group_owner = self.group.upgrade().ok_or(StackError::InvalidState)?;
-        let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let mut stack = self.stack.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let top = stack.slots.len();
-        if top <= n {
-            return Err(StackError::InvalidIndex);
-        }
-        if !stack.can_remove_from(top - n) {
-            return Err(StackError::InvalidIndex);
-        }
-        let table = table_at_index((top - n) as c_int, &stack, &group)?;
-        let has_metatable = group.vm.get_metatable(table)?.is_some();
-        let mut captures = [Value::Nil; 255];
-        for (offset, capture) in captures.iter_mut().take(n).enumerate() {
-            let StackValue::Core(value) = stack.slots[top - n + offset].checked_value(&group.vm)?;
-            if let Value::CFunction(id) = value {
-                if group.functions.get(id).is_none() {
-                    return Err(StackError::WrongVm);
-                }
-            }
-            *capture = value;
-        }
-        let mut offset = 0usize;
-        loop {
-            // SAFETY：呼叫者保證陣列從 entries 起連續、正確對齊並完整初始化，
-            // 直到第一個 null name sentinel；只讀取當前元素，且呼叫期間不失效。
-            let entry = unsafe { entries.add(offset) };
-            // SAFETY：entry 指向上述有效元素；只讀 name 欄位，sentinel 的 func 不讀取。
-            let name = unsafe { (*entry).name };
-            if name.is_null() {
-                break;
-            }
-            if has_metatable {
-                return Err(StackError::InvalidIndex);
-            }
-            let next_offset = offset.checked_add(1).ok_or(StackError::StackLimit)?;
-            // SAFETY：非空 name 指向呼叫期間有效、以 NUL 結尾的唯讀 C 字串。
-            let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-            // SAFETY：非 sentinel 元素的 func 欄位已初始化；函式指標只保存，不解參或呼叫。
-            let function = unsafe { (*entry).func };
-            if let Some(function) = function {
-                let previous = group.functions.find_function(function);
-                let id = match previous {
-                    Some(id) => id,
-                    None => HostFunctionId::new_unique(group.vm.id())
-                        .ok_or(StackError::Runtime(VmError::IdentityExhausted))?,
-                };
-                let prepared_registry = if previous.is_none() {
-                    group.functions.prepare_capacity(&group.vm)?
-                } else {
-                    None
-                };
-                let StateGroup { vm, functions, .. } = &mut *group;
-                if n == 0 {
-                    vm.raw_set_byte_string_key(table, name, Value::CFunction(id))?;
-                    if previous.is_none() {
-                        functions.publish(prepared_registry, HostFunctionEntry { id, function });
-                    }
-                } else {
-                    vm.prepare_unpublished_c_closure::<StackError>(
-                        id,
-                        &captures[..n],
-                        |vm, closure| {
-                            vm.raw_set_byte_string_key(table, name, Value::Object(closure))?;
-                            Ok(())
-                        },
-                        |_, root| {
-                            if previous.is_none() {
-                                functions
-                                    .publish(prepared_registry, HostFunctionEntry { id, function });
-                            }
-                            drop(root);
-                        },
-                    )?;
-                }
-            } else {
-                group
-                    .vm
-                    .raw_set_byte_string_key(table, name, Value::Boolean(false))?;
-            }
-            offset = next_offset;
-        }
-        stack.slots.truncate(top - n);
-        stack.release_empty_capacity();
-        Ok(())
-    }
-
     fn c_function(&self, index: c_int) -> Result<Option<LuaCFunction>, StackError> {
         self.validate()?;
         let group_owner = self.group.upgrade().ok_or(StackError::InvalidState)?;
@@ -4013,64 +3914,6 @@ impl StateControl {
         Ok(tag)
     }
 
-    fn get_named_field(&self, index: Option<c_int>, name: &[u8]) -> Result<c_int, StackError> {
-        self.validate()?;
-        let group_owner = self.group.upgrade().ok_or(StackError::InvalidState)?;
-        let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let mut stack = self.stack.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let table = match index {
-            Some(index) => table_at_index(index, &stack, &group)?,
-            None => globals_table(&group)?,
-        };
-        let (slot, tag) = group.vm.with_temporary_byte_string(name, |vm, key| {
-            let value = vm.raw_get(table, Value::Object(key))?;
-            let tag = checked_value_tag(vm, value)?;
-            let slot = StackSlot::new(vm, StackValue::Core(value))?;
-            let required = stack
-                .slots
-                .len()
-                .checked_add(1)
-                .ok_or(StackError::StackLimit)?;
-            stack.ensure_capacity(vm, required)?;
-            Ok::<_, StackError>((slot, tag))
-        })?;
-        stack.slots.push(slot);
-        Ok(tag)
-    }
-
-    fn get_subtable(&self, index: c_int, name: &[u8]) -> Result<c_int, StackError> {
-        self.validate()?;
-        let group_owner = self.group.upgrade().ok_or(StackError::InvalidState)?;
-        let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let mut stack = self.stack.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        // 先依呼叫前 top 解析 target；任何失敗都不可移動既有 slots。
-        let table = table_at_index(index, &stack, &group)?;
-        let required = stack
-            .slots
-            .len()
-            .checked_add(1)
-            .ok_or(StackError::StackLimit)?;
-        if required > MAX_STACK {
-            return Err(StackError::StackLimit);
-        }
-        let mut prepared_capacity = None;
-        let (subtable, root, existed) =
-            group
-                .vm
-                .get_or_create_byte_named_subtable(table, name, |vm| {
-                    prepared_capacity = stack.prepare_capacity(vm, required)?;
-                    Ok::<(), StackError>(())
-                })?;
-        // runtime 欄位已發布；以下只有已預備容量的 Vec 移交與 push。
-        stack.commit_capacity(prepared_capacity);
-        stack.slots.push(StackSlot {
-            value: StackValue::Core(Value::Object(subtable)),
-            root: Some(root),
-            string_view: None,
-        });
-        Ok(c_int::from(existed))
-    }
-
     fn new_metatable(&self, borrowed_name: &[u8]) -> Result<c_int, StackError> {
         self.validate()?;
         let group_owner = self.group.upgrade().ok_or(StackError::InvalidState)?;
@@ -4262,32 +4105,6 @@ impl StateControl {
         group.vm.raw_set(table, key, value)?;
         let new_len = stack.slots.len() - 2;
         stack.slots.truncate(new_len);
-        stack.release_empty_capacity();
-        Ok(())
-    }
-
-    fn set_named_field(&self, index: Option<c_int>, name: &[u8]) -> Result<(), StackError> {
-        self.validate()?;
-        let group_owner = self.group.upgrade().ok_or(StackError::InvalidState)?;
-        let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let mut stack = self.stack.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        if stack.slots.is_empty() {
-            return Err(StackError::InvalidIndex);
-        }
-        if !stack.can_remove_from(stack.slots.len() - 1) {
-            return Err(StackError::InvalidIndex);
-        }
-        let table = match index {
-            Some(index) => table_at_index(index, &stack, &group)?,
-            None => globals_table(&group)?,
-        };
-        let StackValue::Core(value) = stack
-            .slots
-            .last()
-            .ok_or(StackError::InvalidIndex)?
-            .checked_value(&group.vm)?;
-        group.vm.raw_set_byte_string_key(table, name, value)?;
-        stack.slots.pop();
         stack.release_empty_capacity();
         Ok(())
     }
@@ -6210,6 +6027,7 @@ impl Drop for StateAllocation {
     }
 }
 
+#[allow(deprecated, reason = "保留 Rust 1.94.1 相容性，try_update 自 1.95 才穩定")]
 fn next_generation() -> Result<u64, StackError> {
     NEXT_STATE_GENERATION
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -6311,10 +6129,7 @@ fn metatable_target_at_index(
     group: &StateGroup,
 ) -> Result<Value, StackError> {
     let StackValue::Core(value) =
-        read_at_index(resolve_read_index(index, stack.slots.len())?, stack, group)?
-    else {
-        return Err(StackError::InvalidIndex);
-    };
+        read_at_index(resolve_read_index(index, stack.slots.len())?, stack, group)?;
     checked_value_tag(&group.vm, value)?;
     Ok(value)
 }
@@ -6327,20 +6142,6 @@ fn lookup_close_method_b7(vm: &mut Vm, object: ObjectRef) -> Result<Value, Stack
         vm.raw_get(metatable, Value::Object(key))
             .map_err(StackError::from)
     })
-}
-
-fn globals_table(group: &StateGroup) -> Result<ObjectRef, StackError> {
-    let registry = group.registry_table()?;
-    let Value::Object(globals) = group
-        .vm
-        .raw_get(registry, Value::Integer(LUA_RIDX_GLOBALS))?
-    else {
-        return Err(StackError::InvalidIndex);
-    };
-    if group.vm.object_kind(globals)? != ObjectKind::Table {
-        return Err(StackError::InvalidIndex);
-    }
-    Ok(globals)
 }
 
 fn freelist_next(vm: &Vm, table: ObjectRef, reference: i64) -> Result<i64, StackError> {

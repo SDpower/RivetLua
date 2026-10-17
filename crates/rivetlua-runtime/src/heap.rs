@@ -2185,10 +2185,10 @@ struct UserdataPayload {
     bytes: Vec<UserdataWord>,
     requested_len: usize,
     bytes_charge: usize,
-    bytes_owner: Option<crate::alloc::AllocationCharge>,
+    _bytes_owner: Option<crate::alloc::AllocationCharge>,
     uservalues: Vec<Value>,
     uservalues_charge: usize,
-    uservalues_owner: Option<crate::alloc::AllocationCharge>,
+    _uservalues_owner: Option<crate::alloc::AllocationCharge>,
     metatable: Option<ObjectRef>,
 }
 
@@ -2226,10 +2226,10 @@ impl UserdataPayload {
             bytes,
             requested_len: size,
             bytes_charge,
-            bytes_owner: Some(bytes_owner),
+            _bytes_owner: Some(bytes_owner),
             uservalues,
             uservalues_charge,
-            uservalues_owner: Some(uservalues_owner),
+            _uservalues_owner: Some(uservalues_owner),
             metatable: None,
         })
     }
@@ -2582,7 +2582,7 @@ enum Slot {
         finalizer_remarked: bool,
         // 唯一元素不再增減；Vec 只搬移指標，中間的物件配置維持原址。
         object: Vec<HeapObject>,
-        object_charge: crate::alloc::AllocationCharge,
+        _object_charge: crate::alloc::AllocationCharge,
     },
     Free {
         generation: Generation,
@@ -7623,6 +7623,7 @@ impl Vm {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn string_index_event(&mut self) -> Result<Option<Value>, VmError> {
         let Some(metatable) = self.string_metatable() else {
             return Ok(None);
@@ -8916,7 +8917,7 @@ impl Vm {
             finalizer_order: 0,
             finalizer_remarked: false,
             object,
-            object_charge,
+            _object_charge: object_charge,
         };
         match free {
             Some(index) => self.slots[index] = occupied,
@@ -10645,16 +10646,9 @@ mod p15_payload_accounting_tests {
     use core::mem::size_of;
 
     use super::{
-        FilePayload, HeapObject, HeapPayload, ModulePayload, ObjectKind, RootKind, Slot, Table, Vm,
-        VmError,
+        HeapObject, HeapPayload, ModulePayload, ObjectKind, RootKind, Slot, Table, Vm, VmError,
     };
-    use crate::closure::Closure;
-    use crate::coroutine::{Coroutine, ThreadContext};
-    use crate::errors::Builtin;
-    use crate::pending_op::PendingStack;
-    use crate::string::ByteString;
-    use crate::upvalue::Upvalue;
-    use crate::vm::NativeCompletion;
+    use crate::coroutine::Coroutine;
     use rivetlua_compiler::{
         CompileBudgetSink, CompileLimits, IrLimits, LanguageProfile, compile_with_budget,
     };
@@ -11728,7 +11722,7 @@ mod capi_join_lazy_environment_a43_tests {
     use rivetlua_core::{Generation, LuaProfile, ObjectRef, ProtoId, Value, VerifyLimits};
 
     use super::{
-        FailPoint, GcAge, GcColor, GcCycleKind, GcMode, GcPhase, RootKind, Slot, Vm, VmError,
+        FailPoint, GcAge, GcCycleKind, GcMode, GcPhase, RootKind, Slot, Vm, VmError,
     };
     use crate::closure::Closure;
     use crate::vm::RunOutcome;

@@ -1,3 +1,4 @@
+#[cfg(feature = "lua54")]
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ type AllocCallback = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize
 type MaybeAllocCallback = Option<AllocCallback>;
 type BlockMap = HashMap<usize, Block, BuildHasherDefault<DefaultHasher>>;
 
+#[cfg(feature = "lua54")]
 const ALLOC_ALIGN: usize = std::mem::align_of::<u128>();
 
 static BINDING_ONE: u8 = 0;
@@ -51,7 +53,6 @@ struct Event {
     ordinal: usize,
     binding: u8,
     input: usize,
-    osize: usize,
     nsize: usize,
     output: usize,
     token_origin: Option<u8>,
@@ -111,14 +112,14 @@ fn mark_callback_fault() {
 
 #[cfg(feature = "lua54")]
 fn create_state(allocator: MaybeAllocCallback, ud: *mut c_void) -> *mut lua_State {
-    // SAFETY：allocator 與 ud 在 state 存活期間有效；測試 callback 不會重入 Lua、panic 或 longjmp。
-    unsafe { lua_newstate(allocator, ud) }
+    // allocator 與 ud 在 state 存活期間有效；測試 callback 不會重入 Lua、panic 或 longjmp。
+    lua_newstate(allocator, ud)
 }
 
 #[cfg(feature = "lua55")]
 fn create_state(allocator: MaybeAllocCallback, ud: *mut c_void) -> *mut lua_State {
-    // SAFETY：allocator 與 ud 在 state 存活期間有效；測試 callback 不會重入 Lua、panic 或 longjmp。
-    unsafe { lua_newstate(allocator, ud, 0) }
+    // allocator 與 ud 在 state 存活期間有效；測試 callback 不會重入 Lua、panic 或 longjmp。
+    lua_newstate(allocator, ud, 0)
 }
 
 struct State(*mut lua_State);
@@ -129,8 +130,8 @@ impl State {
     }
 
     fn from_default_allocator() -> Self {
-        // SAFETY：luaL_newstate 不接收外部 pointer；回傳 state 由此 guard 在同一執行緒關閉。
-        Self(unsafe { luaL_newstate() })
+        // luaL_newstate 不接收外部 pointer；回傳 state 由此 guard 在同一執行緒關閉。
+        Self(luaL_newstate())
     }
 
     fn as_ptr(&self) -> *mut lua_State {
@@ -304,7 +305,6 @@ unsafe extern "C" fn tracking_allocator(
             ordinal,
             binding,
             input,
-            osize,
             nsize,
             output: output.expose_provenance(),
             token_origin: existing.map(|block| block.first_binding),

@@ -162,24 +162,22 @@ fn p17_dump_open_call_terminal_results_roundtrip() {
 
 #[test]
 fn p17_full_db_dump_obeys_cli_finite_quota() {
-    let evidence = std::env::var("RIVETLUA_P17_EVIDENCE_DIR").unwrap();
     let fixtures = [
         (
             LanguageProfile::Lua55,
             LuaProfile::Lua55,
-            "b01-lua55-i64f64-85855-1791613374781148000/fixture/lua-5.5.1-tests/db.lua",
+            include_bytes!("../../../vendor/lua55/lua-5.5.1-tests/db.lua").as_slice(),
         ),
         (
             LanguageProfile::Lua54,
             LuaProfile::Lua54,
-            "b01-lua54-i64f64-85855-1791613383015514000/fixture/lua-5.4.9-tests/db.lua",
+            include_bytes!("../../../vendor/lua54/lua-5.4.9-tests/db.lua").as_slice(),
         ),
     ];
     let mut failures = Vec::new();
-    for (language, profile, path) in fixtures {
-        let source = std::fs::read(std::path::Path::new(&evidence).join(path)).unwrap();
+    for (language, profile, source) in fixtures {
         let module = compile_with_budget(
-            &source,
+            source,
             b"@db.lua",
             language,
             &CompileLimits::default(),

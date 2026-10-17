@@ -54,7 +54,7 @@ fn read_top(state: *mut lua_State) -> Vec<u8> {
 fn check(state: *mut lua_State, version: f64, sizes: usize) -> Outcome {
     // SAFETY：呼叫端持有有效 StateOwner，action 僅準備錯誤並返回；C 只在 Rust frame 退出後跳轉。
     unsafe {
-        protect(state, |checkpoint| unsafe {
+        protect(state, |checkpoint| {
             prepare_checkversion(checkpoint, version, sizes)
         })
     }
@@ -229,17 +229,15 @@ fn aux_checkversion_a48_normal_priority_exact_bytes_and_nested_top() {
     // SAFETY：兩層 C checkpoint 只讓 Rust action 回傳後在各自 C frame 跳轉。
     let outer = unsafe {
         protect(state, |outer| {
-            let outcome = unsafe {
-                protect(state, |inner| {
-                    inner_called += 1;
-                    unsafe { prepare_checkversion(inner, CORE_VERSION, NUMSIZES + 1) }
-                })
-            };
+            let outcome = protect(state, |inner| {
+                inner_called += 1;
+                prepare_checkversion(inner, CORE_VERSION, NUMSIZES + 1)
+            });
             assert_eq!(outcome, Outcome::Raised(ErrorClass::Lua));
             assert_eq!(consume_error(state), Ok(ErrorClass::Lua));
             assert_eq!(read_top(state), NUMERIC_ERROR);
-            unsafe { lua_settop(state, 1) };
-            unsafe { prepare_checkversion(outer, CORE_VERSION, NUMSIZES + 1) }
+            lua_settop(state, 1);
+            prepare_checkversion(outer, CORE_VERSION, NUMSIZES + 1)
         })
     };
     assert_eq!(outer, Outcome::Raised(ErrorClass::Lua));

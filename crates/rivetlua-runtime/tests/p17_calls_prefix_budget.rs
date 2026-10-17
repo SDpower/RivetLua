@@ -21,7 +21,7 @@ enum ObservedOutcome {
     Returned(Vec<Value>),
     LuaError(RuntimeErrorKind),
     Aborted(AbortReason),
-    Other(String),
+    Other { _detail: String },
 }
 
 #[derive(Debug)]
@@ -114,7 +114,9 @@ fn run_case(
             RunOutcome::Returned(values) => ObservedOutcome::Returned(values),
             RunOutcome::LuaError(error) => ObservedOutcome::LuaError(error.kind),
             RunOutcome::Aborted(reason) => ObservedOutcome::Aborted(reason),
-            other => ObservedOutcome::Other(format!("{other:?}")),
+            other => ObservedOutcome::Other {
+                _detail: format!("{other:?}"),
+            },
         };
         Ok(RunEvidence {
             outcome,

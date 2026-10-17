@@ -151,4 +151,4 @@ jobs:
           PY
 
       - name: Test workspace
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --no-fail-fast
