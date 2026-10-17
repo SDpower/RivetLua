@@ -4677,6 +4677,7 @@ fn temporary_call_layouts(
     span: &[(usize, usize)],
     protected: &[u8],
     live_at: &[LiveRow],
+    owned_next: &[NumericOwnedNext],
     work: &mut OfficialWorkBudget,
 ) -> Result<Vec<TemporaryCallLayout>, OfficialExportError> {
     let Some(debug) = module.native_debug() else {
@@ -4704,7 +4705,7 @@ fn temporary_call_layouts(
     let plan_calls = module
         .official_execution()
         .map_or(&[][..], |plan| plan.calls());
-    let mut calls = Vec::new();
+    let mut calls: Vec<TemporaryCallLayout> = Vec::new();
     let call_count = proto
         .instructions
         .iter()
@@ -5542,7 +5543,993 @@ fn temporary_call_layouts(
         }
         chain_start = chain_end;
     }
+    // 同一 register 的 home 跨 Call 固定；先蒐集所有 Call 的低槽約束，
+    // 再回頭校正 fixed Call，涵蓋較晚 Call 對較早出生值的限制。
+    let mut low_bound = Vec::new();
+    low_bound.try_reserve_exact(span.len()).map_err(|_| {
+        error(
+            OfficialExportErrorKind::AllocationFailed,
+            proto.id,
+            0,
+            "固定 Call 低槽約束配置失敗",
+        )
+    })?;
+    work_charge(work, span.len(), proto.id, 0)?;
+    low_bound.resize(span.len(), 255u16);
+    for call in &calls {
+        let call_pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                call.pc,
+                "固定 Call 低槽 PC 超出範圍",
+            )
+        })?);
+        let pending = debug.temporaries_at(proto.id, call_pc).unwrap_or(&[]);
+        work_charge(
+            work,
+            span.len()
+                .checked_mul(pending.len().checked_add(1).ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        call.pc,
+                        "固定 Call 低槽掃描 work 溢位",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        call.pc,
+                        "固定 Call 低槽掃描 work 溢位",
+                    )
+                })?,
+            proto.id,
+            call.pc,
+        )?;
+        for (register, range) in span.iter().enumerate() {
+            if mapped[register] != u8::MAX
+                || register == usize::from(proto.frame.environment.0)
+                || register == usize::from(proto.global_environment.0)
+                || range.0 > call.pc
+                || range.1 <= call.pc + 1
+                || !live_at_pc(span, protected, live_at, register, call.pc)
+                || !live_at_pc(span, protected, live_at, register, call.pc + 1)
+            {
+                continue;
+            }
+            let result_written = matches!(proto.instructions[call.pc].instruction,
+                Instruction::Call { base, result_mode: ResultMode::Fixed(results), .. }
+                    if register >= usize::from(base.0)
+                        && register - usize::from(base.0) < usize::from(results))
+                || matches!(proto.instructions[call.pc].instruction,
+                    Instruction::Call { base, result_mode: ResultMode::All, .. }
+                        if register == usize::from(base.0));
+            if result_written
+                || (!call.open_chain
+                    && pending
+                        .iter()
+                        .any(|entry| usize::from(entry.register.0) == register))
+            {
+                continue;
+            }
+            if call.open_chain
+                && protected[register] == 0
+                && dead_after_gathered_pending_open_call(module, proto, call, register, work)?
+            {
+                continue;
+            }
+            low_bound[register] = low_bound[register].min(call.call_base);
+        }
+    }
+    for call in &mut calls {
+        if call.open_chain {
+            continue;
+        }
+        let Instruction::Call {
+            base,
+            result_mode: ResultMode::Fixed(results),
+            ..
+        } = proto.instructions[call.pc].instruction
+        else {
+            continue;
+        };
+        let call_pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                call.pc,
+                "固定 Call 峰值 PC 超出範圍",
+            )
+        })?);
+        let pending = debug.temporaries_at(proto.id, call_pc).unwrap_or(&[]);
+        let mut crossing = Vec::new();
+        crossing.try_reserve_exact(span.len()).map_err(|_| {
+            error(
+                OfficialExportErrorKind::AllocationFailed,
+                proto.id,
+                call.pc,
+                "固定 Call survivor 配置失敗",
+            )
+        })?;
+        let mut live_start = usize::MAX;
+        let mut live_end = 0usize;
+        work_charge(
+            work,
+            span.len()
+                .checked_mul(pending.len().checked_add(1).ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        call.pc,
+                        "固定 Call survivor 掃描 work 溢位",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        call.pc,
+                        "固定 Call survivor 掃描 work 溢位",
+                    )
+                })?,
+            proto.id,
+            call.pc,
+        )?;
+        for (register, range) in span.iter().enumerate() {
+            if mapped[register] == u8::MAX
+                && register != usize::from(proto.frame.environment.0)
+                && register != usize::from(proto.global_environment.0)
+                && (register != usize::from(base.0) || results == 0)
+                && !(register >= usize::from(base.0)
+                    && register - usize::from(base.0) < usize::from(results))
+                && !pending
+                    .iter()
+                    .any(|entry| usize::from(entry.register.0) == register)
+                && range.0 <= call.pc
+                && call.pc + 1 < range.1
+                && live_at_pc(span, protected, live_at, register, call.pc)
+                && live_at_pc(span, protected, live_at, register, call.pc + 1)
+            {
+                crossing.push(register);
+                live_start = live_start.min(range.0);
+                live_end = live_end.max(range.1);
+            }
+        }
+        // pending 的槽也須容納在其他 Call 被迫留在低槽的干涉值。
+        // 只計入當前 Call 尚未由 survivor frontier 保留的值。
+        work_charge(
+            work,
+            pending
+                .len()
+                .checked_mul(span.len())
+                .and_then(|count| count.checked_mul(pending.len().checked_add(1)?))
+                .ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        call.pc,
+                        "固定 Call pending 共存掃描 work 溢位",
+                    )
+                })?,
+            proto.id,
+            call.pc,
+        )?;
+        let mut pending_shift = 0usize;
+        for temporary in pending {
+            let register = usize::from(temporary.register.0);
+            let mut owners = 0usize;
+            for owner in 0..span.len() {
+                if owner == register
+                    || low_bound[owner] > call.window_end
+                    || pending
+                        .iter()
+                        .any(|entry| usize::from(entry.register.0) == owner)
+                    || (live_at_pc(span, protected, live_at, owner, call.pc)
+                        && live_at_pc(span, protected, live_at, owner, call.pc + 1))
+                {
+                    continue;
+                }
+                if mapped_owner_interferes(
+                    proto, span, protected, live_at, owned_next, register, owner, work,
+                )? {
+                    owners += 1;
+                }
+            }
+            let mut storage_conflict = false;
+            if low_bound[register] < 255 {
+                let own_slot = call
+                    .first_slot
+                    .checked_add(temporary.ordinal - 1)
+                    .ok_or_else(|| {
+                        error(
+                            OfficialExportErrorKind::LimitExceeded,
+                            proto.id,
+                            call.pc,
+                            "固定 Call pending home 溢位",
+                        )
+                    })?;
+                work_charge(work, storage.len(), proto.id, call.pc)?;
+                for local in storage {
+                    if (local.start_pc as usize) < span[register].1
+                        && span[register].0 < local.end_pc as usize
+                        && u16::from(official_storage_slot(
+                            local.slot,
+                            anonymous_vararg_slot,
+                            proto.id,
+                            call.pc,
+                        )?) == own_slot
+                    {
+                        storage_conflict = true;
+                        break;
+                    }
+                }
+            }
+            pending_shift = pending_shift.max(owners + usize::from(storage_conflict));
+        }
+        let pending_shift = u16::try_from(pending_shift).map_err(|_| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                call.pc,
+                "固定 Call pending 共存超出 stack",
+            )
+        })?;
+        if pending_shift != 0 {
+            call.first_slot = call.first_slot.checked_add(pending_shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call 前綴溢位",
+                )
+            })?;
+            call.call_base = call.call_base.checked_add(pending_shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call base 溢位",
+                )
+            })?;
+            call.window_start = call
+                .window_start
+                .checked_add(pending_shift)
+                .ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        call.pc,
+                        "固定 Call 窗口溢位",
+                    )
+                })?;
+            call.window_end = call.window_end.checked_add(pending_shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call 窗口溢位",
+                )
+            })?;
+            if call.window_end > 255 {
+                return Err(error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call pending 窗口超出 stack",
+                ));
+            }
+        }
+        if crossing.is_empty() {
+            continue;
+        }
+        let mut local_floor = 0usize;
+        work_charge(work, storage.len(), proto.id, call.pc)?;
+        for local in storage {
+            if local.start_pc as usize >= live_end || live_start >= local.end_pc as usize {
+                continue;
+            }
+            let home = official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, call.pc)?;
+            local_floor = local_floor.max(usize::from(home) + 1);
+        }
+        let mut low_required = Vec::new();
+        low_required.try_reserve_exact(span.len()).map_err(|_| {
+            error(
+                OfficialExportErrorKind::AllocationFailed,
+                proto.id,
+                call.pc,
+                "固定 Call 共存集合配置失敗",
+            )
+        })?;
+        work_charge(
+            work,
+            span.len()
+                .checked_mul(crossing.len().checked_add(1).ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        call.pc,
+                        "固定 Call 共存集合 work 溢位",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        call.pc,
+                        "固定 Call 共存集合 work 溢位",
+                    )
+                })?,
+            proto.id,
+            call.pc,
+        )?;
+        for (register, range) in span.iter().enumerate() {
+            if range.0 < live_end
+                && live_start < range.1
+                && (low_bound[register] <= call.first_slot || crossing.contains(&register))
+            {
+                low_required.push(register);
+            }
+        }
+        let steps = call.pc + 1 - live_start;
+        let per_step = crossing
+            .len()
+            .checked_add(low_required.len())
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call 共存峰值 work 溢位",
+                )
+            })?;
+        work_charge(
+            work,
+            steps.checked_mul(per_step).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call 共存峰值 work 溢位",
+                )
+            })?,
+            proto.id,
+            call.pc,
+        )?;
+        let mut peak = 0usize;
+        for at in live_start..=call.pc {
+            if crossing.iter().any(|&register| {
+                live_at_pc(span, protected, live_at, register, at)
+                    || live_at_pc(span, protected, live_at, register, at + 1)
+            }) {
+                peak = peak.max(
+                    low_required
+                        .iter()
+                        .filter(|&&register| span[register].0 <= at && at < span[register].1)
+                        .count(),
+                );
+            }
+        }
+        let needed = local_floor.checked_add(peak).ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                call.pc,
+                "固定 Call 共存峰值溢位",
+            )
+        })?;
+        let shift =
+            u16::try_from(needed.saturating_sub(usize::from(call.first_slot))).map_err(|_| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call 共存峰值超出 stack",
+                )
+            })?;
+        if shift != 0 {
+            call.first_slot = call.first_slot.checked_add(shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call 前綴溢位",
+                )
+            })?;
+            call.call_base = call.call_base.checked_add(shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call base 溢位",
+                )
+            })?;
+            call.window_start = call.window_start.checked_add(shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call 窗口溢位",
+                )
+            })?;
+            call.window_end = call.window_end.checked_add(shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call 窗口溢位",
+                )
+            })?;
+            if call.window_end > 255 {
+                return Err(error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "固定 Call 共存窗口超出 stack",
+                ));
+            }
+        }
+    }
+    refine_open_call_prefixes(
+        module,
+        proto,
+        anonymous_vararg_slot,
+        &mut calls,
+        span,
+        protected,
+        live_at,
+        owned_next,
+        &low_bound,
+        work,
+    )?;
+    align_reused_pending_prefixes(
+        module,
+        proto,
+        anonymous_vararg_slot,
+        &mut calls,
+        span,
+        protected,
+        live_at,
+        owned_next,
+        &low_bound,
+        work,
+    )?;
     Ok(calls)
+}
+
+// 同一值的 home 不隨 Call 改變。分離的 Call 若為該值建立不同的
+// pending 前綴，須把相關窗口共同移到其低槽共存值之上。
+fn align_reused_pending_prefixes(
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    anonymous_vararg_slot: Option<u8>,
+    calls: &mut [TemporaryCallLayout],
+    span: &[(usize, usize)],
+    protected: &[u8],
+    live_at: &[LiveRow],
+    owned_next: &[NumericOwnedNext],
+    low_bound: &[u16],
+    work: &mut OfficialWorkBudget,
+) -> Result<(), OfficialExportError> {
+    let Some(debug) = module.native_debug() else {
+        return Ok(());
+    };
+    let storage = debug.storage_for(proto.id).ok_or_else(|| {
+        error(
+            OfficialExportErrorKind::InvalidPrototype,
+            proto.id,
+            0,
+            "Call 前綴缺少 local storage",
+        )
+    })?;
+    let mut target = Vec::new();
+    target.try_reserve_exact(calls.len()).map_err(|_| {
+        error(
+            OfficialExportErrorKind::AllocationFailed,
+            proto.id,
+            0,
+            "Call 前綴目標配置失敗",
+        )
+    })?;
+    work_charge(work, calls.len(), proto.id, 0)?;
+    target.extend(calls.iter().map(|call| call.first_slot));
+    let retained_home = |register: usize,
+                         call: &TemporaryCallLayout,
+                         work: &mut OfficialWorkBudget|
+     -> Result<bool, OfficialExportError> {
+        if !live_at_pc(span, protected, live_at, register, call.pc)
+            || !live_at_pc(span, protected, live_at, register, call.pc + 1)
+        {
+            return Ok(false);
+        }
+        let result_written = matches!(proto.instructions[call.pc].instruction,
+            Instruction::Call { base, result_mode: ResultMode::Fixed(results), .. }
+                if register >= usize::from(base.0)
+                    && register - usize::from(base.0) < usize::from(results))
+            || matches!(proto.instructions[call.pc].instruction,
+                Instruction::Call { base, result_mode: ResultMode::All, .. }
+                    if register == usize::from(base.0));
+        if result_written
+            || (call.open_chain
+                && protected[register] == 0
+                && dead_after_gathered_pending_open_call(module, proto, call, register, work)?)
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+    work_charge(work, span.len(), proto.id, 0)?;
+    for register in 0..span.len() {
+        let mut min_home = u16::MAX;
+        let mut max_home = 0u16;
+        let mut max_first = 0u16;
+        let mut max_window_end = 0u16;
+        let mut pending_count = 0usize;
+        for call in calls.iter() {
+            let pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "Call 前綴 PC 超出範圍",
+                )
+            })?);
+            let pending = debug.temporaries_at(proto.id, pc).unwrap_or(&[]);
+            work_charge(work, pending.len(), proto.id, call.pc)?;
+            work_charge(work, 1, proto.id, call.pc)?;
+            if let Some(entry) = pending
+                .iter()
+                .find(|entry| usize::from(entry.register.0) == register)
+            {
+                if retained_home(register, call, work)? {
+                    let home = call
+                        .first_slot
+                        .checked_add(entry.ordinal - 1)
+                        .ok_or_else(|| {
+                            error(
+                                OfficialExportErrorKind::LimitExceeded,
+                                proto.id,
+                                call.pc,
+                                "Call 前綴 home 溢位",
+                            )
+                        })?;
+                    min_home = min_home.min(home);
+                    max_home = max_home.max(home);
+                    pending_count += 1;
+                }
+            }
+        }
+        if pending_count < 2 {
+            continue;
+        }
+        let mut constrained_by_other_call = false;
+        for call in calls.iter() {
+            work_charge(work, 1, proto.id, call.pc)?;
+            if retained_home(register, call, work)? {
+                max_first = max_first.max(call.first_slot);
+                max_window_end = max_window_end.max(call.window_end);
+                let call_pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        call.pc,
+                        "Call 前綴 PC 超出範圍",
+                    )
+                })?);
+                let pending = debug.temporaries_at(proto.id, call_pc).unwrap_or(&[]);
+                work_charge(work, pending.len(), proto.id, call.pc)?;
+                constrained_by_other_call |= call.open_chain
+                    || !pending
+                        .iter()
+                        .any(|entry| usize::from(entry.register.0) == register);
+            }
+        }
+        // fixed Call 的 pending 可逐次 gather 到不同的可見槽；只有其他
+        // Call 也要求此值存活在低槽時，才須對齊共同的 home。
+        if !constrained_by_other_call {
+            continue;
+        }
+        let mut storage_floor = 0u16;
+        work_charge(work, storage.len(), proto.id, span[register].0)?;
+        for local in storage {
+            if (local.start_pc as usize) < span[register].1
+                && span[register].0 < local.end_pc as usize
+            {
+                let slot = official_storage_slot(
+                    local.slot,
+                    anonymous_vararg_slot,
+                    proto.id,
+                    span[register].0,
+                )?;
+                storage_floor = storage_floor.max(u16::from(slot) + 1);
+            }
+        }
+        if min_home == max_home && storage_floor <= min_home {
+            continue;
+        }
+        let mut owners = 0usize;
+        work_charge(work, span.len(), proto.id, span[register].0)?;
+        for owner in 0..span.len() {
+            if owner != register
+                && low_bound[owner] <= max_window_end
+                && mapped_owner_interferes(
+                    proto, span, protected, live_at, owned_next, register, owner, work,
+                )?
+            {
+                owners += 1;
+            }
+        }
+        let required = max_first
+            .max(storage_floor)
+            .checked_add(u16::try_from(owners).map_err(|_| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    span[register].0,
+                    "Call 共存值超出 stack",
+                )
+            })?)
+            .ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    span[register].0,
+                    "Call 共存前綴溢位",
+                )
+            })?;
+        for (index, call) in calls.iter().enumerate() {
+            work_charge(work, 1, proto.id, call.pc)?;
+            if retained_home(register, call, work)? {
+                target[index] = target[index].max(required);
+            }
+        }
+    }
+    // 相鄰 open producer 與 terminal 共用同一個前綴，避免移動其中
+    // 一個 Call 後使已 gather 的 pending 與動態 top 分離。
+    work_charge(work, calls.len(), proto.id, 0)?;
+    let mut chain_start = 0usize;
+    while chain_start < calls.len() {
+        let Some(terminal) = (if calls[chain_start].open_chain {
+            strict_open_call_terminal(proto, calls[chain_start].pc, work)?
+        } else {
+            None
+        }) else {
+            chain_start += 1;
+            continue;
+        };
+        let mut chain_end = chain_start;
+        while chain_end < calls.len() && calls[chain_end].pc <= terminal {
+            work_charge(work, 1, proto.id, calls[chain_end].pc)?;
+            chain_end += 1;
+        }
+        work_charge(
+            work,
+            (chain_end - chain_start).checked_mul(2).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    calls[chain_start].pc,
+                    "open Call 前綴 work 溢位",
+                )
+            })?,
+            proto.id,
+            calls[chain_start].pc,
+        )?;
+        let common = target[chain_start..chain_end]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(target[chain_start]);
+        for first in &mut target[chain_start..chain_end] {
+            *first = common;
+        }
+        chain_start = chain_end;
+    }
+    work_charge(work, calls.len(), proto.id, 0)?;
+    for (call, first) in calls.iter_mut().zip(target) {
+        let shift = first - call.first_slot;
+        call.first_slot = first;
+        call.call_base = call.call_base.checked_add(shift).ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                call.pc,
+                "Call 共存 base 溢位",
+            )
+        })?;
+        call.window_start = call.window_start.checked_add(shift).ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                call.pc,
+                "Call 共存窗口溢位",
+            )
+        })?;
+        call.window_end = call.window_end.checked_add(shift).ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                call.pc,
+                "Call 共存窗口溢位",
+            )
+        })?;
+        if call.window_end > 255 {
+            return Err(error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                call.pc,
+                "Call 共存窗口超出 stack",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn refine_open_call_prefixes(
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    anonymous_vararg_slot: Option<u8>,
+    calls: &mut [TemporaryCallLayout],
+    span: &[(usize, usize)],
+    protected: &[u8],
+    live_at: &[LiveRow],
+    owned_next: &[NumericOwnedNext],
+    low_bound: &[u16],
+    work: &mut OfficialWorkBudget,
+) -> Result<(), OfficialExportError> {
+    let Some(debug) = module.native_debug() else {
+        return Ok(());
+    };
+    let storage = debug.storage_for(proto.id).ok_or_else(|| {
+        error(
+            OfficialExportErrorKind::InvalidPrototype,
+            proto.id,
+            0,
+            "open Call 缺少 local storage",
+        )
+    })?;
+    work_charge(work, calls.len(), proto.id, 0)?;
+    let mut chain_start = 0usize;
+    while chain_start < calls.len() {
+        let Some(terminal) = (if calls[chain_start].open_chain {
+            strict_open_call_terminal(proto, calls[chain_start].pc, work)?
+        } else {
+            None
+        }) else {
+            chain_start += 1;
+            continue;
+        };
+        let mut chain_end = chain_start;
+        while chain_end < calls.len() && calls[chain_end].pc <= terminal {
+            work_charge(work, 1, proto.id, calls[chain_end].pc)?;
+            chain_end += 1;
+        }
+        let mut shift = 0usize;
+        for call in &calls[chain_start..chain_end] {
+            let call_pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "open Call 低槽 PC 超出範圍",
+                )
+            })?);
+            let pending = debug.temporaries_at(proto.id, call_pc).unwrap_or(&[]);
+            let scan = pending.len().checked_mul(calls.len()).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "open Call 低槽 work 溢位",
+                )
+            })?;
+            work_charge(work, scan, proto.id, call.pc)?;
+            let mut incompatible = 0usize;
+            let mut external = 0usize;
+            for temporary in pending {
+                let register = usize::from(temporary.register.0);
+                let own_slot = call
+                    .first_slot
+                    .checked_add(temporary.ordinal - 1)
+                    .ok_or_else(|| {
+                        error(
+                            OfficialExportErrorKind::LimitExceeded,
+                            proto.id,
+                            call.pc,
+                            "open Call 原位前綴溢位",
+                        )
+                    })?;
+                let mut bad_home = false;
+                for other in calls.iter() {
+                    if other.pc == call.pc
+                        || !live_at_pc(span, protected, live_at, register, other.pc)
+                        || !live_at_pc(span, protected, live_at, register, other.pc + 1)
+                    {
+                        continue;
+                    }
+                    let other_pc = InstructionOffset(u32::try_from(other.pc).map_err(|_| {
+                        error(
+                            OfficialExportErrorKind::LimitExceeded,
+                            proto.id,
+                            other.pc,
+                            "open Call 交叉 PC 超出範圍",
+                        )
+                    })?);
+                    let other_pending = debug.temporaries_at(proto.id, other_pc).unwrap_or(&[]);
+                    work_charge(work, other_pending.len(), proto.id, call.pc)?;
+                    let result_written = matches!(proto.instructions[other.pc].instruction,
+                        Instruction::Call { base, result_mode: ResultMode::Fixed(results), .. }
+                            if register >= usize::from(base.0)
+                                && register - usize::from(base.0) < usize::from(results))
+                        || matches!(proto.instructions[other.pc].instruction,
+                            Instruction::Call { base, result_mode: ResultMode::All, .. }
+                                if register == usize::from(base.0));
+                    if result_written {
+                        continue;
+                    }
+                    let owns_other = other_pending.iter().any(|entry| {
+                        usize::from(entry.register.0) == register
+                            && other.first_slot.checked_add(entry.ordinal - 1) == Some(own_slot)
+                    });
+                    let overwritten = if other.open_chain {
+                        if own_slot >= other.call_base {
+                            protected[register] != 0
+                                || !dead_after_gathered_pending_open_call(
+                                    module, proto, other, register, work,
+                                )?
+                        } else {
+                            other.window_start <= own_slot
+                                && own_slot < other.window_end
+                                && !pending_call_prefix_home(
+                                    module, proto, other, register, own_slot, work,
+                                )?
+                        }
+                    } else {
+                        (own_slot >= other.call_base && !owns_other)
+                            || (other.window_start <= own_slot
+                                && own_slot < other.window_end
+                                && !owns_other)
+                    };
+                    if overwritten {
+                        incompatible += 1;
+                        bad_home = true;
+                        break;
+                    }
+                }
+                work_charge(work, storage.len(), proto.id, call.pc)?;
+                let mut storage_conflict = false;
+                for local in storage {
+                    if (local.start_pc as usize) < span[register].1
+                        && span[register].0 < local.end_pc as usize
+                        && u16::from(official_storage_slot(
+                            local.slot,
+                            anonymous_vararg_slot,
+                            proto.id,
+                            call.pc,
+                        )?) == own_slot
+                    {
+                        storage_conflict = true;
+                        break;
+                    }
+                }
+                if storage_conflict {
+                    incompatible += 1;
+                }
+                if !bad_home && !storage_conflict {
+                    continue;
+                }
+                work_charge(
+                    work,
+                    span.len()
+                        .checked_mul(pending.len().checked_add(1).ok_or_else(|| {
+                            error(
+                                OfficialExportErrorKind::LimitExceeded,
+                                proto.id,
+                                call.pc,
+                                "open Call owner work 溢位",
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            error(
+                                OfficialExportErrorKind::LimitExceeded,
+                                proto.id,
+                                call.pc,
+                                "open Call owner work 溢位",
+                            )
+                        })?,
+                    proto.id,
+                    call.pc,
+                )?;
+                let mut owners = 0usize;
+                for owner in 0..span.len() {
+                    if owner == register
+                        || low_bound[owner] > call.window_end
+                        || pending
+                            .iter()
+                            .any(|entry| usize::from(entry.register.0) == owner)
+                        || (live_at_pc(span, protected, live_at, owner, call.pc)
+                            && live_at_pc(span, protected, live_at, owner, call.pc + 1))
+                    {
+                        continue;
+                    }
+                    if mapped_owner_interferes(
+                        proto, span, protected, live_at, owned_next, register, owner, work,
+                    )? {
+                        owners += 1;
+                    }
+                }
+                external = external.max(owners);
+            }
+            shift = shift.max(external.checked_add(incompatible).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "open Call 低槽數溢位",
+                )
+            })?);
+        }
+        let shift = u16::try_from(shift).map_err(|_| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                calls[chain_start].pc,
+                "open Call 低槽超出 stack",
+            )
+        })?;
+        work_charge(
+            work,
+            chain_end - chain_start,
+            proto.id,
+            calls[chain_start].pc,
+        )?;
+        for call in &mut calls[chain_start..chain_end] {
+            call.first_slot = call.first_slot.checked_add(shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "open Call 前綴溢位",
+                )
+            })?;
+            call.call_base = call.call_base.checked_add(shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "open Call base 溢位",
+                )
+            })?;
+            call.window_start = call.window_start.checked_add(shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "open Call 窗口溢位",
+                )
+            })?;
+            call.window_end = call.window_end.checked_add(shift).ok_or_else(|| {
+                error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "open Call 窗口溢位",
+                )
+            })?;
+            if call.window_end > 255 {
+                return Err(error(
+                    OfficialExportErrorKind::LimitExceeded,
+                    proto.id,
+                    call.pc,
+                    "open Call 低槽窗口超出 stack",
+                ));
+            }
+        }
+        chain_start = chain_end;
+    }
+    Ok(())
 }
 
 /// 原始 register 的值經單一 Move 交給外層固定 Call 時，容許兩者共用同一官方槽。
@@ -6087,6 +7074,9 @@ fn compact_map_base_bytes(
                 + size_of::<(u8, usize, usize)>()
                 + size_of::<LiveRow>()
                 // owner_next 以至多兩倍的實際容量保守計費。
+                + size_of::<usize>() * 2
+                // Call 低槽約束及同時存活的兩個 register 集合。
+                + size_of::<u16>()
                 + size_of::<usize>() * 2,
         )
         .and_then(|bytes| bytes.checked_add(size_of::<Vec<usize>>()))
@@ -6104,7 +7094,11 @@ fn compact_map_base_bytes(
         .and_then(|bytes| instruction_bytes.and_then(|extra| bytes.checked_add(extra)))
         .and_then(|bytes| {
             call_count
-                .checked_mul(size_of::<TemporaryCallLayout>() + size_of::<(usize, bool)>())
+                .checked_mul(
+                    size_of::<TemporaryCallLayout>()
+                        + size_of::<(usize, bool)>()
+                        + size_of::<u16>(),
+                )
                 .and_then(|extra| bytes.checked_add(extra))
         })
         .and_then(|bytes| {
@@ -6601,6 +7595,7 @@ fn compact_register_map(
         &span,
         &protected,
         &live_at,
+        &owned_next,
         work,
     )?;
     let profile_stack_limit = if matches!(profile, LuaProfile::Lua54) {
@@ -7208,8 +8203,6 @@ fn compact_register_map(
                 }
             }
         }
-        #[cfg(feature = "std")]
-        let mut first_reject = [None::<(u8, usize)>; 255];
         let mut candidate_ok = |candidate_register: usize,
                                 candidate_start: usize,
                                 candidate_end: usize,
@@ -7217,18 +8210,9 @@ fn compact_register_map(
                                 check_prior: bool,
                                 work: &mut OfficialWorkBudget|
          -> Result<bool, OfficialExportError> {
-            macro_rules! reject {
-                ($reason:expr, $at:expr) => {{
-                    #[cfg(feature = "std")]
-                    if candidate_register == register && check_prior {
-                        first_reject[usize::from(slot)].get_or_insert(($reason, $at));
-                    }
-                    return Ok(false);
-                }};
-            }
             work_charge(work, 1, proto.id, candidate_start)?;
             if slot >= fixed.max(tuple_end) && slot < temp_base {
-                reject!(1, candidate_start);
+                return Ok(false);
             }
             if slot >= tuple_base && slot < tuple_end {
                 work_charge(work, numeric.len(), proto.id, candidate_start)?;
@@ -7239,7 +8223,7 @@ fn compact_register_map(
                         && candidate_start <= pair.next_pc
                         && pair.prepare_pc < candidate_end
                 }) {
-                    reject!(2, candidate_start);
+                    return Ok(false);
                 }
             }
             work_charge(work, aliases.len(), proto.id, candidate_start)?;
@@ -7249,7 +8233,7 @@ fn compact_register_map(
                     && u16::from(alias.tuple) <= slot
                     && slot <= u16::from(alias.tuple) + u16::from(alias.width)
             }) {
-                reject!(3, candidate_start);
+                return Ok(false);
             }
             let (call_first, call_end) = call_layout_range(
                 &call_layouts,
@@ -7290,7 +8274,7 @@ fn compact_register_map(
                             .iter()
                             .any(|entry| usize::from(entry.register.0) == candidate_register)
                     {
-                        reject!(4, call.pc);
+                        return Ok(false);
                     }
                 }
                 let open_all_base = if call.open_chain {
@@ -7336,7 +8320,7 @@ fn compact_register_map(
                     && (survives || protected[candidate_register] != 0)
                     && !dead_open
                 {
-                    reject!(5, call.pc);
+                    return Ok(false);
                 }
                 if !call.open_chain && call.first_slot <= slot && slot < call.call_base {
                     let call_pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
@@ -7358,7 +8342,7 @@ fn compact_register_map(
                             && temporary.ordinal == ordinal
                     });
                     if !own && protected[candidate_register] != 0 {
-                        reject!(6, call.pc);
+                        return Ok(false);
                     }
                 }
                 if !(call.window_start <= slot && slot < call.window_end) {
@@ -7415,7 +8399,7 @@ fn compact_register_map(
                     result_mode,
                 } = proto.instructions[call.pc].instruction
                 else {
-                    reject!(7, call.pc);
+                    return Ok(false);
                 };
                 let relative = candidate_register.checked_sub(usize::from(base.0));
                 let is_result = match result_mode {
@@ -7433,7 +8417,7 @@ fn compact_register_map(
                     && !survives
                     && protected[candidate_register] == 0;
                 if !is_result && !dying_input && !(dead_open && slot >= call.call_base) {
-                    reject!(8, call.pc);
+                    return Ok(false);
                 }
             }
             let env_alias = env_cache_eligible
@@ -7469,7 +8453,7 @@ fn compact_register_map(
                             work,
                         )?
                     {
-                        reject!(9, candidate_start);
+                        return Ok(false);
                     }
                     owner = owner_next[owner];
                 }
@@ -7493,7 +8477,7 @@ fn compact_register_map(
                     continue;
                 }
                 if protected[candidate_register] != 0 {
-                    reject!(10, candidate_start);
+                    return Ok(false);
                 }
                 let overlap_start = candidate_start.max(fixed_start);
                 let overlap_end = candidate_end.min(fixed_end);
@@ -7520,7 +8504,7 @@ fn compact_register_map(
                         )?
                         || live_at_pc(&span, &protected, &live_at, candidate_register, pc)
                     {
-                        reject!(11, pc);
+                        return Ok(false);
                     }
                 }
             }
@@ -7678,82 +8662,6 @@ fn compact_register_map(
             high = high.max(new_slot + 1);
         }
         let slot = chosen.ok_or_else(|| {
-            #[cfg(feature = "std")]
-            {
-                std::eprintln!(
-                    "native slot failure proto={} reg={} span={start}..{end} floor={floor} fixed={fixed} tuple_end={tuple_end} temp_base={temp_base} high={high}",
-                    proto.id.0,
-                    register,
-                );
-                for call in call_layouts
-                    .iter()
-                    .filter(|call| start <= call.pc && call.pc < end)
-                {
-                    let call_pc = InstructionOffset(call.pc as u32);
-                    let pending = module
-                        .native_debug()
-                        .and_then(|debug| debug.temporaries_at(proto.id, call_pc))
-                        .unwrap_or(&[]);
-                    let ordinal = pending
-                        .iter()
-                        .find(|item| usize::from(item.register.0) == register)
-                        .map(|item| item.ordinal);
-                    std::eprintln!(
-                        "  call pc={} first={} base={} window={}..{} open={} live={}/{} pending={ordinal:?} own_slot={:?}",
-                        call.pc,
-                        call.first_slot,
-                        call.call_base,
-                        call.window_start,
-                        call.window_end,
-                        call.open_chain,
-                        live_at_pc(&span, &protected, &live_at, register, call.pc),
-                        live_at_pc(&span, &protected, &live_at, register, call.pc + 1),
-                        ordinal
-                            .and_then(|n| n.checked_sub(1))
-                            .and_then(|n| call.first_slot.checked_add(n)),
-                    );
-                }
-                let mut at = usize::from(floor);
-                while at < first_reject.len() {
-                    let reason = first_reject[at];
-                    let mut next = at + 1;
-                    while next < first_reject.len() && first_reject[next] == reason {
-                        next += 1;
-                    }
-                    std::eprintln!("  slot {at}..{next}: first_reject={reason:?}");
-                    at = next;
-                }
-                let prefix_end = call_layouts
-                    .iter()
-                    .filter(|call| start <= call.pc && call.pc < end)
-                    .map(|call| usize::from(call.call_base))
-                    .max()
-                    .unwrap_or(0)
-                    .min(255);
-                for slot in 0..prefix_end {
-                    let fixed = &fixed_intervals
-                        [fixed_boundaries[slot]..fixed_boundaries[slot + 1]];
-                    let overlapping = fixed
-                        .iter()
-                        .filter(|(_, fixed_start, fixed_end)| {
-                            *fixed_start < end && start < *fixed_end
-                        })
-                        .count();
-                    let mut owner = slot_head[slot];
-                    let mut owner_count = 0usize;
-                    let mut first_owner = None;
-                    while owner != usize::MAX && owner_count < count {
-                        owner_count += 1;
-                        first_owner.get_or_insert(owner);
-                        owner = owner_next[owner];
-                    }
-                    if overlapping != 0 || owner_count != 0 {
-                        std::eprintln!(
-                            "  low_slot={slot} fixed_intervals={overlapping} owners={owner_count} first_owner={first_owner:?}"
-                        );
-                    }
-                }
-            }
             error(
                 OfficialExportErrorKind::LimitExceeded,
                 proto.id,
@@ -15348,7 +16256,11 @@ mod tests {
             let module = encoded.verified();
             let proto = &module.module().prototypes[0];
             let spans = [(usize::MAX, 0), (usize::MAX, 0), (0, 3)];
-            let live_at = [LiveRow::Uncomputed, LiveRow::Uncomputed, LiveRow::Uncomputed];
+            let live_at = [
+                LiveRow::Uncomputed,
+                LiveRow::Uncomputed,
+                LiveRow::Uncomputed,
+            ];
             let calls = temporary_call_layouts(
                 module,
                 proto,
@@ -15359,6 +16271,7 @@ mod tests {
                 &spans,
                 &[0; 3],
                 &live_at,
+                &[],
                 &mut work,
             )
             .unwrap();

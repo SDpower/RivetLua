@@ -775,7 +775,11 @@ fn replacement_delete_noop_fault_matrix() {
                 }
             );
         }
-        assert_eq!(attempts, if action == 2 { 19 } else { 16 }, "action={action}");
+        assert_eq!(
+            attempts,
+            if action == 2 { 19 } else { 16 },
+            "action={action}"
+        );
         let mut expected = vec![None, None];
         // action 0/1 已持有同名短字串；action 2 首次建立它，須多三筆物件配置。
         if action == 2 {

@@ -502,6 +502,13 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         ),
         (AllocationDomain::Host, 208, None, ROOTS),
     ]);
+    #[cfg(feature = "lua54")]
+    expected.push((
+        AllocationDomain::LuaHeap,
+        160,
+        Some(FailPoint::TableArrayGrow),
+        TABLE,
+    ));
     // B12 的 main coroutine 專用 root 在 registry 陣列邊發布後建立。
     expected.push((AllocationDomain::Host, 120, None, ROOTS));
     // 建構時預先建立並以 Registry 持有的 hook / warning CClosure，各自保留精確配置序列。
@@ -549,9 +556,6 @@ fn registry_stack_creation_allocation_failures_are_atomic() {
         .map(|(ordinal, (domain, bytes, point, site))| (ordinal as u64, domain, bytes, point, site))
         .collect();
     assert_eq!(failures, expected);
-    #[cfg(feature = "lua54")]
-    assert_eq!(successes, (43..46).collect::<Vec<_>>());
-    #[cfg(feature = "lua55")]
     assert_eq!(successes, (44..46).collect::<Vec<_>>());
 }
 
