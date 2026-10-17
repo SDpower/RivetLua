@@ -5,7 +5,8 @@
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (0)
 
 extern int rivetlua_capi_requiref_protected_b2(
-    lua_State *state, const char *name, lua_CFunction opener, int global);
+    lua_State *state, const char *name, lua_CFunction opener, int global,
+    int (*private_loaded)(lua_State *));
 
 static int truthy_calls;
 static int nil_calls;
@@ -105,7 +106,7 @@ int main(void) {
   lua_pop(state, 1);
   CHECK(cached_type(state, "native.error") == LUA_TNIL);
   CHECK(rivetlua_capi_requiref_protected_b2(
-      state, "native.error", open_error, 0) == LUA_ERRRUN);
+      state, "native.error", open_error, 0, NULL) == LUA_ERRRUN);
   CHECK(lua_gettop(state) == 2 && lua_type(state, -1) == LUA_TSTRING);
   CHECK(strstr(lua_tostring(state, -1), "native opener failed") != NULL);
   lua_pop(state, 1);

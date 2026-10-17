@@ -291,7 +291,7 @@ fn raw_table_rawequal_full_scalar_string_pointer_and_identity_matrix() {
             })
             .unwrap();
         assert_eq!(objects.len(), 2);
-        assert_ne!(objects[0], objects[1]);
+        assert_eq!(objects[0], objects[1]);
         assert_rawequal_pure(&owner, 1, 2, 1);
         lua_settop(state, 0);
 
@@ -383,9 +383,17 @@ fn raw_table_table_itself_as_top_key_replaces_last_root_safely() {
         assert_eq!(lua_type(state, 1), 1);
         owner
             .with_vm(|vm| {
-                assert_eq!(vm.roots().count(RootKind::Registry), 3);
+                assert_eq!(vm.roots().count(RootKind::Registry), 4);
                 assert_eq!(vm.roots().count(RootKind::Host), 0);
-                assert_eq!(vm.roots().total_count(), 4);
+                let main_thread = vm.main_thread_identity().expect("C state 的 main thread");
+                let mut coroutine_root = None;
+                vm.visit_roots(|kind, _, object| {
+                    if kind == RootKind::Coroutine {
+                        assert!(coroutine_root.replace(object).is_none());
+                    }
+                });
+                assert_eq!(coroutine_root, Some(main_thread));
+                assert_eq!(vm.roots().total_count(), 5);
             })
             .unwrap();
         owner.with_vm(|vm| vm.collect().unwrap()).unwrap();

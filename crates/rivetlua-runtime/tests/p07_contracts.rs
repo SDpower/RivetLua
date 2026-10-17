@@ -144,7 +144,7 @@ fn verified_module_loads_and_executes_move_nil_return() {
         );
         source.profile = profile;
         let verified = verify_module(source, profile, &VerifyLimits::default()).unwrap();
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let actual = vm.load(verified).unwrap().run().unwrap();
         assert_eq!(
             actual,
@@ -448,7 +448,7 @@ fn compiled(input: &[u8], profile: LanguageProfile) -> rivetlua_core::VerifiedMo
 
 fn compiled_run(input: &[u8], profile: LanguageProfile) -> (RunOutcome, u64) {
     let verified = compiled(input, profile);
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let mut execution = vm.load(verified).unwrap();
     let outcome = execution.run().unwrap();
     (outcome, execution.fuel_remaining())
@@ -459,7 +459,7 @@ fn compiled_run_observed(
     profile: LanguageProfile,
 ) -> (RunOutcome, u64, usize, usize) {
     let verified = compiled(input, profile);
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let ledger_before = vm.ledger_snapshot();
     let mut execution = vm.load(verified).unwrap();
     let outcome = execution.run().unwrap();
@@ -553,7 +553,7 @@ fn vm002_compiler_snapshots_local_rhs_before_committing_swap() {
         assert!(snapshot(a_source, b) < a_commit);
         assert!(snapshot(b_source, a) < a_commit);
 
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let before = vm.ledger_snapshot();
         let vm_id = vm.id();
         let mut execution = vm.load(verified).unwrap();
@@ -584,7 +584,7 @@ fn vm010_compiler_reports_later_error_after_local_assignment() {
     for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
         let input = b"local a=10; a=20; return a//0";
         let verified = compiled(input, profile);
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let mut execution = vm.load(verified).unwrap();
         let outcome = execution.run().unwrap();
         let RunOutcome::LuaError(error) = outcome else {
@@ -637,7 +637,7 @@ fn vm003_numeric_for_default_step_sums_one_through_hundred() {
                 .count(),
             1
         );
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let before = vm.ledger_snapshot();
         let mut execution = vm.load(verified).unwrap();
         let actual = execution.run().unwrap();
@@ -663,7 +663,7 @@ fn vm006_numeric_for_zero_step_is_lua_error() {
     for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
         let input = "local s=0; for i=1,3,0 do s=s+1 end; return s";
         let verified = compiled(input.as_bytes(), profile);
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let mut execution = vm.load(verified).unwrap();
         let Ok(RunOutcome::LuaError(error)) = execution.run() else {
             panic!("numeric for 的零 step 必須形成 LuaError")
@@ -786,7 +786,7 @@ fn numeric_for_float_and_non_numeric_paths_are_checked() {
             RunOutcome::Returned(vec![Value::Integer(6)])
         );
         let verified = compiled(b"for i=true,3,1 do end; return 0", profile);
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let mut execution = vm.load(verified).unwrap();
         let Ok(RunOutcome::LuaError(error)) = execution.run() else {
             panic!("非數值 numeric for 初值須形成 LuaError")
@@ -818,7 +818,7 @@ fn numeric_for_float_nonprogress_respects_fuel_budget() {
             b"for i=9007199254740992.0,9007199254740992.0,1.0 do end; return 0",
             profile,
         );
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let before = vm.ledger_snapshot();
         let mut execution = vm.load(verified).unwrap();
         execution.set_fuel(40).unwrap();
@@ -847,7 +847,7 @@ fn compiler_finishes_while_true_with_verified_implicit_return() {
                 ..
             })
         ));
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let mut execution = vm.load(verified).unwrap();
         execution.set_fuel(17).unwrap();
         assert_eq!(
@@ -879,7 +879,7 @@ fn vm005_finite_fuel_aborts_in_while_loop_both_profiles() {
                 _ => None,
             })
             .unwrap();
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let before = vm.ledger_snapshot();
         let mut execution = vm.load(verified).unwrap();
         execution.set_fuel(17).unwrap();
@@ -913,7 +913,7 @@ fn vm007_aborted_execution_rejects_run_and_refuel() {
     for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
         let input = "while true do end";
         let verified = compiled(input.as_bytes(), profile);
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let before = vm.ledger_snapshot();
         let mut execution = vm.load(verified).unwrap();
         execution.set_fuel(7).unwrap();
@@ -953,7 +953,7 @@ fn vm007_aborted_execution_rejects_run_and_refuel() {
 fn nil_table_assignment_is_lua_error_after_verification() {
     for profile in [LanguageProfile::Lua55, LanguageProfile::Lua54] {
         let verified = compiled(b"local t=nil; t[1]=20; return 1", profile);
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let mut execution = vm.load(verified).unwrap();
         let RunOutcome::LuaError(error) = execution.run().unwrap() else {
             panic!("nil table 寫入須是受控 LuaError")

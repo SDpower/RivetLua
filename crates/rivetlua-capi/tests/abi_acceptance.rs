@@ -130,6 +130,7 @@ fn abi004_internal_adapter_ledger_every_allocation_ordinal_rolls_back() {
         assert_eq!(probe.snapshot().reserved, 0);
     }
     assert_eq!(observed.len() as u64, count);
+    // userdata payload 與 HeapObject 各有一次 ObjectReserve。
     assert_eq!(
         observed,
         [
@@ -141,6 +142,7 @@ fn abi004_internal_adapter_ledger_every_allocation_ordinal_rolls_back() {
                 AllocationDomain::LuaHeap,
                 Some(FailPoint::UserdataUservaluesReserve)
             ),
+            (AllocationDomain::LuaHeap, Some(FailPoint::ObjectReserve)),
             (AllocationDomain::LuaHeap, Some(FailPoint::SlotReserve)),
             (AllocationDomain::LuaHeap, Some(FailPoint::ObjectReserve)),
             (AllocationDomain::Host, None),

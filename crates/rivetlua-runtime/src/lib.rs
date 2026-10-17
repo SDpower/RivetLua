@@ -683,6 +683,7 @@ mod tests {
                 outer,
                 parent: Some(parent),
                 parent_root: None,
+                parent_yieldable: true,
                 protected: Some(super::vm::NativeProtected::XPCall {
                     handler: Value::Object(handler),
                 }),
@@ -1121,32 +1122,37 @@ mod tests {
 
     #[test]
     fn heap_007_retired_slot_never_revives_old_host_handle() {
-        let mut vm = Vm::new().unwrap();
-        let original = vm.allocate(Value::Integer(10)).unwrap();
-        let handle = super::HostHandle::<Value>::new(&mut vm, original).unwrap();
-        assert_eq!(vm.remove_root(handle.root_id()), Ok(original));
-        let terminal = vm.set_generation_for_test(original, Generation::new(u64::MAX));
-        vm.reclaim(terminal).unwrap();
-        let replacement = vm.allocate(Value::Integer(20)).unwrap();
-        assert_eq!(
-            vm.slot_state(original.identity().unwrap().slot),
-            Some(SlotState::Retired)
-        );
-        assert_ne!(
-            replacement.identity().unwrap().slot,
-            original.identity().unwrap().slot
-        );
-        assert_eq!(handle.read(&vm), Err(VmError::StaleObject));
-        assert_eq!(vm.read(terminal), Err(VmError::StaleObject));
-        assert_eq!(vm.read(replacement), Ok(Value::Integer(20)));
-        drop(handle);
-        assert_eq!(vm.roots().total_count(), 0);
-        assert_eq!(vm.ledger_snapshot().reserved, 0);
-        record_case(
-            "HEAP-007",
-            "將 slot generation 設為 u64::MAX 後回收並配置替代物件",
-            "原 slot=Retired; 替代物件使用其他 slot; 舊 HostHandle=E_STALE_HANDLE",
-        );
+        for profile in [
+            rivetlua_core::LuaProfile::Lua54,
+            rivetlua_core::LuaProfile::Lua55,
+        ] {
+            let mut vm = Vm::new_with_profile(profile).unwrap();
+            let original = vm.allocate(Value::Integer(10)).unwrap();
+            let handle = super::HostHandle::<Value>::new(&mut vm, original).unwrap();
+            assert_eq!(vm.remove_root(handle.root_id()), Ok(original));
+            let terminal = vm.set_generation_for_test(original, Generation::new(u64::MAX));
+            vm.reclaim(terminal).unwrap();
+            let replacement = vm.allocate(Value::Integer(20)).unwrap();
+            assert_eq!(
+                vm.slot_state(original.identity().unwrap().slot),
+                Some(SlotState::Retired)
+            );
+            assert_ne!(
+                replacement.identity().unwrap().slot,
+                original.identity().unwrap().slot
+            );
+            assert_eq!(handle.read(&vm), Err(VmError::StaleObject));
+            assert_eq!(vm.read(terminal), Err(VmError::StaleObject));
+            assert_eq!(vm.read(replacement), Ok(Value::Integer(20)));
+            drop(handle);
+            assert_eq!(vm.roots().total_count(), 0);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            record_case(
+                "HEAP-007",
+                "將 slot generation 設為 u64::MAX 後回收並配置替代物件",
+                "原 slot=Retired; 替代物件使用其他 slot; 舊 HostHandle=E_STALE_HANDLE",
+            );
+        }
     }
 
     #[test]

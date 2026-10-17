@@ -483,8 +483,8 @@ def copy_canonical_assets(root: Path, package_dir: Path, capi: bool) -> dict[str
         target.write_bytes(data)
         hashes[asset] = _sha(data)
     if capi:
-        for relative in ("rivetlua_abi.h", "lua54/lua.h", "lua54/lauxlib.h", "lua54/luaconf.h",
-                         "lua55/lua.h", "lua55/lauxlib.h", "lua55/luaconf.h"):
+        for relative in ("rivetlua_abi.h", "lua54/lua.h", "lua54/lauxlib.h", "lua54/luaconf.h", "lua54/lualib.h",
+                         "lua55/lua.h", "lua55/lauxlib.h", "lua55/luaconf.h", "lua55/lualib.h"):
             source = Path(root) / "include/rivetlua" / relative
             if source.is_symlink() or not source.is_file():
                 raise ReleaseError("E_HEADER_SOURCE")
@@ -905,8 +905,8 @@ def canonical_hashes(root: Path, capi: bool) -> dict[str, str]:
     names = list(ASSETS)
     if capi:
         names += ["include/rivetlua/" + relative for relative in (
-            "rivetlua_abi.h", "lua54/lua.h", "lua54/lauxlib.h", "lua54/luaconf.h",
-            "lua55/lua.h", "lua55/lauxlib.h", "lua55/luaconf.h")]
+            "rivetlua_abi.h", "lua54/lua.h", "lua54/lauxlib.h", "lua54/luaconf.h", "lua54/lualib.h",
+            "lua55/lua.h", "lua55/lauxlib.h", "lua55/luaconf.h", "lua55/lualib.h")]
     return {name: _sha(_read_regular(root / name, MAX_ARCHIVE)) for name in names}
 
 

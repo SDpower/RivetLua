@@ -142,7 +142,7 @@ fn gc_prepare_allocation_failure_retries_on_same_state_b8() {
     unsafe {
         add_finalizable_b8(state);
         owner
-            .with_vm(|vm| vm.inject_failure_once(FailPoint::MarkReserve))
+            .with_vm(|vm| vm.inject_failure_once(FailPoint::WorkReserve))
             .unwrap();
         let failed = rivetlua_capi_gc_prepare_b8(state, 2, 0, 0, 0, 0);
         assert_eq!((failed.kind, failed.value), (-1, 5));

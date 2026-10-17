@@ -365,15 +365,36 @@ fn root_child_work_and_host_clone_failures_roll_back() {
         Err(VmError::InjectedFailure(FailPoint::ChildReserve))
     );
     assert_eq!(vm.ledger_snapshot(), before);
-    for point in [FailPoint::MarkReserve, FailPoint::WorkReserve] {
-        vm.inject_failure_once(point);
-        assert_eq!(vm.collect(), Err(VmError::InjectedFailure(point)));
-        assert_eq!(vm.ledger_snapshot(), before);
-        assert_eq!(host.read(&vm), Ok(Value::Integer(1)));
-        assert_eq!(vm.read(child), Ok(Value::Integer(2)));
+    let child_root = vm.add_root(RootKind::Temporary, child).unwrap();
+    let mut fill_roots = Vec::new();
+    for _ in 2..64 {
+        let object = vm.allocate(Value::Integer(0)).unwrap();
+        fill_roots.push(vm.add_root(RootKind::Temporary, object).unwrap());
     }
+    let before = vm.ledger_snapshot();
+    vm.inject_failure_once(FailPoint::MarkReserve);
+    assert_eq!(
+        vm.allocate(Value::Integer(3)),
+        Err(VmError::InjectedFailure(FailPoint::MarkReserve))
+    );
+    assert_eq!(vm.ledger_snapshot(), before);
+    let retry = vm.allocate(Value::Integer(3)).unwrap();
+    assert_eq!(retry.identity().unwrap().slot.index(), 64);
+    let retry_root = vm.add_root(RootKind::Temporary, retry).unwrap();
+    let before = vm.ledger_snapshot();
+    vm.inject_failure_once(FailPoint::WorkReserve);
+    assert_eq!(vm.collect(), Err(VmError::InjectedFailure(FailPoint::WorkReserve)));
+    assert_eq!(vm.ledger_snapshot(), before);
+    assert_eq!(host.read(&vm), Ok(Value::Integer(1)));
+    assert_eq!(vm.read(child), Ok(Value::Integer(2)));
+    assert_eq!(vm.read(retry), Ok(Value::Integer(3)));
+    vm.remove_root(retry_root).unwrap();
+    for root in fill_roots {
+        vm.remove_root(root).unwrap();
+    }
+    vm.remove_root(child_root).unwrap();
     drop(host);
-    assert_eq!(vm.collect().unwrap(), 2);
+    assert_eq!(vm.collect().unwrap(), 65);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
 }
 

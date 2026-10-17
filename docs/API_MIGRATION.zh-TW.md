@@ -11,12 +11,14 @@
 | 編譯、載入與執行錯誤 | 保留 `CompileError`、`ContainerError`、`SdkError` 等結構化錯誤分類。執行結果分別處理 `Returned`、`LuaError`、`Aborted`、`PendingClose`；輸出額度錯誤與 fuel 耗盡屬 abort。 | 不要把 abort 當成 Lua error 或成功結果。`FuelExhausted` 是終結狀態，不能靠重新執行或補 fuel 恢復；依 abort reason 停止並回報宿主。 |
 | CLI | 腳本與自動化明確傳入 `--profile lua54|lua55` 及 `--vm-policy compatibility|sandbox|private-service`。`--compatibility [--gaps]` 是相容性資料查詢，不是完整 Lua 相容聲明。 | parser 拒絕不支援或衝突的選項；升級後核對 CLI 用法與退出結果，再更新呼叫端。 |
 | C ABI | `rivetlua_abi_identity_v1` 比對 ABI revision、profile、numeric config、pointer width、endianness、target、header hashes 與 layout。header 固定 Lua 5.5.1 或 5.4.9、i64f64、little-endian、64-bit pointer，並只列出指定 target。 | identity 不符即拒絕；以配對的 Lua headers、RivetLua library 與 host extension 一起重建。C ABI identity 不代表 crate SemVer 或 RVLU bytecode 版本。 |
-| VM policy、root 與序列化 | `Compatibility`、`Sandbox`、`PrivateService` 在建立 VM 時固定；限制政策須明確設定。`Root` 綁定所屬 VM 與物件世代。module 傳輸只保存已驗證 module，不保存 VM heap、closure、stack、coroutine 或宿主服務；private handle／grant 不是 Lua 值，也不可序列化。 | 權限、owner 或 generation 不符時拒絕操作。不要把 module 傳輸當成 VM checkpoint，也不要跨 VM 重用 root、private handle 或 grant。 |
+| VM policy、root 與序列化 | `Compatibility`、`Sandbox`、`PrivateService` 在建立 VM 時固定；限制政策須明確設定；`HostServices::deny_all()` 預設仍拒絕非 table／userdata 值的型別共用 metatable 存取，宿主要啟用時須分別明確授權 `DebugPermission::TypeMetatableRead` 或 `DebugPermission::TypeMetatableWrite`。`DebugPermission::TableMetatableWrite` 仍只授權 table 與一般 userdata 各自的 metatable，不授予型別共用 metatable 權限。`Root` 綁定所屬 VM 與物件世代。module 傳輸只保存已驗證 module，不保存 VM heap、closure、stack、coroutine 或宿主服務；private handle／grant 不是 Lua 值，也不可序列化。 | 權限、owner 或 generation 不符時拒絕操作。不要把 module 傳輸當成 VM checkpoint，也不要跨 VM 重用 root、private handle 或 grant。 |
 | Native／AOT artifact 與平台 | Native artifact 有自己的 backend/code 身分；AOT manifest 另列 schema、RVLU/profile/numeric、target、backend/code、runtime/compiler version 與 build provenance。artifact 身分須由 producer 證據支持；未知或空白欄位保持未知。 | 身分、provenance 或 target 不符時拒絕載入；重建並重新核對 producer 證據。不得從 crate、header、CLI 版本或 artifact digest 單獨推定相容性。 |
+
+C ABI identity v1 的 frozen header set 僅含 `lua.h`、`lauxlib.h`、`luaconf.h`；新增的公開 `lualib.h` 由 SDK 產物檔案雜湊覆蓋，不屬於該三份 header hash。
 
 ## 已知能力邊界
 
-- P19 的 `luaL_openselectedlibs` 仍有缺口；不得宣稱完整 Lua 5.4／5.5 相容。
+- Lua 5.5 的 `luaL_openselectedlibs` 與兩版標準庫 opener 已實作；Lua 5.4 與 Lua 5.5 兩個 profile 的 C 功能測試皆已通過（詳見[檢查結果](LUA_IMPLEMENTATION_CHECK.csv)及[實作計畫](LUA_IMPLEMENTATION_CHECK_PLAN.zh-TW.md)）；不得宣稱完整 Lua 5.4／5.5 相容。
 - P20 的 native executed 數為 0；沒有 JIT 加速證據。
 - P21 desktop 為 `Experimental`、Thumb 為 `BuildOnly`、RV32 為 `Unsupported`；沒有 `Supported` target 或已驗證實板、RAM、RSS 證據。
 - P22 worker 尚未執行，Linux adapter 尚未 cross-compile，OS 隔離尚未實測；Windows 為 `Unsupported`。

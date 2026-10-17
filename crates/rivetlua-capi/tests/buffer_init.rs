@@ -221,11 +221,11 @@ fn buffer_init_a38_matrix() {
 fn buffer_overflow_a49_cleans_anchor_roots_and_ledger() {
     let owner = StateOwner::new().unwrap();
     let state = owner.as_ptr();
-    // 預暖可重用的 heap slot 容量；ledger 比較聚焦於活物件而非首次 Vec 擴容。
+    // 預暖可重用的 heap slot 容量；短字串可能被 intern，因此配置多個獨立 table。
     owner
         .with_vm(|vm| {
             for _ in 0..8 {
-                vm.allocate_byte_string(b"warmup")?;
+                vm.allocate_table()?;
             }
             vm.collect()
         })

@@ -523,10 +523,14 @@ pub enum DebugPermission {
     EventHook,
     /// 只讀取目前可驗證的 table/file/string metatable。
     MetatableRead,
-    /// 只允許 table 的 metatable 設定，沿既有 write barrier。
+    /// 允許 table 與一般 userdata 各自的 metatable 設定，沿既有 write barrier。
     TableMetatableWrite,
     /// 受信任宿主明示允許透過既有標準 I/O 在同一 VM 執行 Lua 偵錯命令。
     Console,
+    /// 讀取非 table／userdata 值依型別共用的 metatable。
+    TypeMetatableRead,
+    /// 修改非 table／userdata 值依型別共用的 metatable。
+    TypeMetatableWrite,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

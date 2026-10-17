@@ -3,16 +3,37 @@ use rivetlua_compiler::{
 };
 use rivetlua_core::{LuaProfile, ObjectRef, Value, VerifyLimits};
 use rivetlua_runtime::{
-    FailPoint, HostHandle, LuaError, MetamethodEvent, RunOutcome, Table, Vm, VmError,
+    FailPoint, HostHandle, LuaError, MetamethodEvent, RootKind, RunOutcome, RuntimeErrorKind,
+    Table, Vm, VmError,
 };
 
+fn new_vm_p10() -> Vm {
+    let profile = match std::env::var("RIVETLUA_P10_PROFILE").as_deref() {
+        Ok("lua54-i64f64") => LuaProfile::Lua54,
+        Ok("lua55-i64f64") | Err(_) => LuaProfile::Lua55,
+        _ => panic!("P10 profile 無效"),
+    };
+    Vm::new_with_profile(profile).unwrap()
+}
+
 fn release_implicit_error(vm: &mut Vm, error: LuaError, baseline_roots: usize) {
+    release_implicit_error_message(vm, error, baseline_roots, None);
+}
+
+fn release_implicit_error_message(
+    vm: &mut Vm,
+    error: LuaError,
+    baseline_roots: usize,
+    expected_message: Option<&[u8]>,
+) {
     let Value::Object(message) = error.value else {
         panic!("隱含 LuaError 須保留 byte string 值")
     };
     assert_eq!(
         vm.with_byte_string(message, |string| string.as_bytes().to_vec()),
-        Ok(error.diagnostic_id.as_bytes().to_vec())
+        Ok(expected_message
+            .unwrap_or(error.diagnostic_id.as_bytes())
+            .to_vec())
     );
     assert_eq!(vm.roots().total_count(), baseline_roots + 1);
     drop(error);
@@ -44,7 +65,7 @@ fn p10_1_event_lookup() {
         .unwrap()
         .verified()
         .clone();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let owner = {
         let mut execution = vm.load(verified).unwrap();
         let Ok(RunOutcome::Returned(values)) = execution.run() else {
@@ -103,7 +124,7 @@ fn p10_1_event_lookup() {
         vm.lookup_metamethod(owner, MetamethodEvent::Index),
         Ok(Value::Object(event_value))
     );
-    assert_eq!(vm.collect().unwrap(), 0);
+    assert_eq!(vm.collect().unwrap(), 1);
     assert_eq!(
         vm.object_kind(event_value),
         Ok(rivetlua_runtime::ObjectKind::Table)
@@ -113,6 +134,13 @@ fn p10_1_event_lookup() {
     vm.inject_failure_once(FailPoint::StringBytesReserve);
     assert_eq!(
         vm.lookup_metamethod(owner, MetamethodEvent::Index),
+        Ok(Value::Object(event_value))
+    );
+    assert_eq!(vm.ledger_snapshot(), before);
+    assert_eq!(vm.roots().total_count(), roots_before);
+    let fresh_string = [b'p'; 128];
+    assert_eq!(
+        vm.allocate_byte_string(&fresh_string),
         Err(VmError::InjectedFailure(FailPoint::StringBytesReserve))
     );
     assert_eq!(vm.ledger_snapshot(), before);
@@ -159,7 +187,7 @@ fn review_builtin_metamethod_error_preserves_event_receiver() {
         "lua54-i64f64" => LanguageProfile::Lua54,
         _ => panic!("P10 profile 無效"),
     };
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     vm.install_error_builtins(env).unwrap();
@@ -173,7 +201,7 @@ fn review_builtin_metamethod_error_preserves_event_receiver() {
     let builtin = vm.raw_get(env, Value::Object(key_error)).unwrap();
     for (event, source) in [
         (b"__call".as_slice(), b"return t(9)".as_slice()),
-        (b"__index".as_slice(), b"return t.missing".as_slice()),
+        (b"__index".as_slice(), b"return t[0]".as_slice()),
     ] {
         meta_set_event(&mut vm, metatable, event, builtin);
         let RunOutcome::LuaError(error) = run_p10(&mut vm, env, source, profile) else {
@@ -188,7 +216,7 @@ fn review_builtin_metamethod_error_preserves_event_receiver() {
         run_p10(
             &mut vm,
             env,
-            b"local a,x=pcall(function() return t(9) end); local b,y=pcall(function() return t.missing end); return a,x==t,b,y==t",
+            b"local a,x=pcall(function() return t(9) end); local b,y=pcall(function() return t[0] end); return a,x==t,b,y==t",
             profile,
         ),
         RunOutcome::Returned(vec![
@@ -203,7 +231,7 @@ fn review_builtin_metamethod_error_preserves_event_receiver() {
     vm.set_metatable(proxy, Some(proxy_metatable)).unwrap();
     meta_set_event(&mut vm, metatable, b"__index", Value::Object(proxy));
     meta_set_event(&mut vm, proxy_metatable, b"__index", builtin);
-    let RunOutcome::LuaError(error) = run_p10(&mut vm, env, b"return t.missing", profile) else {
+    let RunOutcome::LuaError(error) = run_p10(&mut vm, env, b"return t[0]", profile) else {
         panic!("__index 事件鏈末端 Builtin 須被呼叫")
     };
     assert_eq!(error.value, Value::Object(proxy));
@@ -213,7 +241,8 @@ fn review_builtin_metamethod_error_preserves_event_receiver() {
     let RunOutcome::LuaError(error) = run_p10(&mut vm, env, b"return t(9)", profile) else {
         panic!("__call 事件鏈末端 Builtin 須被呼叫")
     };
-    assert_eq!(error.value, Value::Object(proxy));
+    assert_eq!(error.kind, RuntimeErrorKind::BasicArgument);
+    assert_eq!(error.diagnostic_id, "E_BASIC_ARGUMENT");
     drop(error);
 }
 
@@ -226,7 +255,7 @@ fn review_builtin_metamethod_yield_resumes_table_and_call_events() {
         "lua54-i64f64" => LanguageProfile::Lua54,
         _ => panic!("P10 profile 無效"),
     };
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     vm.install_coroutine_builtins(env).unwrap();
@@ -261,7 +290,8 @@ fn review_builtin_metamethod_yield_resumes_table_and_call_events() {
         ])
     );
     drop(env_root);
-    assert_eq!(vm.roots().total_count(), 0);
+    assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
+    assert_eq!(vm.roots().total_count(), 1);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
 }
 
@@ -274,7 +304,7 @@ fn review_builtin_metamethod_protected_result_and_tail_yield() {
         "lua54-i64f64" => LanguageProfile::Lua54,
         _ => panic!("P10 profile 無效"),
     };
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     vm.install_error_builtins(env).unwrap();
@@ -327,7 +357,8 @@ fn review_builtin_metamethod_protected_result_and_tail_yield() {
         ])
     );
     drop(env_root);
-    assert_eq!(vm.roots().total_count(), 0);
+    assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
+    assert_eq!(vm.roots().total_count(), 1);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
 }
 
@@ -360,7 +391,7 @@ fn p10_2_regular_access() {
         "lua54-i64f64" => LanguageProfile::Lua54,
         _ => panic!("P10 profile 無效"),
     };
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let table = vm.allocate_table().unwrap();
@@ -615,7 +646,7 @@ fn p10_3_pending_op_resume() {
         "lua54-i64f64" => LanguageProfile::Lua54,
         _ => panic!("P10 profile 無效"),
     };
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let table = vm.allocate_table().unwrap();
@@ -819,7 +850,12 @@ fn p10_4_metamethod_events() {
                 panic!("Lua 5.5 的第 16 次 __call 鏈須回報受控錯誤")
             };
             assert_eq!(error.diagnostic_id, "E_METATABLE_CHAIN_LIMIT");
-            release_implicit_error(&mut vm, error, roots_before_abort);
+            release_implicit_error_message(
+                &mut vm,
+                error,
+                roots_before_abort,
+                Some(b"call chain too long"),
+            );
         }
         LanguageProfile::Lua54 => assert_eq!(
             outcome,
@@ -844,7 +880,7 @@ fn p10_4_event_matrix() {
         "lua54-i64f64" => LanguageProfile::Lua54,
         _ => panic!("P10 profile 無效"),
     };
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let t = vm.allocate_table().unwrap();
@@ -1031,7 +1067,7 @@ fn assert_raw_concat_float_profile(profile: LanguageProfile) {
             b"1e+15x",
         ]
     };
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     for (source, expected) in [
@@ -1106,7 +1142,7 @@ fn meta_marker(
 #[test]
 fn meta_case_001_raw_false_bypasses_index() {
     let (selected, profile) = meta_profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let target = vm.allocate_table().unwrap();
@@ -1145,7 +1181,7 @@ fn meta_case_001_raw_false_bypasses_index() {
 #[test]
 fn meta_case_002_missing_index_resumes_with_value() {
     let (selected, profile) = meta_profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let target = vm.allocate_table().unwrap();
@@ -1182,7 +1218,7 @@ fn meta_case_002_missing_index_resumes_with_value() {
 #[test]
 fn meta_case_003_raw_write_bypasses_newindex() {
     let (selected, profile) = meta_profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let target = vm.allocate_table().unwrap();
@@ -1223,7 +1259,7 @@ fn meta_case_003_raw_write_bypasses_newindex() {
 #[test]
 fn meta_case_004_call_receives_original_table_first() {
     let (selected, profile) = meta_profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let target = vm.allocate_table().unwrap();
@@ -1267,7 +1303,7 @@ fn meta_case_004_call_receives_original_table_first() {
 #[test]
 fn meta_case_005_index_chain_cycle_is_controlled() {
     let (selected, profile) = meta_profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let target = vm.allocate_table().unwrap();
@@ -1308,7 +1344,7 @@ fn meta_case_005_index_chain_cycle_is_controlled() {
 #[test]
 fn meta_case_006_pending_roots_survive_allocation_collection() {
     let (selected, profile) = meta_profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let target = vm.allocate_table().unwrap();
@@ -1350,7 +1386,7 @@ fn meta_case_006_pending_roots_survive_allocation_collection() {
 #[test]
 fn meta_case_007_lua_error_cleans_pending_at_boundary() {
     let (selected, profile) = meta_profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let target = vm.allocate_table().unwrap();
@@ -1395,7 +1431,7 @@ fn meta_case_007_lua_error_cleans_pending_at_boundary() {
 #[test]
 fn meta_case_008_operator_events_return_expected_values() {
     let (selected, profile) = meta_profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let left = vm.allocate_table().unwrap();
@@ -1463,7 +1499,7 @@ fn meta_case_008_operator_events_return_expected_values() {
 #[test]
 fn meta_case_009_nested_function_reads_and_writes_metatable_table() {
     let (selected, profile) = meta_profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let target = vm.allocate_table().unwrap();
@@ -1538,7 +1574,7 @@ fn meta_case_009_nested_function_reads_and_writes_metatable_table() {
 #[test]
 fn meta_case_010_terminal_paths_release_pending_roots_once() {
     let (selected, profile) = meta_profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let _env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let target = vm.allocate_table().unwrap();
@@ -1628,7 +1664,7 @@ fn p10_5_reentry_gc_cleanup() {
         "lua54-i64f64" => LanguageProfile::Lua54,
         _ => panic!("P10 profile 無效"),
     };
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p10();
     let env = vm.allocate_table().unwrap();
     let env_root = HostHandle::<Table>::new(&mut vm, env).unwrap();
     let table = vm.allocate_table().unwrap();
@@ -1748,7 +1784,12 @@ fn p10_5_reentry_gc_cleanup() {
         panic!("__call 事件鏈須受控終止")
     };
     assert_eq!(error.diagnostic_id, "E_METATABLE_CHAIN_LIMIT");
-    release_implicit_error(&mut vm, error, baseline_roots);
+    release_implicit_error_message(
+        &mut vm,
+        error,
+        baseline_roots,
+        Some(b"call chain too long"),
+    );
     assert_eq!(vm.ledger_snapshot().reserved, 0);
     drop(table_root);
     drop(env_root);

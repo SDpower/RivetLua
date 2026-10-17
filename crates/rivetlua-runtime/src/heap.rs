@@ -73,13 +73,48 @@ mod p17_short_string_index_tests {
     use super::{FailPoint, ObjectKind, RootKind, ShortStringIndex, Vm, VmError};
 
     #[test]
+    fn lua55_seed_keeps_short_strings_and_table_keys_findable_after_gc() {
+        let mut vm = Vm::new_with_ledger(
+            rivetlua_core::LuaProfile::Lua55,
+            super::HostServices::deny_all(),
+            super::AllocationLedger::new(usize::MAX),
+            0x55a1_7e3d,
+        )
+        .unwrap();
+        assert_ne!(
+            ShortStringIndex::hash(b"seeded", 0),
+            ShortStringIndex::hash(b"seeded", vm.hash_seed),
+        );
+        let table = vm.allocate_table().unwrap();
+        let root = vm.add_root(RootKind::Host, table).unwrap();
+        for index in 0..32 {
+            let name = format!("seeded-{index}");
+            let key = vm.allocate_byte_string(name.as_bytes()).unwrap();
+            vm.raw_set(table, Value::Object(key), Value::Integer(index))
+                .unwrap();
+        }
+        vm.collect().unwrap();
+        for index in 0..32 {
+            let name = format!("seeded-{index}");
+            assert_eq!(
+                vm.raw_get_byte_key(table, name.as_bytes()),
+                Ok(Value::Integer(index)),
+            );
+            let first = vm.allocate_byte_string(name.as_bytes()).unwrap();
+            let second = vm.allocate_byte_string(name.as_bytes()).unwrap();
+            assert_eq!(first, second);
+        }
+        vm.remove_root(root).unwrap();
+    }
+
+    #[test]
     fn collision_checks_complete_bytes_and_deletion_keeps_probe_chain() {
         let mut vm = Vm::new().unwrap();
         vm.stop_automatic_gc();
         let probe = vm.ledger_probe();
         let first = vm.allocate_byte_string_fresh(b"first").unwrap();
         let second = vm.allocate_byte_string_fresh(b"second").unwrap();
-        let collision_hash = ShortStringIndex::hash(b"first");
+        let collision_hash = ShortStringIndex::hash(b"first", vm.hash_seed);
         vm.short_strings.reserve_slot(&vm.ledger).unwrap();
         vm.short_strings.insert(collision_hash, first).unwrap();
         vm.short_strings.insert(collision_hash, second).unwrap();
@@ -2422,7 +2457,9 @@ impl HeapObject {
                 | Builtin::CoroutineYield
                 | Builtin::CoroutineStatus
                 | Builtin::CoroutineRunning
+                | Builtin::CoroutineIsYieldable
                 | Builtin::CoroutineClose
+                | Builtin::HostThreadReset
                 | Builtin::CoroutineWrap
                 | Builtin::Basic(_)
                 | Builtin::Table(_)
@@ -2591,8 +2628,11 @@ struct ManagedByteStringAllocation {
 }
 
 impl ShortStringIndex {
-    fn hash(bytes: &[u8]) -> u64 {
+    fn hash(bytes: &[u8], seed: u32) -> u64 {
         let mut hasher = crate::hash::new_default_hasher();
+        if seed != 0 {
+            seed.hash(&mut hasher);
+        }
         bytes.hash(&mut hasher);
         hasher.finish()
     }
@@ -2701,6 +2741,7 @@ struct PendingFinalizerWarning {
 pub struct Vm {
     id: VmId,
     profile: LuaProfile,
+    hash_seed: u32,
     policy: VmPolicy,
     policy_issuer: Option<VmId>,
     export_policy: ExportPolicy,
@@ -2858,7 +2899,7 @@ impl Vm {
         profile: LuaProfile,
         host_services: HostServices,
     ) -> Result<Self, VmError> {
-        Self::new_with_ledger(profile, host_services, AllocationLedger::new(usize::MAX))
+        Self::new_with_ledger(profile, host_services, AllocationLedger::new(usize::MAX), 0)
     }
 
     /// C state 在第一筆 VM 邏輯配置前安裝宿主 admission 橋接。
@@ -2875,10 +2916,21 @@ impl Vm {
         host_services: HostServices,
         admission: crate::rust_alloc::rc::Rc<dyn crate::alloc::AllocationAdmission>,
     ) -> Result<Self, VmError> {
+        Self::new_with_services_and_admission_seeded(profile, host_services, admission, 0)
+    }
+
+    /// Lua 5.5 C state 在任何字串或表配置前固定宿主提供的 hash seed。
+    pub fn new_with_services_and_admission_seeded(
+        profile: LuaProfile,
+        host_services: HostServices,
+        admission: crate::rust_alloc::rc::Rc<dyn crate::alloc::AllocationAdmission>,
+        hash_seed: u32,
+    ) -> Result<Self, VmError> {
         Self::new_with_ledger(
             profile,
             host_services,
             AllocationLedger::with_admission(usize::MAX, admission),
+            hash_seed,
         )
     }
 
@@ -2886,6 +2938,7 @@ impl Vm {
         profile: LuaProfile,
         mut host_services: HostServices,
         ledger: AllocationLedger,
+        hash_seed: u32,
     ) -> Result<Self, VmError> {
         host_services.apply_policy_restrictions();
         let id = VmId::new_unique().ok_or(VmError::VmIdExhausted)?;
@@ -2906,6 +2959,7 @@ impl Vm {
         Ok(Self {
             id,
             profile,
+            hash_seed,
             policy,
             policy_issuer,
             export_policy,
@@ -5553,7 +5607,7 @@ impl Vm {
             if let ShortStringBucket::Occupied { hash, object } = *bucket {
                 let valid = self.with_byte_string(object, |string| {
                     string.len() <= MAX_SHORT_STRING_LEN
-                        && ShortStringIndex::hash(string.as_bytes()) == hash
+                        && ShortStringIndex::hash(string.as_bytes(), self.hash_seed) == hash
                 })?;
                 if !valid {
                     return Err(VmError::LedgerInvariant);
@@ -5576,7 +5630,7 @@ impl Vm {
                 index_before_growth: None,
             });
         }
-        let hash = ShortStringIndex::hash(bytes);
+        let hash = ShortStringIndex::hash(bytes, self.hash_seed);
         if let Some(object) = self.find_short_string(bytes, hash)? {
             self.mark_gc_object(object)?;
             return Ok(ManagedByteStringAllocation {
@@ -6269,6 +6323,14 @@ impl Vm {
 
     /// 先建好完整函式庫，再以單一環境欄位發布。
     pub fn install_debug_builtins(&mut self, environment: ObjectRef) -> Result<(), VmError> {
+        self.install_debug_builtins_inner(environment, true)
+    }
+
+    fn install_debug_builtins_inner(
+        &mut self,
+        environment: ObjectRef,
+        publish_loaded: bool,
+    ) -> Result<(), VmError> {
         if self.object_kind(environment)? != ObjectKind::Table {
             return Err(VmError::WrongObjectType);
         }
@@ -6310,11 +6372,13 @@ impl Vm {
                         name: b"debug",
                         value: Value::Object(library),
                     }),
-                    self.package_registry.map(|registry| StandardModuleField {
-                        table: registry.loaded,
-                        name: b"debug",
-                        value: Value::Object(library),
-                    }),
+                    self.package_registry
+                        .filter(|_| publish_loaded)
+                        .map(|registry| StandardModuleField {
+                            table: registry.loaded,
+                            name: b"debug",
+                            value: Value::Object(library),
+                        }),
                 ])
             })();
             self.remove_root(library_root)?;
@@ -6325,6 +6389,16 @@ impl Vm {
     }
 
     pub fn install_io_os_builtins(&mut self, environment: ObjectRef) -> Result<(), VmError> {
+        self.install_io_os_builtins_inner(environment, true, true, true)
+    }
+
+    fn install_io_os_builtins_inner(
+        &mut self,
+        environment: ObjectRef,
+        publish_loaded: bool,
+        include_io: bool,
+        include_os: bool,
+    ) -> Result<(), VmError> {
         if self.object_kind(environment)? != ObjectKind::Table {
             return Err(VmError::WrongObjectType);
         }
@@ -6332,67 +6406,83 @@ impl Vm {
         let mut first_holder = None;
         let mut staged_streams = [None; 3];
         let installed = (|| {
-            let holder = if let Some((holder, _)) = self.io_registry {
-                holder
+            let holder = if !include_io {
+                None
+            } else if let Some((holder, _)) = self.io_registry {
+                Some(holder)
             } else {
                 let holder = self.allocate_table()?;
                 let root = self.add_root(RootKind::Registry, holder)?;
                 first_holder = Some((holder, root));
-                holder
+                Some(holder)
             };
-            let io = self.allocate_table()?;
-            let io_root = self.add_root(RootKind::Temporary, io)?;
+            let io = include_io.then(|| self.allocate_table()).transpose()?;
+            let io_root = io
+                .map(|table| self.add_root(RootKind::Temporary, table))
+                .transpose()?;
             let staged = (|| {
-                let os = self.allocate_table()?;
-                let os_root = self.add_root(RootKind::Temporary, os)?;
+                let os = include_os.then(|| self.allocate_table()).transpose()?;
+                let os_root = os
+                    .map(|table| self.add_root(RootKind::Temporary, table))
+                    .transpose()?;
                 let staged = (|| {
-                    for (name, kind) in [
-                        (b"open".as_slice(), IoBuiltin::Open),
-                        (b"close", IoBuiltin::Close),
-                        (b"flush", IoBuiltin::Flush),
-                        (b"input", IoBuiltin::Input),
-                        (b"output", IoBuiltin::Output),
-                        (b"lines", IoBuiltin::Lines),
-                        (b"read", IoBuiltin::Read),
-                        (b"write", IoBuiltin::Write),
-                        (b"type", IoBuiltin::Type),
-                        (b"tmpfile", IoBuiltin::TmpFile),
-                        (b"popen", IoBuiltin::POpen),
-                    ] {
-                        self.install_one_builtin(io, name, Builtin::Io(kind))?;
+                    if let Some(io) = io {
+                        for (name, kind) in [
+                            (b"open".as_slice(), IoBuiltin::Open),
+                            (b"close", IoBuiltin::Close),
+                            (b"flush", IoBuiltin::Flush),
+                            (b"input", IoBuiltin::Input),
+                            (b"output", IoBuiltin::Output),
+                            (b"lines", IoBuiltin::Lines),
+                            (b"read", IoBuiltin::Read),
+                            (b"write", IoBuiltin::Write),
+                            (b"type", IoBuiltin::Type),
+                            (b"tmpfile", IoBuiltin::TmpFile),
+                            (b"popen", IoBuiltin::POpen),
+                        ] {
+                            self.install_one_builtin(io, name, Builtin::Io(kind))?;
+                        }
                     }
-                    for (name, kind) in [
-                        (b"clock".as_slice(), OsBuiltin::Clock),
-                        (b"date", OsBuiltin::Date),
-                        (b"difftime", OsBuiltin::Difftime),
-                        (b"execute", OsBuiltin::Execute),
-                        (b"exit", OsBuiltin::Exit),
-                        (b"getenv", OsBuiltin::GetEnv),
-                        (b"remove", OsBuiltin::Remove),
-                        (b"rename", OsBuiltin::Rename),
-                        (b"setlocale", OsBuiltin::SetLocale),
-                        (b"time", OsBuiltin::Time),
-                        (b"tmpname", OsBuiltin::TmpName),
-                    ] {
-                        self.install_one_builtin(os, name, Builtin::Os(kind))?;
+                    if let Some(os) = os {
+                        for (name, kind) in [
+                            (b"clock".as_slice(), OsBuiltin::Clock),
+                            (b"date", OsBuiltin::Date),
+                            (b"difftime", OsBuiltin::Difftime),
+                            (b"execute", OsBuiltin::Execute),
+                            (b"exit", OsBuiltin::Exit),
+                            (b"getenv", OsBuiltin::GetEnv),
+                            (b"remove", OsBuiltin::Remove),
+                            (b"rename", OsBuiltin::Rename),
+                            (b"setlocale", OsBuiltin::SetLocale),
+                            (b"time", OsBuiltin::Time),
+                            (b"tmpname", OsBuiltin::TmpName),
+                        ] {
+                            self.install_one_builtin(os, name, Builtin::Os(kind))?;
+                        }
                     }
-                    if first_holder.is_some() {
-                        self.install_file_metatable(holder)?;
-                        self.install_standard_streams(holder, io, &mut staged_streams)?;
-                    } else {
-                        for name in [b"stdin".as_slice(), b"stdout", b"stderr"] {
-                            let value = self.io_holder_field(holder, name)?;
-                            if value != Value::Nil {
-                                self.set_string_field(io, name, value)?;
+                    if let (Some(holder), Some(io)) = (holder, io) {
+                        if first_holder.is_some() {
+                            self.install_file_metatable(holder)?;
+                            self.install_standard_streams(holder, io, &mut staged_streams)?;
+                        } else {
+                            for name in [b"stdin".as_slice(), b"stdout", b"stderr"] {
+                                let value = self.io_holder_field(holder, name)?;
+                                if value != Value::Nil {
+                                    self.set_string_field(io, name, value)?;
+                                }
                             }
                         }
                     }
-                    self.publish_io_os(environment, io, os)
+                    self.publish_io_os(environment, io, os, publish_loaded)
                 })();
-                self.remove_root(os_root)?;
+                if let Some(root) = os_root {
+                    self.remove_root(root)?;
+                }
                 staged
             })();
-            self.remove_root(io_root)?;
+            if let Some(root) = io_root {
+                self.remove_root(root)?;
+            }
             staged?;
             if let Some(registry) = first_holder.take() {
                 self.io_registry = Some(registry);
@@ -6544,27 +6634,31 @@ impl Vm {
     fn publish_io_os(
         &mut self,
         environment: ObjectRef,
-        io: ObjectRef,
-        os: ObjectRef,
+        io: Option<ObjectRef>,
+        os: Option<ObjectRef>,
+        publish_loaded: bool,
     ) -> Result<(), VmError> {
-        let loaded = self.package_registry.map(|registry| registry.loaded);
+        let loaded = self
+            .package_registry
+            .filter(|_| publish_loaded)
+            .map(|registry| registry.loaded);
         self.publish_standard_module_fields([
-            Some(StandardModuleField {
+            io.map(|io| StandardModuleField {
                 table: environment,
                 name: b"io",
                 value: Value::Object(io),
             }),
-            Some(StandardModuleField {
+            os.map(|os| StandardModuleField {
                 table: environment,
                 name: b"os",
                 value: Value::Object(os),
             }),
-            loaded.map(|table| StandardModuleField {
+            loaded.zip(io).map(|(table, io)| StandardModuleField {
                 table,
                 name: b"io",
                 value: Value::Object(io),
             }),
-            loaded.map(|table| StandardModuleField {
+            loaded.zip(os).map(|(table, os)| StandardModuleField {
                 table,
                 name: b"os",
                 value: Value::Object(os),
@@ -6636,6 +6730,89 @@ impl Vm {
 
     pub(crate) fn package_preload(&self) -> Option<ObjectRef> {
         self.package_registry.map(|registry| registry.preload)
+    }
+
+    /// C 標準庫 opener 共用既有 Rust 安裝器；回傳的暫根由 C stack 接手後退還。
+    #[doc(hidden)]
+    pub fn install_c_library(
+        &mut self,
+        globals: ObjectRef,
+        registry: ObjectRef,
+        module: u8,
+    ) -> Result<(ObjectRef, RootId), VmError> {
+        if self.object_kind(globals)? != ObjectKind::Table
+            || self.object_kind(registry)? != ObjectKind::Table
+        {
+            return Err(VmError::WrongObjectType);
+        }
+        let environment = if module == 0 {
+            globals
+        } else {
+            self.allocate_table()?
+        };
+        let environment_root = self.add_root(RootKind::Temporary, environment)?;
+        let installed = (|| {
+            let name = match module {
+                0 => {
+                    self.install_basic_builtins(environment)?;
+                    return Ok((globals, self.add_root(RootKind::Temporary, globals)?));
+                }
+                1 => {
+                    let loaded = self.c_registry_module_table(registry, b"_LOADED")?;
+                    let preload = self.c_registry_module_table(registry, b"_PRELOAD")?;
+                    if let Some(current) = self.package_registry {
+                        if current.loaded != loaded || current.preload != preload {
+                            return Err(VmError::WrongObjectType);
+                        }
+                    }
+                    self.install_package_builtins_inner(
+                        globals,
+                        Some((loaded, preload)),
+                        Some(environment),
+                    )?;
+                    b"package".as_slice()
+                }
+                2 => { self.install_coroutine_builtins(environment)?; b"coroutine" }
+                3 => { self.install_table_builtins(environment)?; b"table" }
+                4 => { self.install_io_os_builtins_inner(environment, false, true, false)?; b"io" }
+                5 => { self.install_io_os_builtins_inner(environment, false, false, true)?; b"os" }
+                6 => { self.install_string_builtins(environment)?; b"string" }
+                7 => { self.install_math_builtins(environment)?; b"math" }
+                8 => { self.install_utf8_builtins(environment)?; b"utf8" }
+                9 => { self.install_debug_builtins_inner(environment, false)?; b"debug" }
+                _ => return Err(VmError::WrongObjectType),
+            };
+            let value = self.with_temporary_byte_string(name, |vm, key| {
+                vm.raw_get(environment, Value::Object(key))
+            })?;
+            let Value::Object(library) = value else {
+                return Err(VmError::WrongObjectType);
+            };
+            if self.object_kind(library)? != ObjectKind::Table {
+                return Err(VmError::WrongObjectType);
+            }
+            Ok((library, self.add_root(RootKind::Temporary, library)?))
+        })();
+        self.remove_root(environment_root)?;
+        installed
+    }
+
+    fn c_registry_module_table(
+        &mut self,
+        registry: ObjectRef,
+        name: &[u8],
+    ) -> Result<ObjectRef, VmError> {
+        let current = self.with_temporary_byte_string(name, |vm, key| {
+            vm.raw_get(registry, Value::Object(key))
+        })?;
+        if let Value::Object(table) = current {
+            if self.object_kind(table)? == ObjectKind::Table {
+                return Ok(table);
+            }
+        }
+        let table = self.allocate_table()?;
+        self.raw_set_byte_string_key(registry, name, Value::Object(table))?;
+        Ok(table)
     }
 
     fn existing_standard_table(
@@ -6783,6 +6960,15 @@ impl Vm {
 
     /// 先完整建立 package，再發布 env.package／env.require；失敗恢復舊值。
     pub fn install_package_builtins(&mut self, environment: ObjectRef) -> Result<(), VmError> {
+        self.install_package_builtins_inner(environment, None, None)
+    }
+
+    fn install_package_builtins_inner(
+        &mut self,
+        environment: ObjectRef,
+        c_tables: Option<(ObjectRef, ObjectRef)>,
+        package_target: Option<ObjectRef>,
+    ) -> Result<(), VmError> {
         if self.object_kind(environment)? != ObjectKind::Table {
             return Err(VmError::WrongObjectType);
         }
@@ -6792,6 +6978,27 @@ impl Vm {
         let installed = (|| {
             let (loaded, preload) = if let Some(registry) = self.package_registry {
                 (registry.loaded, registry.preload)
+            } else if let Some((loaded, preload)) = c_tables {
+                if self.object_kind(loaded)? != ObjectKind::Table
+                    || self.object_kind(preload)? != ObjectKind::Table
+                {
+                    return Err(VmError::WrongObjectType);
+                }
+                let loaded_root = self.add_root(RootKind::Registry, loaded)?;
+                let preload_root = match self.add_root(RootKind::Registry, preload) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        self.remove_root(loaded_root)?;
+                        return Err(error);
+                    }
+                };
+                first_registry_roots = Some(PackageRegistry {
+                    loaded,
+                    loaded_root,
+                    preload,
+                    preload_root,
+                });
+                (loaded, preload)
             } else {
                 let loaded = self.allocate_table()?;
                 let loaded_root = self.add_root(RootKind::Registry, loaded)?;
@@ -6880,6 +7087,18 @@ impl Vm {
                     self.set_string_field(package, b"loaded", Value::Object(loaded))?;
                     self.set_string_field(package, b"preload", Value::Object(preload))?;
                     self.set_string_field(package, b"searchers", Value::Object(searchers))?;
+                    self.install_one_builtin(
+                        package,
+                        b"searchpath",
+                        Builtin::Load(LoadBuiltin::SearchPath),
+                    )?;
+                    let config = if cfg!(windows) {
+                        b"\\\n;\n?\n!\n-\n".as_slice()
+                    } else {
+                        b"/\n;\n?\n!\n-\n".as_slice()
+                    };
+                    let config = self.allocate_byte_string(config)?;
+                    self.set_string_field(package, b"config", Value::Object(config))?;
                     let path = self.allocate_byte_string(b"")?;
                     self.set_string_field(package, b"path", Value::Object(path))?;
                     let initial_cpath = self.host_services.load.foreign_native_cpath.take();
@@ -6898,7 +7117,7 @@ impl Vm {
                 let mut captured_roots: [Option<RootId>; 9] = [None; 9];
                 let published = (|| {
                     let mut fields: [Option<StandardModuleField>; 12] = [None; 12];
-                    if first_registration {
+                    if first_registration && c_tables.is_none() {
                         // F 初次建立 loaded 時，僅收錄環境中已存在的 table。
                         for (index, name) in [
                             b"_G".as_slice(),
@@ -6926,13 +7145,13 @@ impl Vm {
                             }
                         }
                     }
-                    fields[9] = Some(StandardModuleField {
+                    fields[9] = c_tables.is_none().then_some(StandardModuleField {
                         table: loaded,
                         name: b"package",
                         value: Value::Object(package),
                     });
                     fields[10] = Some(StandardModuleField {
-                        table: environment,
+                        table: package_target.unwrap_or(environment),
                         name: b"package",
                         value: Value::Object(package),
                     });
@@ -7304,6 +7523,7 @@ impl Vm {
                     (b"yield".as_slice(), Builtin::CoroutineYield),
                     (b"status".as_slice(), Builtin::CoroutineStatus),
                     (b"running".as_slice(), Builtin::CoroutineRunning),
+                    (b"isyieldable".as_slice(), Builtin::CoroutineIsYieldable),
                     (b"close".as_slice(), Builtin::CoroutineClose),
                     (b"wrap".as_slice(), Builtin::CoroutineWrap),
                 ] {
@@ -7543,7 +7763,10 @@ impl Vm {
     ) -> Result<ObjectRef, VmError> {
         debug_assert!(matches!(
             builtin,
-            Builtin::CoroutineResume | Builtin::CoroutineYield | Builtin::CoroutineClose
+            Builtin::CoroutineResume
+                | Builtin::CoroutineYield
+                | Builtin::CoroutineClose
+                | Builtin::HostThreadReset
         ));
         self.allocate_builtin_payload(builtin)
     }
@@ -8358,7 +8581,7 @@ impl Vm {
         hash_capacity: usize,
     ) -> Result<ObjectRef, VmError> {
         let (mut table, array_ticket, hash_ticket) =
-            Table::try_new(&self.ledger, array_capacity, hash_capacity)?;
+            Table::try_new(&self.ledger, array_capacity, hash_capacity, self.hash_seed)?;
         let array_charge = array_ticket.commit_charge()?;
         let hash_charge = hash_ticket.commit_charge()?;
         table.install_initial_charges(array_charge, hash_charge);
@@ -9880,7 +10103,7 @@ impl Vm {
         };
         let short_string_hash = match &stored[0].payload {
             HeapPayload::ByteString(string) if string.len() <= MAX_SHORT_STRING_LEN => {
-                Some(ShortStringIndex::hash(string.as_bytes()))
+                Some(ShortStringIndex::hash(string.as_bytes(), self.hash_seed))
             }
             _ => None,
         };

@@ -281,11 +281,13 @@ fn outcome_summary(outcome: &RunOutcome) -> String {
         ),
         RunOutcome::Aborted(reason) => format!("Aborted({reason:?})"),
         RunOutcome::PendingClose(snapshot) => format!("PendingClose({snapshot:?})"),
-        outcome @ (RunOutcome::External(_)
+        outcome @ (RunOutcome::Exited(_)
+        | RunOutcome::External(_)
         | RunOutcome::CloseBoundaryA5 { .. }
         | RunOutcome::NestedReturned(_)
         | RunOutcome::NestedErrored(_)
-        | RunOutcome::NestedFailed(_)) => format!("{outcome:?}"),
+        | RunOutcome::NestedFailed(_)
+        | RunOutcome::SafeDiagnostic(_)) => format!("{outcome:?}"),
     }
 }
 
@@ -345,38 +347,40 @@ fn sdk_wrapper_encode_emits_rvct_v1_for_both_profiles() {
 
 #[test]
 fn sdk_wrapper_encode_obeys_container_and_work_limits_before_reservation() {
-    let engine = Engine::new(LuaProfile::Lua55);
-    let module = engine.compile(b"return 1").unwrap();
-    let encoded = engine
-        .save_module(&module, &budget(ContainerLimits::default()))
-        .unwrap();
+    for profile in profiles() {
+        let engine = Engine::new(profile);
+        let module = engine.compile(b"return 1").unwrap();
+        let encoded = engine
+            .save_module(&module, &budget(ContainerLimits::default()))
+            .unwrap();
 
-    let enough = ContainerLimits {
-        max_container_bytes: encoded.len() * 4,
-        ..ContainerLimits::default()
-    };
-    assert_eq!(
-        engine.save_module(&module, &budget(enough)).unwrap(),
-        encoded
-    );
+        let enough = ContainerLimits {
+            max_container_bytes: encoded.len() * 4,
+            ..ContainerLimits::default()
+        };
+        assert_eq!(
+            engine.save_module(&module, &budget(enough)).unwrap(),
+            encoded
+        );
 
-    let too_small = ContainerLimits {
-        max_container_bytes: 40,
-        ..ContainerLimits::default()
-    };
-    let denied = budget(too_small);
-    assert!(engine.save_module(&module, &denied).is_err());
-    assert_eq!(denied.allocation_trace().next_ordinal, 1);
-    assert_eq!(denied.allocation_snapshot().reserved, 0);
+        let too_small = ContainerLimits {
+            max_container_bytes: 40,
+            ..ContainerLimits::default()
+        };
+        let denied = budget(too_small);
+        assert!(engine.save_module(&module, &denied).is_err());
+        assert_eq!(denied.allocation_trace().next_ordinal, 1);
+        assert_eq!(denied.allocation_snapshot().reserved, 0);
 
-    let no_work = ContainerLimits {
-        max_work: 0,
-        ..ContainerLimits::default()
-    };
-    let denied = budget(no_work);
-    assert!(engine.save_module(&module, &denied).is_err());
-    assert_eq!(denied.allocation_trace().next_ordinal, 1);
-    assert_eq!(denied.allocation_snapshot().reserved, 0);
+        let no_work = ContainerLimits {
+            max_work: 0,
+            ..ContainerLimits::default()
+        };
+        let denied = budget(no_work);
+        assert!(engine.save_module(&module, &denied).is_err());
+        assert_eq!(denied.allocation_trace().next_ordinal, 1);
+        assert_eq!(denied.allocation_snapshot().reserved, 0);
+    }
 }
 
 #[test]
@@ -695,87 +699,88 @@ fn sdk_wrapper_decode_allocation_failure_releases_escrow_and_can_retry() {
 
 #[test]
 fn sdk_wrapper_decode_container_allocation_and_work_limits_accept_exact_and_reject_one_below() {
-    let profile = LuaProfile::Lua55;
-    let engine = Engine::new(profile);
-    let module = engine.compile_named(b"return 44", b"=exact-work").unwrap();
-    let bytes = engine
-        .save_module(&module, &budget(ContainerLimits::default()))
-        .unwrap();
+    for profile in profiles() {
+        let engine = Engine::new(profile);
+        let module = engine.compile_named(b"return 44", b"=exact-work").unwrap();
+        let bytes = engine
+            .save_module(&module, &budget(ContainerLimits::default()))
+            .unwrap();
 
-    let baseline = budget(ContainerLimits::default());
-    engine.load_module(&bytes, &baseline).unwrap();
-    let allocation_exact = baseline
-        .allocation_trace()
-        .last_attempt
-        .expect("成功 decode 應有一次 escrow")
-        .bytes;
+        let baseline = budget(ContainerLimits::default());
+        engine.load_module(&bytes, &baseline).unwrap();
+        let allocation_exact = baseline
+            .allocation_trace()
+            .last_attempt
+            .expect("成功 decode 應有一次 escrow")
+            .bytes;
 
-    let rvlu_len = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
-    let sidecar_len = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
-    let rvlu = &bytes[40..40 + rvlu_len];
-    let sidecar = &bytes[40 + rvlu_len..40 + rvlu_len + sidecar_len];
-    let transport_limits = TransportLimits::default();
-    let scan = transport_scan_admission(rvlu.len(), sidecar.len()).unwrap();
-    let admission = preflight_transport_decode(rvlu, sidecar, profile, &transport_limits).unwrap();
-    let exact_work =
-        40u64 + (bytes.len() as u64) * 8 + scan.work + scan.work + admission.subsequent_work + 1;
+        let rvlu_len = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        let sidecar_len = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        let rvlu = &bytes[40..40 + rvlu_len];
+        let sidecar = &bytes[40 + rvlu_len..40 + rvlu_len + sidecar_len];
+        let transport_limits = TransportLimits::default();
+        let scan = transport_scan_admission(rvlu.len(), sidecar.len()).unwrap();
+        let admission = preflight_transport_decode(rvlu, sidecar, profile, &transport_limits).unwrap();
+        let exact_work =
+            40u64 + (bytes.len() as u64) * 8 + scan.work + scan.work + admission.subsequent_work + 1;
 
-    let exact = ContainerLimits {
-        max_container_bytes: bytes.len(),
-        max_allocation_bytes: allocation_exact,
-        max_work: exact_work,
-        ..ContainerLimits::default()
-    };
-    let exact_budget = budget(exact);
-    assert_eq!(
-        engine
-            .load_module(&bytes, &exact_budget)
-            .unwrap()
-            .source_name(),
-        Some(b"=exact-work".as_slice())
-    );
+        let exact = ContainerLimits {
+            max_container_bytes: bytes.len(),
+            max_allocation_bytes: allocation_exact,
+            max_work: exact_work,
+            ..ContainerLimits::default()
+        };
+        let exact_budget = budget(exact);
+        assert_eq!(
+            engine
+                .load_module(&bytes, &exact_budget)
+                .unwrap()
+                .source_name(),
+            Some(b"=exact-work".as_slice())
+        );
 
-    let one_below_bytes = ContainerLimits {
-        max_container_bytes: bytes.len() - 1,
-        ..ContainerLimits::default()
-    };
-    let one_below_bytes_budget = budget(one_below_bytes);
-    assert_eq!(
-        engine
-            .load_module(&bytes, &one_below_bytes_budget)
-            .unwrap_err()
-            .kind,
-        ContainerErrorKind::LimitExceeded
-    );
-    assert_eq!(one_below_bytes_budget.allocation_trace().next_ordinal, 1);
+        let one_below_bytes = ContainerLimits {
+            max_container_bytes: bytes.len() - 1,
+            ..ContainerLimits::default()
+        };
+        let one_below_bytes_budget = budget(one_below_bytes);
+        assert_eq!(
+            engine
+                .load_module(&bytes, &one_below_bytes_budget)
+                .unwrap_err()
+                .kind,
+            ContainerErrorKind::LimitExceeded
+        );
+        assert_eq!(one_below_bytes_budget.allocation_trace().next_ordinal, 1);
 
-    let one_below_memory = ContainerLimits {
-        max_allocation_bytes: allocation_exact - 1,
-        ..ContainerLimits::default()
-    };
-    let one_below_memory_budget = budget(one_below_memory);
-    assert_eq!(
-        engine
-            .load_module(&bytes, &one_below_memory_budget)
-            .unwrap_err()
-            .kind,
-        ContainerErrorKind::LimitExceeded
-    );
-    assert_eq!(one_below_memory_budget.allocation_trace().next_ordinal, 1);
+        let one_below_memory = ContainerLimits {
+            max_allocation_bytes: allocation_exact - 1,
+            ..ContainerLimits::default()
+        };
+        let one_below_memory_budget = budget(one_below_memory);
+        assert_eq!(
+            engine
+                .load_module(&bytes, &one_below_memory_budget)
+                .unwrap_err()
+                .kind,
+            ContainerErrorKind::LimitExceeded
+        );
+        assert_eq!(one_below_memory_budget.allocation_trace().next_ordinal, 1);
 
-    let one_below_work = ContainerLimits {
-        max_work: exact_work - 1,
-        ..ContainerLimits::default()
-    };
-    let one_below_work_budget = budget(one_below_work);
-    assert_eq!(
-        engine
-            .load_module(&bytes, &one_below_work_budget)
-            .unwrap_err()
-            .kind,
-        ContainerErrorKind::LimitExceeded
-    );
-    assert_eq!(one_below_work_budget.allocation_trace().next_ordinal, 1);
+        let one_below_work = ContainerLimits {
+            max_work: exact_work - 1,
+            ..ContainerLimits::default()
+        };
+        let one_below_work_budget = budget(one_below_work);
+        assert_eq!(
+            engine
+                .load_module(&bytes, &one_below_work_budget)
+                .unwrap_err()
+                .kind,
+            ContainerErrorKind::LimitExceeded
+        );
+        assert_eq!(one_below_work_budget.allocation_trace().next_ordinal, 1);
+    }
 }
 
 #[test]

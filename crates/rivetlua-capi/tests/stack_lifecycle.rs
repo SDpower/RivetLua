@@ -26,6 +26,21 @@ const OTHER_REGISTRY_INDEX: i32 = -1_001_000;
 #[cfg(feature = "lua54")]
 const OTHER_REGISTRY_INDEX: i32 = -(i32::MAX / 2 + 1000);
 
+fn assert_main_coroutine_root(owner: &StateOwner) {
+    owner
+        .with_vm(|vm| {
+            let main_thread = vm.main_thread_identity().expect("C state 的 main thread");
+            let mut coroutine_root = None;
+            vm.visit_roots(|kind, _, object| {
+                if kind == RootKind::Coroutine {
+                    assert!(coroutine_root.replace(object).is_none());
+                }
+            });
+            assert_eq!(coroutine_root, Some(main_thread));
+        })
+        .unwrap();
+}
+
 unsafe extern "C" {
     fn rivetlua_capi_test_protected_index_a4b(
         state: *mut lua_State,
@@ -315,16 +330,17 @@ fn stack_lifecycle_group_refcell_accounting_budget_and_sibling_lifetime() {
         StateOwner::new_with_vm_setup(|vm| dry_baseline = Some(vm.ledger_snapshot())).unwrap();
     let dry_before = dry_baseline.unwrap();
     let dry_after = dry.with_vm(|vm| vm.ledger_snapshot()).unwrap();
-    // B10b2 的永久 hidden hook bridge 多占一個 Registry root。
+    // Registry 包含 registry、emergency、hook bridge 與 warning bridge。
     assert_eq!(
         dry.with_vm(|vm| vm.roots().count(RootKind::Registry))
             .unwrap(),
-        3
+        4
     );
     assert_eq!(
         dry.with_vm(|vm| vm.roots().count(RootKind::Host)).unwrap(),
         0
     );
+    assert_main_coroutine_root(&dry);
     let registry_bytes = dry_after.committed - dry_before.committed - total_bytes;
     let registry_host_bytes =
         dry_after.host_allocation_bytes - dry_before.host_allocation_bytes - total_bytes;
@@ -531,13 +547,14 @@ fn stack_lifecycle_indices_settop_rotate_copy_and_pseudo_boundaries() {
     }
     owner
         .with_vm(|vm| {
-            // B12 registry destination 已改為整數；只剩 emergency 與 B10 bridge。
-            assert_eq!(vm.roots().count(RootKind::Registry), 2);
+            // B12 registry destination 已改為整數；保留 emergency 與兩個 bridge。
+            assert_eq!(vm.roots().count(RootKind::Registry), 3);
             assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
             assert_eq!(vm.roots().count(RootKind::Host), 0);
-            assert_eq!(vm.roots().total_count(), 3);
+            assert_eq!(vm.roots().total_count(), 4);
         })
         .unwrap();
+    assert_main_coroutine_root(&owner);
 }
 
 #[test]
@@ -756,13 +773,14 @@ fn stack_lifecycle_root_failure_rolls_back_without_partial_slot() {
     unsafe { assert_eq!(lua_gettop(owner.as_ptr()), 0) };
     owner
         .with_vm(|vm| {
-            // B10b2 的永久 hidden hook bridge 多占一個 Registry root。
-            assert_eq!(vm.roots().count(RootKind::Registry), 3);
+            // Registry 包含 registry、emergency、hook bridge 與 warning bridge。
+            assert_eq!(vm.roots().count(RootKind::Registry), 4);
             assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
             assert_eq!(vm.roots().count(RootKind::Host), 0);
-            assert_eq!(vm.roots().total_count(), 4);
+            assert_eq!(vm.roots().total_count(), 5);
         })
         .unwrap();
+    assert_main_coroutine_root(&owner);
     assert_eq!(owner.with_vm(|vm| vm.ledger_snapshot()).unwrap(), baseline);
 }
 

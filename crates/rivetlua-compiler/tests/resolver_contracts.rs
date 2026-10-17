@@ -1341,7 +1341,7 @@ fn public_resolver_rejects_invalid_control_flow_and_stops_at_limits() {
         for input in [
             b"break".as_slice(),
             b"goto L; local x <close>; ::L:: return x",
-            b"do goto L end; local x=1; ::L::",
+            b"do goto L end; local x=1; ::L:: x=2",
             b"goto missing",
         ] {
             let (module, chunk) = parsed(input, profile);

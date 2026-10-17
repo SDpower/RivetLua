@@ -164,7 +164,7 @@ fn p09_1_frame_entry_return() {
     };
     let source = b"local f=function() return 7 end; local x=f(); return x";
     let verified = compile(source, profile);
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let mut execution = vm.load(verified).unwrap();
     assert_eq!(
         execution.run(),
@@ -175,7 +175,7 @@ fn p09_1_frame_entry_return() {
     println!("P09_CASE\tCALL-ENTRY\t{selected}\tactual=Returned([Integer(7)])");
 
     let nested = b"local f=function() local g=function() return 8 end; local x=g(); return x end; local y=f(); return y";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let verified = compile(nested, profile);
     let mut execution = vm.load(verified.clone()).unwrap();
@@ -197,7 +197,7 @@ fn p09_1_frame_entry_return() {
     assert_eq!(vm.roots().total_count(), 0);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
 
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let mut execution = vm
         .load(compile(b"local f=nil; local x=f(); return x", profile))
         .unwrap();
@@ -249,7 +249,7 @@ fn p09_1_frame_entry_return() {
     assert_eq!(root.instructions[call + 1].close_path.as_ref(), Some(&path));
     assert_eq!(root.instructions[call + 2].close_path.as_ref(), Some(&path));
     assert!(usize::from(return_base.0) < usize::from(root.register_count));
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let (env, env_root, log, first, second) = close_environment(&mut vm, profile);
     vm.set_collect_every_allocation(true);
     let mut execution = vm
@@ -289,7 +289,7 @@ fn p09_2_closure_upvalue() {
         _ => panic!("P09 profile 無效"),
     };
     let counter = b"local function counter() local n=0; return function() n=n+1; return n end end; local a=counter(); local b=counter(); local x=a(); local y=a(); local z=b(); return x,y,z";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(compile(counter, profile)).unwrap();
     assert_eq!(
@@ -306,7 +306,7 @@ fn p09_2_closure_upvalue() {
     println!("P09_CASE\tCALL-001\t{selected}\tactual=Returned([1,2,1])");
 
     let shared = b"local function pair() local x=3; local t={}; t.get=function() return x end; t.set=function() x=9 end; return t end; local p=pair(); local a=p.get(); p.set(); local b=p.get(); return a,b";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(compile(shared, profile)).unwrap();
     assert_eq!(
@@ -321,7 +321,7 @@ fn p09_2_closure_upvalue() {
     println!("P09_CASE\tCALL-006\t{selected}\tactual=Returned([3,9])");
 
     let reused = b"local function make() local x={v=7}; local t={}; t.get=function() return x.v end; t.set=function() x.v=9 end; return t end; local a=make(); local b=make(); a.set(); local x=a.get(); local y=b.get(); local z=a.get(); return x,y,z";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(compile(reused, profile)).unwrap();
     assert_eq!(
@@ -337,7 +337,7 @@ fn p09_2_closure_upvalue() {
     assert_eq!(vm.ledger_snapshot().reserved, 0);
     println!("P09_CASE\tCALL-009\t{selected}\tactual=Returned([9,7,9])");
 
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(verified_active_callee_case(profile)).unwrap();
     assert_eq!(
@@ -366,7 +366,7 @@ fn p09_2_scope_close() {
         matches!(entry.instruction, Instruction::Close { count: 0, .. })
             && entry.close_path.is_none()
     }));
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(verified).unwrap();
     assert_eq!(
@@ -404,7 +404,7 @@ fn p09_2_scope_close() {
             matches!(entry.instruction, Instruction::Close { count: 0, .. })
                 && entry.close_path.is_none()
         }));
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         vm.set_collect_every_allocation(true);
         let mut execution = vm.load(verified).unwrap();
         let actual = execution.run();
@@ -420,7 +420,7 @@ fn p09_2_scope_close() {
     }
 
     let shared = b"local t={}; do local x=3; t.get=function() return x end; t.set=function() x=9 end end; local a=t.get(); t.set(); local b=t.get(); return a,b";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(compile(shared, profile)).unwrap();
     assert_eq!(
@@ -436,7 +436,7 @@ fn p09_2_scope_close() {
     println!("P09_CASE\tCALL-SCOPE-SHARED\t{selected}\tactual=Returned([3,9])");
 
     let reused = b"local t={}; local i=1; while i<=2 do local x={v=i}; t[i]=function() return x.v end; i=i+1 end; local a=t[1](); local b=t[2](); return a,b";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(compile(reused, profile)).unwrap();
     assert_eq!(
@@ -453,7 +453,7 @@ fn p09_2_scope_close() {
 
     let unopened =
         b"local f; do local x=7; if false then f=function() return x end end end; return 7";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let mut execution = vm.load(compile(unopened, profile)).unwrap();
     assert_eq!(
         execution.run(),
@@ -474,7 +474,7 @@ fn p09_2_scope_close() {
             && matches!(window[1].instruction, Instruction::Close { count: 1, .. })
             && window[1].close_path.is_some()
     }));
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let (env, env_root, log, first, _) = close_environment(&mut vm, profile);
     vm.set_collect_every_allocation(true);
     let mut execution = vm
@@ -557,7 +557,7 @@ fn p09_3_result_adjustment() {
             vec![Value::Integer(7), Value::Nil, Value::Integer(9), Value::Nil],
         ),
     ] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let mut execution = vm.load(compile(source, profile)).unwrap();
         assert_eq!(execution.run(), Ok(RunOutcome::Returned(expected)), "{case}");
         drop(execution);
@@ -608,7 +608,7 @@ fn p09_3_vararg_runtime_subset() {
             vec![Value::Integer(7)],
         ),
     ] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         vm.set_collect_every_allocation(true);
         let mut execution = vm.load(compile(source, profile)).unwrap();
         assert_eq!(execution.run(), Ok(RunOutcome::Returned(expected)), "{case}");
@@ -648,7 +648,7 @@ fn p09_3_prefix_open_pending_close() {
             ..
         }
     )));
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let (env, env_root, log, first, _) = close_environment(&mut vm, profile);
     vm.set_collect_every_allocation(true);
     let mut execution = vm
@@ -690,7 +690,7 @@ fn p09_3_prefix_open_scope_close() {
             .iter()
             .any(|entry| matches!(entry.instruction, Instruction::Close { count: 0, .. }))
     );
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(verified).unwrap();
     assert_eq!(
@@ -779,7 +779,7 @@ fn p09_3_dynamic_call_arguments_cases() {
             vec![Value::Integer(7)],
         ),
     ] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         vm.set_collect_every_allocation(true);
         let mut execution = vm.load(compile(source, profile)).unwrap();
         assert_eq!(execution.run(), Ok(RunOutcome::Returned(expected)), "{case}");
@@ -801,7 +801,7 @@ fn p09_4_named_vararg_profiles_and_table_mutation() {
     };
     if profile == LanguageProfile::Lua55 {
         let exact = b"function f(...va) va[1]=9; va.n=1; return ... end; return f(1,2)";
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let environment = vm.allocate_table().unwrap();
         let environment_handle = HostHandle::<Value>::new(&mut vm, environment).unwrap();
         vm.set_collect_every_allocation(true);
@@ -820,7 +820,7 @@ fn p09_4_named_vararg_profiles_and_table_mutation() {
 
         let source =
             b"local f=function(...va) va[1]=9; va.n=1; return ... end; local r=f(1,2); return r";
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         vm.set_collect_every_allocation(true);
         let mut execution = vm.load(compile(source, profile)).unwrap();
         assert_eq!(
@@ -833,7 +833,7 @@ fn p09_4_named_vararg_profiles_and_table_mutation() {
         println!("P09_CASE\tCALL-011-BODY\t{selected}\tcount=1;value=9");
 
         let tail_local = b"local function f(...va) va[1]=9; va.n=1; return ... end; return f(1,2)";
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         vm.set_collect_every_allocation(true);
         let mut execution = vm.load(compile(tail_local, profile)).unwrap();
         assert_eq!(
@@ -857,7 +857,7 @@ fn p09_4_named_vararg_profiles_and_table_mutation() {
                 vec![Value::Integer(7)],
             ),
         ] {
-            let mut vm = Vm::new().unwrap();
+            let mut vm = Vm::new_with_profile(profile).unwrap();
             vm.set_collect_every_allocation(true);
             let mut execution = vm.load(compile(source, profile)).unwrap();
             assert_eq!(execution.run(), Ok(RunOutcome::Returned(expected)), "{case}");
@@ -868,7 +868,7 @@ fn p09_4_named_vararg_profiles_and_table_mutation() {
         }
 
         let tail_error = b"local function f(...va) va.n=nil; return ... end; return f(1)";
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let mut execution = vm.load(compile(tail_error, profile)).unwrap();
         let Ok(RunOutcome::LuaError(error)) = execution.run() else {
             panic!("尾呼叫內刪除 n 欄位須得到受控 LuaError")
@@ -891,7 +891,7 @@ fn p09_4_named_vararg_profiles_and_table_mutation() {
                 vec![Value::Integer(7)],
             ),
         ] {
-            let mut vm = Vm::new().unwrap();
+            let mut vm = Vm::new_with_profile(profile).unwrap();
             vm.set_collect_every_allocation(true);
             let mut execution = vm.load(compile(source, profile)).unwrap();
             assert_eq!(execution.run(), Ok(RunOutcome::Returned(expected)), "{case}");
@@ -902,7 +902,7 @@ fn p09_4_named_vararg_profiles_and_table_mutation() {
         }
 
         let invalid_n = b"local f=function(...va) va.n=nil; return ... end; local r=f(1); return r";
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let mut execution = vm.load(compile(invalid_n, profile)).unwrap();
         let Ok(RunOutcome::LuaError(error)) = execution.run() else {
             panic!("刪除 n 欄位須得到受控 LuaError")
@@ -947,7 +947,7 @@ fn p09_4_named_vararg_profiles_and_table_mutation() {
     }
 
     let anonymous = b"local function f(...) return ... end; return f(1,nil)";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let mut execution = vm.load(compile(anonymous, profile)).unwrap();
     assert_eq!(
         execution.run(),
@@ -959,7 +959,7 @@ fn p09_4_named_vararg_profiles_and_table_mutation() {
     println!("P09_CASE\tNAMED-VARARG-ANONYMOUS-REGRESSION\t{selected}\tcount=2;tail=nil");
 
     let dynamic_tail = b"local function f(...) return ... end; local function g() return 1,nil end; return f(9,g())";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let mut execution = vm.load(compile(dynamic_tail, profile)).unwrap();
     assert_eq!(
         execution.run(),
@@ -992,7 +992,7 @@ fn p09_5_tail_call_depth_close_path() {
             .iter()
             .any(|entry| matches!(entry.instruction, Instruction::TailCall { .. }))
     }));
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(verified).unwrap();
     execution.set_fuel(100_000).unwrap();
@@ -1007,7 +1007,7 @@ fn p09_5_tail_call_depth_close_path() {
     println!("P09_CASE\tCALL-007\t{selected}\tpeak=1;value=7");
 
     let non_tail = b"local function f(n) if n==0 then return 0 end local x=f(n-1); return x+1 end; return f(1100)";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(compile(non_tail, profile)).unwrap();
     let Ok(RunOutcome::LuaError(error)) = execution.run() else {
@@ -1050,7 +1050,7 @@ fn p09_5_tail_call_depth_close_path() {
                 .all(|entry| !matches!(entry.instruction, Instruction::TailCall { .. })),
             "{case}"
         );
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let mut execution = vm.load(verified).unwrap();
         assert_eq!(
             execution.run(),
@@ -1070,7 +1070,7 @@ fn p09_5_tail_call_depth_close_path() {
             .iter()
             .any(|entry| matches!(entry.instruction, Instruction::TailCall { .. }))
     }));
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     vm.set_collect_every_allocation(true);
     let mut execution = vm.load(verified).unwrap();
     assert_eq!(
@@ -1114,7 +1114,7 @@ fn p09_5_tail_call_depth_close_path() {
             ..
         }
     ));
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let (env, env_root, log, first, second) = close_environment(&mut vm, profile);
     vm.set_collect_every_allocation(true);
     let mut execution = vm
@@ -1145,7 +1145,7 @@ fn p09_5_tail_call_depth_close_path() {
         call + 1
     );
 
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let mut execution = vm.load(compile(source, profile)).unwrap();
     execution.set_fuel(8).unwrap();
     assert_eq!(
@@ -1173,7 +1173,7 @@ fn review_tail_dynamic_arguments_close_after_producer() {
         ("method", b"local function outer() local x=1; local h=function() return x end; local t={f=function(self,...) return h(),... end}; local function g() x=9; return 2,nil end; return t:f(g()) end; return outer()".as_slice(), 9),
     ] {
         let verified = compile(source, profile);
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         vm.set_collect_every_allocation(true);
         let mut execution = vm.load(verified).unwrap();
         assert_eq!(

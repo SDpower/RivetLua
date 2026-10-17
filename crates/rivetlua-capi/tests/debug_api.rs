@@ -548,11 +548,11 @@ fn hook_setter_root_refusal_keeps_binding_and_runtime_atomic_b10b2() {
 
 #[test]
 fn hook_callback_frame_and_token_refusal_retry_b10b2() {
-    // 兩個 profile 的實測交易序列：offset 30 是 CallbackFrame 容量 320 bytes；
+    // 兩個 profile 的實測交易序列：offset 30 是 CallbackFrame 容量，按 size_of 計 328 bytes；
     // offset 31 是 hook overlay 容量 2880 bytes；offset 32 是 i_ci token 136 bytes。
     // 三者都在 hook callback 前失敗，交易須恢復外層 stack 並可立即重試。
     for (offset, bytes) in [
-        (30_u64, 320_usize),
+        (30_u64, 328_usize),
         (31_u64, 2880_usize),
         (32_u64, 136_usize),
     ] {

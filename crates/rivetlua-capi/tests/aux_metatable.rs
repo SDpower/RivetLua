@@ -345,6 +345,7 @@ fn ordinal_and_named_failure_matrix() {
     const ROOTS: &str = "crates/rivetlua-runtime/src/roots.rs";
     const STRING: &str = "crates/rivetlua-runtime/src/string.rs";
     const TABLE: &str = "crates/rivetlua-runtime/src/table.rs";
+    // 這些 direct object 的 ObjectReserve 依 HeapObject layout 計費 256 bytes。
     const LOOKUP: [Event; 7] = [
         (AllocationDomain::Host, None, HEAP, 8),
         (AllocationDomain::Host, None, HEAP, 216),
@@ -365,7 +366,7 @@ fn ordinal_and_named_failure_matrix() {
             AllocationDomain::LuaHeap,
             Some(FailPoint::ObjectReserve),
             HEAP,
-            312,
+            256,
         ),
         (AllocationDomain::Host, None, ROOTS, 120),
     ];
@@ -392,7 +393,7 @@ fn ordinal_and_named_failure_matrix() {
             AllocationDomain::LuaHeap,
             Some(FailPoint::ObjectReserve),
             HEAP,
-            312,
+            256,
         ),
         (AllocationDomain::Host, None, ROOTS, 208),
         (AllocationDomain::Host, None, HEAP, 5760),
@@ -412,7 +413,7 @@ fn ordinal_and_named_failure_matrix() {
             AllocationDomain::LuaHeap,
             Some(FailPoint::ObjectReserve),
             HEAP,
-            312,
+            256,
         ),
         (AllocationDomain::Host, None, ROOTS, 208),
         (
@@ -431,7 +432,7 @@ fn ordinal_and_named_failure_matrix() {
             AllocationDomain::LuaHeap,
             Some(FailPoint::ObjectReserve),
             HEAP,
-            312,
+            256,
         ),
         (AllocationDomain::Host, None, ROOTS, 208),
         (

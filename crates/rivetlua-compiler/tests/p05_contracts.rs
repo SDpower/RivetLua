@@ -662,7 +662,7 @@ fn p05_contract_cases_for_one_profile() {
         &(child.parameter_count, child.is_variadic, child.named_vararg),
     );
 
-    let input = b"local i,t; i,t[i]=i+1,20; for n=2,1,-1 do end; return {7}[1]";
+    let input = b"local i,t; i,t[i]=i+1,20; for n=2,1,-1 do end; return ({7})[1]";
     let output = encoded(input, profile);
     let root = &output.verified().module().prototypes[0];
     assert!(root.instructions.iter().any(|entry| matches!(

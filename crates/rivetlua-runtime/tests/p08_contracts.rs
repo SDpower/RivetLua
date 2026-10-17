@@ -7,10 +7,14 @@ use rivetlua_runtime::{CanonicalKeyClass, ObjectKind, RunOutcome, Table};
 
 #[test]
 fn p08_1_byte_string_public_bytes_and_handle_lifetime() {
-    let profile =
+    let profile_name =
         std::env::var("RIVETLUA_P08_PROFILE").unwrap_or_else(|_| "lua55-i64f64".to_owned());
-    assert!(matches!(profile.as_str(), "lua55-i64f64" | "lua54-i64f64"));
-    let mut vm = Vm::new().unwrap();
+    let profile = match profile_name.as_str() {
+        "lua55-i64f64" => LanguageProfile::Lua55,
+        "lua54-i64f64" => LanguageProfile::Lua54,
+        _ => panic!("P08 profile 無效"),
+    };
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let bytes = [0x00, 0x41, 0x80, 0xff];
     let object = vm.allocate_byte_string(&bytes).unwrap();
     let handle = HostHandle::<ByteString>::new(&mut vm, object).unwrap();
@@ -40,10 +44,14 @@ fn p08_1_byte_string_public_bytes_and_handle_lifetime() {
 
 #[test]
 fn p08_2_canonical_key_public_table_and_normalization() {
-    let profile =
+    let profile_name =
         std::env::var("RIVETLUA_P08_PROFILE").unwrap_or_else(|_| "lua55-i64f64".to_owned());
-    assert!(matches!(profile.as_str(), "lua55-i64f64" | "lua54-i64f64"));
-    let mut vm = Vm::new().unwrap();
+    let profile = match profile_name.as_str() {
+        "lua55-i64f64" => LanguageProfile::Lua55,
+        "lua54-i64f64" => LanguageProfile::Lua54,
+        _ => panic!("P08 profile 無效"),
+    };
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let table = vm.allocate_table().unwrap();
     let handle = HostHandle::<Table>::new(&mut vm, table).unwrap();
     assert_eq!(vm.object_kind(table), Ok(ObjectKind::Table));
@@ -56,8 +64,9 @@ fn p08_2_canonical_key_public_table_and_normalization() {
     assert!(integer == float);
     assert!(vm.canonical_key(Value::Nil).unwrap().is_none());
     assert!(vm.canonical_key(Value::Float(f64::NAN)).unwrap().is_none());
-    let a = vm.allocate_byte_string(&[0, 0x80]).unwrap();
-    let b = vm.allocate_byte_string(&[0, 0x80]).unwrap();
+    let equal_bytes = [0x80; 41];
+    let a = vm.allocate_byte_string(&equal_bytes).unwrap();
+    let b = vm.allocate_byte_string(&equal_bytes).unwrap();
     let ak = vm.canonical_key(Value::Object(a)).unwrap().unwrap();
     let bk = vm.canonical_key(Value::Object(b)).unwrap().unwrap();
     assert_eq!(ak.class(), CanonicalKeyClass::ByteString);
@@ -110,7 +119,7 @@ fn p08_3_raw_vm_cases() {
             Value::Nil,
         ),
     ] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = Vm::new_with_profile(profile).unwrap();
         let verified = compiled(source, profile);
         let mut execution = vm.load(verified).unwrap();
         let actual = execution.run();
@@ -122,7 +131,7 @@ fn p08_3_raw_vm_cases() {
         );
     }
 
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let verified = compiled(b"return \"\\0\\x80\\xff\"", profile);
     let mut execution = vm.load(verified).unwrap();
     let RunOutcome::Returned(values) = execution.run().unwrap() else {
@@ -138,7 +147,7 @@ fn p08_3_raw_vm_cases() {
     .unwrap();
     assert_eq!(vm.roots().total_count(), 0);
 
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let table = vm.allocate_table().unwrap();
     let before = vm.ledger_snapshot();
     for (case, key, expected) in [
@@ -189,7 +198,7 @@ fn p08_4_length_vm_cases() {
     };
 
     let source = b"return #\"\\0A\"";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let mut execution = vm.load(compiled(source, profile)).unwrap();
     let actual = execution.run();
     assert_eq!(actual, Ok(RunOutcome::Returned(vec![Value::Integer(2)])));
@@ -200,7 +209,7 @@ fn p08_4_length_vm_cases() {
     );
 
     let source = b"local t={}; t[1]=7; t[3]=9; return #t";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let mut execution = vm.load(compiled(source, profile)).unwrap();
     let actual = execution.run();
     let Ok(RunOutcome::Returned(values)) = &actual else {
@@ -228,7 +237,7 @@ fn p08_4_length_vm_cases() {
     );
 
     let source = b"return #7";
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(profile).unwrap();
     let mut execution = vm.load(compiled(source, profile)).unwrap();
     let error = execution
         .run()
@@ -267,7 +276,7 @@ fn p08_5_gc_and_failure_cases() {
         LanguageProfile::Lua54
     };
 
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(language_profile).unwrap();
     vm.set_collect_every_allocation(true);
     let source = b"local s=\"\\0\\x80\"; local t={}; t[s]=s; return t,t[s]";
     let mut execution = vm.load(compiled(source, language_profile)).unwrap();
@@ -298,7 +307,7 @@ fn p08_5_gc_and_failure_cases() {
     );
     assert_eq!(vm.ledger_snapshot().reserved, 0);
 
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(language_profile).unwrap();
     vm.set_collect_every_allocation(true);
     let table = vm.allocate_table().unwrap();
     let table_handle = HostHandle::<Table>::new(&mut vm, table).unwrap();
@@ -395,7 +404,7 @@ fn p08_5_gc_and_failure_cases() {
         vm.ledger_snapshot().reserved
     );
 
-    let mut vm = Vm::new().unwrap();
+    let mut vm = Vm::new_with_profile(language_profile).unwrap();
     vm.set_collect_every_allocation(true);
     let table = vm.allocate_table().unwrap();
     let table_handle = HostHandle::<Table>::new(&mut vm, table).unwrap();

@@ -102,8 +102,10 @@ static int check_stack_and_types(void) {
   string = lua_tolstring(state, -1, &len);
   CHECK("lua_tolstring", string != NULL && len == 3 && memcmp(string, "123", 3) == 0);
   CHECK("lua_tostring", strcmp(lua_tostring(state, -1), "123") == 0);
+#if LUA_VERSION_NUM >= 505 || defined(LUA_COMPAT_5_3)
   CHECK("lua_strlen", lua_strlen(state, -1) == 3);
   CHECK("lua_objlen", lua_objlen(state, -1) == 3);
+#endif
   CHECK("lua_rawlen", lua_rawlen(state, -1) == 3);
   CLEAR();
   lua_pushnil(state);
@@ -187,12 +189,14 @@ static int check_auxiliary(void) {
   char *destination;
   CLEAR();
   lua_pushinteger(state, 23);
+#if defined(LUA_COMPAT_APIINTCASTS)
   CHECK("luaL_checkunsigned", luaL_checkunsigned(state, 1) == 23);
   CHECK("luaL_optunsigned", luaL_optunsigned(state, 2, 17) == 17);
   CHECK("luaL_checkint", luaL_checkint(state, 1) == 23);
   CHECK("luaL_optint", luaL_optint(state, 2, 17) == 17);
   CHECK("luaL_checklong", luaL_checklong(state, 1) == 23);
   CHECK("luaL_optlong", luaL_optlong(state, 2, 17) == 17);
+#endif
   CHECK("luaL_opt", luaL_opt(state, luaL_checkinteger, 2, 17) == 17);
   CLEAR();
   lua_pushstring(state, "hello");
@@ -268,8 +272,10 @@ static int check_special(void) {
   CLEAR();
   lua_pushinteger(state, 2);
   lua_pushinteger(state, 3);
+#if LUA_VERSION_NUM >= 505 || defined(LUA_COMPAT_5_3)
   CHECK("lua_equal", lua_equal(state, 1, 1) == 1 && lua_equal(state, 1, 2) == 0);
   CHECK("lua_lessthan", lua_lessthan(state, 1, 2) == 1 && lua_lessthan(state, 2, 1) == 0);
+#endif
   CLEAR();
   lua_pushcfunction(state, bad_type);
   lua_pushnil(state);

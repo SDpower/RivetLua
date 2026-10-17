@@ -1468,7 +1468,8 @@ fn official_object_varargs_remain_live_across_tail_call_and_park_then_collect() 
     vm.collect_major().unwrap();
     assert_eq!(vm.object_kind(table), Err(VmError::StaleObject));
     assert_eq!(vm.object_kind(text), Err(VmError::StaleObject));
-    assert_eq!(vm.roots().total_count(), 0);
+    assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
+    assert_eq!(vm.roots().total_count(), 1);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
 }
 
@@ -1662,17 +1663,18 @@ fn official_pack_unpack_allocation_sites_rollback_and_retry() {
             .find(|site| site.1 == Some(FailPoint::TableArrayReserve))
             .map(|site| site.0)
             .expect("PackUnpack snapshot table 配置未命中");
-        let key = segment
-            .iter()
-            .find(|site| {
-                site.0 > snapshot
-                    && site.1 == Some(FailPoint::StringBytesReserve)
-                    && site.2.ends_with("/string.rs")
-            })
-            .map(|site| site.0)
-            .expect("PackUnpack snapshot key 配置未命中");
         assert!(
-            segment.iter().any(|site| site.0 > key
+            segment.iter().any(|site| site.0 > snapshot
+                && site.1 == Some(FailPoint::TableHashReserve)),
+            "PackUnpack snapshot hash 配置未命中：{segment:?}"
+        );
+        assert!(
+            segment.iter().any(|site| site.0 > snapshot
+                && site.1 == Some(FailPoint::ObjectReserve)),
+            "PackUnpack snapshot object 配置未命中：{segment:?}"
+        );
+        assert!(
+            segment.iter().any(|site| site.0 > snapshot
                 && site.1 == Some(FailPoint::ReturnReserve)
                 && site.2.ends_with("/stdlib/math.rs")),
             "PackUnpack result staging 配置未命中：{segment:?}"

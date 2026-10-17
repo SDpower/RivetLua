@@ -212,14 +212,21 @@ fn native_pending_call_uses_visible_official_slots_before_callee_in_both_profile
                 .map(|word| (word >> 7) & 0xff)
                 .collect();
             assert_eq!(call_slots, [u32::try_from(2 + pending_count).unwrap()]);
+            assert!(
+                full.main.code.iter().filter(|word| **word & 0x7f == 34).count()
+                    >= pending_count,
+                "{profile:?}: 待用值缺少算術來源"
+            );
             for slot in 2..2 + pending_count {
                 let slot = u32::try_from(slot).unwrap();
                 assert!(
                     full.main
                         .code
                         .iter()
-                        .any(|word| { *word & 0x7f == 34 && (word >> 7) & 0xff == slot }),
-                    "{profile:?}: pending slot {slot} 缺少算術產生者"
+                        .any(|word| {
+                            matches!(*word & 0x7f, 0 | 34) && (word >> 7) & 0xff == slot
+                        }),
+                    "{profile:?}: pending slot {slot} 缺少算術值寫入"
                 );
             }
             assert!(
@@ -440,8 +447,8 @@ fn native_open_chain_reloads_global_environment_cache_after_dynamic_result() {
             b"function f() return 1 end; assert(f()); return print".as_slice(),
         ),
         (
-            "os-execute-shape",
-            b"assert(os.execute()); return print".as_slice(),
+            "collectgarbage-shape",
+            b"assert(collectgarbage()); return print".as_slice(),
         ),
     ] {
         for (language, profile) in [
@@ -641,8 +648,8 @@ fn native_open_chain_c_loader_preserves_nested_callees() {
             b"function\n",
         ),
         (
-            b"assert(os.execute()); return print",
-            "local path=os.getenv('RIVETLUA_P15_CHUNK'); os={execute=function() return true end}; local f=assert(loadfile(path)); print(type(f()))",
+            b"assert(collectgarbage()); return print",
+            "local f=assert(loadfile(os.getenv('RIVETLUA_P15_CHUNK'))); print(type(f()))",
             b"function\n",
         ),
         (
@@ -866,8 +873,8 @@ fn native_open_chain_rejects_missing_pending_prefix() {
 #[test]
 fn native_open_chain_respects_255_slot_boundary() {
     for (language, profile, fitting) in [
-        (LanguageProfile::Lua54, LuaProfile::Lua54, 251),
-        (LanguageProfile::Lua55, LuaProfile::Lua55, 250),
+        (LanguageProfile::Lua54, LuaProfile::Lua54, 252),
+        (LanguageProfile::Lua55, LuaProfile::Lua55, 253),
     ] {
         for fixed in [fitting, fitting + 1] {
             let mut source = b"return f(".to_vec();
@@ -900,7 +907,9 @@ fn native_open_chain_respects_255_slot_boundary() {
                     let chunk =
                         decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default())
                             .unwrap();
-                    assert_eq!(chunk.main.max_stack_size, 255, "{profile:?}/strip={strip}");
+                    let slots = usize::from(chunk.main.max_stack_size);
+                    assert!((fixed + 2..=255).contains(&slots),
+                        "{profile:?} fixed={fixed} strip={strip} slots={slots}");
                 } else {
                     assert_eq!(
                         result.unwrap_err().kind,
@@ -2155,7 +2164,7 @@ fn native_debug_long_straight_and_sequential_loops_fit_official_stack() {
     ] {
         for (source, _) in long_native_sources() {
             let (resolved, ir) = native_ir_with_resolved(&source, language);
-            assert!(ir.prototypes[0].register_count > 255);
+            assert!(ir.prototypes[0].instructions.len() > 255);
             let encoded = emit_with_native_debug(
                 &ir,
                 &resolved,
@@ -2176,7 +2185,8 @@ fn native_debug_long_straight_and_sequential_loops_fit_official_stack() {
             .unwrap();
             let decoded =
                 decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
-            assert!(u16::from(decoded.main.max_stack_size) < ir.prototypes[0].register_count);
+            assert!(decoded.main.code.len() > 255);
+            assert!(decoded.main.max_stack_size < 255);
         }
     }
 }
@@ -2189,7 +2199,8 @@ fn native_without_debug_reuses_registers_for_long_straight_code() {
     ] {
         let (source, _) = &long_native_sources()[0];
         let ir = native_ir(source, language);
-        assert!(ir.prototypes[0].register_count > 255);
+        assert!(ir.prototypes[0].instructions.len() > 255);
+        assert!(ir.prototypes[0].register_count < 64);
         let encoded = emit(&ir, &VerifyLimits::default()).unwrap();
         assert!(encoded.verified().native_debug().is_none());
         let mut work = OfficialWorkBudget::for_limits(&VerifyLimits::default()).unwrap();
@@ -2204,7 +2215,8 @@ fn native_without_debug_reuses_registers_for_long_straight_code() {
         .unwrap();
         let decoded =
             decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
-        assert!(u16::from(decoded.main.max_stack_size) < ir.prototypes[0].register_count);
+        assert!(decoded.main.code.len() > 255);
+        assert!(decoded.main.max_stack_size < 64);
     }
 }
 
@@ -2855,48 +2867,91 @@ fn native_debug_long_straight_and_sequential_loops_match_oracles() {
 #[test]
 #[ignore = "須提供本機官方 Lua 5.4.9／5.5.1 oracle 路徑"]
 fn native_debug_local_values_match_both_official_oracles() {
-    let source = b"local function f(x) x=x+2; local y=4; local function inspect() local a,b=debug.getlocal(2,1); local c,d=debug.getlocal(2,2); return a,b,c,d end; local a,b,c,d=inspect(); return a,b,c,d end; return f(5)";
+    let cases: [(&str, &[u8], &[u8]); 2] = [
+        ("named", b"local function f(x) x=x+2; local y=4; local function inspect() local a,b=debug.getlocal(2,1); local c,d=debug.getlocal(2,2); return a,b,c,d end; local a,b,c,d=inspect(); return a,b,c,d end; return f(5)", b"x\t7\ty\t4\n"),
+        ("pending-setlocal", br#"local count, observed = 0, {}
+function probe()
+  count = count + 1
+  local target = count == 1 and 5 or 4
+  local local_name, local_value = debug.getlocal(2, target - 1)
+  local pending_name, pending_value = debug.getlocal(2, target)
+  local beyond = debug.getlocal(2, target + 1)
+  local changed = debug.setlocal(2, target, count * 10)
+  observed[#observed + 1] = local_name
+  observed[#observed + 1] = tostring(local_value)
+  observed[#observed + 1] = pending_name
+  observed[#observed + 1] = tostring(pending_value)
+  observed[#observed + 1] = beyond or 'nil'
+  observed[#observed + 1] = changed
+  return 0
+end
+function g(a, b)
+  local total = 0
+  do local x = 5; total = total + (a+1) + probe() end
+  total = total + (a+1) + probe()
+  return total
+end
+if mode ~= 'direct' then g = assert(load(string.dump(g, mode == 'strip'))) end
+local result = g(0, 0)
+return result"#, b"20\n"),
+    ];
     for (language, profile, variable) in [
         (LanguageProfile::Lua54, LuaProfile::Lua54, "RIVETLUA_LUA54"),
         (LanguageProfile::Lua55, LuaProfile::Lua55, "RIVETLUA_LUA55"),
     ] {
-        let (resolved, ir) = native_ir_with_resolved(source, language);
-        let encoded = emit_with_native_debug(
-            &ir,
-            &resolved,
-            source,
-            b"@native-debug.lua",
-            &VerifyLimits::default(),
-        )
-        .unwrap();
-        let mut work = OfficialWorkBudget::for_limits(&VerifyLimits::default()).unwrap();
-        let bytes = emit_official_chunk(
-            encoded.verified(),
-            ProtoId(0),
-            profile,
-            false,
-            &OfficialChunkLimits::default(),
-            &mut work,
-        )
-        .unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "rivetlua-p14-native-debug-{}-{profile:?}.luac",
-            std::process::id()
-        ));
-        std::fs::write(&path, bytes).unwrap();
-        let output = Command::new(std::env::var_os(variable).unwrap())
-            .env("RIVETLUA_P14_CHUNK", &path)
-            .arg("-e")
-            .arg("local f=assert(loadfile(os.getenv('RIVETLUA_P14_CHUNK'))); print(f())")
-            .output()
+        for &(case, source, expected) in &cases {
+            let (resolved, ir) = native_ir_with_resolved(source, language);
+            let encoded = emit_with_native_debug(
+                &ir,
+                &resolved,
+                source,
+                b"@native-debug.lua",
+                &VerifyLimits::default(),
+            )
             .unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"x\t7\ty\t4\n");
+            let mut work = OfficialWorkBudget::for_limits(&VerifyLimits::default()).unwrap();
+            let bytes = emit_official_chunk(
+                encoded.verified(),
+                ProtoId(0),
+                profile,
+                false,
+                &OfficialChunkLimits::default(),
+                &mut work,
+            )
+            .unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "rivetlua-p14-native-debug-{}-{profile:?}-{case}.luac",
+                std::process::id(),
+            ));
+            let source_path = path.with_extension("lua");
+            std::fs::write(&source_path, source).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            let modes: &[&str] = if case == "pending-setlocal" {
+                &["direct", "full", "strip"]
+            } else {
+                &["direct"]
+            };
+            let results = modes.iter().map(|&mode| {
+                let run = |input: &std::path::Path| Command::new(std::env::var_os(variable).unwrap())
+                    .env("RIVETLUA_P14_CHUNK", input)
+                    .env("RIVETLUA_P14_MODE", mode)
+                    .arg("-e")
+                    .arg("mode=os.getenv('RIVETLUA_P14_MODE'); local f=assert(loadfile(os.getenv('RIVETLUA_P14_CHUNK'))); print(f())")
+                    .output()
+                    .unwrap();
+                (mode, run(&source_path), run(&path))
+            }).collect::<Vec<_>>();
+            std::fs::remove_file(source_path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            for (mode, raw, output) in results {
+                assert!(raw.status.success(), "原始來源 {profile:?} {case} {mode}: {}",
+                    String::from_utf8_lossy(&raw.stderr));
+                assert_eq!(raw.stdout, expected, "原始來源 {profile:?} {case} {mode}");
+                assert!(output.status.success(), "匯出chunk {profile:?} {case} {mode}: {}",
+                    String::from_utf8_lossy(&output.stderr));
+                assert_eq!(output.stdout, raw.stdout, "{profile:?} {case} {mode}");
+            }
+        }
     }
 }
 

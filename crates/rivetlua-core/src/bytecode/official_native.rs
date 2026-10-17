@@ -379,12 +379,26 @@ fn env_field_key_observed_later(
     key: Register,
     pc: usize,
 ) -> bool {
+    env_field_key_observed_later_live(
+        proto, &meta.span, &meta.protected, &meta.live_at, key, pc,
+    )
+}
+
+fn env_field_key_observed_later_live(
+    proto: &BytecodePrototype,
+    spans: &[(usize, usize)],
+    protected: &[u8],
+    live_at: &[LiveRow],
+    key: Register,
+    pc: usize,
+) -> bool {
     let (reads_later, closes_later) = proto.instructions.iter().skip(pc + 1)
         .fold((false, false), |(read_seen, close_seen), entry| {
             let (read, _, _, close) = register_access(&entry.instruction, key, proto.register_count);
             (read_seen || read, close_seen || close)
         });
-    closes_later || (reads_later && generation_live_after_consumer(proto, meta, key, pc))
+    closes_later || (reads_later && cfg_successors(proto, pc).into_iter().flatten()
+        .any(|next| live_at_pc(spans, protected, live_at, usize::from(key.0), next)))
 }
 
 #[derive(Clone, Copy)]
@@ -585,6 +599,83 @@ fn loop_exit_nil_fusions(
     Ok(result)
 }
 
+fn env_field_fusion_candidate(
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    pc: usize,
+    work: &mut OfficialWorkBudget,
+) -> Result<Option<(EnvFieldFusion, Register)>, OfficialExportError> {
+    let Some(prior) = pc.checked_sub(1) else { return Ok(None) };
+    let Some(debug) = module.native_debug().and_then(|debug| debug.prototype(proto.id)) else {
+        return Ok(None);
+    };
+    let Instruction::LoadConst { dest: key, constant } = proto.instructions[prior].instruction else {
+        return Ok(None);
+    };
+    let Instruction::GetTable { dest, table, key: used_key } = proto.instructions[pc].instruction else {
+        return Ok(None);
+    };
+    if table != proto.frame.environment || used_key != key || key == table || dest == table
+        || proto.instructions[prior].close_path.is_some()
+        || proto.instructions[pc].close_path.is_some()
+        || debug.lines.get(prior) != debug.lines.get(pc)
+    {
+        return Ok(None);
+    }
+    let Some(BytecodeConstant::Name(bytes) | BytecodeConstant::String(bytes)) =
+        proto.constants.get(constant.0 as usize) else { return Ok(None) };
+    let field = if let Ok(field) = u8::try_from(constant.0) {
+        field
+    } else {
+        // 同值字串在較早的官方常數槽已存在時，可沿用 8-bit 欄位索引。
+        let mut earlier = None;
+        for (index, candidate) in proto.constants.iter().take(256).enumerate() {
+            work_charge(work, 1, proto.id, pc)?;
+            let (BytecodeConstant::Name(other) | BytecodeConstant::String(other)) = candidate else {
+                continue;
+            };
+            if other.len() != bytes.len() {
+                continue;
+            }
+            work_charge(work, bytes.len(), proto.id, pc)?;
+            if other == bytes {
+                earlier = Some(u8::try_from(index).map_err(|_| {
+                    error(OfficialExportErrorKind::LimitExceeded, proto.id, pc, "環境欄位常數索引超限")
+                })?);
+                break;
+            }
+        }
+        let Some(field) = earlier else { return Ok(None) };
+        field
+    };
+    if bytes.len() > 40 || proto.binding_registers.iter().any(|(_, register)| *register == key)
+        || debug.locals.iter().any(|local| {
+            local.register == key
+                || local.start_pc as usize == pc
+                || local.initialized_pc as usize == pc
+                || local.end_pc as usize == pc
+        })
+    {
+        return Ok(None);
+    }
+    work_charge(work, proto.instructions.len().checked_mul(2)
+        .and_then(|units| units.checked_add(debug.locals.len()))
+        .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+            "環境欄位工作量溢位"))?, proto.id, pc)?;
+    let enters_pair = proto.instructions.iter().any(|entry| {
+        let targets = match entry.instruction {
+            Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. }
+            | Instruction::NumericForPrepare { exit: target, .. } => [Some(target), None],
+            Instruction::NumericForNext { target, exit, .. } => [Some(target), Some(exit)],
+            _ => [None, None],
+        };
+        targets.into_iter().flatten().any(|target| {
+            [prior, pc].contains(&(target.0 as usize))
+        })
+    });
+    Ok((!enters_pair).then_some((EnvFieldFusion { field }, key)))
+}
+
 fn env_field_fusions(
     module: &VerifiedModule,
     proto: &BytecodePrototype,
@@ -601,74 +692,11 @@ fn env_field_fusions(
     if meta.env_upvalue.is_none() {
         return Ok(result);
     }
-    let Some(debug) = module.native_debug().and_then(|debug| debug.prototype(proto.id)) else {
-        return Ok(result);
-    };
     for pc in 1..count {
-        let Instruction::LoadConst { dest: key, constant } = proto.instructions[pc - 1].instruction else {
-            continue;
-        };
-        let Instruction::GetTable { dest, table, key: used_key } = proto.instructions[pc].instruction else {
-            continue;
-        };
-        if table != proto.frame.environment || used_key != key || key == table || dest == table
-            || proto.instructions[pc - 1].close_path.is_some()
-            || proto.instructions[pc].close_path.is_some()
-            || debug.lines.get(pc - 1) != debug.lines.get(pc)
-        {
-            continue;
-        }
-        let Some(BytecodeConstant::Name(bytes) | BytecodeConstant::String(bytes)) =
-            proto.constants.get(constant.0 as usize) else { continue };
-        let field = if let Ok(field) = u8::try_from(constant.0) {
-            field
-        } else {
-            // 同值字串在較早的官方常數槽已存在時，可沿用 8-bit 欄位索引。
-            let mut earlier = None;
-            for (index, candidate) in proto.constants.iter().take(256).enumerate() {
-                work_charge(work, 1, proto.id, pc)?;
-                let (BytecodeConstant::Name(other) | BytecodeConstant::String(other)) = candidate else {
-                    continue;
-                };
-                if other.len() != bytes.len() {
-                    continue;
-                }
-                work_charge(work, bytes.len(), proto.id, pc)?;
-                if other == bytes {
-                    earlier = Some(u8::try_from(index).map_err(|_| {
-                        error(OfficialExportErrorKind::LimitExceeded, proto.id, pc, "環境欄位常數索引超限")
-                    })?);
-                    break;
-                }
+        if let Some((fusion, key)) = env_field_fusion_candidate(module, proto, pc, work)? {
+            if !env_field_key_observed_later(proto, meta, key, pc) {
+                result[pc] = Some(fusion);
             }
-            let Some(field) = earlier else { continue };
-            field
-        };
-        if bytes.len() > 40 || proto.binding_registers.iter().any(|(_, register)| *register == key)
-            || debug.locals.iter().any(|local| {
-                local.register == key
-                    || local.start_pc as usize == pc
-                    || local.initialized_pc as usize == pc
-                    || local.end_pc as usize == pc
-            })
-        {
-            continue;
-        }
-        work_charge(work, count.checked_mul(2).and_then(|units| units.checked_add(debug.locals.len()))
-            .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded, proto.id, pc, "環境欄位工作量溢位"))?, proto.id, pc)?;
-        let enters_pair = proto.instructions.iter().any(|entry| {
-            let targets = match entry.instruction {
-                Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. }
-                | Instruction::NumericForPrepare { exit: target, .. } => [Some(target), None],
-                Instruction::NumericForNext { target, exit, .. } => [Some(target), Some(exit)],
-                _ => [None, None],
-            };
-            targets.into_iter().flatten().any(|target| {
-                [pc - 1, pc].contains(&(target.0 as usize))
-            })
-        });
-        if !enters_pair && !env_field_key_observed_later(proto, meta, key, pc) {
-            result[pc] = Some(EnvFieldFusion { field });
         }
     }
     Ok(result)
@@ -1038,7 +1066,9 @@ fn anonymous_vararg_slot(
     proto: &BytecodePrototype,
     profile: LuaProfile,
 ) -> Result<Option<u8>, OfficialExportError> {
-    if profile != LuaProfile::Lua55 || !proto.is_variadic || proto.named_vararg.is_some() {
+    // Lua 5.5 mainfunc 設為 variadic，但不建立子函式 parlist 的匿名 vararg local。
+    if profile != LuaProfile::Lua55 || proto.parent.is_none()
+        || !proto.is_variadic || proto.named_vararg.is_some() {
         return Ok(None);
     }
     u8::try_from(proto.parameter_count)
@@ -1080,6 +1110,7 @@ fn official_storage_slot(
 struct ParallelMoves {
     moves: [(u8, u8); 512],
     len: usize,
+    used_spare: bool,
 }
 
 impl ParallelMoves {
@@ -1133,6 +1164,7 @@ fn parallel_copy_plan(
     let mut plan = ParallelMoves {
         moves: [(0, 0); 512],
         len: 0,
+        used_spare: false,
     };
     let mut remaining = 0usize;
     work_charge(work, len, id, pc)?;
@@ -1214,6 +1246,7 @@ fn parallel_copy_plan(
         })?;
         let saved = destinations[index];
         plan.push(spare, saved, id, pc)?;
+        plan.used_spare = true;
         work_charge(work, len, id, pc)?;
         for source in sources.iter_mut().take(len).enumerate() {
             let (index, source) = source;
@@ -1828,6 +1861,42 @@ fn environment_cache_chain_safe(
             proto.register_count,
         );
         if read || write || possible_write || close {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+// pending 覆寫 _ENV 的 stack 快取時，期間每次真正讀取都必須由 upvalue
+// 直接取得；之後的非融合讀取會先重新載入快取。
+fn environment_cache_pending_alias_safe(
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    start: usize,
+    end: usize,
+    spans: &[(usize, usize)],
+    protected: &[u8],
+    live_at: &[LiveRow],
+    work: &mut OfficialWorkBudget,
+) -> Result<bool, OfficialExportError> {
+    work_charge(work, end - start, proto.id, start)?;
+    let env = proto.frame.environment;
+    for pc in start..end {
+        let (read, write, possible_write, close) = register_access(
+            &proto.instructions[pc].instruction, env, proto.register_count,
+        );
+        if write || possible_write || close {
+            return Ok(false);
+        }
+        if !read { continue; }
+        let Some((_, key)) = env_field_fusion_candidate(module, proto, pc, work)? else {
+            return Ok(false);
+        };
+        let later = &proto.instructions[pc + 1..];
+        work_charge(work, later.len(), proto.id, pc)?;
+        if env_field_key_observed_later_live(
+            proto, spans, protected, live_at, key, pc,
+        ) {
             return Ok(false);
         }
     }
@@ -3191,6 +3260,24 @@ fn mapped_owner_interferes(
         }
         if candidate_live {
             if numeric_native_access(proto, pc, owner_register, owned, work)?.1 {
+                // 大範圍 nil 清理中的舊 guest 值已死；輸出器會略過此時
+                // 正由另一個活值佔用的實體槽，不能把虛寫視為干涉。
+                let entry = &proto.instructions[pc];
+                let dead_bulk_nil = matches!(entry.instruction,
+                    Instruction::LoadNil { start, count }
+                        if count > 1
+                            && usize::from(start.0).checked_add(usize::from(count))
+                                .is_some_and(|end| usize::from(start.0) <= owner
+                                    && owner < end
+                                    && (candidate < usize::from(start.0) || candidate >= end)))
+                    && entry.close_path.is_none()
+                    && call_cleanup_range(proto, pc).is_none()
+                    && protected[candidate] == 0
+                    && live_at_pc(spans, protected, live_at, candidate, pc)
+                    && live_at_pc(spans, protected, live_at, candidate, pc + 1);
+                if dead_bulk_nil {
+                    continue;
+                }
                 return Ok(true);
             }
         } else if owner_live {
@@ -3388,6 +3475,31 @@ fn extend_capture_spans(
                 let span = &mut spans[usize::from(register.0)];
                 span.0 = span.0.min(pc);
                 span.1 = span.1.max(pc + 1);
+                // Return close group 由官方 RETURN 關閉；整組 Close 的捕獲槽
+                // 在 gather 結果前都必須存活，不能只延長緊鄰 Return 的一項。
+                if matches!(proto.instructions[pc].instruction,
+                    Instruction::Close { base, .. } if base == *register)
+                {
+                    let mut end = pc;
+                    while let Some(entry) = proto.instructions.get(end) {
+                        work_charge(work, 1, proto.id, end)?;
+                        if !matches!(entry.instruction, Instruction::Close { count: 0, .. }) {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    if matches!(proto.instructions.get(end).map(|entry| &entry.instruction),
+                        Some(Instruction::Return { .. }))
+                    {
+                        span.1 = span.1.max(end + 1);
+                    } else if matches!(proto.instructions.get(pc + 1)
+                            .map(|entry| &entry.instruction), Some(Instruction::Return { .. }))
+                        && matches!(proto.instructions[pc].close_path.as_ref()
+                            .map(|path| path.kind), Some(BytecodeExitKind::Return))
+                    {
+                        span.1 = span.1.max(pc + 2);
+                    }
+                }
             }
             let still_open = opened
                 && !matches!(proto.instructions[pc].instruction,
@@ -3602,6 +3714,8 @@ fn fixed_pending_birth_retained(
     pending: &[NativeTemporary],
     mapped: &[u8],
     span: &[(usize, usize)],
+    protected: &[u8],
+    live_at: &[LiveRow],
     base: Register,
     environment: Register,
     global_environment: Register,
@@ -3681,6 +3795,7 @@ fn fixed_pending_birth_retained(
             .filter(|(register, range)| {
                 let (start, end) = **range;
                 !excluded(*register) && start <= birth && after_birth < end
+                    && live_at_pc(span, protected, live_at, *register, after_birth)
             })
             .count();
         let callee_birth = unmapped_callee_alive_at_birth(
@@ -3704,8 +3819,12 @@ fn temporary_call_layouts(
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     anonymous_vararg_slot: Option<u8>,
+    numeric: &[NumericPair],
+    tuple_base: Option<u16>,
     mapped: &[u8],
     span: &[(usize, usize)],
+    protected: &[u8],
+    live_at: &[LiveRow],
     work: &mut OfficialWorkBudget,
 ) -> Result<Vec<TemporaryCallLayout>, OfficialExportError> {
     let Some(debug) = module.native_debug() else {
@@ -3827,6 +3946,18 @@ fn temporary_call_layouts(
         let pending = debug.temporaries_at(proto.id, call_pc).unwrap_or(&[]);
         work_charge(
             work,
+            numeric.len().checked_mul(span.len().checked_add(pending.len())
+                .and_then(|count| count.checked_add(2)).ok_or_else(|| {
+                error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                    "numeric Call frontier 工作量溢位")
+            })?).ok_or_else(|| {
+                error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                    "numeric Call frontier 工作量溢位")
+            })?,
+            proto.id, pc,
+        )?;
+        work_charge(
+            work,
             pending
                 .len()
                 .checked_add(locals.len())
@@ -3842,25 +3973,33 @@ fn temporary_call_layouts(
             proto.id,
             pc,
         )?;
-        let active = locals
-            .iter()
-            .zip(storage)
-            .filter(|(local, storage)| {
-                local.start_pc as usize <= pc
-                    && pc < local.end_pc as usize
-                    && storage.start_pc as usize <= pc
-                    && pc < storage.end_pc as usize
-            })
-            .count()
-            .checked_add(usize::from(anonymous_vararg_slot.is_some()))
-            .ok_or_else(|| {
-                error(
-                    OfficialExportErrorKind::LimitExceeded,
-                    proto.id,
-                    pc,
-                    "native temporary active local 數溢位",
-                )
-            })?;
+        let active_local_frontier = |at: usize| -> Result<usize, OfficialExportError> {
+            let mut frontier = anonymous_vararg_slot.map_or(0, |slot| usize::from(slot) + 1);
+            for (local, storage) in locals.iter().zip(storage) {
+                if local.start_pc as usize <= at && at < local.end_pc as usize
+                    && storage.start_pc as usize <= at && at < storage.end_pc as usize
+                {
+                    let home = official_storage_slot(
+                        local.slot, anonymous_vararg_slot, proto.id, at,
+                    )?;
+                    frontier = frontier.max(usize::from(home) + 1);
+                }
+            }
+            if let Some(tuple_base) = tuple_base {
+                for pair in numeric {
+                    if pair.prepare_pc <= at && at <= pair.next_pc {
+                        let end = pair.block.checked_add(1)
+                            .and_then(|block| block.checked_mul(4))
+                            .and_then(|width| tuple_base.checked_add(width))
+                            .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded,
+                                proto.id, at, "numeric Call frontier 溢位"))?;
+                        frontier = frontier.max(usize::from(end));
+                    }
+                }
+            }
+            Ok(frontier)
+        };
+        let active = active_local_frontier(pc)?;
         // 開放結果會覆寫 Call base 以上的槽。既有 Call 當下與回邊下界
         // 均保留，另以每個 pending 出生時的存活峰值避開較早的 home。
         let retained = if open_chain {
@@ -3876,14 +4015,8 @@ fn temporary_call_layouts(
             };
             let scan_work = span
                 .len()
-                .checked_mul(pending.len().checked_add(1).ok_or_else(|| {
-                    error(
-                        OfficialExportErrorKind::LimitExceeded,
-                        proto.id,
-                        pc,
-                        "native Call frontier pending 數溢位",
-                    )
-                })?)
+                .checked_mul(2)
+                .and_then(|units| units.checked_mul(pending.len().checked_add(1)?))
                 .ok_or_else(|| {
                     error(
                         OfficialExportErrorKind::LimitExceeded,
@@ -3895,6 +4028,8 @@ fn temporary_call_layouts(
             work_charge(work, scan_work, proto.id, pc)?;
             let live_across = |register: usize, range: &(usize, usize)| {
                 !excluded(register) && range.0 <= pc && range.1 > pc + 1
+                    && live_at_pc(span, protected, live_at, register, pc)
+                    && live_at_pc(span, protected, live_at, register, pc + 1)
             };
             let current = if !in_backedge {
                 span.iter().enumerate()
@@ -3936,6 +4071,7 @@ fn temporary_call_layouts(
                             .filter(|(register, range)| {
                                 let (start, end) = **range;
                                 !excluded(*register) && start <= at && at < end
+                                    && live_at_pc(span, protected, live_at, *register, at)
                             })
                             .count()
                     })
@@ -3944,98 +4080,178 @@ fn temporary_call_layouts(
             } else {
                 0
             };
-            let current_with_callee = open_call_frontier_with_callee(
-                current, open_chain, pending, base, mapped,
-                proto.frame.environment, proto.global_environment,
-                proto.id, pc, work,
-            )?;
-            let callee_unmapped = current_with_callee != current;
-            let current = current_with_callee;
-            // 每個 pending 的 home 自出生起佔槽；即使前一個值在 Call 前
-            // 已死亡，兩者出生時的重疊仍須留出前綴。額外掃描全額計費。
-            let per_birth = scan_work
-                .checked_add(locals.len())
-                .and_then(|units| units.checked_add(storage.len()))
-                .and_then(|units| units.checked_add(1))
-                .ok_or_else(|| {
+            if !in_backedge {
+                // callee 已佔 call_base，不再放進 pending 前綴。
+                current
+            } else {
+                let current_with_callee = open_call_frontier_with_callee(
+                    current, open_chain, pending, base, mapped,
+                    proto.frame.environment, proto.global_environment,
+                    proto.id, pc, work,
+                )?;
+                let callee_unmapped = current_with_callee != current;
+                let current = current_with_callee;
+                // 回邊會重訪先前出生的 pending；直線拷貝的原值與其新 home
+                // 由後續 live/Move 別名證明，不應在此重複計入。
+                let per_birth = scan_work
+                    .checked_add(locals.len())
+                    .and_then(|units| units.checked_add(storage.len()))
+                    .and_then(|units| units.checked_add(1))
+                    .ok_or_else(|| {
+                        error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                            "native pending 出生掃描 work 溢位")
+                    })?;
+                let birth_work = pending.len().checked_mul(per_birth).ok_or_else(|| {
                     error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
                         "native pending 出生掃描 work 溢位")
                 })?;
-            let birth_work = pending.len().checked_mul(per_birth).ok_or_else(|| {
-                error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
-                    "native pending 出生掃描 work 溢位")
-            })?;
-            work_charge(work, birth_work, proto.id, pc)?;
-            let mut frontier = active.checked_add(current).ok_or_else(|| {
-                error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
-                    "native temporary frontier 數溢位")
-            })?;
-            for temporary in pending {
-                let register = usize::from(temporary.register.0);
-                let birth = span.get(register).map(|range| range.0)
-                    .filter(|&birth| birth != usize::MAX && birth <= pc)
-                    .ok_or_else(|| {
-                        error(OfficialExportErrorKind::InvalidPrototype, proto.id, pc,
-                            "native pending 出生點無效")
-                    })?;
-                let active_at_birth = locals.iter().zip(storage)
-                    .filter(|(local, storage)| {
-                        local.start_pc as usize <= birth
-                            && birth < local.end_pc as usize
-                            && storage.start_pc as usize <= birth
-                            && birth < storage.end_pc as usize
-                    })
-                    .count()
-                    .checked_add(usize::from(anonymous_vararg_slot.is_some()))
-                    .ok_or_else(|| {
-                        error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
-                            "native pending 出生 local 數溢位")
-                    })?;
-                let live_at_birth = span.iter().enumerate()
-                    .filter(|(register, range)| {
-                        let (start, end) = **range;
-                        !excluded(*register) && start <= birth && birth < end
-                    })
-                    .count();
-                let callee_at_birth = unmapped_callee_alive_at_birth(
-                    callee_unmapped, span, base, birth,
-                );
-                let at_birth = active_at_birth
-                    .checked_add(live_at_birth)
-                    .and_then(|value| value.checked_add(usize::from(callee_at_birth)))
-                    .ok_or_else(|| {
-                        error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
-                            "native pending 出生前綴數溢位")
-                    })?;
-                frontier = frontier.max(at_birth);
-            }
-            frontier.checked_sub(active).ok_or_else(|| {
-                error(OfficialExportErrorKind::InvalidPrototype, proto.id, pc,
-                    "native pending 出生前綴低於 Call local")
-            })?
-        } else {
-            let retained = fixed_pending_birth_retained(
-                active, pending, mapped, span, base,
-                proto.frame.environment, proto.global_environment,
-                locals.len(), storage.len(),
-                |birth| {
-                    locals.iter().zip(storage)
-                        .filter(|(local, storage)| {
-                            local.start_pc as usize <= birth
-                                && birth < local.end_pc as usize
-                                && storage.start_pc as usize <= birth
-                                && birth < storage.end_pc as usize
+                work_charge(work, birth_work, proto.id, pc)?;
+                let mut frontier = active.checked_add(current).ok_or_else(|| {
+                    error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                        "native temporary frontier 數溢位")
+                })?;
+                for temporary in pending {
+                    let register = usize::from(temporary.register.0);
+                    let birth = span.get(register).map(|range| range.0)
+                        .filter(|&birth| birth != usize::MAX && birth <= pc)
+                        .ok_or_else(|| {
+                            error(OfficialExportErrorKind::InvalidPrototype, proto.id, pc,
+                                "native pending 出生點無效")
+                        })?;
+                    let active_at_birth = active_local_frontier(birth)?;
+                    let live_at_birth = span.iter().enumerate()
+                        .filter(|(register, range)| {
+                            let (start, end) = **range;
+                            !excluded(*register) && start <= birth && birth < end
+                                && (live_at_pc(span, protected, live_at, *register, birth)
+                                    || live_at_pc(span, protected, live_at, *register, birth + 1))
                         })
-                        .count()
-                        .checked_add(usize::from(anonymous_vararg_slot.is_some()))
+                        .count();
+                    let callee_at_birth = callee_unmapped
+                        && (live_at_pc(span, protected, live_at, usize::from(base.0), birth)
+                            || live_at_pc(span, protected, live_at, usize::from(base.0), birth + 1));
+                    let at_birth = active_at_birth
+                        .checked_add(live_at_birth)
+                        .and_then(|value| value.checked_add(usize::from(callee_at_birth)))
                         .ok_or_else(|| {
                             error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
-                                "fixed Call 出生 local 數溢位")
-                        })
-                },
-                proto.id, pc, work,
-            )?;
-            retained
+                                "native pending 出生前綴數溢位")
+                        })?;
+                    frontier = frontier.max(at_birth);
+                }
+                frontier.checked_sub(active).ok_or_else(|| {
+                    error(OfficialExportErrorKind::InvalidPrototype, proto.id, pc,
+                        "native pending 出生前綴低於 Call local")
+                })?
+            }
+        } else {
+            // C 函式從參數後的 top 推入暫存值；跨 Call 的原值必須先於
+            // callee，而非只避開已知的參數／結果窗口。pending 由前綴保存。
+            work_charge(work, span.len(), proto.id, pc)?;
+            let fixed_results = match entry.instruction {
+                Instruction::Call { base, result_mode: ResultMode::Fixed(results), .. } =>
+                    Some((usize::from(base.0), usize::from(results))),
+                _ => None,
+            };
+            let crosses_call = |register: usize, range: &(usize, usize)| {
+                let (start, end) = *range;
+                mapped[register] == u8::MAX
+                    && register != usize::from(proto.frame.environment.0)
+                    && register != usize::from(proto.global_environment.0)
+                    && register != usize::from(base.0)
+                    && !fixed_results.is_some_and(|(first, count)| {
+                        register >= first && register - first < count
+                    })
+                    && !pending.iter().any(|entry| usize::from(entry.register.0) == register)
+                    && start <= pc && pc + 1 < end
+                    && live_at_pc(span, protected, live_at, register, pc)
+                    && live_at_pc(span, protected, live_at, register, pc + 1)
+            };
+            let mut current = 0usize;
+            let mut live_start = usize::MAX;
+            let mut live_end = 0usize;
+            for (register, range) in span.iter().enumerate() {
+                if crosses_call(register, range) {
+                    current += 1;
+                    live_start = live_start.min(range.0);
+                    live_end = live_end.max(range.1);
+                }
+            }
+            let mut frontier = active.checked_add(current).ok_or_else(|| {
+                error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                    "fixed Call frontier 數溢位")
+            })?;
+            if current != 0 {
+                // 跨 Call 值的 home 固定不變；之後進入的 local 仍可能
+                // 佔用較高實體槽，不能只看 Call 當下可見的 local 數。
+                work_charge(work, storage.len(), proto.id, pc)?;
+                let mut local_floor = 0usize;
+                for local in storage {
+                    if local.start_pc as usize >= live_end
+                        || live_start >= local.end_pc as usize
+                    {
+                        continue;
+                    }
+                    let home = official_storage_slot(
+                        local.slot, anonymous_vararg_slot, proto.id, pc,
+                    )?;
+                    local_floor = local_floor.max(usize::from(home) + 1);
+                }
+                frontier = frontier.max(local_floor.checked_add(current).ok_or_else(|| {
+                    error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                        "fixed Call local 前綴數溢位")
+                })?);
+            }
+            // 固定 Call 的 home 在整段 IR 中不搬動。跨 Call 的值即使在
+            // Call 前已有局部值結束，出生時仍須避開當時同時存活的槽。
+            for (register, range) in span.iter().enumerate() {
+                if !crosses_call(register, range) || range.0 >= pc { continue; }
+                let birth = range.0;
+                let after_birth = birth.checked_add(1).ok_or_else(|| {
+                    error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                        "fixed Call 出生後 PC 溢位")
+                })?;
+                let scan = span.len()
+                    .checked_mul(pending.len().checked_add(1).ok_or_else(|| {
+                        error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                            "fixed Call 出生掃描 work 溢位")
+                    })?)
+                    .and_then(|units| units.checked_add(locals.len()))
+                    .and_then(|units| units.checked_add(storage.len()))
+                    .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                        "fixed Call 出生掃描 work 溢位"))?;
+                work_charge(work, scan, proto.id, pc)?;
+                let active_birth = active_local_frontier(birth)?;
+                let live_birth = span.iter().enumerate().filter(|(other, range)| {
+                    let (start, end) = **range;
+                    mapped[*other] == u8::MAX
+                        && *other != usize::from(proto.frame.environment.0)
+                        && *other != usize::from(proto.global_environment.0)
+                        && *other != usize::from(base.0)
+                        && !pending.iter().any(|entry| usize::from(entry.register.0) == *other)
+                        && start <= birth && after_birth < end
+                        && live_at_pc(span, protected, live_at, *other, after_birth)
+                }).count();
+                frontier = frontier.max(active_birth.checked_add(live_birth).ok_or_else(|| {
+                    error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                        "fixed Call 出生前綴數溢位")
+                })?);
+            }
+            let retained = frontier.checked_sub(active).ok_or_else(|| {
+                error(OfficialExportErrorKind::InvalidPrototype, proto.id, pc,
+                    "fixed Call 出生前綴低於 active local")
+            })?;
+            if !pending.is_empty() && call_within_backward_edge(proto, pc, work)? {
+                retained.max(fixed_pending_birth_retained(
+                    active, pending, mapped, span, protected, live_at, base,
+                    proto.frame.environment, proto.global_environment,
+                    locals.len(), storage.len(),
+                    active_local_frontier,
+                    proto.id, pc, work,
+                )?)
+            } else {
+                retained
+            }
         };
         let first_slot = active
             .checked_add(retained)
@@ -4619,6 +4835,16 @@ fn dead_after_open_call(
     register: Register,
     work: &mut OfficialWorkBudget,
 ) -> Result<bool, OfficialExportError> {
+    dead_after_open_call_with_pending(proto, call_pc, register, false, work)
+}
+
+fn dead_after_open_call_with_pending(
+    proto: &BytecodePrototype,
+    call_pc: usize,
+    register: Register,
+    gathered_pending: bool,
+    work: &mut OfficialWorkBudget,
+) -> Result<bool, OfficialExportError> {
     let producer_base = match proto.instructions[call_pc].instruction {
         Instruction::Call {
             base,
@@ -4634,6 +4860,16 @@ fn dead_after_open_call(
     for pc in call_pc + 1..proto.instructions.len() {
         work_charge(work, 1, proto.id, pc)?;
         let instruction = &proto.instructions[pc].instruction;
+        // 相鄰 terminal 從 Call 前綴讀取已 gather 的 pending；舊 home
+        // 即使被 producer 的開放結果覆寫，也不影響這次讀取。
+        if gathered_pending && pc == terminal && terminal == call_pc + 1
+            && register.0 < producer_base.0
+            && matches!(instruction, Instruction::Call {
+                base, arg_count: u16::MAX, result_mode: ResultMode::Fixed(0),
+            } if *base == register)
+        {
+            continue;
+        }
         if pc <= terminal && register.0 >= producer_base.0 {
             match instruction {
                 Instruction::Call {
@@ -4704,6 +4940,31 @@ fn dead_after_open_call(
         }
     }
     Ok(true)
+}
+
+fn dead_after_gathered_pending_open_call(
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    call: &TemporaryCallLayout,
+    register: usize,
+    work: &mut OfficialWorkBudget,
+) -> Result<bool, OfficialExportError> {
+    let pending = module.native_debug()
+        .and_then(|debug| debug.temporaries_at(proto.id, InstructionOffset(call.pc as u32)))
+        .unwrap_or(&[]);
+    work_charge(work, pending.len(), proto.id, call.pc)?;
+    let prefix = pending.iter()
+        .find(|temporary| usize::from(temporary.register.0) == register)
+        .and_then(|temporary| temporary.ordinal.checked_sub(1))
+        .and_then(|ordinal| call.first_slot.checked_add(ordinal));
+    let gathered_pending = if let Some(prefix) = prefix {
+        pending_call_prefix_home(module, proto, call, register, prefix, work)?
+    } else {
+        false
+    };
+    dead_after_open_call_with_pending(
+        proto, call.pc, Register(register as u16), gathered_pending, work,
+    )
 }
 
 /// 由 P05 local storage 與 guest register 存取區間配置實體槽；每個暫存槽
@@ -5177,32 +5438,26 @@ fn compact_register_map(
     let owned_next = numeric_owned_next_pairs(module, proto, numeric, &mapped, work)?;
     let live_at = extend_live_spans(proto, &mapped, &mut span, &owned_next,
         bitmap_limit, work)?;
-    let call_layouts =
-        temporary_call_layouts(module, proto, anonymous_vararg_slot, &mapped, &span, work)?;
     let mut fixed = u16::from(debug.map_or(0, |entry| entry.max_active_locals));
     if debug.is_none() {
-        fixed = proto
-            .parameter_count
+        fixed = proto.parameter_count
             .checked_add(u16::from(proto.named_vararg.is_some()))
-            .ok_or_else(|| {
-                error(
-                    OfficialExportErrorKind::LimitExceeded,
-                    proto.id,
-                    0,
-                    "native named vararg fixed slot 溢位",
-                )
-            })?;
+            .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded, proto.id, 0,
+                "native named vararg fixed slot 溢位"))?;
     }
     if anonymous_vararg_slot.is_some() {
-        fixed = fixed.checked_add(1).ok_or_else(|| {
-            error(
-                OfficialExportErrorKind::LimitExceeded,
-                proto.id,
-                0,
-                "匿名 vararg fixed slot 溢位",
-            )
-        })?;
+        fixed = fixed.checked_add(1).ok_or_else(|| error(
+            OfficialExportErrorKind::LimitExceeded, proto.id, 0,
+            "匿名 vararg fixed slot 溢位"))?;
     }
+    // 未別名化的數值控制值先於 Call 窗口；C callee 可在參數後推入值。
+    let low_tuple_base = (debug.is_some() && !numeric.is_empty() && aliases.is_empty())
+        .then_some(fixed);
+    let call_layouts = temporary_call_layouts(
+        module, proto, anonymous_vararg_slot, numeric, low_tuple_base,
+        &mapped, &span, &protected, &live_at, work,
+    )?;
+    let profile_stack_limit = if matches!(profile, LuaProfile::Lua54) { 254 } else { 255 };
     fixed = fixed.max(
         call_layouts
             .iter()
@@ -5230,7 +5485,8 @@ fn compact_register_map(
             })?;
     }
     if let Some(env) = mapped.get_mut(usize::from(proto.frame.environment.0)) {
-        if *env == u8::MAX {
+        // 上限槽仍需留給實際值；邊界上的 environment cache 交由 interval allocator 安置。
+        if *env == u8::MAX && fixed < profile_stack_limit {
             *env = u8::try_from(fixed).map_err(|_| {
                 error(
                     OfficialExportErrorKind::LimitExceeded,
@@ -5247,11 +5503,18 @@ fn compact_register_map(
                     "native environment slot 溢位",
                 )
             })?;
+        } else if *env == u8::MAX && fixed > profile_stack_limit {
+            return Err(error(
+                OfficialExportErrorKind::LimitExceeded,
+                proto.id,
+                0,
+                "native environment slot 超限",
+            ));
         }
     }
-    let tuple_base = fixed;
+    let tuple_base = low_tuple_base.unwrap_or(fixed);
     let (shared_nil_slot, alias_slots) = numeric_alias_nil_slots(&aliases, proto.id, work)?;
-    let temp_base = fixed
+    let tuple_end = tuple_base
         .checked_add(numeric_blocks.checked_mul(4).ok_or_else(|| {
             error(
                 OfficialExportErrorKind::LimitExceeded,
@@ -5259,8 +5522,12 @@ fn compact_register_map(
                 0,
                 "native numeric tuple 溢位",
             )
-        })?)
-        .and_then(|base| u16::try_from(alias_slots).ok().and_then(|count| base.checked_add(count)))
+        })?).ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded,
+            proto.id, 0, "native numeric tuple 溢位"))?;
+    let temp_base = fixed.max(tuple_end)
+        .checked_add(u16::try_from(alias_slots).map_err(|_| error(
+            OfficialExportErrorKind::LimitExceeded, proto.id, 0,
+            "native temp base 溢位"))?)
         .ok_or_else(|| {
             error(
                 OfficialExportErrorKind::LimitExceeded,
@@ -5585,6 +5852,29 @@ fn compact_register_map(
         }
     }
     fixed_boundaries[255] = fixed_index;
+    let environment = usize::from(proto.frame.environment.0);
+    let env_cache_eligible = if env_upvalue.is_some()
+        && proto.frame.environment == proto.global_environment
+        && protected.get(environment) == Some(&0)
+        && span.get(environment).is_some_and(|entry| entry.0 != usize::MAX)
+    {
+        work_charge(work, storage.len().checked_add(module.module().prototypes.len())
+            .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded, proto.id, 0,
+                "environment cache alias work 溢位"))?, proto.id, 0)?;
+        !storage.iter().any(|local| usize::from(local.register.0) == environment)
+            && !module.module().prototypes.iter().any(|child| child.parent == Some(proto.id))
+    } else {
+        false
+    };
+    let fixed_env_interval = if env_cache_eligible
+        && mapped[environment] != u8::MAX {
+        work_charge(work, fixed_intervals.len(), proto.id, 0)?;
+        let interval = (mapped[environment], span[environment].0, span[environment].1);
+        (fixed_intervals.iter().filter(|&&entry| entry == interval).count() == 1)
+            .then_some(interval)
+    } else {
+        None
+    };
     let mut dead_open_cache = Vec::new();
     work_charge(work, call_layouts.len(), proto.id, 0)?;
     dead_open_cache.try_reserve_exact(call_layouts.len()).map_err(|_| {
@@ -5628,6 +5918,50 @@ fn compact_register_map(
         0,
     )?;
     for (start, end, register) in intervals {
+        let mut local_handoff = None;
+        let mut conflicting_handoff = false;
+        if let Some(debug) = module.native_debug() {
+            let temporaries = debug.temporaries_for(proto.id).unwrap_or(&[]);
+            let locals = &debug.prototype(proto.id).ok_or_else(|| {
+                error(OfficialExportErrorKind::InvalidPrototype, proto.id, start,
+                    "native handoff 缺少 prototype debug")
+            })?.locals;
+            work_charge(work, locals.len(), proto.id, start)?;
+            for local in locals {
+                let copy_pc = local.initialized_pc as usize;
+                if copy_pc < start || copy_pc >= end
+                    || !matches!(proto.instructions.get(copy_pc).map(|entry| &entry.instruction),
+                        Some(Instruction::Move { dest, src })
+                            if *dest == local.register && usize::from(src.0) == register)
+                {
+                    continue;
+                }
+                work_charge(work, temporaries.len(), proto.id, copy_pc)?;
+                for temporary in temporaries {
+                    if usize::from(temporary.register.0) != register
+                        || temporary.call_pc.0 as usize >= copy_pc
+                    {
+                        continue;
+                    }
+                    if let Some(copy_end) = pending_open_result_local_alias(
+                        &proto.instructions, proto.register_count, proto.id,
+                        temporary.call_pc.0 as usize, temporary.register,
+                        local.register, locals, work,
+                    )? {
+                        let home = official_storage_slot(
+                            local.slot, anonymous_vararg_slot, proto.id, copy_pc,
+                        )?;
+                        let proof = (home, copy_pc, copy_end);
+                        if local_handoff.is_some_and(|prior| prior != proof) {
+                            conflicting_handoff = true;
+                        } else {
+                            local_handoff = Some(proof);
+                        }
+                    }
+                }
+            }
+        }
+        if conflicting_handoff { local_handoff = None; }
         let mut floor = 0u16;
         if protected[register] != 0 {
             for slot in 0..high {
@@ -5639,11 +5973,22 @@ fn compact_register_map(
             }
         }
         let mut candidate_ok = |candidate_register: usize, candidate_start: usize,
-            candidate_end: usize, slot: u16, check_prior: bool|
+            candidate_end: usize, slot: u16, check_prior: bool,
+            work: &mut OfficialWorkBudget|
             -> Result<bool, OfficialExportError> {
             work_charge(work, 1, proto.id, candidate_start)?;
-            if slot >= tuple_base && slot < temp_base {
+            if slot >= fixed.max(tuple_end) && slot < temp_base {
                 return Ok(false);
+            }
+            if slot >= tuple_base && slot < tuple_end {
+                work_charge(work, numeric.len(), proto.id, candidate_start)?;
+                if numeric.iter().any(|pair| {
+                    let first = usize::from(tuple_base) + usize::from(pair.block) * 4;
+                    first <= usize::from(slot) && usize::from(slot) < first + 4
+                        && candidate_start <= pair.next_pc && pair.prepare_pc < candidate_end
+                }) {
+                    return Ok(false);
+                }
             }
             work_charge(work, aliases.len(), proto.id, candidate_start)?;
             if aliases.iter().any(|alias| {
@@ -5654,22 +5999,10 @@ fn compact_register_map(
             }) {
                 return Ok(false);
             }
-            if check_prior && slot_end[usize::from(slot)] > candidate_start {
-                let mut owner = slot_head[usize::from(slot)];
-                while owner != usize::MAX {
-                    work_charge(work, 1, proto.id, candidate_start)?;
-                    if owner != candidate_register && mapped_owner_interferes(
-                        proto, &span, &protected, &live_at, &owned_next,
-                        candidate_register, owner, work,
-                    )? {
-                        return Ok(false);
-                    }
-                    owner = owner_next[owner];
-                }
-            }
             let (call_first, call_end) = call_layout_range(
                 &call_layouts, candidate_start, candidate_end, proto.id, work)?;
             work_charge(work, call_end - call_first, proto.id, candidate_start)?;
+            let mut owns_open_prefix = false;
             for (offset, call) in call_layouts[call_first..call_end].iter().enumerate() {
                 let call_index = call_first + offset;
                 if !live_at_pc(&span, &protected, &live_at, candidate_register, call.pc) {
@@ -5678,6 +6011,25 @@ fn compact_register_map(
                 let survives = live_at_pc(
                     &span, &protected, &live_at, candidate_register, call.pc + 1,
                 );
+                if !call.open_chain && slot >= call.call_base && survives {
+                    let result_written = matches!(proto.instructions[call.pc].instruction,
+                        Instruction::Call { base, result_mode: ResultMode::Fixed(results), .. }
+                            if candidate_register >= usize::from(base.0)
+                                && candidate_register - usize::from(base.0) < usize::from(results));
+                    let call_pc = InstructionOffset(u32::try_from(call.pc).map_err(|_| {
+                        error(OfficialExportErrorKind::LimitExceeded, proto.id, call.pc,
+                            "固定 Call pending PC 超出範圍")
+                    })?);
+                    let pending = module.native_debug()
+                        .and_then(|debug| debug.temporaries_at(proto.id, call_pc))
+                        .unwrap_or(&[]);
+                    work_charge(work, pending.len(), proto.id, call.pc)?;
+                    if !result_written && !pending.iter().any(|entry| {
+                        usize::from(entry.register.0) == candidate_register
+                    }) {
+                        return Ok(false);
+                    }
+                }
                 let open_all_base = if call.open_chain {
                     match proto.instructions[call.pc].instruction {
                         Instruction::Call { base, result_mode: ResultMode::All, .. } =>
@@ -5696,8 +6048,8 @@ fn compact_register_map(
                 {
                     let cached = &mut dead_open_cache[call_index];
                     if cached.0 != candidate_register {
-                        *cached = (candidate_register, dead_after_open_call(proto, call.pc,
-                            Register(candidate_register as u16), work)?);
+                        *cached = (candidate_register, dead_after_gathered_pending_open_call(
+                            module, proto, call, candidate_register, work)?);
                     }
                     cached.1
                 } else {
@@ -5733,7 +6085,24 @@ fn compact_register_map(
                 if !(call.window_start <= slot && slot < call.window_end) {
                     continue;
                 }
+                // 相鄰 producer 的 pending callee 已在此槽；動態 consumer
+                // 於同槽讀取後使舊值死亡，不能把它誤判為窗口占用衝突。
+                if !survives && call.open_chain && slot == call.call_base
+                    && call.window_start == call.call_base
+                    && call_index > 0
+                {
+                    let producer = &call_layouts[call_index - 1];
+                    if producer.pc + 1 == call.pc && producer.open_chain
+                        && strict_open_call_terminal(proto, producer.pc, work)? == Some(call.pc)
+                        && pending_call_prefix_home(
+                            module, proto, producer, candidate_register, slot, work,
+                        )?
+                    {
+                        continue;
+                    }
+                }
                 if pending_call_prefix_home(module, proto, call, candidate_register, slot, work)? {
+                    owns_open_prefix = true;
                     continue;
                 }
                 if let Instruction::TailCall {
@@ -5778,11 +6147,43 @@ fn compact_register_map(
                     return Ok(false);
                 }
             }
+            let env_alias = env_cache_eligible && candidate_register != environment
+                && mapped[environment] != u8::MAX
+                && u16::from(mapped[environment]) == slot
+                && candidate_start > span[environment].0 && owns_open_prefix
+                && environment_cache_pending_alias_safe(
+                    module, proto, candidate_start, candidate_end,
+                    &span, &protected, &live_at, work,
+                )?;
+            if check_prior && slot_end[usize::from(slot)] > candidate_start {
+                let mut owner = slot_head[usize::from(slot)];
+                while owner != usize::MAX {
+                    work_charge(work, 1, proto.id, candidate_start)?;
+                    if owner != candidate_register && !(env_alias && owner == environment)
+                        && mapped_owner_interferes(
+                            proto, &span, &protected, &live_at, &owned_next,
+                            candidate_register, owner, work,
+                        )? {
+                        return Ok(false);
+                    }
+                    owner = owner_next[owner];
+                }
+            }
             let fixed = &fixed_intervals
                 [fixed_boundaries[usize::from(slot)]..fixed_boundaries[usize::from(slot) + 1]];
             work_charge(work, fixed.len(), proto.id, candidate_start)?;
             for &(_, fixed_start, fixed_end) in fixed {
                 if fixed_start >= candidate_end || candidate_start >= fixed_end {
+                    continue;
+                }
+                if env_alias && fixed_env_interval == Some((slot as u8, fixed_start, fixed_end)) {
+                    continue;
+                }
+                if local_handoff.is_some_and(|(home, copy_pc, copy_end)| {
+                    u16::from(home) == slot && fixed_start == copy_pc
+                        && fixed_end >= copy_end
+                        && candidate_register == register
+                }) {
                     continue;
                 }
                 if protected[candidate_register] != 0 {
@@ -5810,7 +6211,8 @@ fn compact_register_map(
         };
         let mut chosen = None;
         for slot in floor..255u16 {
-            if candidate_ok(register, start, end, slot, true)? {
+            let ok = candidate_ok(register, start, end, slot, true, work)?;
+            if ok {
                 chosen = Some(slot);
                 break;
             }
@@ -5818,31 +6220,57 @@ fn compact_register_map(
         let mut relocation = None;
         let mut scan_work = 0usize;
         if chosen.is_none() && protected[register] == 0 {
-            // 只移動一個先前已配置的未受保護 owner；其原 floor 必為零。
+            // 僅搬走與目前值實際干涉的 owner；舊鏈中的歷史死值仍可留原槽。
             for old_slot in floor..255u16 {
                 scan_work += 1;
-                let owner = slot_head[usize::from(old_slot)];
-                if owner == usize::MAX || owner_next[owner] != usize::MAX
-                    || owner == register || protected[owner] != 0
-                {
+                let head = slot_head[usize::from(old_slot)];
+                if head == usize::MAX || slot_end[usize::from(old_slot)] <= start {
                     continue;
                 }
-                let (owner_start, owner_end) = span[owner];
-                if owner_start >= start || owner_end <= start
-                    || owner_end != slot_end[usize::from(old_slot)]
-                {
+                let old_ok = candidate_ok(register, start, end, old_slot, false, work)?;
+                if !old_ok {
                     continue;
                 }
-                if !candidate_ok(register, start, end, old_slot, false)? {
-                    continue;
+                let mut owner = head;
+                let mut has_conflict = false;
+                let mut protected_conflict = false;
+                while owner != usize::MAX {
+                    scan_work += 1;
+                    if mapped_owner_interferes(proto, &span, &protected, &live_at,
+                        &owned_next, register, owner, work)? {
+                        has_conflict = true;
+                        if protected[owner] != 0 {
+                            protected_conflict = true;
+                            break;
+                        }
+                    }
+                    owner = owner_next[owner];
                 }
+                if !has_conflict || protected_conflict { continue; }
                 for new_slot in 0..255u16 {
                     if new_slot == old_slot {
                         scan_work += 1;
                         continue;
                     }
-                    if candidate_ok(owner, owner_start, owner_end, new_slot, true)? {
-                        relocation = Some((owner, owner_start, owner_end, old_slot, new_slot));
+                    let mut owner = head;
+                    let mut fits = true;
+                    while owner != usize::MAX {
+                        scan_work += 1;
+                        let conflicts = mapped_owner_interferes(proto, &span, &protected,
+                            &live_at, &owned_next, register, owner, work)?;
+                        let owner_ok = if conflicts {
+                            let (owner_start, owner_end) = span[owner];
+                            owner != register && protected[owner] == 0
+                                && candidate_ok(owner, owner_start, owner_end, new_slot, true, work)?
+                        } else { true };
+                        if !owner_ok {
+                            fits = false;
+                            break;
+                        }
+                        owner = owner_next[owner];
+                    }
+                    if fits {
+                        relocation = Some((old_slot, new_slot));
                         chosen = Some(old_slot);
                         break;
                     }
@@ -5852,15 +6280,41 @@ fn compact_register_map(
         }
         drop(candidate_ok);
         work_charge(work, scan_work, proto.id, start)?;
-        if let Some((owner, _owner_start, owner_end, old_slot, new_slot)) = relocation {
-            // 舊槽先前區間的終點不晚於 owner 出生點；emit 尚未開始。
-            mapped[owner] = new_slot as u8;
-            owner_next[owner] = slot_head[usize::from(new_slot)];
-            slot_head[usize::from(new_slot)] = owner;
-            slot_end[usize::from(new_slot)] =
-                slot_end[usize::from(new_slot)].max(owner_end);
-            slot_head[usize::from(old_slot)] = usize::MAX;
-            slot_end[usize::from(old_slot)] = 0;
+        if let Some((old_slot, new_slot)) = relocation {
+            // 搬移集合經逐 owner 與新槽原鏈的活性、Call 窗與固定槽檢查。
+            let mut owner = slot_head[usize::from(old_slot)];
+            let mut kept_head = usize::MAX;
+            let mut kept_tail = usize::MAX;
+            let mut moved_head = usize::MAX;
+            let mut moved_tail = usize::MAX;
+            let mut kept_end = 0usize;
+            let mut moved_end = 0usize;
+            while owner != usize::MAX {
+                work_charge(work, 1, proto.id, start)?;
+                let next = owner_next[owner];
+                let conflicts = mapped_owner_interferes(proto, &span, &protected, &live_at,
+                    &owned_next, register, owner, work)?;
+                owner_next[owner] = usize::MAX;
+                if conflicts {
+                    mapped[owner] = new_slot as u8;
+                    moved_end = moved_end.max(span[owner].1);
+                    if moved_head == usize::MAX { moved_head = owner; }
+                    else { owner_next[moved_tail] = owner; }
+                    moved_tail = owner;
+                } else {
+                    kept_end = kept_end.max(span[owner].1);
+                    if kept_head == usize::MAX { kept_head = owner; }
+                    else { owner_next[kept_tail] = owner; }
+                    kept_tail = owner;
+                }
+                owner = next;
+            }
+            owner_next[moved_tail] = slot_head[usize::from(new_slot)];
+            slot_head[usize::from(new_slot)] = moved_head;
+            slot_end[usize::from(new_slot)] = slot_end[usize::from(new_slot)]
+                .max(moved_end);
+            slot_head[usize::from(old_slot)] = kept_head;
+            slot_end[usize::from(old_slot)] = kept_end;
             high = high.max(new_slot + 1);
         }
         let slot = chosen.ok_or_else(|| {
@@ -6157,7 +6611,8 @@ fn compact_register_map(
                     }
                     if call.open_chain
                         && matches!(result_mode, ResultMode::All)
-                        && dead_after_open_call(proto, pc, Register(register as u16), work)?
+                        && dead_after_gathered_pending_open_call(
+                            module, proto, call, register, work)?
                     {
                         continue;
                     }
@@ -6208,7 +6663,7 @@ fn compact_register_map(
                     "native Call window 起點超出 stack",
                 )
             })?;
-            if parallel_copy_plan(
+            let gather_plan = parallel_copy_plan(
                 &mapped,
                 gather_base,
                 gathered,
@@ -6218,20 +6673,24 @@ fn compact_register_map(
                 proto.id,
                 pc,
                 work,
-            )?
-            .is_none()
-                || parallel_copy_plan(
-                    &mapped, base, scattered, candidate, false, spare, proto.id, pc, work,
-                )?
-                .is_none()
-            {
+            )?;
+            let scatter_plan = parallel_copy_plan(
+                &mapped, base, scattered, candidate, false, spare, proto.id, pc, work,
+            )?;
+            let (Some(gather_plan), Some(scatter_plan)) = (gather_plan, scatter_plan) else {
                 return Err(error(
                     OfficialExportErrorKind::Unsupported,
                     proto.id,
                     pc,
                     "native Call window 無安全 gather/scatter",
                 ));
-            }
+            };
+            // 只有搬移計畫真的使用備用槽時，才把它計入官方 maxstack。
+            let spare = spare.filter(|slot| {
+                gather_plan.moves[..gather_plan.len].iter()
+                    .chain(&scatter_plan.moves[..scatter_plan.len])
+                    .any(|&(dest, src)| dest == *slot || src == *slot)
+            });
             scratch[pc] = call.window_start;
             parallel_spare[pc] = spare.map_or(NO_SPARE_SLOT, u16::from);
             max_stack = max_stack
@@ -6472,6 +6931,16 @@ fn compact_register_map(
             max_stack = max_stack.max(peak);
         }
         pc = end + 1;
+    }
+    // Lua 5.4 的 luaK_checkstack 在 newstack >= MAXREGS(255) 時拒絕；
+    // Lua 5.5 的 MAX_FSTACK(255) 則允許等於上限。
+    if max_stack > profile_stack_limit {
+        return Err(error(
+            OfficialExportErrorKind::LimitExceeded,
+            proto.id,
+            0,
+            "native maxstack 超過 profile 上限",
+        ));
     }
     let max_stack = u8::try_from(max_stack).map_err(|_| {
         error(
@@ -6910,6 +7379,22 @@ struct Builder<'a> {
 impl Builder<'_> {
     fn push(&mut self, word: u32, pc: usize) -> Result<(), OfficialExportError> {
         work_charge(self.work, 1, self.id, pc)?;
+        let next_total = self.total_instructions.checked_add(1).ok_or_else(|| {
+            error(
+                OfficialExportErrorKind::LimitExceeded,
+                self.id,
+                pc,
+                "官方指令數溢位",
+            )
+        })?;
+        if next_total > self.limits.max_instructions {
+            return Err(error(
+                OfficialExportErrorKind::LimitExceeded,
+                self.id,
+                pc,
+                "官方指令數超限",
+            ));
+        }
         if self.code.len() >= self.max_words {
             return Err(error(
                 OfficialExportErrorKind::InvalidPrototype,
@@ -6918,22 +7403,7 @@ impl Builder<'_> {
                 "native 指令數超出預付額度",
             ));
         }
-        *self.total_instructions = self.total_instructions.checked_add(1).ok_or_else(|| {
-            error(
-                OfficialExportErrorKind::LimitExceeded,
-                self.id,
-                pc,
-                "官方指令數溢位",
-            )
-        })?;
-        if *self.total_instructions > self.limits.max_instructions {
-            return Err(error(
-                OfficialExportErrorKind::LimitExceeded,
-                self.id,
-                pc,
-                "官方指令數超限",
-            ));
-        }
+        *self.total_instructions = next_total;
         self.code.try_reserve(1).map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -7102,6 +7572,15 @@ fn planned_copy(
     })
 }
 
+fn used_parallel_spare(plan: &ParallelMoves, marker: u16) -> Option<u8> {
+    if !plan.used_spare { return None }
+    u8::try_from(marker).ok().filter(|slot| *slot < 255)
+}
+
+fn parallel_plan_words(plan: &ParallelMoves, marker: u16) -> usize {
+    plan.len + usize::from(used_parallel_spare(plan, marker).is_some())
+}
+
 // 沿用既有平行搬移的「無讀者才寫目的槽、循環經備用槽」順序；
 // 固定 Call 額外需要非連續的借位 home，故接收實體槽配對。
 fn parallel_slot_pairs_plan(
@@ -7117,7 +7596,7 @@ fn parallel_slot_pairs_plan(
     let mut pending = [false; 512];
     let mut destination_seen = [false; 255];
     let mut readers = [0u16; 256];
-    let mut plan = ParallelMoves { moves: [(0, 0); 512], len: 0 };
+    let mut plan = ParallelMoves { moves: [(0, 0); 512], len: 0, used_spare: false };
     let mut remaining = 0usize;
     work_charge(work, len, id, pc)?;
     for index in 0..len {
@@ -7163,6 +7642,7 @@ fn parallel_slot_pairs_plan(
         })?;
         let saved = destination[index];
         plan.push(spare, saved, id, pc)?;
+        plan.used_spare = true;
         work_charge(work, len, id, pc)?;
         for index in 0..len {
             if pending[index] && sources[index] == saved {
@@ -7204,7 +7684,7 @@ fn fixed_call_pending_moves(
     pc: usize,
     gather: bool,
     work: &mut OfficialWorkBudget,
-) -> Result<Option<ParallelMoves>, OfficialExportError> {
+) -> Result<Option<(ParallelMoves, Option<u8>)>, OfficialExportError> {
     let Instruction::Call {
         base,
         arg_count,
@@ -7347,10 +7827,63 @@ fn fixed_call_pending_moves(
     let spare = fixed_pending_spare_for_pairs(
         marker, &source, &destination, len, proto.id, pc, work,
     )?;
-    let plan = parallel_slot_pairs_plan(
+    let mut plan = parallel_slot_pairs_plan(
         &source, &destination, len, spare, proto.id, pc, work,
     )?;
-    plan.map(Some).ok_or_else(|| error(
+    let mut cleanup_spare = plan.as_ref().and_then(|plan| used_parallel_spare(plan, marker));
+    if plan.is_none() {
+        // 一般 Call gather 沒有循環時不會保留 spare；pending 的 home 卻
+        // 可能與官方前綴互換。只借用已計入 maxstack、且此 Call 前後無活值的槽。
+        let scan = meta.mapped.len()
+            .checked_add(usize::from(meta.max_stack))
+            .and_then(|units| units.checked_add(len.checked_mul(2)?))
+            .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                "固定 Call 備用槽掃描 work 溢位"))?;
+        work_charge(work, scan, proto.id, pc)?;
+        let mut occupied = [false; 255];
+        for (register, &home) in meta.mapped.iter().enumerate() {
+            if home != u8::MAX
+                && (live_at_pc(&meta.span, &meta.protected, &meta.live_at, register, pc)
+                    || live_at_pc(&meta.span, &meta.protected, &meta.live_at, register, pc + 1))
+            {
+                occupied[usize::from(home)] = true;
+            }
+        }
+        let (numeric, _) = numeric_pairs(proto, work)?;
+        let numeric_scan = usize::from(meta.max_stack).saturating_sub(usize::from(window_end))
+            .checked_mul(numeric.len())
+            .and_then(|units| units.checked_mul(meta.numeric_aliases.len().checked_add(1)?))
+            .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded, proto.id, pc,
+                "固定 Call 備用槽 numeric work 溢位"))?;
+        work_charge(work, numeric_scan, proto.id, pc)?;
+        if let Some(extra) = (window_end..u16::from(meta.max_stack))
+            .find(|&slot| {
+                let slot = slot as u8;
+                !occupied[usize::from(slot)]
+                    && meta.anonymous_vararg_slot != Some(slot)
+                    && !numeric.iter().any(|pair| {
+                        if !(pair.prepare_pc <= pc && pc <= pair.next_pc) {
+                            return false;
+                        }
+                        let first = meta.numeric_aliases.iter()
+                            .find(|alias| alias.body_pc == pair.body_pc)
+                            .map_or(usize::from(meta.tuple_base) + usize::from(pair.block) * 4,
+                                |alias| usize::from(alias.tuple));
+                        first <= usize::from(slot) && usize::from(slot) < first + 4
+                    })
+                    && (0..len).all(|index| source[index] != slot && destination[index] != slot)
+            })
+        {
+            plan = parallel_slot_pairs_plan(
+                &source, &destination, len, Some(extra as u8), proto.id, pc, work,
+            )?;
+            if let Some(ref selected) = plan {
+                // 備用槽只在搬移循環期間借用；完成後必須清掉暫存的 GC root。
+                cleanup_spare = used_parallel_spare(selected, extra);
+            }
+        }
+    }
+    plan.map(|plan| Some((plan, cleanup_spare))).ok_or_else(|| error(
         OfficialExportErrorKind::Unsupported, proto.id, pc,
         "固定 Call pending 無安全平行搬移",
     ))
@@ -7364,10 +7897,26 @@ fn emit_fixed_call_pending_moves(
     pc: usize,
     gather: bool,
 ) -> Result<(), OfficialExportError> {
-    if let Some(plan) = fixed_call_pending_moves(module, proto, meta, pc, gather, builder.work)? {
-        for &(dest, src) in &plan.moves[..plan.len] {
-            builder.push(abc(0, dest, src, 0, false), pc)?;
-        }
+    if let Some((plan, cleanup_spare)) =
+        fixed_call_pending_moves(module, proto, meta, pc, gather, builder.work)?
+    {
+        emit_parallel_plan(builder, &plan, cleanup_spare, pc)?;
+    }
+    Ok(())
+}
+
+fn emit_parallel_plan(
+    builder: &mut Builder<'_>,
+    plan: &ParallelMoves,
+    cleanup_spare: Option<u8>,
+    pc: usize,
+) -> Result<(), OfficialExportError> {
+    for &(dest, src) in &plan.moves[..plan.len] {
+        builder.push(abc(0, dest, src, 0, false), pc)?;
+    }
+    if let Some(spare) = cleanup_spare {
+        // 搬移後的複本不是活值，須在下一個 opcode 前移除 GC root。
+        builder.push(abc(8, spare, 0, 0, false), pc)?;
     }
     Ok(())
 }
@@ -7390,9 +7939,8 @@ fn emit_gather(
         pc,
         builder.work,
     )? {
-        for &(dest, src) in &plan.moves[..plan.len] {
-            builder.push(abc(0, dest, src, 0, false), pc)?;
-        }
+        emit_parallel_plan(builder, &plan,
+            used_parallel_spare(&plan, meta.parallel_spare[pc]), pc)?;
         return Ok(());
     }
     for offset in 0..count {
@@ -7444,9 +7992,8 @@ fn emit_scatter(
         pc,
         builder.work,
     )? {
-        for &(dest, src) in &plan.moves[..plan.len] {
-            builder.push(abc(0, dest, src, 0, false), pc)?;
-        }
+        emit_parallel_plan(builder, &plan,
+            used_parallel_spare(&plan, meta.parallel_spare[pc]), pc)?;
         return Ok(());
     }
     for offset in 0..count {
@@ -7676,20 +8223,20 @@ fn native_opcode_words(
                     pc,
                     work,
                 )?
-                .map_or(gathered, |plan| plan.len)
+                .map_or(gathered, |plan| parallel_plan_words(&plan, meta.parallel_spare[pc]))
             } else {
                 gathered
             };
             let scattered = if meta.parallel_spare[pc] != NO_PARALLEL_COPY {
                 planned_copy(meta, *base, scatter_count, 0, false, proto.id, pc, work)?
-                    .map_or(scattered, |plan| plan.len)
+                    .map_or(scattered, |plan| parallel_plan_words(&plan, meta.parallel_spare[pc]))
             } else {
                 scattered
             };
             let pending_before = fixed_call_pending_moves(module, proto, meta, pc, true, work)?
-                .map_or(0, |plan| plan.len);
+                .map_or(0, |(plan, spare)| plan.len + usize::from(spare.is_some()));
             let pending_after = fixed_call_pending_moves(module, proto, meta, pc, false, work)?
-                .map_or(0, |plan| plan.len);
+                .map_or(0, |(plan, spare)| plan.len + usize::from(spare.is_some()));
             1usize
                 .checked_add(gathered)
                 .and_then(|words| words.checked_add(scattered))
@@ -7714,7 +8261,7 @@ fn native_opcode_words(
             };
             let gathered = if meta.parallel_spare[pc] != NO_PARALLEL_COPY {
                 planned_copy(meta, *base, gathered as u16, 0, true, proto.id, pc, work)?
-                    .map_or(gathered, |plan| plan.len)
+                    .map_or(gathered, |plan| parallel_plan_words(&plan, meta.parallel_spare[pc]))
             } else {
                 gathered
             };
@@ -7724,7 +8271,7 @@ fn native_opcode_words(
             ResultMode::Fixed(count) => {
                 let scattered = if meta.parallel_spare[pc] != NO_PARALLEL_COPY {
                     planned_copy(meta, *base, *count, 0, false, proto.id, pc, work)?
-                        .map_or(usize::from(*count), |plan| plan.len)
+                        .map_or(usize::from(*count), |plan| parallel_plan_words(&plan, meta.parallel_spare[pc]))
                 } else {
                     usize::from(*count)
                 };
@@ -7748,7 +8295,7 @@ fn native_opcode_words(
         } => {
             let gathered = if meta.parallel_spare[pc] != NO_PARALLEL_COPY {
                 planned_copy(meta, *base, *count, 0, true, proto.id, pc, work)?
-                    .map_or(usize::from(*count), |plan| plan.len)
+                    .map_or(usize::from(*count), |plan| parallel_plan_words(&plan, meta.parallel_spare[pc]))
             } else {
                 usize::from(*count)
             };
@@ -7996,7 +8543,8 @@ fn preflight_native_prototype(
     NativePreflight::add(
         &mut stats.instructions,
         words,
-        limits.max_instructions,
+        // 上界包含稍後合併的指令；實際上限由 Builder::push 逐條檢查。
+        usize::MAX,
         proto.id,
     )?;
     NativePreflight::add(
@@ -8701,8 +9249,9 @@ fn native_prototype(
     } else {
         debug_entry.map_or((0, 0), |entry| (entry.line_defined, entry.last_line_defined))
     };
+    let reserve_words = word_limit.min(limits.max_instructions.saturating_sub(*total_instructions));
     let mut code = Vec::new();
-    code.try_reserve_exact(word_limit).map_err(|_| {
+    code.try_reserve_exact(reserve_words).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             id,
@@ -8712,7 +9261,7 @@ fn native_prototype(
     })?;
     let mut lines = Vec::new();
     if debug_entry.is_some() {
-        lines.try_reserve_exact(word_limit).map_err(|_| {
+        lines.try_reserve_exact(reserve_words).map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
                 id,
@@ -8726,7 +9275,7 @@ fn native_prototype(
         limits,
         work,
         total_instructions,
-        max_words: word_limit,
+        max_words: reserve_words,
         code,
         source_lines: debug_entry.map(|entry| entry.lines.as_slice()),
         lines,
@@ -8996,6 +9545,33 @@ fn native_prototype(
                             {
                                 cleanup_slot_set(&mut occupied, r(local.register)?);
                             }
+                        }
+                    }
+                    if *count > 1 {
+                        let end = usize::from(start.0).checked_add(usize::from(*count))
+                            .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded,
+                                id, pc, "LoadNil occupied 範圍溢位"))?;
+                        let per_register = meta.numeric_aliases.len().checked_add(1)
+                            .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded,
+                                id, pc, "LoadNil occupied work 溢位"))?;
+                        work_charge(builder.work, meta.mapped.len().checked_mul(per_register)
+                            .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded,
+                                id, pc, "LoadNil occupied work 溢位"))?, id, pc)?;
+                        for register in 0..meta.mapped.len() {
+                            if usize::from(start.0) <= register && register < end
+                                || meta.protected[register] != 0
+                                || !matches!(meta.live_at.get(register), Some(LiveRow::Bits { .. }))
+                                || !live_at_pc(&meta.span, &meta.protected,
+                                    &meta.live_at, register, pc)
+                                || !live_at_pc(&meta.span, &meta.protected,
+                                    &meta.live_at, register, pc + 1)
+                            {
+                                continue;
+                            }
+                            let register = Register(u16::try_from(register).map_err(|_| error(
+                                OfficialExportErrorKind::LimitExceeded, id, pc,
+                                "LoadNil occupied register 超限"))?);
+                            cleanup_slot_set(&mut occupied, r(register)?);
                         }
                     }
                     let mut dead_temporary = true;
@@ -11647,6 +12223,7 @@ mod tests {
         let plan = parallel_slot_pairs_plan(
             &source, &destination, 2, spare, ProtoId(0), 0, &mut work,
         ).unwrap().expect("合法 spare 能保存循環中的原值");
+        assert_eq!(used_parallel_spare(&plan, 3), Some(3));
         let mut values = [0u8; 256];
         values[1] = 11;
         values[2] = 22;
@@ -11654,6 +12231,69 @@ mod tests {
             values[usize::from(dest)] = values[usize::from(src)];
         }
         assert_eq!((values[1], values[2]), (22, 11));
+        let limits = OfficialChunkLimits::default();
+        let mut total_instructions = 0;
+        let mut work = OfficialWorkBudget::new(10_000);
+        let mut builder = Builder {
+            id: ProtoId(0), limits: &limits, work: &mut work,
+            total_instructions: &mut total_instructions,
+            max_words: plan.len + 1, code: Vec::new(),
+            source_lines: None, lines: Vec::new(),
+        };
+        emit_parallel_plan(&mut builder, &plan, used_parallel_spare(&plan, 3), 0).unwrap();
+        assert_eq!(builder.code.len(), plan.len + 1);
+        assert_eq!(builder.code.last().copied(), Some(abc(8, 3, 0, 0, false)));
+        assert_eq!(*builder.total_instructions, plan.len + 1);
+    }
+
+    #[test]
+    fn fixed_result_marker_cycle_clears_temporary_gc_root_and_counts_words() {
+        let proto = dead_open_fixture(vec![
+            Instruction::Call {
+                base: Register(0), arg_count: 1, result_mode: ResultMode::Fixed(1),
+            },
+            Instruction::LoadNil { start: Register(0), count: 2 },
+        ]);
+        assert_eq!(call_cleanup_range(&proto, 1), None);
+
+        let mut work = OfficialWorkBudget::new(10_000);
+        let plan = parallel_copy_plan(
+            &[1, 0], Register(0), 2, 0, true, Some(2), ProtoId(0), 0, &mut work,
+        ).unwrap().expect("循環搬移須使用 marker");
+        let spare = used_parallel_spare(&plan, 2);
+        assert_eq!(spare, Some(2));
+        assert_eq!(parallel_plan_words(&plan, 2), plan.len + 1);
+        let direct = parallel_copy_plan(
+            &[0, 1], Register(0), 2, 0, true, Some(2), ProtoId(0), 0, &mut work,
+        ).unwrap().expect("原位值不需借用 marker");
+        assert_eq!(used_parallel_spare(&direct, 2), None);
+        assert_eq!(parallel_plan_words(&direct, 2), direct.len);
+        let work_before = work.remaining();
+        let limits = OfficialChunkLimits::default();
+        let mut total_instructions = 0;
+        let mut builder = Builder {
+            id: ProtoId(0), limits: &limits, work: &mut work,
+            total_instructions: &mut total_instructions,
+            max_words: plan.len + 1, code: Vec::new(),
+            source_lines: None, lines: Vec::new(),
+        };
+        emit_parallel_plan(&mut builder, &plan, spare, 0).unwrap();
+        assert_eq!(builder.code.len(), parallel_plan_words(&plan, 2));
+        assert_eq!(*builder.total_instructions, builder.code.len());
+        assert_eq!(work_before - builder.work.remaining(), (plan.len + 1) as u64);
+        let mut slots = [Some(11), Some(22), None];
+        for &word in &builder.code {
+            let destination = ((word >> 7) & 0xff) as usize;
+            match word & 0x7f {
+                0 => slots[destination] = slots[((word >> 16) & 0xff) as usize],
+                8 => {
+                    assert_eq!((word >> 16) & 0xff, 0);
+                    slots[destination] = None;
+                }
+                opcode => panic!("非預期平行搬移 opcode {opcode}"),
+            }
+        }
+        assert_eq!(slots, [Some(22), Some(11), None]);
     }
 
     #[test]
@@ -11669,48 +12309,54 @@ mod tests {
         spans[4] = (5, 11);
         spans[5] = (5, 9);
         let check = |pending: &[NativeTemporary], mapped: &[u8],
-                     spans: &[(usize, usize)], max_work: u64| {
+                     spans: &[(usize, usize)], live_at: &[LiveRow], max_work: u64| {
             let mut work = OfficialWorkBudget::new(max_work);
             fixed_pending_birth_retained(
-                12, pending, mapped, spans, Register(3), Register(0), Register(0),
+                12, pending, mapped, spans, &[0; 8], live_at,
+                Register(3), Register(0), Register(0),
                 12, 12, |_| Ok(12), ProtoId(0), 10, &mut work,
             )
         };
-        assert_eq!(check(&pending, &mapped, &spans, 10_000).unwrap(), 2,
+        let mut live_at: Vec<LiveRow> = (0..spans.len()).map(|_| LiveRow::Uncomputed).collect();
+        assert_eq!(check(&pending, &mapped, &spans, &live_at, 10_000).unwrap(), 2,
             "pending 出生後兩個仍活躍的值須高於 active floor");
+        live_at[4] = LiveRow::Bits { base_pc: 8, bytes: vec![1] };
+        assert_eq!(check(&pending, &mapped, &spans, &live_at, 10_000).unwrap(), 1,
+            "寬 span 中的值若未在出生後存活，不得墊高 pending 前綴");
+        live_at[4] = LiveRow::Uncomputed;
         spans[5] = (5, 6);
-        assert_eq!(check(&pending, &mapped, &spans, 10_000).unwrap(), 1,
+        assert_eq!(check(&pending, &mapped, &spans, &live_at, 10_000).unwrap(), 1,
             "出生指令讀完即死的 operand 不佔下一 PC 前綴");
         spans[5] = (4, 6);
-        assert_eq!(check(&pending, &mapped, &spans, 10_000).unwrap(), 1,
+        assert_eq!(check(&pending, &mapped, &spans, &live_at, 10_000).unwrap(), 1,
             "較早出生但恰於此指令死亡的值也不佔前綴");
         spans[5] = (5, 7);
-        assert_eq!(check(&pending, &mapped, &spans, 10_000).unwrap(), 2,
+        assert_eq!(check(&pending, &mapped, &spans, &live_at, 10_000).unwrap(), 2,
             "出生後下一 PC 仍活躍的值須保留");
         spans[5] = (5, 9);
         spans[3] = (5, 12);
-        assert_eq!(check(&pending, &mapped, &spans, 10_000).unwrap(), 3,
+        assert_eq!(check(&pending, &mapped, &spans, &live_at, 10_000).unwrap(), 3,
             "callee 恰在 pending 出生時已存在且跨至 Call 也佔槽");
         spans[3] = (4, 12);
-        assert_eq!(check(&pending, &mapped, &spans, 10_000).unwrap(), 3,
+        assert_eq!(check(&pending, &mapped, &spans, &live_at, 10_000).unwrap(), 3,
             "callee 在 pending 出生前已生且未固定時也佔槽");
         spans[3] = (6, 12);
-        assert_eq!(check(&pending, &mapped, &spans, 10_000).unwrap(), 2,
+        assert_eq!(check(&pending, &mapped, &spans, &live_at, 10_000).unwrap(), 2,
             "callee 在 pending 出生後才產生時不得預留出生槽");
-        assert_eq!(check(&[], &mapped, &spans, 10_000).unwrap(), 0,
+        assert_eq!(check(&[], &mapped, &spans, &live_at, 10_000).unwrap(), 0,
             "空 pending 不提高 fixed Call 前綴");
         pending[0].register = Register(6);
         spans[6] = (5, 11);
-        assert_eq!(check(&pending, &mapped, &spans, 10_000).unwrap(), 0,
+        assert_eq!(check(&pending, &mapped, &spans, &live_at, 10_000).unwrap(), 0,
             "未跨 Call 的 pending 不觸發出生峰掃描");
         pending[0].register = Register(2);
         spans[6] = (usize::MAX, 0);
         mapped[4] = 1;
-        assert_eq!(check(&pending, &mapped, &spans, 10_000).unwrap(), 1,
+        assert_eq!(check(&pending, &mapped, &spans, &live_at, 10_000).unwrap(), 1,
             "既有 mapped home 不重算為未映射前綴");
         mapped[4] = u8::MAX;
         assert_eq!(
-            check(&pending, &mapped, &spans, 1)
+            check(&pending, &mapped, &spans, &live_at, 1)
                 .expect_err("超出預付 work 必須拒絕").kind,
             OfficialExportErrorKind::WorkExhausted,
         );
@@ -12211,6 +12857,38 @@ mod tests {
             result_mode: ResultMode::Fixed(2),
         };
         assert!(!check(unmodified_argument));
+    }
+
+    #[test]
+    fn gathered_pending_open_call_allows_dead_home_but_not_later_read() {
+        let instructions = vec![
+            Instruction::Call {
+                base: Register(4),
+                arg_count: 2,
+                result_mode: ResultMode::All,
+            },
+            Instruction::Call {
+                base: Register(3),
+                arg_count: u16::MAX,
+                result_mode: ResultMode::Fixed(0),
+            },
+            Instruction::LoadNil { start: Register(3), count: 1 },
+            Instruction::Return {
+                base: Register(2),
+                result_mode: ResultMode::Fixed(1),
+            },
+        ];
+        let check = |instructions, gathered| {
+            dead_after_open_call_with_pending(
+                &dead_open_fixture(instructions), 0, Register(3), gathered,
+                &mut OfficialWorkBudget::new(100_000),
+            ).unwrap()
+        };
+        assert!(!check(instructions.clone(), false));
+        assert!(check(instructions.clone(), true));
+        let mut later_read = instructions;
+        later_read.insert(2, Instruction::Move { dest: Register(8), src: Register(3) });
+        assert!(!check(later_read, true));
     }
 
     fn run(mapped: &[u8], gather: bool, spare: Option<u8>, original: &[i32]) -> Option<Vec<i32>> {

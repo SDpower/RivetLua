@@ -1043,29 +1043,20 @@ fn aux_gsub_a45_matrix() {
             enter_active_gc(&owner, mode);
             let source = std::ffi::CString::new("x").unwrap();
             let pattern = std::ffi::CString::new("x").unwrap();
-            let replacement = std::ffi::CString::new("y").unwrap();
-            let active_before = vm_snapshot(&owner);
+            let mut expected_top = stack_snapshot(state).0;
             owner.with_vm(|vm| vm.inject_failure_once(point)).unwrap();
-            // SAFETY：此模式與 phase 由 enter_active_gc 準備；輸入 C 字串有效。
-            let result = unsafe {
-                rivetlua_capi::stack::luaL_gsub(
-                    state,
-                    source.as_ptr(),
-                    pattern.as_ptr(),
-                    replacement.as_ptr(),
-                )
-            };
-            assert!(
-                result.is_null(),
-                "active {mode:?}/{point:?} must be reached"
-            );
-            if result.is_null() {
-                let after = vm_snapshot(&owner);
-                assert_eq!(after.0, active_before.0, "active ledger {mode:?}/{point:?}");
-                assert_eq!(after.2, active_before.2, "active GC {mode:?}/{point:?}");
-                assert_eq!(after.3, active_before.3, "active roots {mode:?}/{point:?}");
-                // SAFETY：命名故障已消耗，重試必須可以完成發布。
-                let retry = unsafe {
+            let mut reached = false;
+            // 輸出保留在 stack root，避免 GC 回收後重用 slot 而錯過 reserve 成長點。
+            for attempt in 0..4096 {
+                let replacement = std::ffi::CString::new(format!(
+                    "active-gsub-{mode:?}-{point:?}-{attempt:04}-{}",
+                    "z".repeat(64)
+                ))
+                .unwrap();
+                let active_before = vm_snapshot(&owner);
+                assert_ne!(active_before.2.phase, GcPhase::Pause);
+                // SAFETY：此模式與 phase 由 enter_active_gc 準備；輸入 C 字串有效。
+                let result = unsafe {
                     rivetlua_capi::stack::luaL_gsub(
                         state,
                         source.as_ptr(),
@@ -1073,10 +1064,41 @@ fn aux_gsub_a45_matrix() {
                         replacement.as_ptr(),
                     )
                 };
-                assert_string(retry, 1, b"y");
-            } else {
-                assert_string(result, 1, b"y");
+                if result.is_null() {
+                    let after = vm_snapshot(&owner);
+                    assert_eq!(after.0, active_before.0, "active ledger {mode:?}/{point:?}");
+                    assert_eq!(after.2, active_before.2, "active GC {mode:?}/{point:?}");
+                    assert_eq!(after.3, active_before.3, "active roots {mode:?}/{point:?}");
+                    assert_eq!(stack_snapshot(state).0, expected_top);
+                    if point == FailPoint::MarkReserve {
+                        assert_eq!(
+                            owner
+                                .with_vm(|vm| vm.allocation_trace().last_failure)
+                                .unwrap()
+                                .unwrap()
+                                .attempt
+                                .point,
+                            Some(point),
+                            "active {mode:?}/{point:?}"
+                        );
+                    }
+                    // SAFETY：命名故障已消耗；重試必須可以完成發布。
+                    let retry = unsafe {
+                        rivetlua_capi::stack::luaL_gsub(
+                            state,
+                            source.as_ptr(),
+                            pattern.as_ptr(),
+                            replacement.as_ptr(),
+                        )
+                    };
+                    assert_string(retry, replacement.as_bytes().len(), replacement.as_bytes());
+                    reached = true;
+                    break;
+                }
+                assert_string(result, replacement.as_bytes().len(), replacement.as_bytes());
+                expected_top += 1;
             }
+            assert!(reached, "active {mode:?}/{point:?} must be reached");
         }
 
         let owner = StateOwner::new().unwrap();

@@ -21,6 +21,7 @@ use crate::{ByteString, ObjectKind, Vm, VmError};
 pub struct Table {
     metatable: Option<ObjectRef>,
     weak_mode: WeakMode,
+    hash_seed: u32,
     mutation_version: u64,
     array: Vec<Option<Value>>,
     hash: Vec<Option<(CanonicalKey, Value)>>,
@@ -32,6 +33,7 @@ impl Table {
         ledger: &AllocationLedger,
         array_capacity: usize,
         hash_capacity: usize,
+        hash_seed: u32,
     ) -> Result<(Self, Reservation, Reservation), VmError> {
         let mut array = Vec::new();
         let array_ticket = reserve_vec(
@@ -61,6 +63,7 @@ impl Table {
             Self {
                 metatable: None,
                 weak_mode: WeakMode::Strong,
+                hash_seed,
                 mutation_version: 0,
                 array,
                 hash,
@@ -374,8 +377,11 @@ impl Table {
         Ok(cleared)
     }
 
-    fn bucket(key: &CanonicalKey, count: usize) -> usize {
+    fn bucket(&self, key: &CanonicalKey, count: usize) -> usize {
         let mut hasher = new_default_hasher();
+        if self.hash_seed != 0 {
+            self.hash_seed.hash(&mut hasher);
+        }
         key.hash(&mut hasher);
         (hasher.finish() as usize) % count
     }
@@ -409,7 +415,7 @@ impl Table {
         if count == 0 {
             return None;
         }
-        let start = Self::bucket(key, count);
+        let start = self.bucket(key, count);
         (0..count)
             .map(|step| Self::probe(start, step, count))
             .find(|&index| {
@@ -420,6 +426,7 @@ impl Table {
     }
 
     fn empty_bucket(
+        &self,
         buckets: &[Option<(CanonicalKey, Value)>],
         key: &CanonicalKey,
     ) -> Result<usize, VmError> {
@@ -427,7 +434,7 @@ impl Table {
         if count == 0 {
             return Err(VmError::LedgerInvariant);
         }
-        let start = Self::bucket(key, count);
+        let start = self.bucket(key, count);
         for step in 0..count {
             let index = Self::probe(start, step, count);
             if buckets[index].is_none() {
@@ -455,6 +462,9 @@ impl Table {
             return Value::Nil;
         }
         let mut hasher = new_default_hasher();
+        if self.hash_seed != 0 {
+            self.hash_seed.hash(&mut hasher);
+        }
         3_u8.hash(&mut hasher);
         name.hash(&mut hasher);
         let start = (hasher.finish() as usize) % count;
@@ -674,7 +684,7 @@ impl Table {
             })
         } else {
             ledger.checkpoint(FailPoint::TableInsert)?;
-            let index = Self::empty_bucket(&self.hash, &key)?;
+            let index = self.empty_bucket(&self.hash, &key)?;
             Ok(PreparedTableMutation::HashInsert { index, key, value })
         }
     }
@@ -839,7 +849,7 @@ impl Table {
                     let canonical = CanonicalKey {
                         kind: KeyKind::Integer(key),
                     };
-                    let start = Self::bucket(&canonical, self.hash.len());
+                    let start = self.bucket(&canonical, self.hash.len());
                     let Some(empty) = (0..self.hash.len())
                         .map(|step| Self::probe(start, step, self.hash.len()))
                         .find(|candidate| {
@@ -1600,11 +1610,25 @@ mod tests {
     };
 
     #[test]
+    fn lua55_seed_changes_table_buckets() {
+        let ledger = crate::alloc::AllocationLedger::new(usize::MAX);
+        let (plain, _, _) = Table::try_new(&ledger, 0, 64, 0).unwrap();
+        let (seeded, _, _) = Table::try_new(&ledger, 0, 64, 0x55a1_7e3d).unwrap();
+        assert!((0..64).any(|index| {
+            let key = CanonicalKey {
+                kind: super::KeyKind::Integer(index),
+            };
+            plain.bucket(&key, 64) != seeded.bucket(&key, 64)
+        }));
+    }
+
+    #[test]
     fn b13_dead_key_layout_preserves_live_bucket_and_table() {
         #[allow(dead_code)]
         struct BaselineTableFields {
             metatable: Option<ObjectRef>,
             weak_mode: WeakMode,
+            hash_seed: u32,
             mutation_version: u64,
             array: Vec<Option<Value>>,
             hash: Vec<Option<(CanonicalKey, Value)>>,
@@ -1642,7 +1666,13 @@ mod tests {
 
     #[test]
     fn b14_table_charge_metadata_fits_shared_ledger_layout() {
-        assert!(std::mem::size_of::<Table>() <= 160);
+        // Lua 5.5 的每 VM hash seed 由 table 保存；HeapObject 固定大小另由
+        // heap layout 測試約束，ledger 依實際 size_of::<HeapObject>() 計費。
+        assert!(
+            std::mem::size_of::<Table>() <= 168,
+            "table layout={} bytes",
+            std::mem::size_of::<Table>()
+        );
     }
 
     #[test]
@@ -2608,9 +2638,13 @@ mod tests {
             Bytes(Vec<u8>),
         }
 
-        let profile =
+        let profile_name =
             std::env::var("RIVETLUA_P08_PROFILE").unwrap_or_else(|_| "lua55-i64f64".to_owned());
-        assert!(matches!(profile.as_str(), "lua55-i64f64" | "lua54-i64f64"));
+        let profile = match profile_name.as_str() {
+            "lua55-i64f64" => rivetlua_core::LuaProfile::Lua55,
+            "lua54-i64f64" => rivetlua_core::LuaProfile::Lua54,
+            _ => panic!("P08 profile 無效"),
+        };
         let expected = BTreeMap::from([
             (SeenKey::Integer(1), (Value::Integer(11), 1)),
             (SeenKey::Integer(3), (Value::Integer(33), 1)),
@@ -2620,7 +2654,7 @@ mod tests {
         ]);
 
         for order in [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]] {
-            let mut vm = Vm::new().unwrap();
+            let mut vm = Vm::new_with_profile(profile).unwrap();
             let table = vm.allocate_table().unwrap();
             let string = vm.allocate_byte_string(&[0, 0x80]).unwrap();
             let fields = [
@@ -2659,7 +2693,7 @@ mod tests {
             .unwrap();
             assert_eq!(seen, expected);
             println!(
-                "P08_CASE\tTAB-010\t{profile}\tinput_order={order:?}\texpected_fields=5\tactual={seen:?}"
+                "P08_CASE\tTAB-010\t{profile_name}\tinput_order={order:?}\texpected_fields=5\tactual={seen:?}"
             );
         }
     }

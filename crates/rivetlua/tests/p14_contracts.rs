@@ -619,11 +619,18 @@ fn sdk_case_neg_002() {
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "未驗證 Module 竟可公開建構");
         assert!(
-            stderr.contains("error[E0451]")
-                && stderr.contains("field `verified` of struct `Module` is private"),
-            "預期 E0451 欄位私有診斷：{stderr}"
+            output.status.code().is_some_and(|code| code != 0),
+            "未驗證 Module 竟可公開建構，status={:?}",
+            output.status
+        );
+        assert!(
+            stderr.contains("E0451")
+                && stderr.contains("field")
+                && stderr.contains("verified")
+                && stderr.contains("Module")
+                && stderr.contains("private"),
+            "預期 E0451 拒絕以私有 verified 欄位建構 Module：{stderr}"
         );
         std::fs::remove_dir_all(scratch).unwrap();
         emit(

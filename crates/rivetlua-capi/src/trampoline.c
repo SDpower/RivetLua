@@ -9,6 +9,7 @@
 
 #include "lua.h"
 #include "lauxlib.h"
+#include "lualib.h"
 
 #include "trampoline_codes.h"
 
@@ -152,6 +153,21 @@ typedef struct rivetlua_capi_checkpoint_a1 {
 
 static _Thread_local rivetlua_capi_checkpoint_a1 *rivetlua_capi_top_a1;
 static _Thread_local rivetlua_capi_checkpoint_a1 *rivetlua_capi_resume_top_a5;
+
+/* 僅比對 live TLS checkpoint 的 state 指標；-1 表示此 state 沒有活動 C 邊界。 */
+int rivetlua_capi_yield_boundary_a5(const lua_State *state) {
+  rivetlua_capi_checkpoint_a1 *target = rivetlua_capi_resume_top_a5;
+  rivetlua_capi_checkpoint_a1 *cursor = rivetlua_capi_top_a1;
+  if (state == NULL) return -1;
+  if (target == NULL || target->state != state) {
+    for (; cursor != NULL; cursor = cursor->previous)
+      if (cursor->state == state) return 0;
+    return -1;
+  }
+  for (; cursor != NULL && cursor != target; cursor = cursor->previous)
+    if (cursor->state != state || cursor->yieldable_a5 == 0) return 0;
+  return cursor == target ? 1 : 0;
+}
 #if LUA_VERSION_NUM >= 505
 static _Thread_local rivetlua_capi_checkpoint_a1 *rivetlua_capi_selfclose_resume_b11;
 static _Thread_local volatile int *rivetlua_capi_selfclose_status_b11;
@@ -169,7 +185,7 @@ extern int rivetlua_capi_yield_prepare_a5(
     lua_State *state, int nresults, lua_KContext context,
     lua_KFunction continuation);
 extern rivetlua_capi_resume_setup_a5 rivetlua_capi_resume_prepare_a5(
-    lua_State *state, lua_State *from, int nargs);
+    lua_State *state, lua_State *from, int nargs, int from_yieldable);
 extern rivetlua_capi_resume_finish_result_a5 rivetlua_capi_resume_finish_a5(
     lua_State *state, size_t base, size_t frame_depth, int error_class);
 extern int rivetlua_capi_continuation_push_a5(
@@ -1802,6 +1818,8 @@ int lua_yieldk(lua_State *state, int nresults, lua_KContext context,
 
 int lua_resume(lua_State *state, lua_State *from, int nargs, int *nresults) {
   if (state == NULL || nresults == NULL) return LUA_ERRRUN;
+  /* 先記錄父 checkpoint；child checkpoint 進入後查詢會看到 child 邊界。 */
+  int from_yieldable = from != NULL && lua_isyieldable(from);
   int frame_depth = rivetlua_capi_call_depth_b7(state);
   if (frame_depth < 0) return LUA_ERRRUN;
   rivetlua_capi_checkpoint_a1 checkpoint;
@@ -1853,7 +1871,7 @@ int lua_resume(lua_State *state, lua_State *from, int nargs, int *nresults) {
   }
   checkpoint.rust_action_active = 1;
   rivetlua_capi_resume_setup_a5 setup =
-      rivetlua_capi_resume_prepare_a5(state, from, nargs);
+      rivetlua_capi_resume_prepare_a5(state, from, nargs, from_yieldable);
   checkpoint.rust_action_active = 0;
   if (setup.kind < 0) {
     result = setup.status;
@@ -2605,7 +2623,7 @@ enum {
   RV_A3_SETMETATABLE, RV_A3_NEXT, RV_A4B_PUSHVALUE, RV_A4B_COPY,
   RV_A4B_REF, RV_A4B_UNREF, RV_A4B_GETMETATABLE, RV_A4B_SETMETATABLE,
   RV_A4B_GETUSERVALUE, RV_A4B_SETUSERVALUE,
-  RV_A4B_GETMETAFIELD, RV_A4B_TESTUDATA
+  RV_A4B_GETMETAFIELD, RV_A4B_TESTUDATA, RV_A5_OPEN_STANDARD_LIBRARY
 };
 
 /* Rust dispatch 已返回 POD；所有非局部跳轉只在目前 C checkpoint。 */
@@ -2629,6 +2647,112 @@ static rivetlua_capi_strict_result_b2 rivetlua_a3_generic(
   }
   abort();
 }
+
+int luaopen_base(lua_State *state) {
+  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 0, 0,
+                             0, 0, NULL, NULL, NULL, NULL).value;
+}
+
+int luaopen_package(lua_State *state) {
+  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 1, 0,
+                             0, 0, NULL, NULL, NULL, NULL).value;
+}
+
+int luaopen_coroutine(lua_State *state) {
+  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 2, 0,
+                             0, 0, NULL, NULL, NULL, NULL).value;
+}
+
+int luaopen_table(lua_State *state) {
+  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 3, 0,
+                             0, 0, NULL, NULL, NULL, NULL).value;
+}
+
+int luaopen_io(lua_State *state) {
+  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 4, 0,
+                             0, 0, NULL, NULL, NULL, NULL).value;
+}
+
+int luaopen_os(lua_State *state) {
+  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 5, 0,
+                             0, 0, NULL, NULL, NULL, NULL).value;
+}
+
+int luaopen_string(lua_State *state) {
+  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 6, 0,
+                             0, 0, NULL, NULL, NULL, NULL).value;
+}
+
+int luaopen_math(lua_State *state) {
+  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 7, 0,
+                             0, 0, NULL, NULL, NULL, NULL).value;
+}
+
+int luaopen_utf8(lua_State *state) {
+  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 8, 0,
+                             0, 0, NULL, NULL, NULL, NULL).value;
+}
+
+int luaopen_debug(lua_State *state) {
+  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 9, 0,
+                             0, 0, NULL, NULL, NULL, NULL).value;
+}
+
+#if LUA_VERSION_NUM >= 505
+void luaL_openselectedlibs(lua_State *state, int load, int preload) {
+  static const struct {
+    const char *name;
+    lua_CFunction openf;
+    int mask;
+  } libraries[] = {
+    {LUA_GNAME, luaopen_base, LUA_GLIBK},
+    {LUA_LOADLIBNAME, luaopen_package, LUA_LOADLIBK},
+    {LUA_COLIBNAME, luaopen_coroutine, LUA_COLIBK},
+    {LUA_DBLIBNAME, luaopen_debug, LUA_DBLIBK},
+    {LUA_IOLIBNAME, luaopen_io, LUA_IOLIBK},
+    {LUA_MATHLIBNAME, luaopen_math, LUA_MATHLIBK},
+    {LUA_OSLIBNAME, luaopen_os, LUA_OSLIBK},
+    {LUA_STRLIBNAME, luaopen_string, LUA_STRLIBK},
+    {LUA_TABLIBNAME, luaopen_table, LUA_TABLIBK},
+    {LUA_UTF8LIBNAME, luaopen_utf8, LUA_UTF8LIBK}
+  };
+  size_t index;
+  luaL_getsubtable(state, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
+  for (index = 0; index < sizeof(libraries) / sizeof(libraries[0]); ++index) {
+    if (load & libraries[index].mask) {
+      luaL_requiref(state, libraries[index].name, libraries[index].openf, 1);
+      lua_pop(state, 1);
+    } else if (preload & libraries[index].mask) {
+      lua_pushcfunction(state, libraries[index].openf);
+      lua_setfield(state, -2, libraries[index].name);
+    }
+  }
+  lua_pop(state, 1);
+}
+#else
+void luaL_openlibs(lua_State *state) {
+  static const struct {
+    const char *name;
+    lua_CFunction openf;
+  } libraries[] = {
+    {LUA_GNAME, luaopen_base},
+    {LUA_LOADLIBNAME, luaopen_package},
+    {LUA_COLIBNAME, luaopen_coroutine},
+    {LUA_TABLIBNAME, luaopen_table},
+    {LUA_IOLIBNAME, luaopen_io},
+    {LUA_OSLIBNAME, luaopen_os},
+    {LUA_STRLIBNAME, luaopen_string},
+    {LUA_MATHLIBNAME, luaopen_math},
+    {LUA_UTF8LIBNAME, luaopen_utf8},
+    {LUA_DBLIBNAME, luaopen_debug}
+  };
+  size_t index;
+  for (index = 0; index < sizeof(libraries) / sizeof(libraries[0]); ++index) {
+    luaL_requiref(state, libraries[index].name, libraries[index].openf, 1);
+    lua_pop(state, 1);
+  }
+}
+#endif
 
 void lua_pushvalue(lua_State *state, int index) {
   (void)rivetlua_a3_generic(state, NULL, RV_A4B_PUSHVALUE, index, 0,

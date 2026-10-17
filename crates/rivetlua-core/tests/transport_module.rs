@@ -556,51 +556,55 @@ fn native_sidecar_rejects_forged_identity_lines_counts_and_missing_fields() {
 
 #[test]
 fn preflight_rejects_small_rvlu_with_forged_large_declared_counts_before_allocation() {
-    let profile = LuaProfile::Lua55;
-    let limits = TransportLimits::default();
-    let verified = verify_module(simple_native_module(profile), profile, &limits.verify).unwrap();
-    let encoded = encode_transport_module(&verified, &limits, &mut work(&limits)).unwrap();
-    let first_record = 36usize;
-    let constants_len_at = first_record + 53;
-    let constants_count_at = constants_len_at + 4;
-    assert_eq!(
-        u32::from_le_bytes(
-            encoded.rvlu()[constants_count_at..constants_count_at + 4]
+    for profile in [
+        LuaProfile::Lua54,
+        LuaProfile::Lua55,
+    ] {
+        let limits = TransportLimits::default();
+        let verified = verify_module(simple_native_module(profile), profile, &limits.verify).unwrap();
+        let encoded = encode_transport_module(&verified, &limits, &mut work(&limits)).unwrap();
+        let first_record = 36usize;
+        let constants_len_at = first_record + 53;
+        let constants_count_at = constants_len_at + 4;
+        assert_eq!(
+            u32::from_le_bytes(
+                encoded.rvlu()[constants_count_at..constants_count_at + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            1
+        );
+        let constants_len = u32::from_le_bytes(
+            encoded.rvlu()[constants_len_at..constants_len_at + 4]
                 .try_into()
-                .unwrap()
-        ),
-        1
-    );
-    let constants_len = u32::from_le_bytes(
-        encoded.rvlu()[constants_len_at..constants_len_at + 4]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let instructions_len_at = constants_count_at + constants_len;
-    let instructions_count_at = instructions_len_at + 4;
-    let instructions_len = u32::from_le_bytes(
-        encoded.rvlu()[instructions_len_at..instructions_len_at + 4]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let metadata_count_at = instructions_count_at + instructions_len + 4;
-    for offset in [constants_count_at, instructions_count_at, metadata_count_at] {
-        let mut forged = encoded.rvlu().to_vec();
-        forged[offset..offset + 4].copy_from_slice(&100_000u32.to_le_bytes());
-        assert!(
-            rivetlua_core::preflight_transport_decode(&forged, encoded.sidecar(), profile, &limits)
+                .unwrap(),
+        ) as usize;
+        let instructions_len_at = constants_count_at + constants_len;
+        let instructions_count_at = instructions_len_at + 4;
+        let instructions_len = u32::from_le_bytes(
+            encoded.rvlu()[instructions_len_at..instructions_len_at + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let metadata_count_at = instructions_count_at + instructions_len + 4;
+        for offset in [constants_count_at, instructions_count_at, metadata_count_at] {
+            let mut forged = encoded.rvlu().to_vec();
+            forged[offset..offset + 4].copy_from_slice(&100_000u32.to_le_bytes());
+            assert!(
+                rivetlua_core::preflight_transport_decode(&forged, encoded.sidecar(), profile, &limits)
+                    .is_err()
+            );
+            assert!(
+                decode_transport_module(
+                    &forged,
+                    encoded.sidecar(),
+                    profile,
+                    &limits,
+                    &mut work(&limits)
+                )
                 .is_err()
-        );
-        assert!(
-            decode_transport_module(
-                &forged,
-                encoded.sidecar(),
-                profile,
-                &limits,
-                &mut work(&limits)
-            )
-            .is_err()
-        );
+            );
+        }
     }
 }
 
@@ -655,86 +659,90 @@ fn metadata_lookup_work_grows_quadratically_with_bindings_even_for_two_instructi
 
 #[test]
 fn transport_admission_work_sidecar_temporary_and_retained_boundaries_retry() {
-    let profile = LuaProfile::Lua54;
-    let verified = verify_module(
-        simple_native_module(profile),
-        profile,
-        &VerifyLimits::default(),
-    )
-    .unwrap();
-    let limits = TransportLimits::default();
-    let scan = transport_encode_scan_admission(&verified, &limits).unwrap();
-    let admission = preflight_transport_encode(&verified, &limits).unwrap();
-    let total = scan.work + admission.subsequent_work;
-    assert!(total > 1);
-    let mut low = limits;
-    low.max_work = total - 1;
-    assert!(preflight_transport_encode(&verified, &low).is_err());
-    assert!(encode_transport_module(&verified, &limits, &mut OfficialWorkBudget::new(0)).is_err());
-    assert!(
-        encode_transport_module(&verified, &limits, &mut OfficialWorkBudget::new(total - 1))
-            .is_err()
-    );
-    let encoded =
-        encode_transport_module(&verified, &limits, &mut OfficialWorkBudget::new(total)).unwrap();
-    assert_eq!(&encoded.sidecar()[..4], b"RVAS");
-    assert_eq!(&encoded.sidecar()[4..6], &1u16.to_le_bytes());
-    assert_eq!(encoded.sidecar()[7], 0);
-    assert_eq!(
-        u64::from_le_bytes(encoded.sidecar()[8..16].try_into().unwrap()),
-        16
-    );
+    for profile in [
+        LuaProfile::Lua54,
+        LuaProfile::Lua55,
+    ] {
+        let verified = verify_module(
+            simple_native_module(profile),
+            profile,
+            &VerifyLimits::default(),
+        )
+        .unwrap();
+        let limits = TransportLimits::default();
+        let scan = transport_encode_scan_admission(&verified, &limits).unwrap();
+        let admission = preflight_transport_encode(&verified, &limits).unwrap();
+        let total = scan.work + admission.subsequent_work;
+        assert!(total > 1);
+        let mut low = limits;
+        low.max_work = total - 1;
+        assert!(preflight_transport_encode(&verified, &low).is_err());
+        assert!(encode_transport_module(&verified, &limits, &mut OfficialWorkBudget::new(0)).is_err());
+        assert!(
+            encode_transport_module(&verified, &limits, &mut OfficialWorkBudget::new(total - 1))
+                .is_err()
+        );
+        let encoded =
+            encode_transport_module(&verified, &limits, &mut OfficialWorkBudget::new(total)).unwrap();
+        assert_eq!(&encoded.sidecar()[..4], b"RVAS");
+        assert_eq!(&encoded.sidecar()[4..6], &1u16.to_le_bytes());
+        assert_eq!(encoded.sidecar()[7], 0);
+        assert_eq!(
+            u64::from_le_bytes(encoded.sidecar()[8..16].try_into().unwrap()),
+            16
+        );
 
-    let scan = transport_scan_admission(encoded.rvlu().len(), encoded.sidecar().len()).unwrap();
-    let admission =
-        preflight_transport_decode(encoded.rvlu(), encoded.sidecar(), profile, &limits).unwrap();
-    let total = scan.work + admission.subsequent_work;
-    let mut low = limits;
-    low.max_work = total - 1;
-    assert!(preflight_transport_decode(encoded.rvlu(), encoded.sidecar(), profile, &low).is_err());
-    let mut low = limits;
-    low.max_sidecar_bytes = encoded.sidecar().len() - 1;
-    assert!(preflight_transport_decode(encoded.rvlu(), encoded.sidecar(), profile, &low).is_err());
-    let mut low = limits;
-    low.max_temporary_bytes = admission.temporary_bytes - 1;
-    assert!(preflight_transport_decode(encoded.rvlu(), encoded.sidecar(), profile, &low).is_err());
-    let mut low = limits;
-    low.max_retained_bytes = admission.retained_bytes - 1;
-    assert!(preflight_transport_decode(encoded.rvlu(), encoded.sidecar(), profile, &low).is_err());
-    assert!(
-        decode_transport_module(
+        let scan = transport_scan_admission(encoded.rvlu().len(), encoded.sidecar().len()).unwrap();
+        let admission =
+            preflight_transport_decode(encoded.rvlu(), encoded.sidecar(), profile, &limits).unwrap();
+        let total = scan.work + admission.subsequent_work;
+        let mut low = limits;
+        low.max_work = total - 1;
+        assert!(preflight_transport_decode(encoded.rvlu(), encoded.sidecar(), profile, &low).is_err());
+        let mut low = limits;
+        low.max_sidecar_bytes = encoded.sidecar().len() - 1;
+        assert!(preflight_transport_decode(encoded.rvlu(), encoded.sidecar(), profile, &low).is_err());
+        let mut low = limits;
+        low.max_temporary_bytes = admission.temporary_bytes - 1;
+        assert!(preflight_transport_decode(encoded.rvlu(), encoded.sidecar(), profile, &low).is_err());
+        let mut low = limits;
+        low.max_retained_bytes = admission.retained_bytes - 1;
+        assert!(preflight_transport_decode(encoded.rvlu(), encoded.sidecar(), profile, &low).is_err());
+        assert!(
+            decode_transport_module(
+                encoded.rvlu(),
+                encoded.sidecar(),
+                profile,
+                &limits,
+                &mut OfficialWorkBudget::new(0)
+            )
+            .is_err()
+        );
+        assert!(
+            decode_transport_module(
+                encoded.rvlu(),
+                encoded.sidecar(),
+                profile,
+                &limits,
+                &mut OfficialWorkBudget::new(total - 1)
+            )
+            .is_err()
+        );
+        let mut exact = limits;
+        exact.max_work = total;
+        exact.max_sidecar_bytes = encoded.sidecar().len();
+        exact.max_temporary_bytes = admission.temporary_bytes;
+        exact.max_retained_bytes = admission.retained_bytes;
+        let reloaded = decode_transport_module(
             encoded.rvlu(),
             encoded.sidecar(),
             profile,
-            &limits,
-            &mut OfficialWorkBudget::new(0)
+            &exact,
+            &mut OfficialWorkBudget::new(total),
         )
-        .is_err()
-    );
-    assert!(
-        decode_transport_module(
-            encoded.rvlu(),
-            encoded.sidecar(),
-            profile,
-            &limits,
-            &mut OfficialWorkBudget::new(total - 1)
-        )
-        .is_err()
-    );
-    let mut exact = limits;
-    exact.max_work = total;
-    exact.max_sidecar_bytes = encoded.sidecar().len();
-    exact.max_temporary_bytes = admission.temporary_bytes;
-    exact.max_retained_bytes = admission.retained_bytes;
-    let reloaded = decode_transport_module(
-        encoded.rvlu(),
-        encoded.sidecar(),
-        profile,
-        &exact,
-        &mut OfficialWorkBudget::new(total),
-    )
-    .unwrap();
-    assert_eq!(reloaded.module(), verified.module());
+        .unwrap();
+        assert_eq!(reloaded.module(), verified.module());
+    }
 }
 
 #[test]

@@ -1,8 +1,8 @@
 use rivetlua_compiler::{
     CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
 };
-use rivetlua_core::{ObjectRef, Value, VerifyLimits};
-use rivetlua_runtime::{AbortReason, HostHandle, ObjectKind, RunOutcome, Vm};
+use rivetlua_core::{LuaProfile, ObjectRef, Value, VerifyLimits};
+use rivetlua_runtime::{AbortReason, HostHandle, ObjectKind, RootKind, RunOutcome, Vm};
 
 fn profile() -> (LanguageProfile, String) {
     let name = std::env::var("RIVETLUA_P11_PROFILE").unwrap_or_else(|_| "lua55-i64f64".to_owned());
@@ -12,6 +12,21 @@ fn profile() -> (LanguageProfile, String) {
         _ => panic!("P11 profile 無效"),
     };
     (profile, name)
+}
+
+fn new_vm_p11() -> Vm {
+    let runtime_profile = match profile().0 {
+        LanguageProfile::Lua54 => LuaProfile::Lua54,
+        LanguageProfile::Lua55 => LuaProfile::Lua55,
+    };
+    Vm::new_with_profile(runtime_profile).unwrap()
+}
+
+fn assert_only_main_thread_root(vm: &Vm) {
+    let main = vm.main_thread_identity().expect("coroutine 庫須保留主 thread");
+    assert_eq!(vm.object_kind(main), Ok(ObjectKind::Coroutine));
+    assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
+    assert_eq!(vm.roots().total_count(), 1);
 }
 
 fn compile(source: &[u8], profile: LanguageProfile) -> rivetlua_core::VerifiedModule {
@@ -29,7 +44,7 @@ fn compile(source: &[u8], profile: LanguageProfile) -> rivetlua_core::VerifiedMo
 #[test]
 fn review_builtin_close_event_yield_continues_once() {
     let (profile, _) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, env_root) = coroutine_environment(&mut vm);
     let closer = vm.allocate_table().unwrap();
     let metatable = vm.allocate_table().unwrap();
@@ -62,14 +77,14 @@ fn review_builtin_close_event_yield_continues_once() {
     );
     drop(execution);
     drop(env_root);
-    assert_eq!(vm.roots().total_count(), 0);
+    assert_only_main_thread_root(&vm);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
 }
 
 #[test]
 fn review_builtin_close_event_error_preserves_replacement_value() {
     let (profile, _) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, env_root) = environment(&mut vm);
     let closer = vm.allocate_table().unwrap();
     let metatable = vm.allocate_table().unwrap();
@@ -192,7 +207,7 @@ fn err_case_005_close_failure_continues_and_replaces_error() {
         b"local ok,e=pcall(function() local a <close> = one; local b <close> = two; error(9) end); return ok,e".as_slice(),
         b"local a <close> = one; local b <close> = two; return 7".as_slice(),
     ] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root, log, first, second) = close_environment(&mut vm, profile);
         let new_error = vm.allocate_table().unwrap();
         put_name(&mut vm, env, b"new_error", Value::Object(new_error));
@@ -231,7 +246,7 @@ fn err_case_003_pcall_fuel_abort_remains_host_terminal() {
         b"return pcall(function() while true do end end)".as_slice(),
         b"return xpcall(function() error({}) end,function(e) while true do end end)".as_slice(),
     ] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, env_root) = environment(&mut vm);
         let mut execution = vm
             .load_with_environment(compile(source, profile), Value::Object(env))
@@ -262,7 +277,7 @@ fn err_case_003_pcall_fuel_abort_remains_host_terminal() {
 #[test]
 fn close_case_004_reentrant_close_and_xpcall_handler_survive_gc() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, env_root, log, first, _) = close_environment(&mut vm, profile);
     vm.install_coroutine_builtins(env).unwrap();
     install_close_handler(
@@ -301,7 +316,7 @@ fn close_case_004_reentrant_close_and_xpcall_handler_survive_gc() {
     assert_eq!(vm.object_kind(original), Ok(ObjectKind::Table));
     drop(env_root);
     vm.collect().unwrap();
-    assert_eq!(vm.roots().total_count(), 0);
+    assert_only_main_thread_root(&vm);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
     println!("P11_STAGE\tclose_case_004\t{name}\tstatus=PASS;reentry=once;gc=forced");
 }
@@ -310,7 +325,7 @@ fn close_case_004_reentrant_close_and_xpcall_handler_survive_gc() {
 fn close_case_005_coroutine_hard_abort_is_not_close_or_resume_tuple() {
     let (profile, name) = profile();
     for in_close in [false, true] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, env_root, _log, first, _) = close_environment(&mut vm, profile);
         vm.install_coroutine_builtins(env).unwrap();
         if in_close {
@@ -340,10 +355,12 @@ fn close_case_005_coroutine_hard_abort_is_not_close_or_resume_tuple() {
             rivetlua_runtime::RuntimeErrorKind::TerminalExecution
         );
         drop(execution);
-        assert_eq!(vm.roots().total_count(), 1);
+        assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
+        assert_eq!(vm.roots().count(RootKind::Host), 1);
+        assert_eq!(vm.roots().total_count(), 2);
         drop(env_root);
         vm.collect().unwrap();
-        assert_eq!(vm.roots().total_count(), 0);
+        assert_only_main_thread_root(&vm);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
     }
     println!("P11_STAGE\tclose_case_005\t{name}\tstatus=PASS;abort=host;close=unpromised");
@@ -362,7 +379,7 @@ fn cor_case_005_close_suspended_error_and_invalid_state() {
             vec![Value::Boolean(false), Value::Integer(9), Value::Boolean(false), Value::Integer(9)],
         ),
     ] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root, log, first, _) = close_environment(&mut vm, profile);
         vm.install_coroutine_builtins(env).unwrap();
         vm.set_collect_every_allocation(true);
@@ -383,7 +400,7 @@ fn cor_case_005_close_suspended_error_and_invalid_state() {
         assert_eq!(vm.raw_get(log, Value::Integer(2)), Ok(Value::Nil));
     }
     {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root, log, first, second) = close_environment(&mut vm, profile);
         vm.install_coroutine_builtins(env).unwrap();
         let new_error = vm.allocate_table().unwrap();
@@ -429,7 +446,7 @@ fn cor_case_005_close_suspended_error_and_invalid_state() {
         );
     }
     {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root) = coroutine_environment(&mut vm);
         let source = b"local co; co=coroutine.create(function() return coroutine.close(co) end); local ok,e=coroutine.resume(co); local valid,value=pcall(coroutine.close,{}); return ok,valid,coroutine.status(co)";
         let outcome = vm
@@ -438,9 +455,9 @@ fn cor_case_005_close_suspended_error_and_invalid_state() {
             .run()
             .unwrap();
         let RunOutcome::Returned(values) = outcome else {
-            panic!("self-close 應失敗且主執行可續行")
+            panic!("self-close 後主執行應可續行")
         };
-        assert_eq!(values[0], Value::Boolean(false));
+        assert_eq!(values[0], Value::Boolean(profile == LanguageProfile::Lua55));
         assert_eq!(values[1], Value::Boolean(false));
         let Value::Object(status) = values[2] else {
             panic!("self-close 後協程須為 Dead")
@@ -452,7 +469,7 @@ fn cor_case_005_close_suspended_error_and_invalid_state() {
         );
     }
     {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root, log, first, _) = close_environment(&mut vm, profile);
         vm.install_error_builtins(env).unwrap();
         vm.install_coroutine_builtins(env).unwrap();
@@ -482,7 +499,7 @@ fn cor_case_005_close_suspended_error_and_invalid_state() {
 fn cor_case_006_wrap_unwraps_results_and_closes_on_error() {
     let (profile, name) = profile();
     {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root) = coroutine_environment(&mut vm);
         let source = b"local f=coroutine.wrap(function(x) return x,nil,9 end); return f(7)";
         let outcome = vm
@@ -496,7 +513,7 @@ fn cor_case_006_wrap_unwraps_results_and_closes_on_error() {
         );
     }
     {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root, log, first, _) = close_environment(&mut vm, profile);
         vm.install_coroutine_builtins(env).unwrap();
         vm.set_collect_every_allocation(true);
@@ -518,7 +535,7 @@ fn cor_case_006_wrap_unwraps_results_and_closes_on_error() {
         assert_eq!(vm.raw_get(log, Value::Integer(2)), Ok(Value::Nil));
     }
     {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root, log, first, _) = close_environment(&mut vm, profile);
         vm.install_coroutine_builtins(env).unwrap();
         let original = vm.allocate_table().unwrap();
@@ -537,7 +554,7 @@ fn cor_case_006_wrap_unwraps_results_and_closes_on_error() {
         assert_eq!(vm.raw_get(log, Value::Integer(1)), Ok(Value::Object(first)));
     }
     {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root, log, first, second) = close_environment(&mut vm, profile);
         vm.install_coroutine_builtins(env).unwrap();
         let original = vm.allocate_table().unwrap();
@@ -574,7 +591,7 @@ fn cor_case_006_wrap_unwraps_results_and_closes_on_error() {
 #[test]
 fn cor_case_005_new_builtin_can_be_coroutine_body() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _root, log, first, _) = close_environment(&mut vm, profile);
     vm.install_coroutine_builtins(env).unwrap();
     vm.set_collect_every_allocation(true);
@@ -603,7 +620,7 @@ fn cor_case_005_new_builtin_can_be_coroutine_body() {
 #[test]
 fn cor_case_006_new_wrapper_can_be_coroutine_body() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _root) = coroutine_environment(&mut vm);
     let source = b"local maker=coroutine.create(coroutine.wrap); local ok,f=coroutine.resume(maker,function(x) return x,9 end); local body=coroutine.create(f); local resumed,a,b=coroutine.resume(body,7); return ok,resumed,a,b";
     let outcome = vm
@@ -620,7 +637,7 @@ fn cor_case_006_new_wrapper_can_be_coroutine_body() {
             Value::Integer(9),
         ])
     );
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _root) = coroutine_environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let source = b"local f=coroutine.wrap(function() return {} end); local body=coroutine.create(f); return coroutine.resume(body)";
@@ -643,7 +660,7 @@ fn cor_case_006_new_wrapper_can_be_coroutine_body() {
 #[test]
 fn close_case_001_lifo_return_and_nil_false_skip() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _root, log, first, second) = close_environment(&mut vm, profile);
     vm.set_collect_every_allocation(true);
     let result = vm.load_with_environment(
@@ -672,7 +689,7 @@ fn close_case_002_block_goto_break_and_generic_fourth() {
         b"local function iter() return 1 end; for k in iter,nil,nil,one do break end; return 7"
             .as_slice(),
     ] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root, log, first, _) = close_environment(&mut vm, profile);
         vm.set_collect_every_allocation(true);
         let outcome = vm
@@ -702,7 +719,7 @@ fn close_case_002_block_goto_break_and_generic_fourth() {
 #[test]
 fn err_case_004_protected_close_receives_original_error() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _root, log, first, second) = close_environment(&mut vm, profile);
     vm.set_collect_every_allocation(true);
     let source = b"local ok,e=pcall(function() local a <close> = one; local function inner() local b <close> = two; error(9) end; inner() end); return ok,e";
@@ -728,7 +745,7 @@ fn err_case_004_protected_close_receives_original_error() {
 #[test]
 fn close_case_003_coroutine_body_error_keeps_close_entry() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _root, log, _, _) = close_environment(&mut vm, profile);
     vm.install_coroutine_builtins(env).unwrap();
     let source = b"local co=coroutine.create(function() local x <close> = one; error(9) end); local ok,e=coroutine.resume(co); return ok,e";
@@ -760,7 +777,7 @@ fn close_case_001_generic_for_normal_and_break_close_once() {
             1,
         ),
     ] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root, log, first, _) = close_environment(&mut vm, profile);
         vm.set_collect_every_allocation(true);
         let outcome = vm
@@ -781,7 +798,7 @@ fn close_case_001_generic_for_normal_and_break_close_once() {
 #[test]
 fn close_case_002_generic_for_protected_error_passes_original_value() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _root, log, first, _) = close_environment(&mut vm, profile);
     vm.set_collect_every_allocation(true);
     let source = b"local original={}; local n=0; local function iter() n=n+1; if n==1 then return 1 end end; local ok,e=pcall(function() for k in iter,nil,nil,one do error(original) end end); return ok,e,original";
@@ -815,7 +832,7 @@ fn close_case_003_return_and_goto_close_before_transfer() {
         b"local function f() do local x <close> = one; return 9 end end; local result=f(); return result,#log,log[1]".as_slice(),
         b"do local x <close> = one; goto finished end; ::finished:: return #log,log[1]".as_slice(),
     ] {
-        let mut vm = Vm::new().unwrap();
+        let mut vm = new_vm_p11();
         let (env, _root, log, first, _) = close_environment(&mut vm, profile);
         vm.set_collect_every_allocation(true);
         let outcome = vm
@@ -843,7 +860,7 @@ fn close_case_003_return_and_goto_close_before_transfer() {
 #[test]
 fn close_case_001_invalid_value_fails_at_declaration() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = environment(&mut vm);
     let outcome = vm
         .load_with_environment(
@@ -862,7 +879,7 @@ fn close_case_001_invalid_value_fails_at_declaration() {
 #[test]
 fn err_case_001_escaped_environment_survives_gc() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (original_env, original_root) = environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let source = b"local function make() return function() return pcall end end; return make()";
@@ -915,7 +932,7 @@ fn err_case_001_escaped_environment_survives_gc() {
 #[test]
 fn err_case_001_original_table_and_nested_boundary() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, env_root) = environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let source = b"local t={}; local outer,a,b=pcall(function() return pcall(function() error(t) end) end); return outer,a,b,t";
@@ -985,7 +1002,7 @@ fn err_case_001_original_table_and_nested_boundary() {
 #[test]
 fn err_case_001_unprotected_runtime_error_has_message_value() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, env_root) = environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let outcome = vm
@@ -1030,7 +1047,7 @@ fn err_case_001_unprotected_runtime_error_has_message_value() {
 #[test]
 fn err_case_002_xpcall_handler_reentry_and_abort() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, env_root) = environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let source = b"local t={}; local n=0; local ok,v=xpcall(function() error(t) end,function(e) n=n+1; if n<3 then error(n) end; return {original=e,count=n} end); return ok,v,n";
@@ -1110,7 +1127,7 @@ fn err_case_002_xpcall_handler_reentry_and_abort() {
 #[test]
 fn err_case_002_builtin_target_preserves_nested_results() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, env_root) = environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let source = b"return pcall(pcall, function() return 7,8 end)";
@@ -1189,7 +1206,7 @@ fn err_case_002_builtin_target_preserves_nested_results() {
 #[test]
 fn cor_case_001_yield_resumes_without_replaying_side_effect() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"n=0; local co=coroutine.create(function(x) n=n+1; local y=coroutine.yield(x+1); return y+n end); local a,b=coroutine.resume(co,9); local c,d=coroutine.resume(co,20); return a,b,c,d,n,coroutine.status(co)";
     let result = vm
@@ -1223,7 +1240,7 @@ fn cor_case_001_yield_resumes_without_replaying_side_effect() {
 #[test]
 fn cor_case_002_nested_resume_reports_normal_parent() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let source = b"local a; a=coroutine.create(function() local b=coroutine.create(function() return coroutine.status(a) end); local ok,s=coroutine.resume(b); return ok,s,coroutine.status(b) end); local ok,x,y,z=coroutine.resume(a); return ok,x,y,z,coroutine.status(a)";
@@ -1253,7 +1270,7 @@ fn cor_case_002_nested_resume_reports_normal_parent() {
 #[test]
 fn cor_case_002_nested_yield_restores_running_parent() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let source = b"local a,b; a=coroutine.create(function() b=coroutine.create(function() coroutine.yield(coroutine.status(a)); return coroutine.status(a) end); local ok,x=coroutine.resume(b); local suspended=coroutine.status(b); local ok2,y=coroutine.resume(b); return ok,x,suspended,ok2,y,coroutine.status(a) end); local ok,p,q,r,s,t,u=coroutine.resume(a); return ok,p,q,r,s,t,u,coroutine.status(a)";
@@ -1290,7 +1307,7 @@ fn cor_case_002_nested_yield_restores_running_parent() {
 #[test]
 fn cor_case_003_dead_resume_is_lua_failure_without_replay() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"n=0; local co=coroutine.create(function() n=n+1; return 4 end); local a,b=coroutine.resume(co); local c,d=coroutine.resume(co); return a,b,c,d,n,coroutine.status(co)";
     let outcome = vm
@@ -1330,7 +1347,7 @@ fn cor_case_003_dead_resume_is_lua_failure_without_replay() {
 #[test]
 fn cor_case_004_main_yield_is_catchable_lua_error() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"return pcall(coroutine.yield,7)";
     let outcome = vm
@@ -1356,7 +1373,7 @@ fn cor_case_004_main_yield_is_catchable_lua_error() {
 #[test]
 fn cor_case_001_escaped_open_upvalue_and_distinct_slots() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local f,g; local a=coroutine.create(function() local x=7; f=function() return x end; coroutine.yield(); x=9; return x end); local b=coroutine.create(function() local x=40; g=function() return x end; coroutine.yield(); x=41; return x end); coroutine.resume(a); coroutine.resume(b); local p,q=f(),g(); coroutine.resume(a); coroutine.resume(b); return p,q,f(),g()";
     let outcome = vm
@@ -1379,7 +1396,7 @@ fn cor_case_001_escaped_open_upvalue_and_distinct_slots() {
 #[test]
 fn cor_case_001_escaped_closure_keeps_suspended_thread_reachable() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, env_root) = coroutine_environment(&mut vm);
     let source = b"local co=coroutine.create(function() local x={v=8}; getter=function() return x end; coroutine.yield() end); coroutine.resume(co); local t=getter(); co=nil; return t";
     let outcome = vm
@@ -1409,14 +1426,14 @@ fn cor_case_001_escaped_closure_keeps_suspended_thread_reachable() {
         vm.object_kind(table),
         Err(rivetlua_runtime::VmError::StaleObject)
     );
-    assert_eq!(vm.roots().total_count(), 0);
+    assert_only_main_thread_root(&vm);
     println!("P11_STAGE\tcor_case_001_owner_gc\t{name}\tstatus=PASS;closure_thread_edge=traced");
 }
 
 #[test]
 fn cor_case_001_pending_metamethod_survives_yield_and_gc() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let table = vm.allocate_table().unwrap();
     let _table_root = HostHandle::<Value>::new(&mut vm, table).unwrap();
@@ -1480,7 +1497,7 @@ fn cor_case_001_pending_metamethod_survives_yield_and_gc() {
 #[test]
 fn cor_case_003_body_error_keeps_original_value_and_dead_thread() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let source = b"local t={v=3}; local co=coroutine.create(function() local retained=t; error(t) end); local ok,e=coroutine.resume(co); return ok,e==t,coroutine.status(co),co";
@@ -1520,7 +1537,7 @@ fn cor_case_003_body_error_keeps_original_value_and_dead_thread() {
 #[test]
 fn cor_case_001_yield_result_modes_and_tail_call() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local a=coroutine.create(function(...) local x,y=coroutine.yield(...); return x,y end); local p,q,r=coroutine.resume(a,1,2); local s,t,u=coroutine.resume(a,3,4); local b=coroutine.create(function() return coroutine.yield(8) end); local v,w=coroutine.resume(b); local z,j,k=coroutine.resume(b,5,6); return p,q,r,s,t,u,v,w,z,j,k";
     let outcome = vm
@@ -1550,7 +1567,7 @@ fn cor_case_001_yield_result_modes_and_tail_call() {
 #[test]
 fn cor_case_001_yield_inside_protected_call_resumes_boundary() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local co=coroutine.create(function() local ok,x=pcall(function() return coroutine.yield(7) end); return ok,x end); local a,b=coroutine.resume(co); local c,d,e=coroutine.resume(co,20); return a,b,c,d,e";
     let outcome = vm
@@ -1574,7 +1591,7 @@ fn cor_case_001_yield_inside_protected_call_resumes_boundary() {
 #[test]
 fn cor_case_001_builtin_yield_target_preserves_protected_boundary() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local co=coroutine.create(function() return pcall(coroutine.yield,7) end); local a,b=coroutine.resume(co); local c,d,e=coroutine.resume(co,20); local f,g=pcall(coroutine.status,co); return a,b,c,d,e,f,g";
     let outcome = vm
@@ -1609,7 +1626,7 @@ fn cor_case_001_builtin_yield_target_preserves_protected_boundary() {
 #[test]
 fn cor_case_001_builtin_create_and_resume_as_protected_targets() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local a,co=pcall(coroutine.create,function() return 9 end); local b,c,d=pcall(coroutine.resume,co); return a,b,c,d,coroutine.status(co)";
     let outcome = vm
@@ -1642,7 +1659,7 @@ fn cor_case_001_builtin_create_and_resume_as_protected_targets() {
 #[test]
 fn cor_case_003_coroutine_key_and_invalid_raw_length() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source =
         b"local co=coroutine.create(function() end); local t={}; t[co]=9; c=co; return t[co]";
@@ -1669,7 +1686,7 @@ fn cor_case_003_coroutine_key_and_invalid_raw_length() {
 #[test]
 fn cor_case_004_hard_abort_is_terminal_and_not_a_resume_tuple() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, env_root) = coroutine_environment(&mut vm);
     let source =
         b"local co=coroutine.create(function() while true do end end); return coroutine.resume(co)";
@@ -1688,7 +1705,7 @@ fn cor_case_004_hard_abort_is_terminal_and_not_a_resume_tuple() {
     drop(execution);
     drop(env_root);
     vm.collect().unwrap();
-    assert_eq!(vm.roots().total_count(), 0);
+    assert_only_main_thread_root(&vm);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
     println!("P11_STAGE\tcor_case_004_abort\t{name}\tstatus=PASS;abort=terminal;resume_tuple=none");
 }
@@ -1696,7 +1713,7 @@ fn cor_case_004_hard_abort_is_terminal_and_not_a_resume_tuple() {
 #[test]
 fn cor_case_001_native_builtin_body_yield_and_error() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local s=coroutine.create(coroutine.status); local a,b=coroutine.resume(s,s); local y=coroutine.create(coroutine.yield); local c,d,e=coroutine.resume(y,7,8); local f,g,h=coroutine.resume(y,9,10); local t={}; local z=coroutine.create(error); local i,j=coroutine.resume(z,t); return a,b,coroutine.status(s),c,d,e,f,g,h,coroutine.status(y),i,j==t,coroutine.status(z)";
     let outcome = vm
@@ -1742,7 +1759,7 @@ fn cor_case_001_native_builtin_body_yield_and_error() {
 #[test]
 fn cor_case_001_native_protected_and_nested_resume() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local p=coroutine.create(pcall); local a,b,c,d=coroutine.resume(p,function() return 2,3 end); local q=coroutine.create(pcall); local e,f,g=coroutine.resume(q,function() error(9) end); local x=coroutine.create(xpcall); local h,i,j=coroutine.resume(x,function() error(5) end,function(v) return v+1 end); local inner=coroutine.create(function() return 4 end); local outer=coroutine.create(coroutine.resume); local k,l,m=coroutine.resume(outer,inner); return a,b,c,d,e,f,g,h,i,j,k,l,m";
     let outcome = vm
@@ -1774,7 +1791,7 @@ fn cor_case_001_native_protected_and_nested_resume() {
 #[test]
 fn cor_case_001_native_resume_yield_propagates_two_statuses() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local inner=coroutine.create(function(x) local z=coroutine.yield(x); return z+1 end); local outer=coroutine.create(coroutine.resume); local a,b,c=coroutine.resume(outer,inner,11); local d,e=coroutine.resume(inner,12); return a,b,c,d,e";
     let mut execution = vm
@@ -1799,7 +1816,7 @@ fn cor_case_001_native_resume_yield_propagates_two_statuses() {
 #[test]
 fn cor_case_001_native_nested_builtin_and_handler_limit() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local p=coroutine.create(pcall); local a,b,c,d=coroutine.resume(p,pcall,function() return 2 end); local x=coroutine.create(xpcall); local e,f=coroutine.resume(x,function() error(1) end,error); return a,b,c,d,e,f";
     let outcome = vm
@@ -1835,7 +1852,7 @@ fn cor_case_001_native_nested_builtin_and_handler_limit() {
 #[test]
 fn cor_case_003_native_resume_dead_inner_and_gc_roots() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let source = b"local t={}; local p=coroutine.create(pcall); local a,b,c=coroutine.resume(p,function() return t end); local inner=coroutine.create(function() return 1 end); coroutine.resume(inner); local outer=coroutine.create(coroutine.resume); local d,e,f=coroutine.resume(outer,inner); return a,b,c==t,d,e,coroutine.status(outer)";
@@ -1870,7 +1887,7 @@ fn cor_case_003_native_resume_dead_inner_and_gc_roots() {
 #[test]
 fn cor_case_003_native_resume_missing_target_stays_lua_tuple() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local co=coroutine.create(coroutine.resume); local a,b=coroutine.resume(co); return a,b,coroutine.status(co)";
     let outcome = vm
@@ -1899,7 +1916,7 @@ fn cor_case_003_native_resume_missing_target_stays_lua_tuple() {
 #[test]
 fn cor_case_001_native_protected_builtin_error_and_handler() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local t={}; local p=coroutine.create(pcall); local a,b,c=coroutine.resume(p,error,9); local x=coroutine.create(xpcall); local d,e,f=coroutine.resume(x,nil,function(v) return t end); return a,b,c,d,e,f==t";
     let outcome = vm
@@ -1926,7 +1943,7 @@ fn cor_case_001_native_protected_builtin_error_and_handler() {
 #[test]
 fn cor_case_001_native_protected_builtin_success_and_resume() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local p=coroutine.create(pcall); local a,b,c=coroutine.resume(p,coroutine.status,p); local inner=coroutine.create(function() return 7,8 end); local q=coroutine.create(pcall); local d,e,f,g,h=coroutine.resume(q,coroutine.resume,inner); return a,b,c,d,e,f,g,h";
     let outcome = vm
@@ -1964,7 +1981,7 @@ fn cor_case_001_native_protected_builtin_success_and_resume() {
 #[test]
 fn cor_case_001_native_protected_builtin_yield_continues() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local p=coroutine.create(pcall); local a,b=coroutine.resume(p,coroutine.yield,7); local c,d,e=coroutine.resume(p,8); local x=coroutine.create(xpcall); local f,g=coroutine.resume(x,coroutine.yield,function(v) return v end,9); local h,i,j=coroutine.resume(x,10); return a,b,c,d,e,f,g,h,i,j";
     let outcome = vm
@@ -1995,7 +2012,7 @@ fn cor_case_001_native_protected_builtin_yield_continues() {
 #[test]
 fn cor_case_001_native_protected_nested_builtin_targets() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local p=coroutine.create(pcall); local a,b,c,d=coroutine.resume(p,xpcall,function() return 3 end,function(v) return v end); local x=coroutine.create(xpcall); local e,f,g,h=coroutine.resume(x,pcall,function(v) return v end,function() error(4) end); local z=coroutine.create(pcall); local i,j,k,l,m=coroutine.resume(z,xpcall,pcall,function(v) return v end,function() return 6 end); return a,b,c,d,e,f,g,h,i,j,k,l,m";
     let outcome = vm
@@ -2029,7 +2046,7 @@ fn cor_case_001_native_protected_nested_builtin_targets() {
 #[test]
 fn cor_case_001_native_nested_builtin_yield_keeps_outer_suspended() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     vm.set_collect_every_allocation(true);
     let source = b"local p=coroutine.create(pcall); local a,b=coroutine.resume(p,xpcall,function() local x=coroutine.yield(7); return x+1 end,function(v) return v end); local s=coroutine.status(p); local c,d,e,f=coroutine.resume(p,9); local z=coroutine.create(pcall); local h,i=coroutine.resume(z,xpcall,pcall,function(v) return v end,function() local y=coroutine.yield(12); return y+1 end); local s2=coroutine.status(z); local j,k,l,m,n=coroutine.resume(z,13); local t={}; local q=coroutine.create(pcall); local u,v,w,x,y=coroutine.resume(q,xpcall,pcall,function(v) return v end,function() return t end); return a,b,s,c,d,e,f,h,i,s2,j,k,l,m,n,u,v,w,x,y==t";
@@ -2088,7 +2105,9 @@ fn cor_case_001_native_nested_builtin_yield_keeps_outer_suspended() {
         ]
     );
     vm.collect().unwrap();
-    assert_eq!(vm.roots().total_count(), 1);
+    assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
+    assert_eq!(vm.roots().count(RootKind::Host), 1);
+    assert_eq!(vm.roots().total_count(), 2);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
     println!(
         "P11_STAGE\tcor_case_001_native_nested_yield\t{name}\tstatus=PASS;outer=suspended;continuation=once"
@@ -2098,7 +2117,7 @@ fn cor_case_001_native_nested_builtin_yield_keeps_outer_suspended() {
 #[test]
 fn cor_case_001_native_pcall_yield_keeps_protected_continuation() {
     let (profile, name) = profile();
-    let mut vm = Vm::new().unwrap();
+    let mut vm = new_vm_p11();
     let (env, _env_root) = coroutine_environment(&mut vm);
     let source = b"local n=0; local p=coroutine.create(pcall); local a,b=coroutine.resume(p,function() n=n+1; local v=coroutine.yield(7); return n,v end); local c,d,e,f=coroutine.resume(p,8); return a,b,c,d,e,f,n";
     let outcome = vm

@@ -22,6 +22,7 @@ pub(crate) enum LoadBuiltin {
         package: ObjectRef,
     },
     PreloadSearcher,
+    SearchPath,
     LuaSearcher {
         package: ObjectRef,
         environment: ObjectRef,
@@ -42,7 +43,7 @@ impl LoadBuiltin {
             Self::Require { package }
             | Self::LuaSearcher { package, .. }
             | Self::NativeSearcher { package, .. } => Some(package),
-            Self::PreloadSearcher => None,
+            Self::PreloadSearcher | Self::SearchPath => None,
         }
     }
 

@@ -1210,6 +1210,12 @@ pub enum ExternalCommand {
         args: Vec<Value>,
         results: ResultMode,
     },
+    NestedCapiCall {
+        target: Value,
+        args: Vec<Value>,
+        results: ResultMode,
+        yieldable: bool,
+    },
     NestedOperation {
         operation: ValueOperation,
         args: Vec<Value>,
@@ -1383,6 +1389,7 @@ enum MinMaxProgress {
 struct ResumeCaller {
     context: ThreadContext,
     owner: Option<ObjectRef>,
+    owner_yieldable: bool,
     owner_root: Option<RootId>,
     child: ObjectRef,
     child_root: Option<RootId>,
@@ -1402,6 +1409,7 @@ struct NativeBodyContinuation {
     outer: ObjectRef,
     parent: Option<ObjectRef>,
     parent_root: Option<RootId>,
+    parent_yieldable: bool,
     wrapped: bool,
     destination: Register,
     result_mode: ResultMode,
@@ -1438,6 +1446,7 @@ struct ExternalNested {
     previous_nested_origin: Option<ExternalToken>,
     caller_depth: usize,
     results: ResultMode,
+    yieldable: bool,
 }
 
 impl ExternalPending {
@@ -1510,6 +1519,7 @@ pub(crate) enum NativeCompletion {
         outer: ObjectRef,
         parent: Option<ObjectRef>,
         parent_root: Option<RootId>,
+        parent_yieldable: bool,
         protected: Option<NativeProtected>,
     },
 }
@@ -1569,6 +1579,7 @@ pub struct Execution<'vm> {
     yield_site: Option<YieldSite>,
     active_coroutine: Option<ObjectRef>,
     active_coroutine_root: Option<RootId>,
+    capi_resume_parent_yieldability: Option<(ObjectRef, bool)>,
     resume_stack: Vec<ResumeCaller>,
     resume_charge: usize,
     resume_charges: AllocationCharges,
@@ -1638,6 +1649,7 @@ pub(crate) struct ExecutionCore {
     yield_site: Option<YieldSite>,
     active_coroutine: Option<ObjectRef>,
     active_coroutine_root: Option<RootId>,
+    capi_resume_parent_yieldability: Option<(ObjectRef, bool)>,
     resume_stack: Vec<ResumeCaller>,
     resume_charge: usize,
     resume_charges: AllocationCharges,
@@ -1924,6 +1936,9 @@ impl ExecutionCore {
         }
         if let Some(object) = self.active_coroutine {
             visit(object)?;
+        }
+        if let Some((parent, _)) = self.capi_resume_parent_yieldability {
+            visit(parent)?;
         }
         if let Some((object, _)) = self.debug_hook_c_call_pending {
             visit(object)?;
@@ -2477,6 +2492,7 @@ impl Vm {
             let values = match &command {
                 ExternalCommand::Return(values)
                 | ExternalCommand::NestedCall { args: values, .. }
+                | ExternalCommand::NestedCapiCall { args: values, .. }
                 | ExternalCommand::NestedOperation { args: values, .. } => values.as_slice(),
                 ExternalCommand::Error(value) => core::slice::from_ref(value),
             };
@@ -2525,6 +2541,10 @@ impl Vm {
                 return Ok((RunOutcome::Aborted(reason), 0));
             }
         }
+        let nested_call_yieldable = match &command {
+            ExternalCommand::NestedCapiCall { yieldable, .. } => *yieldable,
+            _ => true,
+        };
         match command {
             ExternalCommand::Return(values) => {
                 let core = self.take_top_external_core(token)?;
@@ -2632,13 +2652,26 @@ impl Vm {
                 target,
                 args,
                 results,
+            }
+            | ExternalCommand::NestedCapiCall {
+                target,
+                args,
+                results,
+                ..
             } => {
                 let core = self.borrow_top_external_core(token)?;
                 let mut execution = Execution::from_core(self, core);
                 execution.native_internal_output = native_internal;
                 #[cfg_attr(feature = "std", allow(unused_mut))]
                 let mut action = || {
-                    execution.start_external_nested(token, target, &args, results, None)
+                    execution.start_external_nested(
+                        token,
+                        target,
+                        &args,
+                        results,
+                        None,
+                        nested_call_yieldable,
+                    )
                 };
                 #[cfg(feature = "std")]
                 let start = catch_unwind(AssertUnwindSafe(action));
@@ -2679,6 +2712,7 @@ impl Vm {
                         &args,
                         operation.result_mode(),
                         Some(operation),
+                        false,
                     )
                 };
                 #[cfg(feature = "std")]
@@ -3162,6 +3196,14 @@ impl Vm {
         });
         let assigned = self.with_coroutine_mut(child, &[], |co| {
             co.external_suspended = suspended.take();
+            if let Some(core) = co
+                .external_suspended
+                .as_mut()
+                .and_then(|held| held.markers.last_mut())
+                .and_then(|marker| marker.core.as_mut())
+            {
+                core.capi_resume_parent_yieldability = None;
+            }
             co.state = CoroutineState::Suspended;
         });
         if let Err(error) = assigned {
@@ -3188,8 +3230,22 @@ impl Vm {
         &mut self,
         child: ObjectRef,
     ) -> Result<ExternalResumeA5, RuntimeError> {
+        self.resume_external_with_capi_parent_a5(child, None)
+    }
+
+    /// C API 續接時用當次 `from` 邊界取代暫停前的父查詢上下文。
+    pub fn resume_external_with_capi_parent_a5(
+        &mut self,
+        child: ObjectRef,
+        capi_resume_parent_yieldability: Option<(ObjectRef, bool)>,
+    ) -> Result<ExternalResumeA5, RuntimeError> {
         if self.execution_running() || self.finalizer_running() {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        if let Some((parent, _)) = capi_resume_parent_yieldability {
+            if self.object_kind(parent)? != ObjectKind::Coroutine {
+                return Err(VmError::WrongObjectType.into());
+            }
         }
         let (count, parent) = self
             .with_coroutine(child, |co| {
@@ -3296,6 +3352,12 @@ impl Vm {
             self.with_coroutine_mut(parent, &[], |co| co.state = CoroutineState::Normal)?;
         }
         self.remove_root(child_root)?;
+        let core = self
+            .parked_executions
+            .last_mut()
+            .and_then(|marker| marker.core.as_mut())
+            .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        core.capi_resume_parent_yieldability = capi_resume_parent_yieldability;
         Ok(ExternalResumeA5 {
             mappings,
             _charge: mapping_charge,
@@ -3568,6 +3630,7 @@ impl<'vm> Execution<'vm> {
         args: &[Value],
         results: ResultMode,
         operation: Option<ValueOperation>,
+        yieldable: bool,
     ) -> Result<(), RuntimeError> {
         if self.state != ExecutionState::Parked || self.external_pending.is_none() {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
@@ -3632,6 +3695,11 @@ impl<'vm> Execution<'vm> {
             .external_pending
             .take()
             .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
+        let yieldable = yieldable
+            && self
+                .external_nested
+                .last()
+                .is_none_or(|nested| nested.yieldable);
         self.external_nested.push(ExternalNested {
             token,
             outer_pending,
@@ -3640,6 +3708,7 @@ impl<'vm> Execution<'vm> {
             previous_nested_origin: self.nested_origin,
             caller_depth: self.callers.len(),
             results,
+            yieldable,
         });
         let outer = core::mem::replace(&mut self.frame, frame);
         self.callers.push(outer);
@@ -3918,6 +3987,7 @@ impl<'vm> Execution<'vm> {
             yield_site: core.yield_site,
             active_coroutine: core.active_coroutine,
             active_coroutine_root: core.active_coroutine_root,
+            capi_resume_parent_yieldability: core.capi_resume_parent_yieldability,
             resume_stack: core.resume_stack,
             resume_charge: core.resume_charge,
             resume_charges: core.resume_charges,
@@ -3988,6 +4058,7 @@ impl<'vm> Execution<'vm> {
             yield_site: self.yield_site.take(),
             active_coroutine: self.active_coroutine.take(),
             active_coroutine_root: self.active_coroutine_root.take(),
+            capi_resume_parent_yieldability: self.capi_resume_parent_yieldability.take(),
             resume_stack: core::mem::take(&mut self.resume_stack),
             resume_charge: core::mem::replace(&mut self.resume_charge, 0),
             resume_charges: core::mem::replace(&mut self.resume_charges, AllocationCharges::new()),
@@ -4266,17 +4337,30 @@ impl Vm {
         let Value::Object(object) = coroutine else {
             return Err(VmError::WrongObjectType.into());
         };
-        if matches!(
-            self.coroutine_state(object)?,
-            CoroutineState::Running | CoroutineState::Normal
-        ) {
+        let main_reset = self.main_thread_identity() == Some(object);
+        let state = self.coroutine_state(object)?;
+        let main_idle = main_reset
+            && state == CoroutineState::Running
+            && !self.execution_running()
+            && !self.finalizer_running()
+            && self.parked_executions.is_empty()
+            && self.with_coroutine(object, |co| {
+                co.context.is_none() && co.unwind_context.is_none()
+            })?;
+        if (main_reset && !main_idle)
+            || (!main_reset && matches!(state, CoroutineState::Running | CoroutineState::Normal))
+        {
             return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
         }
         let held = crate::HostHandle::<Value>::new(self, object)?;
         let mut execution = Execution::for_native_finalizer(self)?;
         let target = execution
             .vm
-            .allocate_callback_action_builtin(Builtin::CoroutineClose)?;
+            .allocate_callback_action_builtin(if main_reset {
+                Builtin::HostThreadReset
+            } else {
+                Builtin::CoroutineClose
+            })?;
         let target_handle = match crate::HostHandle::<Value>::new(execution.vm, target) {
             Ok(handle) => handle,
             Err(error) => {
@@ -4313,8 +4397,13 @@ impl Vm {
         if !ready {
             return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
         }
+        let main_reset = self.main_thread_identity() == Some(object);
         self.with_coroutine_mut(object, &[], |co| {
-            co.state = CoroutineState::Suspended;
+            co.state = if main_reset {
+                CoroutineState::Running
+            } else {
+                CoroutineState::Suspended
+            };
             co.entry = Value::Nil;
             co.replace_context(None);
             co.unwind_context = None;
@@ -5221,6 +5310,7 @@ impl Vm {
             yield_site: None,
             active_coroutine: None,
             active_coroutine_root: None,
+            capi_resume_parent_yieldability: None,
             resume_stack: Vec::new(),
             resume_charge: 0,
             resume_charges: AllocationCharges::new(),
@@ -5517,6 +5607,7 @@ impl Execution<'_> {
             yield_site: None,
             active_coroutine: None,
             active_coroutine_root: None,
+            capi_resume_parent_yieldability: None,
             resume_stack: Vec::new(),
             resume_charge: 0,
             resume_charges: AllocationCharges::new(),
@@ -5843,6 +5934,7 @@ impl Execution<'_> {
             yield_site: None,
             active_coroutine: None,
             active_coroutine_root: None,
+            capi_resume_parent_yieldability: None,
             resume_stack: Vec::new(),
             resume_charge: 0,
             resume_charges: AllocationCharges::new(),
@@ -5941,6 +6033,9 @@ impl Execution<'_> {
         }
         if let Some(object) = self.active_coroutine {
             visit(ActiveRootKind::ActiveCoroutine, object);
+        }
+        if let Some((parent, _)) = self.capi_resume_parent_yieldability {
+            visit(ActiveRootKind::ResumeContext, parent);
         }
         for caller in &self.resume_stack {
             caller.context.trace_children(|object| {
@@ -7080,11 +7175,11 @@ impl Execution<'_> {
                 final_args.extend_from_slice(args);
                 return Ok(Some((current, final_args, ticket, count)));
             }
-            let Value::Object(object) = current else {
-                return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
-            };
-            match self.vm.object_kind(object)? {
-                ObjectKind::Closure | ObjectKind::Builtin | ObjectKind::CClosure => {
+            if let Value::Object(object) = current {
+                if matches!(
+                    self.vm.object_kind(object)?,
+                    ObjectKind::Closure | ObjectKind::Builtin | ObjectKind::CClosure
+                ) {
                     let total = count
                         .checked_add(args.len())
                         .ok_or(VmError::ArithmeticOverflow)?;
@@ -7099,37 +7194,32 @@ impl Execution<'_> {
                     final_args.extend_from_slice(args);
                     return Ok(Some((current, final_args, ticket, count)));
                 }
-                ObjectKind::Table | ObjectKind::Userdata => {
-                    if count == MAX_TAG_LOOP
-                        || (self.vm.language_profile() == LuaProfile::Lua55 && count == 15)
-                    {
-                        let mut error = RuntimeError::new(RuntimeErrorKind::MetatableChainLimit);
-                        error.value = Value::Object(
-                            self.vm.allocate_byte_string(b"call chain too long")?,
-                        );
-                        return Err(error);
-                    }
-                    let event = self.vm.lookup_metamethod(object, MetamethodEvent::Call)?;
-                    if event == Value::Nil {
-                        return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
-                    }
-                    if self.vm.finalizer_running() {
-                        if self.finalizer_steps >= 1_000_000 {
-                            return Err(RuntimeError::new(RuntimeErrorKind::MetatableChainLimit));
-                        }
-                        self.finalizer_steps += 1;
-                    } else {
-                        if self.fuel == 0 {
-                            return Ok(None);
-                        }
-                        self.fuel -= 1;
-                    }
-                    chain[count] = current;
-                    count += 1;
-                    current = event;
-                }
-                _ => return Err(RuntimeError::new(RuntimeErrorKind::NotCallable)),
             }
+            if count == MAX_TAG_LOOP
+                || (self.vm.language_profile() == LuaProfile::Lua55 && count == 15)
+            {
+                let mut error = RuntimeError::new(RuntimeErrorKind::MetatableChainLimit);
+                error.value = Value::Object(self.vm.allocate_byte_string(b"call chain too long")?);
+                return Err(error);
+            }
+            let event = self.vm.lookup_metamethod_value(current, MetamethodEvent::Call)?;
+            if event == Value::Nil {
+                return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
+            }
+            if self.vm.finalizer_running() {
+                if self.finalizer_steps >= 1_000_000 {
+                    return Err(RuntimeError::new(RuntimeErrorKind::MetatableChainLimit));
+                }
+                self.finalizer_steps += 1;
+            } else {
+                if self.fuel == 0 {
+                    return Ok(None);
+                }
+                self.fuel -= 1;
+            }
+            chain[count] = current;
+            count += 1;
+            current = event;
         }
     }
 
@@ -7138,16 +7228,7 @@ impl Execution<'_> {
         value: Value,
         event: MetamethodEvent,
     ) -> Result<Value, RuntimeError> {
-        let Value::Object(object) = value else {
-            return Ok(Value::Nil);
-        };
-        if !matches!(
-            self.vm.object_kind(object)?,
-            ObjectKind::Table | ObjectKind::File | ObjectKind::Userdata
-        ) {
-            return Ok(Value::Nil);
-        }
-        Ok(self.vm.lookup_metamethod(object, event)?)
+        Ok(self.vm.lookup_metamethod_value(value, event)?)
     }
 
     fn lookup_binary_event(
@@ -7251,7 +7332,7 @@ impl Execution<'_> {
             self.fuel = 0;
         }
         if let RegularCallAction::Completed(DispatchResult::Continue) = action {
-            if self.basic_continuation_pending(base, next) {
+            if self.close_unwind.is_some() || self.basic_continuation_pending(base, next) {
                 return Ok(action);
             }
             let first = self.frame.index(base)?;
@@ -7478,7 +7559,9 @@ impl Execution<'_> {
                     | Builtin::CoroutineYield
                     | Builtin::CoroutineStatus
                     | Builtin::CoroutineRunning
+                    | Builtin::CoroutineIsYieldable
                     | Builtin::CoroutineClose
+                    | Builtin::HostThreadReset
                     | Builtin::CoroutineWrap
                     | Builtin::CoroutineWrapped(_)) => {
                         if let Some(boundary) = self.protected.last_mut() {
@@ -8587,10 +8670,12 @@ impl Execution<'_> {
         } else {
             None
         };
+        let owner_yieldable = self.running_coroutine_yieldable();
         let parent = self.swap_thread(context);
         self.resume_stack.push(ResumeCaller {
             context: parent,
             owner: self.active_coroutine,
+            owner_yieldable,
             owner_root: self.active_coroutine_root.take(),
             child: object,
             child_root: Some(child_root),
@@ -8779,9 +8864,8 @@ impl Execution<'_> {
         tail_return: bool,
         next: usize,
     ) -> Result<RegularCallAction, RuntimeError> {
-        if self.vm.finalizer_running() {
-            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineYield));
-        }
+        // 此入口僅接已驗證的原生 child coroutine；尚無 Lua frame 時，
+        // active_coroutine 與其禁止 yield 邊界都屬於恢復它的父 thread。
         let root = root_coroutine(self.vm, object)?;
         let mut values = Vec::new();
         let prepared = (|| {
@@ -8895,6 +8979,9 @@ impl Execution<'_> {
                     Builtin::Official(_) => {
                         return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
                     }
+                    Builtin::HostThreadReset => {
+                        return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
+                    }
                     Builtin::Error => {
                         return self.start_native_protected_error(
                             object,
@@ -8956,6 +9043,33 @@ impl Execution<'_> {
                             object,
                             protected,
                             Ok(&[Value::Object(thread), Value::Boolean(is_main)]),
+                            destination,
+                            mode,
+                            tail_return,
+                            next,
+                        );
+                    }
+                    Builtin::CoroutineIsYieldable => {
+                        let selected = match body_args.first().copied() {
+                            None => object,
+                            Some(Value::Object(target))
+                                if self.vm.object_kind(target)? == ObjectKind::Coroutine =>
+                            {
+                                target
+                            }
+                            _ => {
+                                let error = self.coroutine_message(b"E_WRONG_OBJECT_TYPE")?;
+                                return self.start_native_protected_error(
+                                    object, protected, error, destination, mode, tail_return, next,
+                                );
+                            }
+                        };
+                        return self.finish_native_protected_direct(
+                            object,
+                            protected,
+                            Ok(&[Value::Boolean(
+                                self.coroutine_object_yieldable(selected),
+                            )]),
                             destination,
                             mode,
                             tail_return,
@@ -9134,6 +9248,7 @@ impl Execution<'_> {
         protected: Option<NativeProtected>,
     ) -> Result<RegularCallAction, RuntimeError> {
         let outer_root = root_coroutine(self.vm, object)?;
+        let parent_yieldable = self.running_coroutine_yieldable();
         let parent = self.active_coroutine;
         let parent_root = self.active_coroutine_root.take();
         if let Some(parent) = parent {
@@ -9162,6 +9277,7 @@ impl Execution<'_> {
                     outer: object,
                     parent,
                     parent_root,
+                    parent_yieldable,
                     protected,
                 };
                 if caller.native.is_some() {
@@ -9327,6 +9443,7 @@ impl Execution<'_> {
                         tail_return,
                         next,
                         true,
+                        false,
                     );
                 }
                 values.remove(0);
@@ -9452,6 +9569,7 @@ impl Execution<'_> {
         wrapped: bool,
     ) -> Result<RegularCallAction, RuntimeError> {
         let outer_root = root_coroutine(self.vm, object)?;
+        let parent_yieldable = self.running_coroutine_yieldable();
         let parent = self.active_coroutine;
         let parent_root = self.active_coroutine_root.take();
         if let Some(parent) = parent {
@@ -9466,6 +9584,7 @@ impl Execution<'_> {
             outer: object,
             parent,
             parent_root,
+            parent_yieldable,
             wrapped,
             destination,
             result_mode: mode,
@@ -9473,6 +9592,23 @@ impl Execution<'_> {
             resume_pc: next,
         };
         let input = args.get(1..).unwrap_or(&[]);
+        if builtin == Builtin::CoroutineClose
+            && self.vm.language_profile() == LuaProfile::Lua55
+            && (input.is_empty() || input.first() == Some(&Value::Object(object)))
+        {
+            // 原生 body 尚無 Lua frame；自行關閉直接沿既有 body 完成路徑返回零值。
+            return self
+                .finish_native_builtin_body(
+                    continuation,
+                    true,
+                    Vec::new(),
+                    destination,
+                    mode,
+                    tail_return,
+                    next,
+                )
+                .map(RegularCallAction::Completed);
+        }
         let action = match builtin {
             Builtin::CoroutineWrapped(inner) => self.start_wrapped_coroutine(
                 inner,
@@ -9722,7 +9858,7 @@ impl Execution<'_> {
                 (true, CoroutineState::Dead, None)
             } else {
                 match builtin {
-                    Builtin::Official(_) => {
+                    Builtin::Official(_) | Builtin::HostThreadReset => {
                         return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
                     }
                     Builtin::CoroutineYield => {
@@ -9765,6 +9901,30 @@ impl Execution<'_> {
                         values.push(Value::Object(object));
                         values.push(Value::Boolean(false));
                         (true, CoroutineState::Dead, None)
+                    }
+                    Builtin::CoroutineIsYieldable => {
+                        let selected = match input.first().copied() {
+                            None => Ok(object),
+                            Some(Value::Object(target))
+                                if self.vm.object_kind(target)? == ObjectKind::Coroutine =>
+                            {
+                                Ok(target)
+                            }
+                            _ => Err(VmError::WrongObjectType),
+                        };
+                        match selected {
+                            Ok(target) => {
+                                values.push(Value::Boolean(
+                                    self.coroutine_object_yieldable(target),
+                                ));
+                                (true, CoroutineState::Dead, None)
+                            }
+                            Err(_) => {
+                                let error = self.coroutine_message(b"E_WRONG_OBJECT_TYPE")?;
+                                values.push(error);
+                                (false, CoroutineState::Dead, Some(error))
+                            }
+                        }
                     }
                     Builtin::CoroutineCreate => {
                         let entry = input.first().copied().unwrap_or(Value::Nil);
@@ -9863,6 +10023,57 @@ impl Execution<'_> {
             .main_thread_identity()
             .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
         Ok((main, true))
+    }
+
+    fn running_coroutine_yieldable(&self) -> bool {
+        self.active_coroutine.is_some()
+            && !self.vm.finalizer_running()
+            && !(self.vm.debug_hook_running() && self.pending_ops.contains_debug_hook())
+            && self
+                .external_nested
+                .last()
+                .is_none_or(|nested| nested.yieldable)
+    }
+
+    fn coroutine_object_yieldable(&self, target: ObjectRef) -> bool {
+        if self.vm.main_thread_identity() == Some(target) {
+            false
+        } else if self.active_coroutine == Some(target) {
+            self.running_coroutine_yieldable()
+        } else {
+            for caller in self.resume_stack.iter().rev() {
+                if caller.owner == Some(target) {
+                    return caller.owner_yieldable;
+                }
+                if let Some(body) = caller.native_body {
+                    if body.parent == Some(target) {
+                        return body.parent_yieldable;
+                    }
+                }
+                for completion in caller
+                    .native
+                    .iter()
+                    .chain(caller.outer_resumes.items.iter())
+                {
+                    if let NativeCompletion::Resume {
+                        parent: Some(parent),
+                        parent_yieldable,
+                        ..
+                    } = completion
+                    {
+                        if *parent == target {
+                            return *parent_yieldable;
+                        }
+                    }
+                }
+            }
+            if let Some((parent, yieldable)) = self.capi_resume_parent_yieldability {
+                if parent == target {
+                    return yieldable;
+                }
+            }
+            true
+        }
     }
 
     fn coroutine_status_state(&self, object: ObjectRef) -> Result<CoroutineState, VmError> {
@@ -9989,14 +10200,58 @@ impl Execution<'_> {
                     Some(ticket),
                 )
             }
+            Builtin::CoroutineIsYieldable => {
+                let target = match args.first().copied() {
+                    None => self.running_thread()?.0,
+                    Some(Value::Object(object)) => {
+                        if self.vm.object_kind(object)? != ObjectKind::Coroutine {
+                            return Err(VmError::WrongObjectType.into());
+                        }
+                        object
+                    }
+                    Some(_) => return Err(VmError::WrongObjectType.into()),
+                };
+                let yieldable = self.coroutine_object_yieldable(target);
+                let (values, ticket) =
+                    string_lib::values(self.vm, &[Value::Boolean(yieldable)])?;
+                self.complete_builtin_values(destination, mode, tail_return, next, values, ticket)
+            }
             Builtin::CoroutineResume => {
                 self.start_coroutine_resume(destination, args, mode, tail_return, next, false)
             }
-            Builtin::CoroutineClose => {
-                let Value::Object(object) = args.first().copied().unwrap_or(Value::Nil) else {
-                    return Err(VmError::WrongObjectType.into());
+            Builtin::CoroutineClose | Builtin::HostThreadReset => {
+                let host_reset = builtin == Builtin::HostThreadReset;
+                let object = match args.first().copied() {
+                    None if !host_reset && self.vm.language_profile() == LuaProfile::Lua55 => {
+                        self.running_thread()?.0
+                    }
+                    Some(Value::Object(object)) => object,
+                    _ => return Err(VmError::WrongObjectType.into()),
                 };
-                self.start_coroutine_close(object, destination, mode, tail_return, next, false)
+                if !host_reset
+                    && self.vm.language_profile() == LuaProfile::Lua55
+                    && self.active_coroutine == Some(object)
+                {
+                    if self.resume_stack.last().map(|caller| caller.child) != Some(object)
+                        || self.close_unwind.is_some()
+                    {
+                        return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
+                    }
+                    let mut error = explicit_error(Value::Nil, self.frame.pc);
+                    self.prepare_close_error_value(&mut error)?;
+                    self.close_unwind = Some(CloseUnwind {
+                        error,
+                        caller_depth: 0,
+                        include_root: true,
+                        finish: CloseFinish::Coroutine { wrap: false },
+                        failed: false,
+                        waiting_depth: None,
+                    });
+                    return Ok(RegularCallAction::Completed(DispatchResult::Continue));
+                }
+                self.start_coroutine_close(
+                    object, destination, mode, tail_return, next, false, host_reset,
+                )
             }
             Builtin::CoroutineWrap => {
                 let entry = args.first().copied().unwrap_or(Value::Nil);
@@ -10043,7 +10298,7 @@ impl Execution<'_> {
                 if self.vm.debug_hook_running() && self.pending_ops.contains_debug_hook() {
                     return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                 }
-                if self.vm.finalizer_running() || self.active_coroutine.is_none() {
+                if !self.running_coroutine_yieldable() {
                     return Err(RuntimeError::new(RuntimeErrorKind::CoroutineYield));
                 }
                 self.yield_site = Some(YieldSite {
@@ -12151,15 +12406,8 @@ impl Execution<'_> {
             .nth(ordinal.saturating_sub(1));
         let guest_start = usize::from(mapping.guest_start.0);
         let guest_end = guest_start.saturating_add(usize::from(mapping.guest_register_count));
-        // Lua 5.5 主 chunk 的 R0 保留給匿名 vararg；剝除 debug locals 後，
-        // 正索引的 temporary 應從其後的實際值開始。
-        let hidden_root_vararg = self.vm.language_profile() == LuaProfile::Lua55
-            && prototype.id.0 == 0
-            && guest.flags & 3 != 0
-            && guest.debug.locals.is_empty();
-        let register_index = guest_start
-            .saturating_add(ordinal.saturating_sub(1))
-            .saturating_add(usize::from(hidden_root_vararg));
+        // 官方正索引直接指向實體槽；Lua 5.5 的 vararg table 也佔用其中一槽。
+        let register_index = guest_start.saturating_add(ordinal.saturating_sub(1));
         if ordinal == 0 || register_index >= guest_end {
             return Ok(None);
         }
@@ -13928,6 +14176,7 @@ impl Execution<'_> {
         if has_environment
             && verified.official_artifact().is_none()
             && verified.native_debug().is_none()
+            && verified.official_execution().is_none()
         {
             return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
         }
@@ -14471,7 +14720,11 @@ impl Execution<'_> {
         tail_return: bool,
         next: usize,
     ) -> Result<RegularCallAction, RuntimeError> {
-        if matches!(kind, DebugBuiltin::SetHook | DebugBuiltin::GetHook) {
+        if kind == DebugBuiltin::SetCStackLimit {
+            if self.vm.language_profile() != LuaProfile::Lua54 {
+                return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
+            }
+        } else if matches!(kind, DebugBuiltin::SetHook | DebugBuiltin::GetHook) {
             if !self
                 .vm
                 .debug_capability()
@@ -14487,12 +14740,71 @@ impl Execution<'_> {
             let Some(permission) = kind.permission() else {
                 return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
             };
-            if !self.vm.debug_capability().allows(permission) {
+            let type_permission = match kind {
+                DebugBuiltin::GetMetatable => Some(DebugPermission::TypeMetatableRead),
+                DebugBuiltin::SetMetatable => Some(DebugPermission::TypeMetatableWrite),
+                _ => None,
+            };
+            let capability = self.vm.debug_capability();
+            if !capability.allows(permission)
+                && !type_permission.is_some_and(|permission| capability.allows(permission))
+            {
                 return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+            }
+            if let Some(type_permission) = type_permission {
+                let value = args
+                    .first()
+                    .copied()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                let (original_scope, either_scope) = match value {
+                    Value::Object(object) => match self.vm.object_kind(object)? {
+                        ObjectKind::Table | ObjectKind::Userdata => (true, false),
+                        ObjectKind::File if kind == DebugBuiltin::GetMetatable => (true, false),
+                        ObjectKind::ByteString if kind == DebugBuiltin::GetMetatable => (false, true),
+                        ObjectKind::File
+                        | ObjectKind::Value
+                        | ObjectKind::Upvalue
+                        | ObjectKind::Module => {
+                            return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                        }
+                        _ => (false, false),
+                    },
+                    _ => (false, false),
+                };
+                if !(capability.allows(if original_scope { permission } else { type_permission })
+                    || (either_scope && capability.allows(permission)))
+                {
+                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
+                }
             }
         }
         if !self.charge_native_work(1)? {
             return Ok(RegularCallAction::Aborted);
+        }
+        if kind == DebugBuiltin::SetCStackLimit {
+            let argument = args
+                .first()
+                .copied()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+            if let Value::Object(object) = argument {
+                if self.vm.object_kind(object)? == ObjectKind::ByteString {
+                    let len = self.vm.with_byte_string(object, |text| text.len())?;
+                    if !self.charge_native_work(len)? {
+                        return Ok(RegularCallAction::Aborted);
+                    }
+                }
+            }
+            let _limit = basic::lua_integer(basic::number(self.vm, argument, None)?)
+                .ok_or(RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+            let (values, ticket) = math_lib::values(self.vm, &[Value::Integer(200)])?;
+            return self.complete_builtin_values(
+                destination,
+                mode,
+                tail_return,
+                next,
+                values,
+                ticket,
+            );
         }
         if kind == DebugBuiltin::Debug {
             let environment = Value::Object(
@@ -14807,6 +15119,7 @@ impl Execution<'_> {
             if has_environment
                 && official_artifact.is_none()
                 && self.vm.module(module)?.native_debug().is_none()
+                && self.vm.module(module)?.official_execution().is_none()
             {
                 return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
             }
@@ -14985,36 +15298,18 @@ impl Execution<'_> {
         let result = match kind {
             DebugBuiltin::GetInfo => unreachable!(),
             DebugBuiltin::GetMetatable => {
-                let Value::Object(object) = args
+                let value = args
                     .first()
                     .copied()
-                    .ok_or_else(|| RuntimeError::new(RuntimeErrorKind::DebugArgument))?
-                else {
-                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
-                };
-                let metatable = match self.vm.object_kind(object)? {
-                    ObjectKind::Table | ObjectKind::File | ObjectKind::Userdata => {
-                        self.vm.get_metatable(object)?
-                    }
-                    ObjectKind::ByteString => self.vm.string_metatable(),
-                    _ => return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug)),
-                };
+                    .ok_or_else(|| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
+                let metatable = self.vm.get_metatable_for_value(value)?;
                 metatable.map(Value::Object).unwrap_or(Value::Nil)
             }
             DebugBuiltin::SetMetatable => {
-                let Value::Object(table) = args
+                let value = args
                     .first()
                     .copied()
-                    .ok_or_else(|| RuntimeError::new(RuntimeErrorKind::DebugArgument))?
-                else {
-                    return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument));
-                };
-                if !matches!(
-                    self.vm.object_kind(table)?,
-                    ObjectKind::Table | ObjectKind::Userdata
-                ) {
-                    return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
-                }
+                    .ok_or_else(|| RuntimeError::new(RuntimeErrorKind::DebugArgument))?;
                 let metatable = match args.get(1).copied() {
                     None | Some(Value::Nil) => None,
                     Some(Value::Object(object))
@@ -15024,8 +15319,8 @@ impl Execution<'_> {
                     }
                     _ => return Err(RuntimeError::new(RuntimeErrorKind::DebugArgument)),
                 };
-                self.vm.set_metatable(table, metatable)?;
-                Value::Object(table)
+                self.vm.set_metatable_for_value(value, metatable)?;
+                value
             }
             _ => return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug)),
         };
@@ -18592,6 +18887,9 @@ impl Execution<'_> {
             LoadBuiltin::PreloadSearcher => {
                 return self.preload_searcher(args, destination, mode, tail_return, next);
             }
+            LoadBuiltin::SearchPath => {
+                return self.package_searchpath(args, destination, mode, tail_return, next);
+            }
             LoadBuiltin::LuaSearcher {
                 package,
                 environment,
@@ -18833,6 +19131,201 @@ impl Execution<'_> {
             self.complete_builtin_values(destination, mode, tail_return, next, values, ticket)
         })();
         self.vm.remove_root(diagnostic_root)?;
+        result
+    }
+
+    fn package_searchpath(
+        &mut self,
+        args: &[Value],
+        destination: Register,
+        mode: ResultMode,
+        tail_return: bool,
+        next: usize,
+    ) -> Result<RegularCallAction, RuntimeError> {
+        if !self.vm.host_repository_available() {
+            return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyRepository));
+        }
+        let mut name_buffer = LoadBuffer::new(self.vm);
+        let mut path_buffer = LoadBuffer::new(self.vm);
+        for (index, buffer) in [(0, &mut name_buffer), (1, &mut path_buffer)] {
+            let value = args
+                .get(index)
+                .copied()
+                .ok_or(RuntimeError::new(RuntimeErrorKind::PackageArgument))?;
+            if !self.append_load_value(buffer, value, RuntimeErrorKind::PackageArgument)? {
+                return Ok(RegularCallAction::Aborted);
+            }
+        }
+        let mut sep_buffer = LoadBuffer::new(self.vm);
+        if let Some(value) = args.get(2).copied().filter(|value| *value != Value::Nil) {
+            if !self.append_load_value(&mut sep_buffer, value, RuntimeErrorKind::PackageArgument)? {
+                return Ok(RegularCallAction::Aborted);
+            }
+        } else {
+            sep_buffer.append(b".", 1)?;
+        }
+        let mut rep_buffer = LoadBuffer::new(self.vm);
+        if let Some(value) = args.get(3).copied().filter(|value| *value != Value::Nil) {
+            if !self.append_load_value(&mut rep_buffer, value, RuntimeErrorKind::PackageArgument)? {
+                return Ok(RegularCallAction::Aborted);
+            }
+        } else if cfg!(windows) {
+            rep_buffer.append(b"\\", 1)?;
+        } else {
+            rep_buffer.append(b"/", 1)?;
+        }
+        fn c_string(bytes: &[u8]) -> &[u8] {
+            bytes.split(|byte| *byte == 0).next().unwrap_or(&[])
+        }
+        let name = c_string(name_buffer.as_bytes());
+        let path = c_string(path_buffer.as_bytes());
+        let sep = c_string(sep_buffer.as_bytes());
+        let rep = c_string(rep_buffer.as_bytes());
+        let limits = self.vm.load_limits();
+        let mut module_name = LoadBuffer::new(self.vm);
+        let mut remaining = name;
+        while !remaining.is_empty() {
+            if !self.charge_native_work(sep.len().min(remaining.len()))? {
+                return Ok(RegularCallAction::Aborted);
+            }
+            let (part, advance) = if !sep.is_empty() && remaining.starts_with(sep) {
+                (rep, sep.len())
+            } else {
+                (&remaining[..1], 1)
+            };
+            if !self.charge_native_work(module_name.copy_work(part.len())?)? {
+                return Ok(RegularCallAction::Aborted);
+            }
+            module_name.append(part, limits.max_temporary_bytes)?;
+            remaining = &remaining[advance..];
+        }
+        let mut expanded_path = LoadBuffer::new(self.vm);
+        for byte in path {
+            let part = if *byte == b'?' {
+                module_name.as_bytes()
+            } else {
+                core::slice::from_ref(byte)
+            };
+            if !self.charge_native_work(expanded_path.copy_work(part.len())?)? {
+                return Ok(RegularCallAction::Aborted);
+            }
+            expanded_path.append(part, limits.max_temporary_bytes)?;
+        }
+        let mut diagnostics = LoadBuffer::new(self.vm);
+        for (index, candidate) in expanded_path.as_bytes().split(|byte| *byte == b';').enumerate() {
+            if index >= limits.max_path_candidates && !candidate.is_empty() {
+                return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
+            }
+            if !candidate.is_empty() {
+                let ledger = self.vm.allocation_ledger().clone();
+                let mut budget = LoadBudget::metered(
+                    limits.max_work_units,
+                    limits.max_temporary_bytes,
+                    &mut self.fuel,
+                    &mut self.finalizer_steps,
+                    self.vm.finalizer_running(),
+                    ledger,
+                );
+                let found = match budget.spend_work(
+                    name.len()
+                        .saturating_add(candidate.len())
+                        .saturating_add(1),
+                ) {
+                    Ok(()) => {
+                        self.vm
+                            .host_search_repository(name, candidate, &mut budget)
+                    }
+                    Err(error) => Err(LoadServiceError::Host(error)),
+                };
+                if let Some(stop) = budget.stop() {
+                    return match stop {
+                        LoadBudgetStop::Limit => {
+                            Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget))
+                        }
+                        LoadBudgetStop::Fuel => Ok(RegularCallAction::Aborted),
+                        LoadBudgetStop::Allocation(error) => Err(error.into()),
+                        LoadBudgetStop::Terminal => {
+                            Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution))
+                        }
+                    };
+                }
+                let found = match found {
+                    Ok(found) => found,
+                    Err(error) => {
+                        if let LoadServiceError::Host(ref host) = error {
+                            if host.diagnostic.capacity() > budget.claimed_temporary() {
+                                return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
+                            }
+                        }
+                        let charge = budget.take_temporary_charge();
+                        drop(budget);
+                        let mapped =
+                            self.load_host_failure(error, RuntimeErrorKind::HostPolicyRepository);
+                        drop(charge);
+                        return match mapped? {
+                            Some(error) => Err(error),
+                            None => Ok(RegularCallAction::Aborted),
+                        };
+                    }
+                };
+                if let Some(found) = found {
+                    let reported = found
+                        .data
+                        .capacity()
+                        .checked_add(found.loader_data.capacity())
+                        .ok_or(VmError::ArithmeticOverflow)?;
+                    if reported > budget.claimed_temporary() {
+                        return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
+                    }
+                    let charge = budget.take_temporary_charge();
+                    drop(budget);
+                    drop(found);
+                    drop(charge);
+                    let filename = self.vm.allocate_byte_string(candidate)?;
+                    let root = self.vm.add_root(RootKind::Temporary, filename)?;
+                    let result = (|| {
+                        let (values, ticket) =
+                            string_lib::values(self.vm, &[Value::Object(filename)])?;
+                        self.complete_builtin_values(
+                            destination,
+                            mode,
+                            tail_return,
+                            next,
+                            values,
+                            ticket,
+                        )
+                    })();
+                    self.vm.remove_root(root)?;
+                    return result;
+                }
+            }
+            let prefix = if index == 0 {
+                b"no file '".as_slice()
+            } else {
+                b"\n\tno file '".as_slice()
+            };
+            for part in [prefix, candidate, b"'"] {
+                if !self.charge_native_work(diagnostics.copy_work(part.len())?)? {
+                    return Ok(RegularCallAction::Aborted);
+                }
+                diagnostics.append(part, limits.max_temporary_bytes)?;
+            }
+        }
+        let message = self.vm.allocate_byte_string(diagnostics.as_bytes())?;
+        let root = self.vm.add_root(RootKind::Temporary, message)?;
+        let result = (|| {
+            let (values, ticket) =
+                string_lib::values(self.vm, &[Value::Nil, Value::Object(message)])?;
+            self.complete_builtin_values(
+                destination,
+                mode,
+                tail_return,
+                next,
+                values,
+                ticket,
+            )
+        })();
+        self.vm.remove_root(root)?;
         result
     }
 
@@ -20499,20 +20992,7 @@ impl Execution<'_> {
         value: Value,
         name: &[u8],
     ) -> Result<Option<Value>, RuntimeError> {
-        let Value::Object(object) = value else {
-            return Ok(None);
-        };
-        let metatable = match self.vm.object_kind(object)? {
-            ObjectKind::Table | ObjectKind::Userdata => self.vm.get_metatable(object)?,
-            ObjectKind::ByteString => self.vm.string_metatable(),
-            _ => None,
-        };
-        let Some(metatable) = metatable else {
-            return Ok(None);
-        };
-        let value = self.vm.with_temporary_byte_string(name, |vm, key| {
-            vm.raw_get(metatable, Value::Object(key))
-        })?;
+        let value = self.vm.lookup_raw_metafield_value(value, name)?;
         Ok((value != Value::Nil).then_some(value))
     }
 
@@ -20535,6 +21015,19 @@ impl Execution<'_> {
         next: usize,
     ) -> Result<RegularCallAction, RuntimeError> {
         const MAX_BASIC_CALLBACK_DEPTH: usize = 32;
+        if matches!(&basic, BasicPending::Pairs { .. } | BasicPending::ToString { .. })
+            && self.pending_ops.contains_basic_callback_cycle(
+                held,
+                event,
+                self.callers.len(),
+                self.frame.stack_base,
+                self.frame.prototype,
+                self.frame.module,
+            )
+        {
+            basic.clear(self.vm)?;
+            return Err(RuntimeError::new(RuntimeErrorKind::StackLimit));
+        }
         if self.pending_ops.basic_depth() >= MAX_BASIC_CALLBACK_DEPTH {
             basic.clear(self.vm)?;
             return Err(RuntimeError::new(RuntimeErrorKind::StackLimit));
@@ -21684,13 +22177,21 @@ impl Execution<'_> {
         tail_return: bool,
         next: usize,
         wrap: bool,
+        host_reset: bool,
     ) -> Result<RegularCallAction, RuntimeError> {
-        if self.vm.main_thread_identity() == Some(object) {
-            return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
-        }
         let state = self.vm.coroutine_state(object)?;
-        if matches!(state, CoroutineState::Running | CoroutineState::Normal)
-            || self.active_coroutine == Some(object)
+        let main = self.vm.main_thread_identity() == Some(object);
+        if (host_reset
+            && (!main
+                || state != CoroutineState::Running
+                || self.active_coroutine.is_some()
+                || !self.vm.with_coroutine(object, |co| {
+                    co.context.is_none() && co.unwind_context.is_none()
+                })?))
+            || (!host_reset
+                && (main
+                    || matches!(state, CoroutineState::Running | CoroutineState::Normal)
+                    || self.active_coroutine == Some(object)))
         {
             return Err(RuntimeError::new(RuntimeErrorKind::CoroutineClose));
         }
@@ -21700,19 +22201,22 @@ impl Execution<'_> {
             co.take_context().or_else(|| co.unwind_context.take())
         })?;
         let Some(mut context) = prior else {
-            self.vm.with_coroutine_mut(object, &[], |co| {
-                co.state = CoroutineState::Dead;
-                co.entry = Value::Nil;
-                co.native = None;
-                co.native_bridge = None;
-            })?;
+            if !host_reset {
+                self.vm.with_coroutine_mut(object, &[], |co| {
+                    co.state = CoroutineState::Dead;
+                    co.entry = Value::Nil;
+                    co.native = None;
+                    co.native_bridge = None;
+                })?;
+            }
             let mut values = Vec::new();
-            let result = if wrap {
-                Err(explicit_error(
-                    original.unwrap_or(Value::Nil),
-                    self.frame.pc,
-                ))
-            } else {
+            let result: Result<RegularCallAction, RuntimeError> = (|| {
+                if wrap {
+                    return Err(explicit_error(
+                        original.unwrap_or(Value::Nil),
+                        self.frame.pc,
+                    ));
+                }
                 let ticket = reserve_vec(
                     self.vm.allocation_ledger(),
                     &mut values,
@@ -21731,8 +22235,20 @@ impl Execution<'_> {
                     values,
                     Some(ticket),
                 )
+            })();
+            let state_update = if host_reset && result.is_ok() {
+                self.vm.with_coroutine_mut(object, &[], |co| {
+                    co.state = CoroutineState::Dead;
+                    co.entry = Value::Nil;
+                    co.native = None;
+                    co.native_bridge = None;
+                })
+            } else {
+                Ok(())
             };
-            self.vm.remove_root(root)?;
+            let cleanup = self.vm.remove_root(root);
+            state_update?;
+            cleanup?;
             return result;
         };
         if let Err(error) = self.ensure_resume_capacity() {
@@ -21749,10 +22265,12 @@ impl Execution<'_> {
             self.vm.remove_root(root)?;
             return Err(error);
         }
+        let owner_yieldable = self.running_coroutine_yieldable();
         let parent = self.swap_thread(context);
         self.resume_stack.push(ResumeCaller {
             context: parent,
             owner: self.active_coroutine,
+            owner_yieldable,
             owner_root: self.active_coroutine_root.take(),
             child: object,
             child_root: Some(root),
@@ -21841,6 +22359,7 @@ impl Execution<'_> {
                 caller.tail_return,
                 caller.resume_pc,
                 wrap,
+                false,
             );
             if let Some(root) = caller.child_root {
                 self.vm.remove_root(root)?;
@@ -21890,6 +22409,24 @@ impl Execution<'_> {
                 let mut error = unwind.error;
                 self.prepare_close_error_value(&mut error)?;
                 return Err(error);
+            }
+            if caller.wrapped {
+                if unwind.failed {
+                    let mut error = unwind.error;
+                    self.prepare_close_error_value(&mut error)?;
+                    return Err(error);
+                }
+                let values = Vec::new();
+                if caller.tail_return {
+                    return self.propagate_tail_result(values, None);
+                }
+                self.write_call_values(
+                    caller.destination,
+                    caller.result_mode,
+                    caller.resume_pc,
+                    &values,
+                )?;
+                return Ok(DispatchResult::Continue);
             }
             let mut values = Vec::new();
             let ticket = reserve_vec(
@@ -22138,10 +22675,12 @@ impl Execution<'_> {
                 return Err(error.into());
             }
         };
+        let owner_yieldable = self.running_coroutine_yieldable();
         let parent = self.swap_thread(context);
         self.resume_stack.push(ResumeCaller {
             context: parent,
             owner: self.active_coroutine,
+            owner_yieldable,
             owner_root: self.active_coroutine_root.take(),
             child: object,
             child_root: Some(child_root),
@@ -22331,6 +22870,7 @@ impl Execution<'_> {
                 caller.tail_return,
                 caller.resume_pc,
                 true,
+                false,
             );
             if let Some(root) = caller.child_root {
                 self.vm.remove_root(root)?;
@@ -22583,6 +23123,38 @@ impl Execution<'_> {
         Ok(Some(DispatchResult::Continue))
     }
 
+    /// C `lua_resume(child, from)` 的父執行緒邊界只供查詢，不限制 child 自身 yield。
+    /// 若父 C callback 已停放，僅該 callback 的協程可作為當次查詢父執行緒。
+    pub fn set_capi_resume_parent_yieldability(
+        &mut self,
+        parent: ObjectRef,
+        yieldable: bool,
+    ) -> Result<(), RuntimeError> {
+        if self.state != ExecutionState::Ready {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        if self.vm.object_kind(parent)? != ObjectKind::Coroutine {
+            return Err(VmError::WrongObjectType.into());
+        }
+        let resume_bootstrap = matches!(self.frame.read(Register(0)),
+            Ok(Value::Object(target)) if self.vm.builtin(target) == Ok(Builtin::CoroutineResume));
+        if !self.host_call_bootstrap || !resume_bootstrap {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        let main = self.vm.main_thread_identity();
+        if self.vm.parked_executions.last().is_some_and(|top| {
+            !top.core.as_ref().is_some_and(|core| {
+                (core.active_coroutine == Some(parent)
+                    || (main == Some(parent) && core.active_coroutine.is_none()))
+                    && core.external_pending.is_some()
+            })
+        }) {
+            return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
+        }
+        self.capi_resume_parent_yieldability = Some((parent, yieldable));
+        Ok(())
+    }
+
     pub fn set_fuel(&mut self, fuel: u64) -> Result<(), RuntimeError> {
         if self.state != ExecutionState::Ready {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
@@ -22752,22 +23324,12 @@ impl Execution<'_> {
         let event = match op {
             UnaryOperation::Not => None,
             UnaryOperation::Length => {
-                if let Value::Object(object) = value {
-                    if matches!(
-                        self.vm.object_kind(object)?,
-                        ObjectKind::Table | ObjectKind::Userdata
-                    ) {
-                        let event = self.lookup_value_event(value, MetamethodEvent::Len)?;
-                        if event != Value::Nil {
-                            Some(event)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
+                if matches!(value, Value::Object(object) if self.vm.object_kind(object)? == ObjectKind::ByteString)
+                {
                     None
+                } else {
+                    let event = self.lookup_value_event(value, MetamethodEvent::Len)?;
+                    (event != Value::Nil).then_some(event)
                 }
             }
             UnaryOperation::Negate if !matches!(value, Value::Integer(_) | Value::Float(_)) => {
@@ -23297,12 +23859,20 @@ impl Execution<'_> {
             return Ok((RunOutcome::Exited(request), 0));
         }
         let shutdown_close_run = self.terminal_shutdown_drain && self.close_unwind.is_some();
+        let main = self.vm.main_thread_identity();
         let parked_authorized = match (self.vm.parked_executions.last(), self.nested_origin) {
             (None, None) => true,
             (Some(top), None) => {
                 (top.prepared_reset_target.is_some() && top.core.is_some())
                     || top.core.as_ref().is_some_and(|core| {
                         core.external_close_boundary_a5 && core.close_unwind.is_some()
+                    })
+                    || self.capi_resume_parent_yieldability.is_some_and(|(parent, _)| {
+                        top.core.as_ref().is_some_and(|core| {
+                            (core.active_coroutine == Some(parent)
+                                || (main == Some(parent) && core.active_coroutine.is_none()))
+                                && core.external_pending.is_some()
+                        })
                     })
             }
             (Some(top), Some(origin)) => top.token == origin && top.core.is_none(),
@@ -30388,6 +30958,7 @@ mod tests {
             outer: vm.allocate_coroutine(Value::Nil).unwrap(),
             parent: None,
             parent_root: None,
+            parent_yieldable: false,
             protected: None,
         };
         let with_coroutine = vm.ledger_snapshot();

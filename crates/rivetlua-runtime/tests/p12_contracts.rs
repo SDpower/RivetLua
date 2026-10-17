@@ -70,13 +70,22 @@ fn p12_6_site_file_is(file: &str, name: &str) -> bool {
 
 fn p12_6_lua_allocation_sequence(vm: &mut Vm) -> Result<(), VmError> {
     let table = vm.allocate_table_with_capacity(2, 2)?;
-    let string = vm.allocate_byte_string(b"key")?;
-    vm.raw_set(table, Value::Integer(3), Value::Integer(7))?;
-    vm.raw_set(table, Value::Integer(100), Value::Integer(8))?;
-    vm.raw_set(table, Value::Integer(101), Value::Integer(9))?;
-    vm.raw_set(table, Value::Object(string), Value::Integer(10))?;
-    vm.add_child(table, string)?;
-    Ok(())
+    let root = vm.add_root(RootKind::Temporary, table)?;
+    let result = (|| {
+        let string = vm.allocate_byte_string(b"key")?;
+        let string_root = vm.add_root(RootKind::Temporary, string)?;
+        let result = (|| {
+            vm.raw_set(table, Value::Integer(3), Value::Integer(7))?;
+            vm.raw_set(table, Value::Integer(100), Value::Integer(8))?;
+            vm.raw_set(table, Value::Integer(101), Value::Integer(9))?;
+            vm.raw_set(table, Value::Object(string), Value::Integer(10))?;
+            vm.add_child(table, string)
+        })();
+        vm.remove_root(string_root)?;
+        result
+    })();
+    vm.remove_root(root)?;
+    result
 }
 
 #[test]
@@ -197,13 +206,19 @@ fn p12_6_vm_lifecycle_10_000_balances_all_domains() {
         }
         if iteration % 4 == 0 {
             let weak = vm.allocate_table().unwrap();
+            let weak_root = vm.add_root(RootKind::Host, weak).unwrap();
             let mt = vm.allocate_table().unwrap();
+            let mt_root = vm.add_root(RootKind::Temporary, mt).unwrap();
             let mode_key = vm.allocate_byte_string(b"__mode").unwrap();
+            let mode_key_root = vm.add_root(RootKind::Temporary, mode_key).unwrap();
             let mode_value = vm.allocate_byte_string(b"k").unwrap();
+            let mode_value_root = vm.add_root(RootKind::Temporary, mode_value).unwrap();
             vm.raw_set(mt, Value::Object(mode_key), Value::Object(mode_value))
                 .unwrap();
             vm.set_metatable(weak, Some(mt)).unwrap();
-            let weak_root = vm.add_root(RootKind::Host, weak).unwrap();
+            vm.remove_root(mode_value_root).unwrap();
+            vm.remove_root(mode_key_root).unwrap();
+            vm.remove_root(mt_root).unwrap();
             let key = vm.allocate_table().unwrap();
             let key_root = vm.add_root(RootKind::Host, key).unwrap();
             let linked = vm.allocate_table().unwrap();
@@ -227,8 +242,10 @@ fn p12_6_vm_lifecycle_10_000_balances_all_domains() {
             let environment = vm.allocate_table().unwrap();
             let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
             let callback = p12_6_loaded_closure(&mut vm, environment, &finalizer_module);
+            let callback_root = vm.add_root(RootKind::Temporary, callback).unwrap();
             let target = vm.allocate_table().unwrap();
             attach_finalizer(&mut vm, target, callback);
+            vm.remove_root(callback_root).unwrap();
             vm.collect().unwrap();
             let count_key = vm.allocate_byte_string(b"count").unwrap();
             assert_eq!(
@@ -246,9 +263,15 @@ fn p12_6_vm_lifecycle_10_000_balances_all_domains() {
             vm.install_coroutine_builtins(environment).unwrap();
             vm.install_error_builtins(environment).unwrap();
             let closable = vm.allocate_table().unwrap();
+            let closable_root = vm.add_root(RootKind::Temporary, closable).unwrap();
             let close_mt = vm.allocate_table().unwrap();
+            let close_mt_root = vm.add_root(RootKind::Temporary, close_mt).unwrap();
             let close_key = vm.allocate_byte_string(b"__close").unwrap();
+            let close_key_root = vm.add_root(RootKind::Temporary, close_key).unwrap();
             let close_callback = p12_6_loaded_closure(&mut vm, environment, &close_module);
+            let close_callback_root = vm
+                .add_root(RootKind::Temporary, close_callback)
+                .unwrap();
             vm.raw_set(
                 close_mt,
                 Value::Object(close_key),
@@ -256,10 +279,19 @@ fn p12_6_vm_lifecycle_10_000_balances_all_domains() {
             )
             .unwrap();
             vm.set_metatable(closable, Some(close_mt)).unwrap();
+            vm.remove_root(close_callback_root).unwrap();
+            vm.remove_root(close_key_root).unwrap();
+            vm.remove_root(close_mt_root).unwrap();
             let observed = vm.allocate_table().unwrap();
+            let observed_root = vm.add_root(RootKind::Temporary, observed).unwrap();
             let observed_mt = vm.allocate_table().unwrap();
+            let observed_mt_root = vm.add_root(RootKind::Temporary, observed_mt).unwrap();
             let index_key = vm.allocate_byte_string(b"__index").unwrap();
+            let index_key_root = vm.add_root(RootKind::Temporary, index_key).unwrap();
             let index_callback = p12_6_loaded_closure(&mut vm, environment, &index_module);
+            let index_callback_root = vm
+                .add_root(RootKind::Temporary, index_callback)
+                .unwrap();
             vm.raw_set(
                 observed_mt,
                 Value::Object(index_key),
@@ -267,8 +299,13 @@ fn p12_6_vm_lifecycle_10_000_balances_all_domains() {
             )
             .unwrap();
             vm.set_metatable(observed, Some(observed_mt)).unwrap();
+            vm.remove_root(index_callback_root).unwrap();
+            vm.remove_root(index_key_root).unwrap();
+            vm.remove_root(observed_mt_root).unwrap();
             let closable_key = vm.allocate_byte_string(b"closable").unwrap();
+            let closable_key_root = vm.add_root(RootKind::Temporary, closable_key).unwrap();
             let observed_key = vm.allocate_byte_string(b"observed").unwrap();
+            let observed_key_root = vm.add_root(RootKind::Temporary, observed_key).unwrap();
             vm.raw_set(
                 environment,
                 Value::Object(closable_key),
@@ -281,6 +318,10 @@ fn p12_6_vm_lifecycle_10_000_balances_all_domains() {
                 Value::Object(observed),
             )
             .unwrap();
+            vm.remove_root(observed_key_root).unwrap();
+            vm.remove_root(closable_key_root).unwrap();
+            vm.remove_root(observed_root).unwrap();
+            vm.remove_root(closable_root).unwrap();
             let mut execution = vm
                 .load_with_environment(rich.clone(), Value::Object(environment))
                 .unwrap();
@@ -653,16 +694,24 @@ fn p12_5_error_yield_and_explicit_remark() {
         &profile,
         b"return function(o) error('gc fail') end",
     );
+    let failing_root = vm.add_root(RootKind::Temporary, failing).unwrap();
     let failed = vm.allocate_table().unwrap();
+    let failed_root = vm.add_root(RootKind::Temporary, failed).unwrap();
     attach_finalizer(&mut vm, failed, failing);
+    vm.remove_root(failing_root).unwrap();
     let yielding = lua_finalizer(
         &mut vm,
         environment,
         &profile,
         b"return function(o) coroutine.yield(1) end",
     );
+    let yielding_root = vm.add_root(RootKind::Temporary, yielding).unwrap();
     let yielded = vm.allocate_table().unwrap();
+    let yielded_root = vm.add_root(RootKind::Temporary, yielded).unwrap();
     attach_finalizer(&mut vm, yielded, yielding);
+    vm.remove_root(yielding_root).unwrap();
+    vm.remove_root(failed_root).unwrap();
+    vm.remove_root(yielded_root).unwrap();
     let warnings = vm.gc_trace().finalizer_warnings;
     vm.collect().unwrap();
     assert_eq!(vm.gc_trace().finalizer_warnings, warnings + 2);
@@ -1291,16 +1340,27 @@ fn p12_4_public_ephemeron_and_all_weak_cleanup() {
     assert_eq!(vm.object_kind(value), Err(VmError::StaleObject));
 
     let all = vm.allocate_table().unwrap();
+    let all_root = vm.add_root(RootKind::Host, all).unwrap();
     let all_mt = vm.allocate_table().unwrap();
+    let all_mt_root = vm.add_root(RootKind::Temporary, all_mt).unwrap();
+    let mode_key = vm.allocate_byte_string(b"__mode").unwrap();
+    let mode_key_root = vm.add_root(RootKind::Temporary, mode_key).unwrap();
     let all_mode = vm.allocate_byte_string(b"kv").unwrap();
+    let all_mode_root = vm.add_root(RootKind::Temporary, all_mode).unwrap();
     vm.raw_set(all_mt, Value::Object(mode_key), Value::Object(all_mode))
         .unwrap();
     vm.set_metatable(all, Some(all_mt)).unwrap();
-    let all_root = vm.add_root(RootKind::Host, all).unwrap();
+    vm.remove_root(all_mode_root).unwrap();
+    vm.remove_root(mode_key_root).unwrap();
+    vm.remove_root(all_mt_root).unwrap();
     let all_key = vm.allocate_table().unwrap();
+    let all_key_root = vm.add_root(RootKind::Temporary, all_key).unwrap();
     let all_value = vm.allocate_table().unwrap();
+    let all_value_root = vm.add_root(RootKind::Temporary, all_value).unwrap();
     vm.raw_set(all, Value::Object(all_key), Value::Object(all_value))
         .unwrap();
+    vm.remove_root(all_value_root).unwrap();
+    vm.remove_root(all_key_root).unwrap();
     vm.raw_set(all, Value::Integer(1), Value::Integer(2))
         .unwrap();
     vm.collect().unwrap();
@@ -1665,11 +1725,19 @@ fn attach_finalizer(
     target: rivetlua_core::ObjectRef,
     callback: rivetlua_core::ObjectRef,
 ) -> rivetlua_core::ObjectRef {
+    let callback_root = vm.add_root(RootKind::Temporary, callback).unwrap();
+    let target_root = vm.add_root(RootKind::Temporary, target).unwrap();
     let metatable = vm.allocate_table().unwrap();
+    let metatable_root = vm.add_root(RootKind::Temporary, metatable).unwrap();
     let key = vm.allocate_byte_string(b"__gc").unwrap();
+    let key_root = vm.add_root(RootKind::Temporary, key).unwrap();
     vm.raw_set(metatable, Value::Object(key), Value::Object(callback))
         .unwrap();
     vm.set_metatable(target, Some(metatable)).unwrap();
+    vm.remove_root(key_root).unwrap();
+    vm.remove_root(metatable_root).unwrap();
+    vm.remove_root(target_root).unwrap();
+    vm.remove_root(callback_root).unwrap();
     metatable
 }
 

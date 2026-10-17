@@ -76,8 +76,8 @@ fn emergency_object(owner: &StateOwner) -> ObjectRef {
             });
             assert_eq!(
                 registry_roots.len(),
-                3,
-                "registry、emergency 與 hook bridge 各有一個永久 root"
+                4,
+                "registry、emergency、hook bridge 與 warning bridge 各有一個永久 root"
             );
             assert_eq!(
                 registry_roots
@@ -98,8 +98,16 @@ fn emergency_object(owner: &StateOwner) -> ObjectRef {
                     .iter()
                     .filter(|&&object| vm.object_kind(object) == Ok(ObjectKind::CClosure))
                     .count(),
-                1
+                2
             );
+            let main_thread = vm.main_thread_identity().expect("C state 的 main thread");
+            let mut coroutine_root = None;
+            vm.visit_roots(|kind, _, object| {
+                if kind == RootKind::Coroutine {
+                    assert!(coroutine_root.replace(object).is_none());
+                }
+            });
+            assert_eq!(coroutine_root, Some(main_thread));
             let object = registry_roots
                 .into_iter()
                 .find(|&object| vm.object_kind(object) == Ok(ObjectKind::ByteString))

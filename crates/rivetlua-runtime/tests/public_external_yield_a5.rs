@@ -24,6 +24,168 @@ fn compile(source: &[u8], profile: LuaProfile) -> rivetlua_core::VerifiedModule 
 }
 
 #[test]
+fn nested_capi_call_scopes_coroutine_yieldability_a5() {
+    for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+        let mut vm = Vm::new_with_profile(profile).unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+        vm.install_basic_builtins(environment).unwrap();
+        vm.install_coroutine_builtins(environment).unwrap();
+        let RunOutcome::Returned(values) = vm
+            .load_with_environment(
+                compile(b"return function() return coroutine.isyieldable() end", profile),
+                Value::Object(environment),
+            )
+            .unwrap()
+            .run()
+            .unwrap()
+        else {
+            panic!("測試函式未建立");
+        };
+        let Value::Object(function) = values[0] else {
+            panic!("測試函式不是閉包");
+        };
+        let function_root = vm.add_root(RootKind::Host, function).unwrap();
+        let RunOutcome::Returned(values) = vm
+            .load_with_environment(
+                compile(
+                    b"return function() local ok=pcall(coroutine.yield,7); return ok end",
+                    profile,
+                ),
+                Value::Object(environment),
+            )
+            .unwrap()
+            .run()
+            .unwrap()
+        else {
+            panic!("拒絕測試函式未建立");
+        };
+        let Value::Object(yield_function) = values[0] else {
+            panic!("拒絕測試函式不是閉包");
+        };
+        let yield_root = vm.add_root(RootKind::Host, yield_function).unwrap();
+        let callback = HostFunctionId::new_unique(vm.id()).unwrap();
+        let child = vm.new_coroutine(Value::CFunction(callback)).unwrap();
+        let Value::Object(child) = child.as_value(&vm).unwrap() else {
+            panic!("child 身分遺失");
+        };
+        let token = {
+            let mut execution = vm.resume(Value::Object(child), &[]).unwrap();
+            let RunOutcome::External(token) = execution.run().unwrap() else {
+                panic!("C callback 未停放");
+            };
+            token
+        };
+        for (yieldable, expected) in [(false, false), (true, true)] {
+            assert_eq!(
+                vm.continue_external(
+                    token,
+                    ExternalCommand::NestedCapiCall {
+                        target: Value::Object(function),
+                        args: vec![],
+                        results: ResultMode::Fixed(1),
+                        yieldable,
+                    },
+                ),
+                Ok(RunOutcome::NestedReturned(vec![Value::Boolean(expected)])),
+            );
+        }
+        assert_eq!(
+            vm.continue_external(
+                token,
+                ExternalCommand::NestedCapiCall {
+                    target: Value::Object(yield_function),
+                    args: vec![],
+                    results: ResultMode::Fixed(1),
+                    yieldable: false,
+                },
+            ),
+            Ok(RunOutcome::NestedReturned(vec![Value::Boolean(false)])),
+        );
+        assert_eq!(
+            vm.continue_external(
+                token,
+                ExternalCommand::NestedCapiCall {
+                    target: Value::Object(function),
+                    args: vec![],
+                    results: ResultMode::Fixed(1),
+                    yieldable: true,
+                },
+            ),
+            Ok(RunOutcome::NestedReturned(vec![Value::Boolean(true)])),
+        );
+        assert_eq!(
+            vm.continue_external(token, ExternalCommand::Return(vec![])),
+            Ok(RunOutcome::Returned(vec![Value::Boolean(true)])),
+        );
+        vm.remove_root(function_root).unwrap();
+        vm.remove_root(yield_root).unwrap();
+        vm.remove_root(environment_root).unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+}
+
+#[test]
+fn resumed_child_observes_parent_c_boundary_yieldability_a5() {
+    for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
+        let mut vm = Vm::new_with_profile(profile).unwrap();
+        let environment = vm.allocate_table().unwrap();
+        let environment_root = vm.add_root(RootKind::Host, environment).unwrap();
+        vm.install_basic_builtins(environment).unwrap();
+        vm.install_coroutine_builtins(environment).unwrap();
+        let source = b"return function(parent) local child = coroutine.create(function() return coroutine.isyieldable(parent) end); local ok, value = coroutine.resume(child); return ok, value end";
+        let RunOutcome::Returned(values) = vm
+            .load_with_environment(compile(source, profile), Value::Object(environment))
+            .unwrap()
+            .run()
+            .unwrap()
+        else {
+            panic!("觀察函式未建立");
+        };
+        let Value::Object(observer) = values[0] else {
+            panic!("觀察函式不是閉包");
+        };
+        let observer_root = vm.add_root(RootKind::Host, observer).unwrap();
+        let callback = HostFunctionId::new_unique(vm.id()).unwrap();
+        let parent = vm.new_coroutine(Value::CFunction(callback)).unwrap();
+        let Value::Object(parent) = parent.as_value(&vm).unwrap() else {
+            panic!("parent 身分遺失");
+        };
+        let token = {
+            let mut execution = vm.resume(Value::Object(parent), &[]).unwrap();
+            let RunOutcome::External(token) = execution.run().unwrap() else {
+                panic!("parent C callback 未停放");
+            };
+            token
+        };
+        for (yieldable, expected) in [(false, false), (true, true)] {
+            assert_eq!(
+                vm.continue_external(
+                    token,
+                    ExternalCommand::NestedCapiCall {
+                        target: Value::Object(observer),
+                        args: vec![Value::Object(parent)],
+                        results: ResultMode::Fixed(2),
+                        yieldable,
+                    },
+                ),
+                Ok(RunOutcome::NestedReturned(vec![
+                    Value::Boolean(true),
+                    Value::Boolean(expected),
+                ])),
+            );
+        }
+        assert_eq!(
+            vm.continue_external(token, ExternalCommand::Return(vec![])),
+            Ok(RunOutcome::Returned(vec![Value::Boolean(true)])),
+        );
+        vm.remove_root(observer_root).unwrap();
+        vm.remove_root(environment_root).unwrap();
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+    }
+}
+
+#[test]
 fn c_coroutine_yield_detaches_global_lifo_and_restores_by_identity_a5() {
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
         let mut vm = Vm::new_with_profile(profile).unwrap();
@@ -517,14 +679,42 @@ fn foreign_and_stale_external_resume_are_rejected_without_mutation_a5() {
         let Value::Object(object) = child.as_value(&vm).unwrap() else {
             panic!("child 身分遺失");
         };
+        let parent = vm.new_coroutine(Value::CFunction(function)).unwrap();
+        let Value::Object(parent_object) = parent.as_value(&vm).unwrap() else {
+            panic!("parent 身分遺失");
+        };
+        let table = vm.allocate_table().unwrap();
+        let table_root = vm.add_root(RootKind::Host, table).unwrap();
+        let mut other = Vm::new_with_profile(profile).unwrap();
+        let foreign_function = HostFunctionId::new_unique(other.id()).unwrap();
+        let foreign = other
+            .new_coroutine(Value::CFunction(foreign_function))
+            .unwrap();
+        let Value::Object(foreign_object) = foreign.as_value(&other).unwrap() else {
+            panic!("foreign parent 身分遺失");
+        };
         let token = {
             let mut execution = vm.resume(Value::Object(object), &[]).unwrap();
+            for (invalid, kind) in [
+                (table, rivetlua_runtime::VmError::WrongObjectType),
+                (foreign_object, rivetlua_runtime::VmError::WrongVm),
+            ] {
+                assert_eq!(
+                    execution
+                        .set_capi_resume_parent_yieldability(invalid, false)
+                        .unwrap_err()
+                        .kind,
+                    RuntimeErrorKind::Heap(kind),
+                );
+            }
+            execution
+                .set_capi_resume_parent_yieldability(parent_object, true)
+                .unwrap();
             let RunOutcome::External(token) = execution.run().unwrap() else {
                 panic!("child 未進入外部 callback");
             };
             token
         };
-        let mut other = Vm::new_with_profile(profile).unwrap();
         assert_eq!(
             other.suspend_external_a5(token, object).unwrap_err().kind,
             RuntimeErrorKind::Heap(rivetlua_runtime::VmError::WrongVm)
@@ -532,7 +722,22 @@ fn foreign_and_stale_external_resume_are_rejected_without_mutation_a5() {
         assert!(vm.resume_external_a5(object).is_err());
         assert_eq!(vm.external_event(token).unwrap().function, function);
         assert_eq!(vm.suspend_external_a5(token, object), Ok(1));
-        let resumed = vm.resume_external_a5(object).unwrap();
+        for (invalid, kind) in [
+            (table, rivetlua_runtime::VmError::WrongObjectType),
+            (foreign_object, rivetlua_runtime::VmError::WrongVm),
+        ] {
+            assert_eq!(
+                vm.resume_external_with_capi_parent_a5(object, Some((invalid, false)))
+                    .err()
+                    .expect("無效 parent 必須拒絕")
+                    .kind,
+                RuntimeErrorKind::Heap(kind),
+            );
+            assert_eq!(vm.coroutine_state(object), Ok(CoroutineState::Suspended));
+        }
+        let resumed = vm
+            .resume_external_with_capi_parent_a5(object, Some((parent_object, true)))
+            .unwrap();
         assert!(vm.external_event(token).is_err());
         vm.continue_external(
             resumed.top_token().unwrap(),
@@ -540,6 +745,7 @@ fn foreign_and_stale_external_resume_are_rejected_without_mutation_a5() {
         )
         .unwrap();
         assert!(vm.resume_external_a5(object).is_err());
+        vm.remove_root(table_root).unwrap();
         assert_eq!(vm.ledger_snapshot().reserved, 0);
     }
 }

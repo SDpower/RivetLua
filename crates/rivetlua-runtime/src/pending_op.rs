@@ -625,6 +625,35 @@ impl PendingStack {
             .count()
     }
 
+    pub(crate) fn contains_basic_callback_cycle(
+        &self,
+        held: Value,
+        event: Value,
+        caller_depth: usize,
+        caller_stack_base: usize,
+        caller_prototype: usize,
+        caller_module: Option<ObjectRef>,
+    ) -> bool {
+        self.entries.iter().any(|pending| {
+            let same_held = match (pending.values[0], held) {
+                (Value::Float(left), Value::Float(right)) => left.to_bits() == right.to_bits(),
+                (left, right) => left == right,
+            };
+            pending.kind == PendingKind::Basic
+                && matches!(
+                    pending.basic.as_ref(),
+                    Some(BasicPending::Pairs { .. } | BasicPending::ToString { .. })
+                )
+                && pending.stage == ResumeStage::AwaitingReturn
+                && same_held
+                && pending.values[1] == event
+                && pending.caller_depth == caller_depth
+                && pending.caller_stack_base == caller_stack_base
+                && pending.caller_prototype == caller_prototype
+                && pending.caller_module == caller_module
+        })
+    }
+
     pub(crate) fn contains_debug_hook(&self) -> bool {
         self.entries
             .iter()

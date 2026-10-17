@@ -5,8 +5,8 @@ use rivetlua_capi::stack::{
     StateOwner, lua_createtable, lua_gettop, lua_pushinteger, lua_pushvalue, lua_rawequal,
     lua_rawget, lua_rawset, lua_settop, lua_tointegerx, lua_type, lua_xmove,
 };
-use rivetlua_core::{HostFunctionId, Value};
-use rivetlua_runtime::{FailPoint, GcMode, ObjectKind, VmError};
+use rivetlua_core::{HostFunctionId, SlotId, Value};
+use rivetlua_runtime::{FailPoint, GcMode, GcPhase, ObjectKind, SlotState, VmError};
 
 static CALLED: AtomicUsize = AtomicUsize::new(0);
 
@@ -561,15 +561,48 @@ fn c_closure_a43_named_failpoints_preserve_state_and_retry() {
     ] {
         let owner = prepared_capture_owner();
         let state = owner.as_ptr();
+        if point == FailPoint::MarkReserve {
+            owner
+                .with_vm(|vm| vm.set_gc_debt_threshold(usize::MAX))
+                .unwrap();
+        }
         prime_protected_error(state);
-        owner
-            .with_vm(|vm| {
-                if active_gc {
-                    vm.incremental_step(1).unwrap();
-                }
-            })
-            .unwrap();
-        if active_gc {
+        if point == FailPoint::MarkReserve {
+            prime_protected_error(state);
+            owner
+                .with_vm(|vm| -> Result<(), VmError> {
+                    let mut slot_count = 0;
+                    while vm.slot_state(SlotId::new(slot_count)).is_some() {
+                        slot_count += 1;
+                    }
+                    loop {
+                        let has_free_slot = (0..slot_count).any(|index| {
+                            matches!(vm.slot_state(SlotId::new(index)), Some(SlotState::Free))
+                        });
+                        if slot_count % 64 == 0 && !has_free_slot {
+                            break;
+                        }
+                        vm.allocate_table()?;
+                        while vm.slot_state(SlotId::new(slot_count)).is_some() {
+                            slot_count += 1;
+                        }
+                    }
+                    assert!((0..slot_count).all(|index| {
+                        !matches!(vm.slot_state(SlotId::new(index)), Some(SlotState::Free))
+                    }));
+                    if vm.gc_trace().phase == GcPhase::Pause {
+                        vm.incremental_step(1)?;
+                    }
+                    assert_ne!(vm.gc_trace().phase, GcPhase::Pause);
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+            prime_protected_allocation_error(&owner);
+        } else if active_gc {
+            owner
+                .with_vm(|vm| vm.incremental_step(1).unwrap())
+                .unwrap();
             prime_protected_error(state);
             prime_protected_allocation_error(&owner);
         }
@@ -580,12 +613,18 @@ fn c_closure_a43_named_failpoints_preserve_state_and_retry() {
                     vm.gc_trace(),
                     vm.roots().total_count(),
                 );
+                if active_gc {
+                    assert_ne!(snapshot.1.phase, GcPhase::Pause, "point={point:?}");
+                }
                 vm.inject_failure_once(point);
                 snapshot
             })
             .unwrap();
         // SAFETY：有效 state；命名失敗點只能中斷未發布 closure。
-        assert!(unsafe { rivetlua_capi_test_protected_error_a4b(state, 0, 0, 2, Some(first)) } > 0);
+        assert!(
+            unsafe { rivetlua_capi_test_protected_error_a4b(state, 0, 0, 2, Some(first)) } > 0,
+            "point={point:?}"
+        );
         assert_eq!(unsafe { lua_gettop(state) }, 2, "point={point:?}");
         owner
             .with_vm(|vm| {
@@ -594,6 +633,21 @@ fn c_closure_a43_named_failpoints_preserve_state_and_retry() {
                 assert_eq!(vm.roots().total_count(), before.2, "point={point:?}");
             })
             .unwrap();
+        if point == FailPoint::MarkReserve {
+            owner
+                .with_vm(|vm| {
+                    assert_eq!(
+                        vm.allocation_trace()
+                            .last_failure
+                            .unwrap()
+                            .attempt
+                            .point,
+                        Some(point),
+                        "point={point:?}"
+                    );
+                })
+                .unwrap();
+        }
         // SAFETY：同一有效 state；failpoint 為單次，立即重試須成功。
         unsafe {
             lua_pushcclosure(state, Some(first), 2);

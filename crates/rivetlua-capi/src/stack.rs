@@ -32,6 +32,8 @@ use crate::trampoline::Checkpoint;
 
 unsafe extern "C" {
     fn strerror(errnum: c_int) -> *mut c_char;
+    // SAFETY：C 端只比對傳入指標與仍存活的 TLS checkpoint，不解參照 state。
+    safe fn rivetlua_capi_yield_boundary_a5(pointer: *mut lua_State) -> c_int;
     fn rivetlua_capi_default_warning_install_b6(pointer: *mut lua_State);
     fn rivetlua_capi_default_panic_install_a2(pointer: *mut lua_State);
     #[link_name = "lua_compare"]
@@ -1749,6 +1751,7 @@ impl StateControl {
     fn resume_prepare_a5(
         &self,
         from: Option<&StateControl>,
+        from_yieldable: Option<bool>,
         nargs: c_int,
     ) -> Result<ResumeSetupA5, StackError> {
         self.validate()?;
@@ -1772,7 +1775,17 @@ impl StateControl {
                 return Err(StackError::WrongVm);
             }
         }
+        let resume_parent = from
+            .and_then(|source| source.thread_identity)
+            .zip(from_yieldable);
         let mut group = owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
+        if let (Some(source), Some(frame)) = (from, group.callback_frames.entries.last()) {
+            if frame.owner_generation != source.state_generation
+                || group.vm.external_event(frame.token).is_err()
+            {
+                return Err(StackError::Busy);
+            }
+        }
         let child = self.thread_identity.ok_or(StackError::InvalidState)?;
         let state = group.vm.coroutine_state(child)?;
         if state != CoroutineState::Suspended {
@@ -1798,7 +1811,9 @@ impl StateControl {
             let prepared_frames = group
                 .callback_frames
                 .prepare_additional(&group.vm, held.frames.entries.len())?;
-            let remap = group.vm.resume_external_a5(child)?;
+            let remap = group
+                .vm
+                .resume_external_with_capi_parent_a5(child, resume_parent)?;
             let k = held.continuation;
             let context = held.context;
             let base = held.frames.entries.first().map_or(0, CallbackFrame::base);
@@ -1830,24 +1845,46 @@ impl StateControl {
                 context,
             });
         }
+        let first_resume = self.a5_status.get() != 1;
         let base = stack
             .slots
             .len()
-            .checked_sub(count.checked_add(1).ok_or(StackError::StackLimit)?)
+            .checked_sub(
+                count
+                    .checked_add(usize::from(first_resume))
+                    .ok_or(StackError::StackLimit)?,
+            )
             .ok_or(StackError::InvalidIndex)?;
-        let StackValue::Core(entry) = stack.slots[base].checked_value(&group.vm)?;
-        let arguments = callback_values_b4(&group.vm, &stack.slots[base + 1..])?;
-        group.vm.set_host_coroutine_entry_a5(child, entry)?;
+        let entry = if first_resume {
+            let StackValue::Core(entry) = stack.slots[base].checked_value(&group.vm)?;
+            Some(entry)
+        } else {
+            None
+        };
+        let arguments = callback_values_b4(
+            &group.vm,
+            &stack.slots[base + usize::from(first_resume)..],
+        )?;
+        if let Some(entry) = entry {
+            group.vm.set_host_coroutine_entry_a5(child, entry)?;
+        }
         let worker_fuel = group.worker_fuel();
         let outcome = group
             .vm
             .resume(Value::Object(child), &arguments.values)
-            .and_then(|mut execution| run_worker_execution(&mut execution, worker_fuel));
+            .and_then(|mut execution| {
+                if let Some((parent, yieldable)) = resume_parent {
+                    execution.set_capi_resume_parent_yieldability(parent, yieldable)?;
+                }
+                run_worker_execution(&mut execution, worker_fuel)
+            });
         let outcome = group.account_worker_result(outcome, self.native_parent.get());
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                let _ = group.vm.clear_host_coroutine_entry_a5(child, entry);
+                if let Some(entry) = entry {
+                    let _ = group.vm.clear_host_coroutine_entry_a5(child, entry);
+                }
                 return Err(error.into());
             }
         };
@@ -2834,18 +2871,30 @@ impl StateControl {
         }
         // 外層 C callback 可同步 reset 同組 child；permit 只在本次 reset C frame
         // 存活，且 parent prefix 的 owner、深度與 token 必須保持原狀。
-        if require_callback_owner
-            && group
+        if require_callback_owner {
+            if let Some(frame) = group
                 .callback_frames
                 .entries
                 .last()
-                .is_some_and(|frame| frame.owner_generation != self.state_generation)
-            && !self
-                .reset_permit_a5
-                .get()
-                .is_some_and(|permit| permit.matches_prefix(self, &group))
-        {
-            return Err(StackError::Busy);
+                .filter(|frame| frame.owner_generation != self.state_generation)
+            {
+                let reset_allowed = self
+                    .reset_permit_a5
+                    .get()
+                    .is_some_and(|permit| permit.matches_prefix(self, &group));
+                // 父 C callback 停放期間，尚未執行或已完成的 child stack 仍可讀寫結果。
+                let inactive_child = !self.main_control
+                    && self.thread_identity.is_some_and(|child| {
+                        matches!(
+                            group.vm.coroutine_state(child),
+                            Ok(CoroutineState::Suspended | CoroutineState::Dead)
+                        )
+                    })
+                    && group.vm.external_event(frame.token).is_ok();
+                if !reset_allowed && !inactive_child {
+                    return Err(StackError::Busy);
+                }
+            }
         }
         Ok(())
     }
@@ -3472,6 +3521,39 @@ impl StateControl {
             view,
             StackCapacityPlan::Prepared(prepared),
         )
+    }
+
+    fn open_standard_library(&self, module: c_int) -> Result<c_int, StackError> {
+        self.validate()?;
+        let group_owner = self.group.upgrade().ok_or(StackError::InvalidState)?;
+        let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
+        let mut stack = self.stack.try_borrow_mut().map_err(|_| StackError::Busy)?;
+        let required = stack.slots.len().checked_add(1).ok_or(StackError::StackLimit)?;
+        if required > MAX_STACK {
+            return Err(StackError::StackLimit);
+        }
+        if !(0..=9).contains(&module) {
+            return Err(StackError::InvalidIndex);
+        }
+        let prepared = stack.prepare_capacity(&group.vm, required)?;
+        let registry = group.registry_table()?;
+        let Value::Object(globals) = group.vm.raw_get(
+            registry,
+            Value::Integer(LUA_RIDX_GLOBALS),
+        )? else {
+            return Err(StackError::InvalidIndex);
+        };
+        let (library, library_root) = group.vm.install_c_library(
+            globals,
+            registry,
+            module as u8,
+        )?;
+        let slot = StackSlot::new(&mut group.vm, StackValue::Core(Value::Object(library)));
+        group.vm.remove_root(library_root)?;
+        let slot = slot?;
+        stack.commit_capacity(prepared);
+        stack.slots.push(slot);
+        Ok(1)
     }
 
     fn publish_string_view(
@@ -5145,6 +5227,7 @@ impl StateOwner {
             Rc::new(crate::allocator::default_state()),
             services,
             |_| {},
+            0,
         )
     }
 
@@ -5253,6 +5336,7 @@ impl StateOwner {
             Rc::new(CAllocatorState::new(function, user_data)),
             HostServices::deny_all(),
             |_| {},
+            0,
         )
     }
 
@@ -5263,6 +5347,7 @@ impl StateOwner {
             Rc::new(crate::allocator::default_state()),
             HostServices::deny_all(),
             setup,
+            0,
         )
     }
 
@@ -5270,13 +5355,19 @@ impl StateOwner {
         allocator: Rc<CAllocatorState>,
         services: HostServices,
         setup: impl FnOnce(&mut Vm),
+        hash_seed: u32,
     ) -> Result<Self, StackError> {
         let profile = if cfg!(feature = "lua55") {
             LuaProfile::Lua55
         } else {
             LuaProfile::Lua54
         };
-        let mut vm = Vm::new_with_services_and_admission(profile, services, allocator.clone())?;
+        let mut vm = Vm::new_with_services_and_admission_seeded(
+            profile,
+            services,
+            allocator.clone(),
+            hash_seed,
+        )?;
         setup(&mut vm);
         let generation = next_generation()?;
         let group_bytes = group_accounted_bytes()?;
@@ -7044,10 +7135,11 @@ impl StateControl {
             let outcome = if let Some(token) = token {
                 group.continue_worker_external(
                     token,
-                    ExternalCommand::NestedCall {
+                    ExternalCommand::NestedCapiCall {
                         target: event,
                         args: std::mem::take(&mut args.values),
                         results: ResultMode::Fixed(1),
+                        yieldable: false,
                     },
                     self.native_parent.get(),
                 )?
@@ -7531,6 +7623,7 @@ impl StateControl {
         nargs: c_int,
         nresults: c_int,
         public: bool,
+        yieldable: bool,
     ) -> Result<CallbackStepB4, StackError> {
         self.validate()?;
         let mode = callback_mode_b4(nresults)?;
@@ -7565,10 +7658,11 @@ impl StateControl {
         let outcome = if let Some(token) = callback_token {
             group.continue_worker_external(
                 token,
-                ExternalCommand::NestedCall {
+                    ExternalCommand::NestedCapiCall {
                     target,
                     args: std::mem::take(&mut args.values),
                     results: mode,
+                    yieldable,
                 },
                 native_parent,
             )
@@ -7986,7 +8080,7 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_call_prepare_b4(
 ) -> CallbackStepB4 {
     ffi_boundary(CallbackStepB4::error(), || {
         // SAFETY：有效 state 是 C driver 的前置條件；checked_state 驗身分。
-        unsafe { checked_state(pointer)? }.callback_prepare_b4(nargs, nresults, false)
+        unsafe { checked_state(pointer)? }.callback_prepare_b4(nargs, nresults, false, false)
     })
 }
 
@@ -8020,7 +8114,12 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_call_prepare_a2(
         // SAFETY：live state 為 C 呼叫者前置條件。
         let state = unsafe { checked_state(pointer)? };
         state
-            .callback_prepare_b4(nargs, nresults, true)
+            .callback_prepare_b4(
+                nargs,
+                nresults,
+                true,
+                rivetlua_capi_yield_boundary_a5(pointer) == 1,
+            )
             .or_else(|error| state.callback_error_step_a2(error))
     })
 }
@@ -9954,7 +10053,15 @@ fn publish_default_state(owner: StateOwner) -> *mut lua_State {
 #[allow(non_snake_case)]
 pub extern "C" fn luaL_newstate() -> *mut lua_State {
     ffi_boundary(std::ptr::null_mut(), || {
+        #[cfg(feature = "lua54")]
         let owner = StateOwner::new()?;
+        #[cfg(feature = "lua55")]
+        let owner = StateOwner::new_with_allocator_setup(
+            Rc::new(crate::allocator::default_state()),
+            HostServices::deny_all(),
+            |_| {},
+            crate::luaL_makeseed(std::ptr::null_mut()),
+        )?;
         Ok(publish_default_state(owner))
     })
 }
@@ -10041,7 +10148,7 @@ pub unsafe extern "C" fn lua_newstate(f: Option<LuaAlloc>, ud: *mut c_void) -> *
     })
 }
 
-/// Lua 5.5 的 seed 不參與本片 allocator 綁定；VM 既有 profile 規則保持不變。
+/// Lua 5.5 的 seed 在首筆 VM 配置前固定於字串與表索引。
 ///
 /// # Safety
 /// f/ud 必須在 state 存活期間可呼叫；callback 不得跨 ABI unwind 或 longjmp。
@@ -10050,11 +10157,17 @@ pub unsafe extern "C" fn lua_newstate(f: Option<LuaAlloc>, ud: *mut c_void) -> *
 pub unsafe extern "C" fn lua_newstate(
     f: Option<LuaAlloc>,
     ud: *mut c_void,
-    _seed: c_uint,
+    seed: c_uint,
 ) -> *mut lua_State {
     ffi_boundary(std::ptr::null_mut(), || {
         let function = f.ok_or(StackError::InvalidState)?;
-        Ok(StateOwner::new_with_allocator(function, ud)?.into_c_ptr())
+        Ok(StateOwner::new_with_allocator_setup(
+            Rc::new(CAllocatorState::new(function, ud)),
+            HostServices::deny_all(),
+            |_| {},
+            seed,
+        )?
+        .into_c_ptr())
     })
 }
 
@@ -10191,6 +10304,11 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_reset_preflight_b11(
         if state.reset_permit_a5.get().is_some() {
             return Err(StackError::Busy);
         }
+        let main_idle = state.main_control
+            && group.vm.main_thread_identity() == Some(identity)
+            && state.checkpoint_depth.get() == 0
+            && group.callback_frames.entries.is_empty()
+            && group.vm.coroutine_state(identity)? == CoroutineState::Running;
         if group
             .callback_frames
             .entries
@@ -10198,10 +10316,10 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_reset_preflight_b11(
             .any(|frame| frame.owner_generation == state.state_generation)
             || group.vm.execution_running()
             || group.vm.finalizer_running()
-            || matches!(
+            || (matches!(
                 group.vm.coroutine_state(identity)?,
                 CoroutineState::Running | CoroutineState::Normal
-            )
+            ) && !main_idle)
         {
             return Err(StackError::Busy);
         }
@@ -10730,6 +10848,12 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_reset_cancel_b11(pointer: *mut lua
             return Ok(0);
         }
         group.vm.cancel_prepared_thread_reset_b11()?;
+        if state.main_control {
+            let identity = state.thread_identity.ok_or(StackError::InvalidState)?;
+            if group.vm.coroutine_state(identity)? == CoroutineState::Dead {
+                group.vm.finalize_thread_reset(Value::Object(identity))?;
+            }
+        }
         Ok(0)
     })
 }
@@ -11263,6 +11387,7 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_resume_prepare_a5(
     pointer: *mut lua_State,
     from: *mut lua_State,
     nargs: c_int,
+    from_yieldable: c_int,
 ) -> ResumeSetupA5 {
     match catch_unwind(AssertUnwindSafe(|| -> Result<ResumeSetupA5, StackError> {
         // SAFETY：有效 C state 是公開 API 前置條件；checked_state 驗證世代與 thread。
@@ -11273,7 +11398,7 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_resume_prepare_a5(
             // SAFETY：非空 from 的有效期由 C caller 保證。
             Some(unsafe { checked_state(from)? })
         };
-        state.resume_prepare_a5(source, nargs)
+        state.resume_prepare_a5(source, source.map(|_| from_yieldable != 0), nargs)
     })) {
         Ok(Ok(setup)) => setup,
         Ok(Err(error)) => ResumeSetupA5::rejected(error),
@@ -11322,7 +11447,9 @@ pub unsafe extern "C" fn lua_setcstacklimit(pointer: *mut lua_State, _limit: c_u
 pub unsafe extern "C" fn lua_isyieldable(pointer: *mut lua_State) -> c_int {
     with_state(pointer, 0, |state| {
         Ok(c_int::from(
-            !state.main_control && state.thread_identity.is_some(),
+            !state.main_control
+                && state.thread_identity.is_some()
+                && rivetlua_capi_yield_boundary_a5(pointer) != 0,
         ))
     })
 }
@@ -12742,6 +12869,7 @@ const A4B_GETUSERVALUE: c_int = 19;
 const A4B_SETUSERVALUE: c_int = 20;
 const A4B_GETMETAFIELD: c_int = 21;
 const A4B_TESTUDATA: c_int = 22;
+const A5_OPEN_STANDARD_LIBRARY: c_int = 23;
 
 fn generic_error_a3(
     pointer: *mut lua_State,
@@ -13109,6 +13237,9 @@ pub(crate) unsafe extern "C" fn rivetlua_capi_generic_dispatch_a3(
                     } else {
                         returned(0, state.test_userdata(first, name)?)
                     }
+                }
+                A5_OPEN_STANDARD_LIBRARY => {
+                    returned(state.open_standard_library(first)?, std::ptr::null_mut())
                 }
                 _ => Err(StackError::InvalidIndex),
             }

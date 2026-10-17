@@ -37,3 +37,15 @@
 ## 完成判準
 
 只有在每個列入範圍的 Lua 項目於 Lua 5.5.1 與 Lua 5.4.9 均有明確實作映射和至少一項有效行為測試，必要測試已在安全啟動鏈下實際執行，且修正後受影響測試通過時，才可報告「已實作並有測試覆蓋」。未支援項目、無測試項目、零匹配、未執行檢查、工具鏈禁令阻擋或上游 oracle 未提供的情況，須分別列出，不宣稱完整 Lua 相容或全面通過。
+
+## B4 文件整合完成摘要
+
+B1、B2、B3 已完成；B4 已將 core、stdlib、C API、SDK 四份映射整合為新增的 `docs/LUA_IMPLEMENTATION_CHECK.csv`，共 653 列，新增 Lua 5.4、Lua 5.5 結果與逐列證據欄。最終 Lua 5.4 為 434 PASS、219 N/A；Lua 5.5 為 438 PASS、215 N/A。沒有 FAIL、NOT_RUN 或 BLOCKED。三個 `profile` 明確以 N/A 開頭的列，兩個結果欄均標 N/A；正向支援版本由對應 profile 列記錄。
+
+結果來自 D=`/Volumes/VP4300L_4T/stevelo/.cache/rivetlua-lua-check` 的執行記錄。Rust 測試先建置：`cargo test --offline --locked --no-run --message-format=json -p <crate> --test <target>`，unit tests 使用 `--lib`；C API 建置另加 `--no-default-features --features lua54` 或 `--no-default-features --features lua55`。之後執行 D/target 下對應 binary，參數為 `--test-threads=1`。共同環境以清空變數起始，PATH=`/Volumes/VP4300L_4T/stevelo/.rustup/toolchains/stable-aarch64-apple-darwin/bin:/bin`，共享 target 為 D/target；C 編譯器使用 `/Library/Developer/CommandLineTools/usr/bin/clang`、`--ld-path=/Library/Developer/CommandLineTools/usr/bin/ld`、SDK `/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk`、AR `/opt/homebrew/Cellar/llvm/22.1.8_2/bin/llvm-ar`。不使用 launcher wrappers 或 DYLD 設定，RUST_BACKTRACE=0、LLVM_DISABLE_SYMBOLIZATION=1。只在 source、test、input、config 等相關輸入未變時重用既有結果。
+
+主代理完成的定點 runner exit 0，共 918 次測試執行 PASS。包含 P13 Lua54/Lua55 各 380 PASS、各 5 ignored；compiler bytecode_contracts 35 PASS；official_chunk_export 預設 36 PASS，另 19 個 default-ignored 官方 oracle case 各自 exact 執行 PASS；core pending/fixed_birth/fixed_pending_pair 與 marker-cycle 清槽/word-count 四個定點各 PASS；RVLU-TRANSPORT-SCAN 兩個 exact 測試各 1 PASS/16 filtered，兩函式內均遍歷 Lua54/Lua55；HEAP-007 雙 profile PASS；runtime official_chunk_runtime 26、p17_calls_prefix_budget 14、p17_debug_traceback 21 PASS。C API dump/load 與 gc_controls 兩 feature 的逐列結果已收錄。未執行完整 upstream suite，也未執行已取消的 phase acceptance、gate、CI；5 個 ignored 測試未計為 PASS。
+
+本次測試程式碼狀態為 `HEAD 3ee4972e008cab0750628fd5fcc36a16fb2240c0` 加本次未提交修正（計畫不授權新 commit）。19 個 official Lua oracle case 的實際命令為對應 binary `--ignored --exact <test ID> --nocapture --test-threads=1`；使用 D/oracle/lua54、D/oracle/lua55 中已核實的 `lua`／`luac`，並設定 `RIVETLUA_LUA54`、`RIVETLUA_LUA55`、`RIVETLUA_LUA54_LUAC`、`RIVETLUA_LUA55_LUAC`。
+
+Lua55 seed 仍是 CAPI lifecycle、runtime seeded short-string/table-bucket 與 source-forwarding 的分層覆蓋，沒有透過 C API 直接觀察非零 seed hash 的 oracle。HostServices 預設拒絕、空 path/cpath、mock callback 與 unsupported/N/A 範圍保留；未宣稱完整 Lua 相容或 release readiness。文件自審與欄位／653 列／唯一鍵靜態檢查通過；主代理已完成整合審查與功能測試。D 內共用建置快取、離線 oracle、暫存測試輸入／輸出、中間映射與記錄均已清除；來源與必要 fixtures 保留。C API dump/load 前次兩版結果沿用的依據是：fixture 固定回傳 41，不經此次新增的 cycle marker 清理路徑，相關輸入與執行條件未變。

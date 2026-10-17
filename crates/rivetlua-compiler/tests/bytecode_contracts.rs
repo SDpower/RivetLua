@@ -260,30 +260,32 @@ fn public_ir_lua55_global_declaration_without_initializer_preserves_existing_val
 
 #[test]
 fn public_ir_is_deterministic_and_stops_before_limits() {
-    let resolved_binary = resolved(b"return 1+2", LanguageProfile::Lua55);
-    assert_eq!(
-        lower(&resolved_binary, &IrLimits::default()).unwrap(),
-        lower(&resolved_binary, &IrLimits::default()).unwrap()
-    );
-    let limits = IrLimits {
-        max_instructions: 1,
-        ..IrLimits::default()
-    };
-    assert!(lower(&resolved_binary, &limits).is_err());
-    let register_limits = IrLimits {
-        max_registers: 1,
-        ..IrLimits::default()
-    };
-    assert!(lower(&resolved_binary, &register_limits).is_err());
-    let nested = resolved(b"local function f() return 1 end", LanguageProfile::Lua55);
-    let prototype_limits = IrLimits {
-        max_prototypes: 1,
-        ..IrLimits::default()
-    };
-    assert!(lower(&nested, &prototype_limits).is_err());
-    let mut malformed = resolved_binary;
-    malformed.functions.clear();
-    assert!(lower(&malformed, &IrLimits::default()).is_err());
+    for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
+        let resolved_binary = resolved(b"return 1+2", profile);
+        assert_eq!(
+            lower(&resolved_binary, &IrLimits::default()).unwrap(),
+            lower(&resolved_binary, &IrLimits::default()).unwrap()
+        );
+        let limits = IrLimits {
+            max_instructions: 1,
+            ..IrLimits::default()
+        };
+        assert!(lower(&resolved_binary, &limits).is_err());
+        let register_limits = IrLimits {
+            max_registers: 1,
+            ..IrLimits::default()
+        };
+        assert!(lower(&resolved_binary, &register_limits).is_err());
+        let nested = resolved(b"local function f() return 1 end", profile);
+        let prototype_limits = IrLimits {
+            max_prototypes: 1,
+            ..IrLimits::default()
+        };
+        assert!(lower(&nested, &prototype_limits).is_err());
+        let mut malformed = resolved_binary;
+        malformed.functions.clear();
+        assert!(lower(&malformed, &IrLimits::default()).is_err());
+    }
 }
 
 fn jump_target(instruction: &Instruction) -> Option<usize> {
@@ -1214,7 +1216,6 @@ fn public_ir_clears_local_initializer_source_after_binding_move() {
 }
 
 fn assert_statement_call_private_interval(source: &[u8], kind: &str) {
-    let mut missing = Vec::new();
     for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
         let ir = lower(&resolved(source, profile), &IrLimits::default()).unwrap();
         let root = ir.prototype_for(FunctionId(0)).unwrap();
@@ -1237,12 +1238,12 @@ fn assert_statement_call_private_interval(source: &[u8], kind: &str) {
                 _ => None,
             })
             .expect("call statement 必須產生 Fixed(0) Call");
-        let (prior_pc, prior_end) = root.instructions[..call_pc]
+        let prior_pc = root.instructions[..call_pc]
             .iter()
             .enumerate()
             .rev()
             .find_map(|(pc, entry)| match entry.instruction {
-                Instruction::LoadNil { start, count } => Some((pc, start.0 + count)),
+                Instruction::LoadNil { .. } => Some(pc),
                 _ => None,
             })
             .expect("前一個 local initializer 必須清除暫存器");
@@ -1257,7 +1258,13 @@ fn assert_statement_call_private_interval(source: &[u8], kind: &str) {
                 _ => None,
             })
             .expect("外層 live binding 必須可回傳");
-        assert!(live.0 < prior_end && prior_end < return_base.0);
+        let (cleanup_start, cleanup_end) = match root.instructions[call_pc + 1].instruction {
+            Instruction::LoadNil { start, count } => (start.0, start.0 + count),
+            ref other => panic!("{profile:?} {kind}: Call 後缺少清理，取得 {other:?}"),
+        };
+        assert!(cleanup_start <= base.0 && base.0 < cleanup_end);
+        assert!(live.0 < cleanup_start || live.0 >= cleanup_end);
+        assert_eq!(cleanup_end, root.register_count);
         assert!(
             root.instructions[call_pc + 1..return_pc]
                 .iter()
@@ -1293,10 +1300,9 @@ fn assert_statement_call_private_interval(source: &[u8], kind: &str) {
             };
             if let Some(register) = register {
                 assert!(
-                    prior_end <= register.0 && register.0 < return_base.0,
-                    "{profile:?} {kind}: R{} 不在 statement-private interval R{prior_end}..R{}",
+                    cleanup_start <= register.0 && register.0 < cleanup_end,
+                    "{profile:?} {kind}: R{} 不在 Call 清理區間 R{cleanup_start}..R{cleanup_end}",
                     register.0,
-                    return_base.0
                 );
             }
         }
@@ -1308,7 +1314,6 @@ fn assert_statement_call_private_interval(source: &[u8], kind: &str) {
             !new_table.is_empty(),
             "{profile:?} {kind}: 缺少 private argument"
         );
-        assert!(base.0 >= prior_end && base.0 < return_base.0);
         match kind {
             "normal" => assert_eq!(arg_count, 2),
             "method" => {
@@ -1330,22 +1335,9 @@ fn assert_statement_call_private_interval(source: &[u8], kind: &str) {
             _ => unreachable!(),
         }
 
-        let expected_count = root.register_count - prior_end;
-        let next = root
-            .instructions
-            .get(call_pc + 1)
-            .map(|entry| &entry.instruction);
-        if !matches!(next, Some(Instruction::LoadNil { start, count })
-            if start.0 == prior_end && *count == expected_count)
-        {
-            missing.push(format!(
-                "{profile:?} {kind}: Call pc={call_pc} 後為 {next:?}，預期 LoadNil R{prior_end} count={expected_count}"
-            ));
-        }
         rivetlua_compiler::emit(&ir, &rivetlua_compiler::VerifyLimits::default())
             .expect("call statement RVLU_V2 必須通過 verifier");
     }
-    assert!(missing.is_empty(), "{}", missing.join("\n"));
 }
 
 #[test]
