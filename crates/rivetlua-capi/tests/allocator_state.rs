@@ -112,14 +112,14 @@ fn mark_callback_fault() {
 
 #[cfg(feature = "lua54")]
 fn create_state(allocator: MaybeAllocCallback, ud: *mut c_void) -> *mut lua_State {
-    // allocator 與 ud 在 state 存活期間有效；測試 callback 不會重入 Lua、panic 或 longjmp。
-    lua_newstate(allocator, ud)
+    // SAFETY：allocator 與 ud 在 state 存活期間有效；測試 callback 不會重入 Lua、panic 或 longjmp。
+    unsafe { lua_newstate(allocator, ud) }
 }
 
 #[cfg(feature = "lua55")]
 fn create_state(allocator: MaybeAllocCallback, ud: *mut c_void) -> *mut lua_State {
-    // allocator 與 ud 在 state 存活期間有效；測試 callback 不會重入 Lua、panic 或 longjmp。
-    lua_newstate(allocator, ud, 0)
+    // SAFETY：allocator 與 ud 在 state 存活期間有效；測試 callback 不會重入 Lua、panic 或 longjmp。
+    unsafe { lua_newstate(allocator, ud, 0) }
 }
 
 struct State(*mut lua_State);
