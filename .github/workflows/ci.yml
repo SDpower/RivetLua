@@ -22,9 +22,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/rivetlua-p16-target
-      TMPDIR: ${{ runner.temp }}/rivetlua-p16-target/tmp
-      RIVETLUA_P16_EVIDENCE_DIR: ${{ runner.temp }}/rivetlua-p16-evidence
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Checkout
@@ -40,7 +37,12 @@ jobs:
           rustc -vV | grep -F "host: ${{ matrix.target }}"
 
       - name: Prepare shared phase cache
-        run: mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR" "$RIVETLUA_P16_EVIDENCE_DIR"
+        run: |
+          phase_target="$RUNNER_TEMP/rivetlua-p16-target"
+          phase_tmp="$phase_target/tmp"
+          phase_evidence="$RUNNER_TEMP/rivetlua-p16-evidence"
+          mkdir -p "$phase_target" "$phase_tmp" "$phase_evidence"
+          printf '%s\n' "CARGO_TARGET_DIR=$phase_target" "TMPDIR=$phase_tmp" "RIVETLUA_P16_EVIDENCE_DIR=$phase_evidence" >> "$GITHUB_ENV"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
