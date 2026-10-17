@@ -383,7 +383,10 @@ fn root_child_work_and_host_clone_failures_roll_back() {
     let retry_root = vm.add_root(RootKind::Temporary, retry).unwrap();
     let before = vm.ledger_snapshot();
     vm.inject_failure_once(FailPoint::WorkReserve);
-    assert_eq!(vm.collect(), Err(VmError::InjectedFailure(FailPoint::WorkReserve)));
+    assert_eq!(
+        vm.collect(),
+        Err(VmError::InjectedFailure(FailPoint::WorkReserve))
+    );
     assert_eq!(vm.ledger_snapshot(), before);
     assert_eq!(host.read(&vm), Ok(Value::Integer(1)));
     assert_eq!(vm.read(child), Ok(Value::Integer(2)));

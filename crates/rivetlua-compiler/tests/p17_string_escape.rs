@@ -32,10 +32,7 @@ fn unicode_short_escapes_encode_lua_utf8_boundaries_for_both_profiles() {
         (b"\"\\u{200000}\"", b"\xf8\x88\x80\x80\x80"),
         (b"\"\\u{3FFFFFF}\"", b"\xfb\xbf\xbf\xbf\xbf"),
         (b"\"\\u{4000000}\"", b"\xfc\x84\x80\x80\x80\x80"),
-        (
-            b"\"\\u{7FFFFFFF}\"",
-            b"\xfd\xbf\xbf\xbf\xbf\xbf",
-        ),
+        (b"\"\\u{7FFFFFFF}\"", b"\xfd\xbf\xbf\xbf\xbf\xbf"),
     ];
 
     for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {

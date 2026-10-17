@@ -19,12 +19,18 @@ pub enum IdentityError {
 }
 
 impl ReleaseIdentity {
-    pub fn from_verified(module: &VerifiedModule, crate_semver: &str) -> Result<Self, IdentityError> {
+    pub fn from_verified(
+        module: &VerifiedModule,
+        crate_semver: &str,
+    ) -> Result<Self, IdentityError> {
         let numbers = crate_semver.split('.').collect::<Vec<_>>();
-        if numbers.len() != 3 || numbers.iter().any(|part| {
-            part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit())
-                || (part.len() > 1 && part.starts_with('0'))
-        }) {
+        if numbers.len() != 3
+            || numbers.iter().any(|part| {
+                part.is_empty()
+                    || !part.bytes().all(|byte| byte.is_ascii_digit())
+                    || (part.len() > 1 && part.starts_with('0'))
+            })
+        {
             return Err(IdentityError::CrateVersion);
         }
         Ok(Self {
@@ -37,9 +43,11 @@ impl ReleaseIdentity {
         })
     }
 
-    pub fn from_rvlu_bytes(bytes: &[u8], expected_profile: LuaProfile, crate_semver: &str)
-        -> Result<Self, IdentityError>
-    {
+    pub fn from_rvlu_bytes(
+        bytes: &[u8],
+        expected_profile: LuaProfile,
+        crate_semver: &str,
+    ) -> Result<Self, IdentityError> {
         let module = decode_module(bytes, expected_profile, &VerifyLimits::default())
             .map_err(|_| IdentityError::Module)?;
         Self::from_verified(&module, crate_semver)
@@ -50,14 +58,20 @@ impl ReleaseIdentity {
 mod tests {
     use super::*;
     use rivetlua_core::{
-        BytecodeBindingId, BytecodeConstant, BytecodeInstruction, BytecodeModule, BytecodePrototype,
-        BytecodeSpan, ConstId, EnvironmentSource, FrameLayout, Instruction, ProtoId, Register,
-        ResultMode, RVLU_NUMERIC_I64_F64, RVLU_V2, encode_module,
+        BytecodeBindingId, BytecodeConstant, BytecodeInstruction, BytecodeModule,
+        BytecodePrototype, BytecodeSpan, ConstId, EnvironmentSource, FrameLayout, Instruction,
+        ProtoId, RVLU_NUMERIC_I64_F64, RVLU_V2, Register, ResultMode, encode_module,
     };
 
     fn encoded(profile: LuaProfile) -> Vec<u8> {
-        let span = BytecodeSpan { start_byte: 0, end_byte: 8 };
-        let binding = BytecodeBindingId { function: 0, ordinal: 0 };
+        let span = BytecodeSpan {
+            start_byte: 0,
+            end_byte: 8,
+        };
+        let binding = BytecodeBindingId {
+            function: 0,
+            ordinal: 0,
+        };
         let module = BytecodeModule {
             format_version: RVLU_V2,
             profile,
@@ -89,12 +103,18 @@ mod tests {
                 upvalues: vec![],
                 instructions: vec![
                     BytecodeInstruction {
-                        instruction: Instruction::LoadConst { dest: Register(0), constant: ConstId(0) },
+                        instruction: Instruction::LoadConst {
+                            dest: Register(0),
+                            constant: ConstId(0),
+                        },
                         span,
                         close_path: None,
                     },
                     BytecodeInstruction {
-                        instruction: Instruction::Return { base: Register(0), result_mode: ResultMode::Fixed(1) },
+                        instruction: Instruction::Return {
+                            base: Register(0),
+                            result_mode: ResultMode::Fixed(1),
+                        },
                         span,
                         close_path: None,
                     },
@@ -102,7 +122,10 @@ mod tests {
                 close_paths: vec![],
             }],
         };
-        encode_module(module, profile, &VerifyLimits::default()).unwrap().bytes().to_vec()
+        encode_module(module, profile, &VerifyLimits::default())
+            .unwrap()
+            .bytes()
+            .to_vec()
     }
 
     #[test]
@@ -113,16 +136,32 @@ mod tests {
             let identity = ReleaseIdentity::from_verified(&module, "1.2.3").unwrap();
             assert_eq!(identity.lua_profile, module.profile());
             assert_eq!(identity.bytecode_format_version, module.format_version());
-            assert_eq!(ReleaseIdentity::from_rvlu_bytes(&bytes, profile, "1.2.3"), Ok(identity.clone()));
+            assert_eq!(
+                ReleaseIdentity::from_rvlu_bytes(&bytes, profile, "1.2.3"),
+                Ok(identity.clone())
+            );
             assert_eq!(identity.c_abi_version, None);
             assert_eq!(identity.native_artifact_version, None);
             assert_eq!(identity.platform_version, None);
             for bad in ["", "1.2", "01.2.3", "1.02.3", "1.2.03", "1.2.x"] {
-                assert_eq!(ReleaseIdentity::from_verified(&module, bad), Err(IdentityError::CrateVersion));
+                assert_eq!(
+                    ReleaseIdentity::from_verified(&module, bad),
+                    Err(IdentityError::CrateVersion)
+                );
             }
-            let other = if profile == LuaProfile::Lua54 { LuaProfile::Lua55 } else { LuaProfile::Lua54 };
-            assert_eq!(ReleaseIdentity::from_rvlu_bytes(&bytes, other, "1.2.3"), Err(IdentityError::Module));
-            assert_eq!(ReleaseIdentity::from_rvlu_bytes(b"invalid", profile, "1.2.3"), Err(IdentityError::Module));
+            let other = if profile == LuaProfile::Lua54 {
+                LuaProfile::Lua55
+            } else {
+                LuaProfile::Lua54
+            };
+            assert_eq!(
+                ReleaseIdentity::from_rvlu_bytes(&bytes, other, "1.2.3"),
+                Err(IdentityError::Module)
+            );
+            assert_eq!(
+                ReleaseIdentity::from_rvlu_bytes(b"invalid", profile, "1.2.3"),
+                Err(IdentityError::Module)
+            );
         }
     }
 }

@@ -2,11 +2,11 @@
 
 use crate::rust_alloc::vec::Vec;
 
+use crate::rust_alloc::rc::Rc;
 use core::cell::Cell;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
 use core::panic::Location;
-use crate::rust_alloc::rc::Rc;
 
 use crate::VmError;
 
@@ -184,13 +184,18 @@ struct LedgerState {
 
 impl LedgerState {
     fn record_peaks(&mut self) -> Result<(), VmError> {
-        let outstanding = self.snapshot.committed
+        let outstanding = self
+            .snapshot
+            .committed
             .checked_add(self.snapshot.reserved)
             .ok_or(VmError::ArithmeticOverflow)?;
         self.peaks.committed = self.peaks.committed.max(self.snapshot.committed);
         self.peaks.outstanding = self.peaks.outstanding.max(outstanding);
         self.peaks.lua_heap_bytes = self.peaks.lua_heap_bytes.max(self.snapshot.lua_heap_bytes);
-        self.peaks.host_allocation_bytes = self.peaks.host_allocation_bytes.max(self.snapshot.host_allocation_bytes);
+        self.peaks.host_allocation_bytes = self
+            .peaks
+            .host_allocation_bytes
+            .max(self.snapshot.host_allocation_bytes);
         Ok(())
     }
 }
@@ -979,7 +984,9 @@ pub(crate) fn reserve_vec<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{AllocationDomain, AllocationLedger, AllocationPeaks, FailPoint, checked_bytes, reserve_vec};
+    use super::{
+        AllocationDomain, AllocationLedger, AllocationPeaks, FailPoint, checked_bytes, reserve_vec,
+    };
     use crate::VmError;
 
     #[test]
@@ -1005,8 +1012,11 @@ mod tests {
         assert_eq!(ledger.reserve(41).err(), Some(VmError::AllocationFailed));
         assert_eq!(ledger.peaks(), before_reject);
         drop(host);
-        let lua = ledger.reserve_at(20, AllocationDomain::LuaHeap, None)
-            .unwrap().commit_charge().unwrap();
+        let lua = ledger
+            .reserve_at(20, AllocationDomain::LuaHeap, None)
+            .unwrap()
+            .commit_charge()
+            .unwrap();
         assert_eq!(ledger.peaks().lua_heap_bytes, 20);
         drop(lua);
         assert_eq!(ledger.snapshot().committed, 0);

@@ -3,8 +3,8 @@ use rivetlua::{
     PrivateService, ResourceBudget, ResourceLimits, ServiceAccessError, ServiceAudience,
     ServiceOperation, Vm, VmPolicy,
 };
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Clone)]
 struct TestClock(Arc<AtomicU64>);
@@ -121,14 +121,16 @@ fn exercise_policy(profile: LuaProfile, policy: VmPolicy) {
         limits(32),
         clock.now() + 100,
     ));
-    assert!(allow(vm.dispatch_private_service(
-        &handle,
-        &mut legal_grant,
-        ServiceOperation::Invoke,
-        ServiceAudience::Host,
-        b"",
-    ))
-    .is_empty());
+    assert!(
+        allow(vm.dispatch_private_service(
+            &handle,
+            &mut legal_grant,
+            ServiceOperation::Invoke,
+            ServiceAudience::Host,
+            b"",
+        ))
+        .is_empty()
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     let other_issuer = PolicyCapabilities::new().expect("建立另一個宿主 issuer");
@@ -243,14 +245,16 @@ fn exercise_policy(profile: LuaProfile, policy: VmPolicy) {
         limits(32),
         clock.now() + 100,
     ));
-    assert!(allow(vm.dispatch_private_service(
-        &new_handle,
-        &mut new_grant,
-        ServiceOperation::Invoke,
-        ServiceAudience::Host,
-        b"",
-    ))
-    .is_empty());
+    assert!(
+        allow(vm.dispatch_private_service(
+            &new_handle,
+            &mut new_grant,
+            ServiceOperation::Invoke,
+            ServiceAudience::Host,
+            b"",
+        ))
+        .is_empty()
+    );
     assert_eq!(new_calls.load(Ordering::SeqCst), 1);
 
     let budget_calls = Arc::new(AtomicUsize::new(0));
@@ -263,14 +267,16 @@ fn exercise_policy(profile: LuaProfile, policy: VmPolicy) {
         limits(3),
         clock.now() + 100,
     ));
-    assert!(allow(vm.dispatch_private_service(
-        &budget_handle,
-        &mut budget_grant,
-        ServiceOperation::Invoke,
-        ServiceAudience::Host,
-        b"",
-    ))
-    .is_empty());
+    assert!(
+        allow(vm.dispatch_private_service(
+            &budget_handle,
+            &mut budget_grant,
+            ServiceOperation::Invoke,
+            ServiceAudience::Host,
+            b"",
+        ))
+        .is_empty()
+    );
     assert_denied(vm.dispatch_private_service(
         &budget_handle,
         &mut budget_grant,

@@ -23,7 +23,9 @@ fn new_vm_p11() -> Vm {
 }
 
 fn assert_only_main_thread_root(vm: &Vm) {
-    let main = vm.main_thread_identity().expect("coroutine 庫須保留主 thread");
+    let main = vm
+        .main_thread_identity()
+        .expect("coroutine 庫須保留主 thread");
     assert_eq!(vm.object_kind(main), Ok(ObjectKind::Coroutine));
     assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
     assert_eq!(vm.roots().total_count(), 1);

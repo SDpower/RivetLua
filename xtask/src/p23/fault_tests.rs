@@ -15,8 +15,8 @@ fn fault_manifest(profile: &str, point_id: &str, action: &str) -> ExperimentMani
         occurrence: 1,
         action: action.into(),
     };
-    let (input_sha256, scenario_sha256) = fault::input_digests(&plan, profile)
-        .expect("fault test digests are available");
+    let (input_sha256, scenario_sha256) =
+        fault::input_digests(&plan, profile).expect("fault test digests are available");
     let mut json = super::manifest_tests::manifest_for(profile, 23001)
         .replace("\"batch\":\"P23-B01\"", "\"batch\":\"P23-B03\"")
         .replace("\"max_input_bytes\":1024", "\"max_input_bytes\":16777216")
@@ -84,9 +84,18 @@ fn fault_plan_uses_only_registered_point_actions() {
     assert_eq!(fault::validate_plan(&valid), Ok(()));
 
     for invalid in [
-        FaultPlan { point_id: "FP-UNKNOWN".into(), ..valid.clone() },
-        FaultPlan { action: "wrong-action".into(), ..valid.clone() },
-        FaultPlan { occurrence: 0, ..valid },
+        FaultPlan {
+            point_id: "FP-UNKNOWN".into(),
+            ..valid.clone()
+        },
+        FaultPlan {
+            action: "wrong-action".into(),
+            ..valid.clone()
+        },
+        FaultPlan {
+            occurrence: 0,
+            ..valid
+        },
     ] {
         assert!(fault::validate_plan(&invalid).is_err());
     }

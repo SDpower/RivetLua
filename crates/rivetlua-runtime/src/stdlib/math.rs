@@ -2,9 +2,9 @@
 
 use crate::rust_alloc::vec::Vec;
 
-use rivetlua_core::{LuaProfile, Value};
 #[cfg(not(feature = "std"))]
 use rivetlua_core::number::NoStdFloat;
+use rivetlua_core::{LuaProfile, Value};
 
 use crate::alloc::{FailPoint, Reservation, reserve_vec};
 use crate::pending_op::PrintArguments;

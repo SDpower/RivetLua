@@ -5,17 +5,17 @@ use std::process::{Child, Command};
 
 use rivetlua_runtime::VmPolicy;
 
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod windows;
 
-#[cfg(target_os = "macos")]
-use macos as platform;
 #[cfg(target_os = "linux")]
 use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use windows as platform;
 
@@ -28,7 +28,9 @@ pub(crate) enum PolicyDenied {
 }
 
 impl PolicyDenied {
-    pub(crate) const fn public_code(self) -> &'static [u8] { b"E_POLICY_DENIED" }
+    pub(crate) const fn public_code(self) -> &'static [u8] {
+        b"E_POLICY_DENIED"
+    }
 }
 
 pub(crate) struct LaunchPlan {
@@ -39,7 +41,10 @@ pub(crate) struct LaunchPlan {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum ProofPhase { Parent, Child }
+enum ProofPhase {
+    Parent,
+    Child,
+}
 
 pub(crate) struct IsolationProof {
     policy: VmPolicy,
@@ -50,17 +55,22 @@ pub(crate) struct IsolationProof {
 
 impl IsolationProof {
     pub(crate) fn matches(&self, policy: VmPolicy, pid: u32, parent: bool) -> bool {
-        self.policy == policy && self.pid == pid
-            && (self.phase == ProofPhase::Parent) == parent
+        self.policy == policy && self.pid == pid && (self.phase == ProofPhase::Parent) == parent
     }
 }
 
-pub(crate) fn configure(command: &mut Command, binary: &Path, run_dir: &Path,
-    policy: VmPolicy, artifacts: &[PathBuf]) -> Result<LaunchPlan, PolicyDenied> {
+pub(crate) fn configure(
+    command: &mut Command,
+    binary: &Path,
+    run_dir: &Path,
+    policy: VmPolicy,
+    artifacts: &[PathBuf],
+) -> Result<LaunchPlan, PolicyDenied> {
     if policy == VmPolicy::Compatibility || !binary.is_absolute() || !run_dir.is_absolute() {
         return Err(PolicyDenied::InvalidWorker);
     }
-    command.env_clear()
+    command
+        .env_clear()
         .env("RIVETLUA_P16_WORKER_CACHE", run_dir)
         .current_dir(run_dir)
         .arg(match policy {
@@ -82,33 +92,51 @@ pub(crate) fn configure(command: &mut Command, binary: &Path, run_dir: &Path,
         }
         platform::configure(command, binary, run_dir, policy)?
     };
-    Ok(LaunchPlan { policy, binary: binary.to_path_buf(),
-        run_dir: run_dir.to_path_buf(), platform })
+    Ok(LaunchPlan {
+        policy,
+        binary: binary.to_path_buf(),
+        run_dir: run_dir.to_path_buf(),
+        platform,
+    })
 }
 
-pub(crate) fn parent_probe(child: &Child, plan: &LaunchPlan)
-    -> Result<IsolationProof, PolicyDenied> {
+pub(crate) fn parent_probe(
+    child: &Child,
+    plan: &LaunchPlan,
+) -> Result<IsolationProof, PolicyDenied> {
     if !plan.binary.is_absolute() || !plan.run_dir.is_absolute() {
         return Err(PolicyDenied::InvalidWorker);
     }
     let evidence = platform::parent_probe(child, &plan.platform, plan.policy)?;
-    Ok(IsolationProof { policy: plan.policy, pid: child.id(),
-        phase: ProofPhase::Parent, _evidence: evidence })
+    Ok(IsolationProof {
+        policy: plan.policy,
+        pid: child.id(),
+        phase: ProofPhase::Parent,
+        _evidence: evidence,
+    })
 }
 
-pub(crate) fn child_probe(policy: VmPolicy, run_dir: &Path)
-    -> Result<IsolationProof, PolicyDenied> {
+pub(crate) fn child_probe(
+    policy: VmPolicy,
+    run_dir: &Path,
+) -> Result<IsolationProof, PolicyDenied> {
     if policy == VmPolicy::Compatibility || !run_dir.is_absolute() {
         return Err(PolicyDenied::InvalidWorker);
     }
     let evidence = platform::child_probe(policy, run_dir)?;
-    Ok(IsolationProof { policy, pid: std::process::id(),
-        phase: ProofPhase::Child, _evidence: evidence })
+    Ok(IsolationProof {
+        policy,
+        pid: std::process::id(),
+        phase: ProofPhase::Child,
+        _evidence: evidence,
+    })
 }
 
 pub(crate) fn terminate_group(child: &mut Child) -> bool {
     #[cfg(unix)]
-    let group_stopped = i32::try_from(child.id()).ok().filter(|group| *group > 0)
+    let group_stopped = i32::try_from(child.id())
+        .ok()
+        .filter(|group| *group > 0)
         .is_some_and(|group| {
             // SAFETY：受限 worker 在獨立 process group；負號只指定該 group。
             let result = unsafe { libc::kill(-group, libc::SIGKILL) };

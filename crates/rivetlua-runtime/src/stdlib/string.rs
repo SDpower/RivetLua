@@ -75,8 +75,11 @@ fn argument_with_message(vm: &mut Vm, message: &[u8]) -> Result<RuntimeError, Ru
 
 fn char_range_error(vm: &mut Vm, index: usize) -> Result<RuntimeError, RuntimeError> {
     let mut message = ErrorText::new();
-    write!(message, "bad argument #{index} to 'char' (value out of range)")
-        .map_err(|_| VmError::ArithmeticOverflow)?;
+    write!(
+        message,
+        "bad argument #{index} to 'char' (value out of range)"
+    )
+    .map_err(|_| VmError::ArithmeticOverflow)?;
     argument_with_message(vm, message.as_bytes())
 }
 
@@ -618,7 +621,9 @@ mod p17_b03_tests {
     use super::{StringBuiltin, execute};
     use crate::vm::{RunOutcome, RuntimeError, RuntimeErrorKind};
     use crate::{ObjectKind, RootKind, Vm, VmError};
-    use rivetlua_compiler::{CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve};
+    use rivetlua_compiler::{
+        CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+    };
     use rivetlua_core::{LuaProfile, Value, VerifyLimits};
 
     fn assert_error_message(vm: &mut Vm, error: RuntimeError, fragment: &[u8]) {
@@ -627,12 +632,13 @@ mod p17_b03_tests {
         let Value::Object(message) = error.value else {
             panic!("字串錯誤應保留 Lua 可見文字")
         };
-        assert!(vm
-            .with_byte_string(message, |text| text
+        assert!(
+            vm.with_byte_string(message, |text| text
                 .as_bytes()
                 .windows(fragment.len())
                 .any(|window| window == fragment))
-            .unwrap());
+                .unwrap()
+        );
         let root = vm.add_root(RootKind::Temporary, message).unwrap();
         vm.collect().unwrap();
         assert_eq!(vm.object_kind(message), Ok(ObjectKind::ByteString));
@@ -648,11 +654,7 @@ mod p17_b03_tests {
         for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
             let mut vm = Vm::new_with_profile(profile).unwrap();
             for value in [256, -1, i64::MAX, i64::MIN] {
-                let error = match execute(
-                    &mut vm,
-                    StringBuiltin::Char,
-                    &[Value::Integer(value)],
-                ) {
+                let error = match execute(&mut vm, StringBuiltin::Char, &[Value::Integer(value)]) {
                     Err(error) => error,
                     Ok(_) => panic!("超出 byte 範圍的 string.char 必須失敗"),
                 };
@@ -688,7 +690,10 @@ mod p17_b03_tests {
             let parsed = parse(&tokens, language, &limits).unwrap();
             let resolved = resolve(&parsed, &tokens, language, &limits).unwrap();
             let ir = lower(&resolved, &IrLimits::default()).unwrap();
-            let module = emit(&ir, &VerifyLimits::default()).unwrap().verified().clone();
+            let module = emit(&ir, &VerifyLimits::default())
+                .unwrap()
+                .verified()
+                .clone();
 
             let mut vm = Vm::new_with_profile(profile).unwrap();
             let environment = vm.allocate_table().unwrap();
@@ -697,7 +702,9 @@ mod p17_b03_tests {
             vm.install_error_builtins(environment).unwrap();
             vm.install_string_builtins(environment).unwrap();
             vm.set_collect_every_allocation(true);
-            let mut execution = vm.load_with_environment(module, Value::Object(environment)).unwrap();
+            let mut execution = vm
+                .load_with_environment(module, Value::Object(environment))
+                .unwrap();
             let RunOutcome::Returned(values) = execution.run().unwrap() else {
                 panic!("受保護的字串錯誤應返回")
             };
@@ -709,13 +716,23 @@ mod p17_b03_tests {
                 let Value::Object(message) = values[index] else {
                     panic!("pcall 應交付字串錯誤訊息")
                 };
-                assert!(vm.with_byte_string(message, |text| text.as_bytes().windows(fragment.len()).any(|part| part == fragment)).unwrap());
+                assert!(
+                    vm.with_byte_string(message, |text| text
+                        .as_bytes()
+                        .windows(fragment.len())
+                        .any(|part| part == fragment))
+                        .unwrap()
+                );
             }
             for (index, expected) in [(4, b"\0\xff".as_slice()), (5, b"ab-ab".as_slice())] {
                 let Value::Object(result) = values[index] else {
                     panic!("正常字串結果應為物件")
                 };
-                assert_eq!(vm.with_byte_string(result, |text| text.as_bytes().to_vec()).unwrap(), expected);
+                assert_eq!(
+                    vm.with_byte_string(result, |text| text.as_bytes().to_vec())
+                        .unwrap(),
+                    expected
+                );
             }
             assert_eq!(vm.roots().count(RootKind::Temporary), 0);
             vm.remove_root(environment_root).unwrap();

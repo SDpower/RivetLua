@@ -1,27 +1,27 @@
 //! P23 實驗入口；工具目錄只列資訊，不自動執行外部工具。
 
-mod manifest;
-mod harness;
-mod codec;
-mod language;
-mod sdk;
 mod capi_sequence;
+mod codec;
 mod fault;
-mod tools;
-mod schedule;
-mod performance;
-#[cfg(test)]
-mod manifest_tests;
-#[cfg(test)]
-mod harness_tests;
 #[cfg(test)]
 mod fault_tests;
+mod harness;
 #[cfg(test)]
-mod tool_tests;
+mod harness_tests;
+mod language;
+mod manifest;
 #[cfg(test)]
-mod schedule_tests;
+mod manifest_tests;
+mod performance;
 #[cfg(test)]
 mod performance_tests;
+mod schedule;
+#[cfg(test)]
+mod schedule_tests;
+mod sdk;
+#[cfg(test)]
+mod tool_tests;
+mod tools;
 
 #[cfg(test)]
 pub(super) use manifest::{ExperimentManifest, select_target, target_registry};
@@ -58,10 +58,12 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
         [command] if command == "registry" => {
             let entries = manifest::target_registry()
                 .iter()
-                .map(|target| format!(
-                    "{{\"id\":\"{}\",\"seed\":{},\"input_kind\":\"{}\",\"oracle\":\"{}\"}}",
-                    target.id, target.seed, target.input_kind, target.oracle
-                ))
+                .map(|target| {
+                    format!(
+                        "{{\"id\":\"{}\",\"seed\":{},\"input_kind\":\"{}\",\"oracle\":\"{}\"}}",
+                        target.id, target.seed, target.input_kind, target.oracle
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             println!("{{\"version\":1,\"targets\":[{entries}]}}");
@@ -105,8 +107,12 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         [command, tier] if command == "schedule" => print_schedule(tier, 3),
-        [command, tier, flag, seeds] if command == "schedule" && flag == "--seeds" && tier == "release" => {
-            let count = seeds.parse::<usize>().map_err(|_| "E_P23B04_RELEASE_SEEDS")?;
+        [command, tier, flag, seeds]
+            if command == "schedule" && flag == "--seeds" && tier == "release" =>
+        {
+            let count = seeds
+                .parse::<usize>()
+                .map_err(|_| "E_P23B04_RELEASE_SEEDS")?;
             print_schedule(tier, count)
         }
         [command, flag, path] if command == "performance" && flag == "--manifest" => {
@@ -115,10 +121,15 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
             let manifest = manifest::ExperimentManifest::parse(input)?;
             let _lock = PANIC_HOOK_LOCK.lock().map_err(|_| "E_PERF_HOOK")?;
             let _hook = QuietPanicHook::new();
-            let collected = panic::catch_unwind(AssertUnwindSafe(|| performance::collect(&manifest)))
-                .map_err(|_| "E_PERF_PANIC")??;
+            let collected =
+                panic::catch_unwind(AssertUnwindSafe(|| performance::collect(&manifest)))
+                    .map_err(|_| "E_PERF_PANIC")??;
             println!("{}", collected.json);
-            if collected.all_jit_fallback { Err("E_PERF_JIT_FALLBACK".into()) } else { Ok(()) }
+            if collected.all_jit_fallback {
+                Err("E_PERF_JIT_FALLBACK".into())
+            } else {
+                Ok(())
+            }
         }
         [command, rest @ ..] if command == "perf-compare" => compare_perf(rest),
         [command, flag, path] if command == "fault" && flag == "--manifest" => {
@@ -128,31 +139,50 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
             if host_triple() != Some(manifest.target.as_str()) {
                 return Err("E_FAULT_HOST_UNSUPPORTED".into());
             }
-            let _lock = PANIC_HOOK_LOCK.lock().map_err(|_| "E_FAULT_HOOK".to_owned())?;
+            let _lock = PANIC_HOOK_LOCK
+                .lock()
+                .map_err(|_| "E_FAULT_HOOK".to_owned())?;
             let _hook = QuietPanicHook::new();
-            let coverage = match panic::catch_unwind(AssertUnwindSafe(|| fault::run_fault(&manifest))) {
-                Ok(result) => result?,
-                Err(_) => return Err("E_FAULT_PANIC".into()),
-            };
+            let coverage =
+                match panic::catch_unwind(AssertUnwindSafe(|| fault::run_fault(&manifest))) {
+                    Ok(result) => result?,
+                    Err(_) => return Err("E_FAULT_PANIC".into()),
+                };
             println!(
                 "{{\"version\":1,\"point_id\":\"{}\",\"status\":\"{}\",\"code\":\"{}\",\"reached\":{},\"injected\":{},\"cleanup_ok\":{},\"accounting_ok\":{},\"side_effects\":{},\"callbacks\":{}}}",
-                coverage.point_id, coverage.status, coverage.code, coverage.reached,
-                coverage.injected, coverage.cleanup_ok, coverage.accounting_ok,
-                coverage.side_effects, coverage.callbacks,
+                coverage.point_id,
+                coverage.status,
+                coverage.code,
+                coverage.reached,
+                coverage.injected,
+                coverage.cleanup_ok,
+                coverage.accounting_ok,
+                coverage.side_effects,
+                coverage.callbacks,
             );
-            if coverage.status == "PASS" { Ok(()) } else { Err(coverage.code.into()) }
+            if coverage.status == "PASS" {
+                Ok(())
+            } else {
+                Err(coverage.code.into())
+            }
         }
-        [command, manifest_flag, manifest_path, input_flag, input_path]
-            if command == "fuzz" && manifest_flag == "--manifest" && input_flag == "--input" =>
-        {
-            let manifest_bytes = read_bounded(manifest_path, MAX_MANIFEST_FILE, "E_MANIFEST_INPUT")?;
-            let manifest_text = std::str::from_utf8(&manifest_bytes)
-                .map_err(|_| "E_MANIFEST_JSON".to_owned())?;
+        [
+            command,
+            manifest_flag,
+            manifest_path,
+            input_flag,
+            input_path,
+        ] if command == "fuzz" && manifest_flag == "--manifest" && input_flag == "--input" => {
+            let manifest_bytes =
+                read_bounded(manifest_path, MAX_MANIFEST_FILE, "E_MANIFEST_INPUT")?;
+            let manifest_text =
+                std::str::from_utf8(&manifest_bytes).map_err(|_| "E_MANIFEST_JSON".to_owned())?;
             let manifest = manifest::ExperimentManifest::parse(manifest_text)?;
             if manifest.batch != "P23-B02" {
                 return Err("E_FUZZ_BATCH".into());
             }
-            let input_bytes = read_bounded(input_path, manifest.budget.max_input_bytes, "E_FUZZ_INPUT")?;
+            let input_bytes =
+                read_bounded(input_path, manifest.budget.max_input_bytes, "E_FUZZ_INPUT")?;
             let digest = crate::p17::package_sha256_bytes(&input_bytes)
                 .map_err(|_| "E_FUZZ_DIGEST".to_owned())?;
             if !digest.eq_ignore_ascii_case(&manifest.input_sha256) {
@@ -161,9 +191,13 @@ pub(super) fn run(args: &[String]) -> Result<(), String> {
             let summary = if host_triple() != Some(manifest.target.as_str()) {
                 harness::FuzzSummary::blocked("E_FUZZ_HOST_UNSUPPORTED")
             } else {
-                let _lock = PANIC_HOOK_LOCK.lock().map_err(|_| "E_FUZZ_HOOK".to_owned())?;
+                let _lock = PANIC_HOOK_LOCK
+                    .lock()
+                    .map_err(|_| "E_FUZZ_HOOK".to_owned())?;
                 let _hook = QuietPanicHook::new();
-                match panic::catch_unwind(AssertUnwindSafe(|| harness::fuzz(&manifest, &input_bytes))) {
+                match panic::catch_unwind(AssertUnwindSafe(|| {
+                    harness::fuzz(&manifest, &input_bytes)
+                })) {
                     Ok(result) => result?,
                     Err(_) => harness::FuzzSummary::panic(0),
                 }
@@ -188,19 +222,36 @@ fn print_schedule(tier: &str, seeds: usize) -> Result<(), String> {
         _ => return Err("E_P23B04_TIER".into()),
     };
     let jobs = schedule::schedule(tier, seeds).map_err(str::to_owned)?;
-    let entries = jobs.iter().map(|job| format!(
-        "{{\"target_id\":\"{}\",\"profile\":\"{}\",\"seed\":{},\"seconds\":{}}}",
-        job.target_id, job.profile, job.seed, job.seconds,
-    )).collect::<Vec<_>>().join(",");
+    let entries = jobs
+        .iter()
+        .map(|job| {
+            format!(
+                "{{\"target_id\":\"{}\",\"profile\":\"{}\",\"seed\":{},\"seconds\":{}}}",
+                job.target_id, job.profile, job.seed, job.seconds,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     println!("{{\"version\":1,\"jobs\":[{entries}]}}");
     Ok(())
 }
 
 fn compare_perf(args: &[String]) -> Result<(), String> {
-    let [baseline_flag, baseline_path, candidate_flag, candidate_path, rest @ ..] = args else {
+    let [
+        baseline_flag,
+        baseline_path,
+        candidate_flag,
+        candidate_path,
+        rest @ ..,
+    ] = args
+    else {
         return Err("E_PERF_USAGE".into());
     };
-    if baseline_flag != "--baseline" || candidate_flag != "--candidate" || rest.len() > 9 || rest.len() % 3 != 0 {
+    if baseline_flag != "--baseline"
+        || candidate_flag != "--candidate"
+        || rest.len() > 9
+        || rest.len() % 3 != 0
+    {
         return Err("E_PERF_USAGE".into());
     }
     let read = |path: &str| -> Result<String, String> {
@@ -211,10 +262,15 @@ fn compare_perf(args: &[String]) -> Result<(), String> {
     let candidate = read(candidate_path)?;
     let mut pairs = Vec::new();
     for group in rest.chunks_exact(3) {
-        if group[0] != "--pair" { return Err("E_PERF_USAGE".into()); }
+        if group[0] != "--pair" {
+            return Err("E_PERF_USAGE".into());
+        }
         pairs.push((read(&group[1])?, read(&group[2])?));
     }
-    let references = pairs.iter().map(|(left, right)| (left.as_str(), right.as_str())).collect::<Vec<_>>();
+    let references = pairs
+        .iter()
+        .map(|(left, right)| (left.as_str(), right.as_str()))
+        .collect::<Vec<_>>();
     let summary = performance::compare(&baseline, &candidate, &references)?;
     println!("{summary}");
     Ok(())
@@ -245,11 +301,23 @@ fn host_triple() -> Option<&'static str> {
         Some("aarch64-apple-darwin")
     } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
         Some("x86_64-apple-darwin")
-    } else if cfg!(all(target_arch = "aarch64", target_os = "linux", target_env = "gnu")) {
+    } else if cfg!(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
         Some("aarch64-unknown-linux-gnu")
-    } else if cfg!(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")) {
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
         Some("x86_64-unknown-linux-gnu")
-    } else if cfg!(all(target_arch = "x86_64", target_os = "windows", target_env = "msvc")) {
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "windows",
+        target_env = "msvc"
+    )) {
         Some("x86_64-pc-windows-msvc")
     } else {
         None
@@ -262,14 +330,29 @@ fn print_summary(
     input_len: usize,
     summary: &harness::FuzzSummary,
 ) {
-    let code = summary.code.map_or("null".to_owned(), |value| format!("\"{}\"", crate::json_escape(value)));
-    let minimized_hash = summary.minimized_sha256.as_ref()
+    let code = summary.code.map_or("null".to_owned(), |value| {
+        format!("\"{}\"", crate::json_escape(value))
+    });
+    let minimized_hash = summary
+        .minimized_sha256
+        .as_ref()
         .map_or("null".to_owned(), |value| format!("\"{value}\""));
-    let minimized_len = summary.minimized_len.map_or("null".to_owned(), |value| value.to_string());
+    let minimized_len = summary
+        .minimized_len
+        .map_or("null".to_owned(), |value| value.to_string());
     println!(
         "{{\"version\":1,\"target_id\":\"{}\",\"profile\":\"{}\",\"status\":\"{}\",\"code\":{},\"input_sha256\":\"{}\",\"input_bytes\":{},\"cases\":{},\"accepted\":{},\"rejected\":{},\"limited\":{},\"minimized_sha256\":{},\"minimized_bytes\":{}}}",
-        manifest.target_id, manifest.profile, summary.status, code, input_sha256, input_len,
-        summary.cases, summary.accepted, summary.rejected, summary.limited,
-        minimized_hash, minimized_len,
+        manifest.target_id,
+        manifest.profile,
+        summary.status,
+        code,
+        input_sha256,
+        input_len,
+        summary.cases,
+        summary.accepted,
+        summary.rejected,
+        summary.limited,
+        minimized_hash,
+        minimized_len,
     );
 }

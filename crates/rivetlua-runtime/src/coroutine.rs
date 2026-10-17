@@ -147,7 +147,8 @@ impl ThreadContext {
                 visit(object)?;
             }
         }
-        for unwind in self.close_unwind
+        for unwind in self
+            .close_unwind
             .into_iter()
             .chain(self.suspended_close_for_handler.iter().copied())
         {

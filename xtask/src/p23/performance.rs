@@ -82,16 +82,24 @@ pub(super) fn collect(manifest: &ExperimentManifest) -> Result<PerfCollection, S
     let cold_vm_ns = cold_start.elapsed().as_nanos();
     callback_vm.set_allocation_limit(crate::p20::P23_HEAP_LIMIT);
     let callback = callback_vm
-        .register_callback(&[], Rc::new(|_, _| CallbackResult::Return(vec![Value::Integer(7)])))
+        .register_callback(
+            &[],
+            Rc::new(|_, _| CallbackResult::Return(vec![Value::Integer(7)])),
+        )
         .map_err(|_| "E_PERF_CALLBACK")?;
     let mut callback_ns = Vec::with_capacity(5);
     for _ in 0..5 {
-        let mut execution = callback_vm.call(&callback, &[]).map_err(|_| "E_PERF_CALLBACK")?;
-        execution.set_fuel(crate::p20::P23_FUEL).map_err(|_| "E_PERF_FUEL")?;
+        let mut execution = callback_vm
+            .call(&callback, &[])
+            .map_err(|_| "E_PERF_CALLBACK")?;
+        execution
+            .set_fuel(crate::p20::P23_FUEL)
+            .map_err(|_| "E_PERF_FUEL")?;
         let tick = Instant::now();
         let outcome = execution.run().map_err(|_| "E_PERF_CALLBACK")?;
         callback_ns.push(tick.elapsed().as_nanos());
-        if !matches!(outcome, RunOutcome::Returned(ref values) if values.as_slice() == [Value::Integer(7)]) {
+        if !matches!(outcome, RunOutcome::Returned(ref values) if values.as_slice() == [Value::Integer(7)])
+        {
             return Err("E_PERF_CALLBACK_RESULT".into());
         }
     }
@@ -101,19 +109,35 @@ pub(super) fn collect(manifest: &ExperimentManifest) -> Result<PerfCollection, S
     drop(callback_vm);
 
     let mut scenarios = crate::p20::p23_collect(
-        &manifest.profile, profile, &manifest.target, &manifest.toolchain, false,
-    ).map_err(|_| "E_PERF_COLLECT")?;
+        &manifest.profile,
+        profile,
+        &manifest.target,
+        &manifest.toolchain,
+        false,
+    )
+    .map_err(|_| "E_PERF_COLLECT")?;
     let mut native_executed = 0u128;
     let mut total_logical = 0u128;
     if jit {
         for scenario in crate::p20::p23_collect(
-            &manifest.profile, profile, &manifest.target, &manifest.toolchain, true,
-        ).map_err(|_| "E_PERF_COLLECT")? {
+            &manifest.profile,
+            profile,
+            &manifest.target,
+            &manifest.toolchain,
+            true,
+        )
+        .map_err(|_| "E_PERF_COLLECT")?
+        {
             let value = StrictJsonParser::parse(&scenario).map_err(|_| "E_PERF_REPORT")?;
-            for sample in field(&value, "raw_samples")?.as_array().ok_or("E_PERF_REPORT")? {
-                native_executed = native_executed.checked_add(number(sample, "native_executed")?)
+            for sample in field(&value, "raw_samples")?
+                .as_array()
+                .ok_or("E_PERF_REPORT")?
+            {
+                native_executed = native_executed
+                    .checked_add(number(sample, "native_executed")?)
                     .ok_or("E_PERF_REPORT")?;
-                total_logical = total_logical.checked_add(number(sample, "total_logical_instructions")?)
+                total_logical = total_logical
+                    .checked_add(number(sample, "total_logical_instructions")?)
                     .ok_or("E_PERF_REPORT")?;
             }
             scenarios.push(scenario);
@@ -122,26 +146,65 @@ pub(super) fn collect(manifest: &ExperimentManifest) -> Result<PerfCollection, S
     if start.elapsed().as_secs() >= manifest.budget.seconds {
         return Err("E_PERF_DEADLINE".into());
     }
-    let features = manifest.features.iter().map(|item| quoted(item)).collect::<Vec<_>>().join(",");
-    let callback_samples = callback_ns.iter().map(u128::to_string).collect::<Vec<_>>().join(",");
-    let jit_status = if !jit { "NOT_REQUESTED" } else if native_executed == 0 { "FALLBACK" } else { "NATIVE_EXECUTED" };
+    let features = manifest
+        .features
+        .iter()
+        .map(|item| quoted(item))
+        .collect::<Vec<_>>()
+        .join(",");
+    let callback_samples = callback_ns
+        .iter()
+        .map(u128::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let jit_status = if !jit {
+        "NOT_REQUESTED"
+    } else if native_executed == 0 {
+        "FALLBACK"
+    } else {
+        "NATIVE_EXECUTED"
+    };
     let json = format!(
         "{{\"version\":1,\"identity\":{{\"experiment_id\":{},\"commit\":{},\"dirty\":{},\"crate\":{},\"target_id\":{},\"seed\":{},\"worker_policy\":{},\"profile\":{},\"numeric\":{},\"target\":{},\"cpu\":{},\"os\":{},\"toolchain\":{},\"features\":[{features}],\"scenario_sha256\":{},\"corpus_sha256\":{},\"input_sha256\":{},\"fuel\":{},\"heap_bytes\":{},\"cases\":{},\"seconds\":{},\"max_input_bytes\":{},\"max_depth\":{},\"iterations\":5,\"warmup\":2}},\"environment_source\":\"supplied-manifest\",\"cold_vm_ns\":{cold_vm_ns},\"host_callback_ns\":[{callback_samples}],\"host_callback_ledger\":{{\"committed\":{},\"reserved\":{},\"lua_heap_bytes\":{},\"host_allocation_bytes\":{}}},\"memory\":{{\"heap_limit_bytes\":{},\"shared_module_resident_bytes\":null,\"physical_rss_bytes\":null}},\"jit\":{{\"status\":{},\"native_executed\":{native_executed},\"total_logical\":{total_logical},\"native_ratio\":{}}},\"scenarios\":[{}],\"baseline_approved\":false}}",
-        quoted(&manifest.experiment_id), quoted(&manifest.commit), manifest.dirty,
-        quoted(&manifest.crate_name), quoted(&manifest.target_id), manifest.seed,
+        quoted(&manifest.experiment_id),
+        quoted(&manifest.commit),
+        manifest.dirty,
+        quoted(&manifest.crate_name),
+        quoted(&manifest.target_id),
+        manifest.seed,
         quoted(&manifest.worker_policy),
-        quoted(&manifest.profile), quoted(&manifest.numeric), quoted(&manifest.target),
-        quoted(&manifest.cpu), quoted(&manifest.os), quoted(&manifest.toolchain),
-        quoted(&manifest.scenario_sha256), quoted(&manifest.corpus_sha256), quoted(&manifest.input_sha256),
-        manifest.budget.fuel, manifest.budget.heap_bytes, manifest.budget.cases,
-        manifest.budget.seconds, manifest.budget.max_input_bytes, manifest.budget.max_depth,
-        callback_ledger.committed, callback_ledger.reserved,
-        callback_ledger.lua_heap_bytes, callback_ledger.host_allocation_bytes,
-        crate::p20::P23_HEAP_LIMIT, quoted(jit_status),
-        if total_logical == 0 { "null".to_owned() } else { format!("{:.6}", native_executed as f64 / total_logical as f64) },
+        quoted(&manifest.profile),
+        quoted(&manifest.numeric),
+        quoted(&manifest.target),
+        quoted(&manifest.cpu),
+        quoted(&manifest.os),
+        quoted(&manifest.toolchain),
+        quoted(&manifest.scenario_sha256),
+        quoted(&manifest.corpus_sha256),
+        quoted(&manifest.input_sha256),
+        manifest.budget.fuel,
+        manifest.budget.heap_bytes,
+        manifest.budget.cases,
+        manifest.budget.seconds,
+        manifest.budget.max_input_bytes,
+        manifest.budget.max_depth,
+        callback_ledger.committed,
+        callback_ledger.reserved,
+        callback_ledger.lua_heap_bytes,
+        callback_ledger.host_allocation_bytes,
+        crate::p20::P23_HEAP_LIMIT,
+        quoted(jit_status),
+        if total_logical == 0 {
+            "null".to_owned()
+        } else {
+            format!("{:.6}", native_executed as f64 / total_logical as f64)
+        },
         scenarios.join(","),
     );
-    Ok(PerfCollection { json, all_jit_fallback: jit && native_executed == 0 })
+    Ok(PerfCollection {
+        json,
+        all_jit_fallback: jit && native_executed == 0,
+    })
 }
 
 fn quoted(value: &str) -> String {
@@ -184,16 +247,47 @@ fn report(input: &str) -> Result<Report, String> {
     };
     let experiment_id = get("experiment_id")?;
     let commit = get("commit")?;
-    if experiment_id.is_empty() || commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if experiment_id.is_empty()
+        || commit.len() != 40
+        || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return Err("E_PERF_REPORT".into());
     }
     let mut comparable = [
-        "crate", "target_id", "seed", "worker_policy", "profile", "numeric", "target", "cpu", "os",
-        "toolchain", "scenario_sha256", "corpus_sha256", "input_sha256", "fuel", "heap_bytes",
-        "cases", "seconds", "max_input_bytes", "max_depth", "iterations", "warmup",
-    ].iter().map(|key| get(key)).collect::<Result<Vec<_>, _>>()?;
-    let mut features = field(identity, "features")?.as_array().ok_or("E_PERF_REPORT")?
-        .iter().map(|item| item.as_str().map(str::to_owned).ok_or("E_PERF_REPORT".into()))
+        "crate",
+        "target_id",
+        "seed",
+        "worker_policy",
+        "profile",
+        "numeric",
+        "target",
+        "cpu",
+        "os",
+        "toolchain",
+        "scenario_sha256",
+        "corpus_sha256",
+        "input_sha256",
+        "fuel",
+        "heap_bytes",
+        "cases",
+        "seconds",
+        "max_input_bytes",
+        "max_depth",
+        "iterations",
+        "warmup",
+    ]
+    .iter()
+    .map(|key| get(key))
+    .collect::<Result<Vec<_>, _>>()?;
+    let mut features = field(identity, "features")?
+        .as_array()
+        .ok_or("E_PERF_REPORT")?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_owned)
+                .ok_or("E_PERF_REPORT".into())
+        })
         .collect::<Result<Vec<_>, String>>()?;
     features.sort();
     comparable.push(features.join("\0"));
@@ -206,16 +300,27 @@ fn report(input: &str) -> Result<Report, String> {
     {
         return Err("E_PERF_JIT_FALLBACK".into());
     }
-    for scenario in field(&value, "scenarios")?.as_array().ok_or("E_PERF_REPORT")? {
+    for scenario in field(&value, "scenarios")?
+        .as_array()
+        .ok_or("E_PERF_REPORT")?
+    {
         let info = field(scenario, "identity")?;
-        let workload_id = field(info, "workload_id")?.as_str().ok_or("E_PERF_REPORT")?;
-        let Some((_, source)) = crate::p20::p23_workloads().into_iter().find(|(id, _)| *id == workload_id) else {
+        let workload_id = field(info, "workload_id")?
+            .as_str()
+            .ok_or("E_PERF_REPORT")?;
+        let Some((_, source)) = crate::p20::p23_workloads()
+            .into_iter()
+            .find(|(id, _)| *id == workload_id)
+        else {
             return Err("E_PERF_REPORT".into());
         };
-        let source_sha = crate::p17::package_sha256_bytes(source.as_bytes()).map_err(|_| "E_PERF_REPORT")?;
+        let source_sha =
+            crate::p17::package_sha256_bytes(source.as_bytes()).map_err(|_| "E_PERF_REPORT")?;
         for (key, expected) in [
-            ("lua_profile", get("profile")?), ("target", get("target")?),
-            ("toolchain", get("toolchain")?), ("source_hash", source_sha),
+            ("lua_profile", get("profile")?),
+            ("target", get("target")?),
+            ("toolchain", get("toolchain")?),
+            ("source_hash", source_sha),
         ] {
             if field(info, key)?.as_str() != Some(expected.as_str()) {
                 return Err("E_PERF_REPORT".into());
@@ -225,22 +330,26 @@ fn report(input: &str) -> Result<Report, String> {
         if !matches!(mode, "interpreter" | "jit") || (mode == "jit" && !jit_expected) {
             return Err("E_PERF_REPORT".into());
         }
-        let key = (
-            workload_id.to_owned(), mode.to_owned(),
-        );
-        let raw = field(scenario, "raw_samples")?.as_array().ok_or("E_PERF_REPORT")?;
+        let key = (workload_id.to_owned(), mode.to_owned());
+        let raw = field(scenario, "raw_samples")?
+            .as_array()
+            .ok_or("E_PERF_REPORT")?;
         if raw.len() != 6 {
             return Err("E_PERF_REPORT".into());
         }
         let mut hot = Vec::new();
         for sample in raw {
             match field(sample, "kind")?.as_str().ok_or("E_PERF_REPORT")? {
-                "hot" => hot.push(u64::try_from(number(sample, "hot_ns")?).map_err(|_| "E_PERF_REPORT")?),
-                "first" => {},
+                "hot" => {
+                    hot.push(u64::try_from(number(sample, "hot_ns")?).map_err(|_| "E_PERF_REPORT")?)
+                }
+                "first" => {}
                 _ => return Err("E_PERF_REPORT".into()),
             }
         }
-        if hot.len() != 5 || hot.contains(&0) { return Err("E_PERF_REPORT".into()); }
+        if hot.len() != 5 || hot.contains(&0) {
+            return Err("E_PERF_REPORT".into());
+        }
         hot.sort_unstable();
         let summary = field(scenario, "summary")?;
         let p50 = u64::try_from(number(summary, "hot_ns_p50")?).map_err(|_| "E_PERF_REPORT")?;
@@ -251,42 +360,64 @@ fn report(input: &str) -> Result<Report, String> {
     if samples.len() != if jit_expected { 6 } else { 3 } {
         return Err("E_PERF_REPORT".into());
     }
-    Ok(Report { experiment_id, commit, comparable, samples })
+    Ok(Report {
+        experiment_id,
+        commit,
+        comparable,
+        samples,
+    })
 }
 
 fn pair_regressions(baseline: &Report, candidate: &Report) -> Result<Vec<String>, String> {
-    if baseline.comparable != candidate.comparable || baseline.samples.keys().ne(candidate.samples.keys()) {
+    if baseline.comparable != candidate.comparable
+        || baseline.samples.keys().ne(candidate.samples.keys())
+    {
         return Err("E_PERF_INCOMPARABLE".into());
     }
-    baseline.samples.iter().filter_map(|(key, baseline_ns)| {
-        let candidate_ns = candidate.samples[key];
-        match regression_requires_triage(*baseline_ns, candidate_ns) {
-            Ok(true) => Some(Ok(format!("{}:{}", key.0, key.1))),
-            Ok(false) => None,
-            Err(code) => Some(Err(code.to_owned())),
-        }
-    }).collect()
+    baseline
+        .samples
+        .iter()
+        .filter_map(|(key, baseline_ns)| {
+            let candidate_ns = candidate.samples[key];
+            match regression_requires_triage(*baseline_ns, candidate_ns) {
+                Ok(true) => Some(Ok(format!("{}:{}", key.0, key.1))),
+                Ok(false) => None,
+                Err(code) => Some(Err(code.to_owned())),
+            }
+        })
+        .collect()
 }
 
-pub(super) fn compare(initial_baseline: &str, initial_candidate: &str, reruns: &[(&str, &str)]) -> Result<String, String> {
+pub(super) fn compare(
+    initial_baseline: &str,
+    initial_candidate: &str,
+    reruns: &[(&str, &str)],
+) -> Result<String, String> {
     if reruns.len() > 3 {
         return Err("E_PERF_RERUNS".into());
     }
     let baseline = report(initial_baseline)?;
     let candidate = report(initial_candidate)?;
     let mut regressions = pair_regressions(&baseline, &candidate)?
-        .into_iter().collect::<std::collections::BTreeSet<_>>();
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
     let mut seen = std::collections::BTreeSet::from([
-        baseline.experiment_id.clone(), candidate.experiment_id.clone(),
+        baseline.experiment_id.clone(),
+        candidate.experiment_id.clone(),
     ]);
-    if seen.len() != 2 { return Err("E_PERF_RERUNS".into()); }
+    if seen.len() != 2 {
+        return Err("E_PERF_RERUNS".into());
+    }
     let mut rerun_regressions = 0usize;
     for (left_text, right_text) in reruns {
         let left = report(left_text)?;
         let right = report(right_text)?;
-        if left.commit != baseline.commit || right.commit != candidate.commit
-            || left.comparable != baseline.comparable || right.comparable != candidate.comparable
-            || !seen.insert(left.experiment_id.clone()) || !seen.insert(right.experiment_id.clone())
+        if left.commit != baseline.commit
+            || right.commit != candidate.commit
+            || left.comparable != baseline.comparable
+            || right.comparable != candidate.comparable
+            || !seen.insert(left.experiment_id.clone())
+            || !seen.insert(right.experiment_id.clone())
         {
             return Err("E_PERF_RERUNS".into());
         }
@@ -294,12 +425,23 @@ pub(super) fn compare(initial_baseline: &str, initial_candidate: &str, reruns: &
         rerun_regressions += usize::from(!pair_affected.is_empty());
         regressions.extend(pair_affected);
     }
-    let state = if regressions.is_empty() { "NO_REGRESSION" }
-        else if reruns.len() < 3 { "PAIRED_RERUNS_REQUIRED" }
-        else { "INDEPENDENT_REVIEW_REQUIRED" };
-    let affected = regressions.iter().map(|item| quoted(item)).collect::<Vec<_>>().join(",");
+    let state = if regressions.is_empty() {
+        "NO_REGRESSION"
+    } else if reruns.len() < 3 {
+        "PAIRED_RERUNS_REQUIRED"
+    } else {
+        "INDEPENDENT_REVIEW_REQUIRED"
+    };
+    let affected = regressions
+        .iter()
+        .map(|item| quoted(item))
+        .collect::<Vec<_>>()
+        .join(",");
     Ok(format!(
         "{{\"version\":1,\"comparison_scope\":\"hot_ns_p50\",\"baseline_commit\":{},\"candidate_commit\":{},\"regressed_scenarios\":[{affected}],\"paired_reruns\":{},\"rerun_pairs_with_regression\":{rerun_regressions},\"rerun_evidence\":\"supplied-reports\",\"independence_verified\":false,\"triage_state\":{},\"baseline_approved\":false}}",
-        quoted(&baseline.commit), quoted(&candidate.commit), reruns.len(), quoted(state),
+        quoted(&baseline.commit),
+        quoted(&candidate.commit),
+        reruns.len(),
+        quoted(state),
     ))
 }

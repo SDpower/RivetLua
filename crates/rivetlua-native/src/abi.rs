@@ -13,14 +13,31 @@ pub struct NumericValue {
 }
 
 impl NumericValue {
-    pub const fn nil() -> Self { Self { tag: TAG_NIL, bits: 0 } }
+    pub const fn nil() -> Self {
+        Self {
+            tag: TAG_NIL,
+            bits: 0,
+        }
+    }
 
     pub fn from_value(value: Value) -> Option<Self> {
         match value {
-            Value::Nil => Some(Self { tag: TAG_NIL, bits: 0 }),
-            Value::Boolean(value) => Some(Self { tag: TAG_BOOLEAN, bits: u64::from(value) }),
-            Value::Integer(value) => Some(Self { tag: TAG_INTEGER, bits: value as u64 }),
-            Value::Float(value) => Some(Self { tag: TAG_FLOAT, bits: value.to_bits() }),
+            Value::Nil => Some(Self {
+                tag: TAG_NIL,
+                bits: 0,
+            }),
+            Value::Boolean(value) => Some(Self {
+                tag: TAG_BOOLEAN,
+                bits: u64::from(value),
+            }),
+            Value::Integer(value) => Some(Self {
+                tag: TAG_INTEGER,
+                bits: value as u64,
+            }),
+            Value::Float(value) => Some(Self {
+                tag: TAG_FLOAT,
+                bits: value.to_bits(),
+            }),
             _ => None,
         }
     }
@@ -36,8 +53,12 @@ impl NumericValue {
         }
     }
 
-    pub const fn tag(self) -> u64 { self.tag }
-    pub const fn bits(self) -> u64 { self.bits }
+    pub const fn tag(self) -> u64 {
+        self.tag
+    }
+    pub const fn bits(self) -> u64 {
+        self.bits
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,13 +116,15 @@ pub(crate) const VALUE_BITS_OFFSET: i32 = core::mem::offset_of!(NumericValue, bi
 #[cfg(feature = "compiler")]
 pub(crate) const VALUE_SIZE: i32 = core::mem::size_of::<NumericValue>() as i32;
 #[cfg(feature = "compiler")]
-pub(crate) const FRAME_REGISTERS_OFFSET: i32 = core::mem::offset_of!(RawFrame, registers_ptr) as i32;
+pub(crate) const FRAME_REGISTERS_OFFSET: i32 =
+    core::mem::offset_of!(RawFrame, registers_ptr) as i32;
 #[cfg(feature = "compiler")]
 pub(crate) const FRAME_PC_OFFSET: i32 = core::mem::offset_of!(RawFrame, pc) as i32;
 #[cfg(feature = "compiler")]
 pub(crate) const FRAME_FUEL_OFFSET: i32 = core::mem::offset_of!(RawFrame, fuel_remaining) as i32;
 #[cfg(feature = "compiler")]
-pub(crate) const FRAME_STEP_BUDGET_OFFSET: i32 = core::mem::offset_of!(RawFrame, step_budget) as i32;
+pub(crate) const FRAME_STEP_BUDGET_OFFSET: i32 =
+    core::mem::offset_of!(RawFrame, step_budget) as i32;
 #[cfg(feature = "compiler")]
 pub(crate) const FRAME_EXIT_OFFSET: i32 = core::mem::offset_of!(RawFrame, exit) as i32;
 #[cfg(feature = "compiler")]
@@ -120,7 +143,10 @@ pub(crate) fn call_entry(
         || state.pc != entry_pc
         || state.pc > max_pc
         || state.dynamic_top > state.registers.len() as u64
-        || state.registers.iter().any(|value| value.to_value().is_none())
+        || state
+            .registers
+            .iter()
+            .any(|value| value.to_value().is_none())
     {
         return Err(NativeError::InvalidState);
     }
@@ -179,7 +205,10 @@ pub(crate) fn call_entry(
         || frame.expected_epoch != state.expected_epoch
         || frame.observed_epoch != state.observed_epoch
         || frame.executed != original_fuel - frame.fuel_remaining
-        || state.registers.iter().any(|value| value.to_value().is_none())
+        || state
+            .registers
+            .iter()
+            .any(|value| value.to_value().is_none())
     {
         return Err(NativeError::InvalidExit);
     }

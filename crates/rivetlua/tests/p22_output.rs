@@ -21,7 +21,9 @@ fn profiles() -> [LuaProfile; 2] {
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn assert_export_denied<T>(result: Result<T, ExportError>) {

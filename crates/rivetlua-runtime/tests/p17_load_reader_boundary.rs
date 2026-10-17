@@ -240,8 +240,7 @@ fn compile_runner(source: &[u8], language: LanguageProfile) -> Result<VerifiedMo
     let syntax = parse(&chunk, language, &limits).map_err(|error| format!("parse: {error:?}"))?;
     let resolved = resolve(&syntax, &chunk, language, &limits)
         .map_err(|error| format!("resolve: {error:?}"))?;
-    let ir = lower(&resolved, &IrLimits::default())
-        .map_err(|error| format!("lower: {error:?}"))?;
+    let ir = lower(&resolved, &IrLimits::default()).map_err(|error| format!("lower: {error:?}"))?;
     emit_with_native_debug(
         &ir,
         &resolved,
@@ -293,7 +292,11 @@ fn run_case(
     profile: LuaProfile,
     official: bool,
 ) -> Result<(), String> {
-    let origin = if official { "official_dump_load" } else { "native" };
+    let origin = if official {
+        "official_dump_load"
+    } else {
+        "native"
+    };
     let source = source(case, official);
     let module = compile_runner(&source, language)
         .map_err(|error| format!("{profile:?} {} {origin} compile: {error}", case.name))?;
@@ -308,7 +311,11 @@ fn run_case(
         ..LoadLimits::default()
     };
     let mut services = HostServices::deny_all()
-        .and_dump(DumpCapability::deny_all().with_official_bytecode(true).with_limits(dump_limits))
+        .and_dump(
+            DumpCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(dump_limits),
+        )
         .and_load(
             LoadCapability::deny_all()
                 .and_compiler(MemoryCompiler)
@@ -316,9 +323,8 @@ fn run_case(
                 .with_limits(load_limits),
         );
     if case.install_debug {
-        services = services.and_debug(
-            DebugCapability::deny_all().allow(DebugPermission::Traceback),
-        );
+        services =
+            services.and_debug(DebugCapability::deny_all().allow(DebugPermission::Traceback));
     }
     let mut vm = Vm::new_with_services(profile, services)
         .map_err(|error| format!("{profile:?} {} {origin} VM: {error:?}", case.name))?;

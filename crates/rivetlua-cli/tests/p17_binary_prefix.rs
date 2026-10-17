@@ -151,7 +151,11 @@ fn p17_binary_file_prefix_loads_dumped_chunk() {
     let official_path = scratch.path.join("official.luac");
     fs::write(&official_path, &official).expect("寫入官方 chunk fixture");
     let direct_official = run_lua(profile, &[official_path.as_os_str()], &scratch.path);
-    assert_success(&direct_official, b"official-file-ok\n", "官方 chunk 檔案輸入");
+    assert_success(
+        &direct_official,
+        b"official-file-ok\n",
+        "官方 chunk 檔案輸入",
+    );
 
     let official_prefixed_path = scratch.path.join("official-prefixed.luac");
     fs::write(&official_prefixed_path, with_source_prefix(&official))
@@ -174,13 +178,8 @@ fn p17_binary_file_prefix_loads_dumped_chunk() {
     assert_success(&direct_rvlu, b"rvlu-file-ok\n", "RVLU 檔案輸入");
 
     let rvlu_prefixed_path = scratch.path.join("module-prefixed.rvlu");
-    fs::write(&rvlu_prefixed_path, with_source_prefix(&rvlu))
-        .expect("寫入前綴 RVLU fixture");
-    let prefixed_rvlu = run_lua(
-        profile,
-        &[rvlu_prefixed_path.as_os_str()],
-        &scratch.path,
-    );
+    fs::write(&rvlu_prefixed_path, with_source_prefix(&rvlu)).expect("寫入前綴 RVLU fixture");
+    let prefixed_rvlu = run_lua(profile, &[rvlu_prefixed_path.as_os_str()], &scratch.path);
     assert_success(
         &prefixed_rvlu,
         b"rvlu-file-ok\n",
@@ -216,8 +215,14 @@ fn p17_binary_file_prefix_keeps_source_and_binary_errors() {
     )
     .expect("寫入保留 runtime 行號的 source fixture");
     let source_error = run_lua(profile, &[source_line_path.as_os_str()], &scratch.path);
-    assert!(!source_error.status.success(), "source runtime error 須保留");
-    assert!(source_error.stdout.is_empty(), "source runtime error 不應輸出 stdout");
+    assert!(
+        !source_error.status.success(),
+        "source runtime error 須保留"
+    );
+    assert!(
+        source_error.stdout.is_empty(),
+        "source runtime error 不應輸出 stdout"
+    );
     assert!(
         source_error
             .stderr
@@ -264,5 +269,8 @@ fn p17_binary_file_prefix_keeps_source_and_binary_errors() {
     fs::write(&wrong_profile_path, with_source_prefix(&wrong_profile))
         .expect("寫入前綴 wrong-profile RVLU fixture");
     let wrong_profile_output = run_lua(profile, &[wrong_profile_path.as_os_str()], &scratch.path);
-    assert_binary_rejected(&wrong_profile_output, "不匹配 profile 的 RVLU module 須拒絕");
+    assert_binary_rejected(
+        &wrong_profile_output,
+        "不匹配 profile 的 RVLU module 須拒絕",
+    );
 }

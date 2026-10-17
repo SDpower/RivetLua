@@ -566,7 +566,9 @@ assert(checksum > 0)
 
 fn assert_shared_open_call_chain(module: &VerifiedModule) {
     let proto = &module.module().prototypes[0];
-    let debug = module.native_debug().expect("應有 native temporary metadata");
+    let debug = module
+        .native_debug()
+        .expect("應有 native temporary metadata");
     let found = proto.instructions.windows(2).enumerate().any(|(pc, pair)| {
         if !matches!(pair[0].instruction, Instruction::Call { result_mode: ResultMode::All, .. })
             || !matches!(pair[1].instruction, Instruction::Call {
@@ -594,7 +596,10 @@ fn assert_shared_open_call_chain(module: &VerifiedModule) {
         });
         shared >= 2 && later_ordinary_call
     });
-    assert!(found, "須保留兩個共用 pending、All→open fixed 與後續普通 Call");
+    assert!(
+        found,
+        "須保留兩個共用 pending、All→open fixed 與後續普通 Call"
+    );
 }
 
 fn describe_calls_export_failure(module: &VerifiedModule, error: &OfficialExportError) {
@@ -614,42 +619,79 @@ fn describe_calls_export_failure(module: &VerifiedModule, error: &OfficialExport
         return;
     };
     let active = |at: u32| {
-        debug.locals.iter().zip(storage).filter(|(local, slot)| {
-            local.start_pc <= at && at < local.end_pc
-                && slot.start_pc <= at && at < slot.end_pc
-        }).count()
+        debug
+            .locals
+            .iter()
+            .zip(storage)
+            .filter(|(local, slot)| {
+                local.start_pc <= at && at < local.end_pc && slot.start_pc <= at && at < slot.end_pc
+            })
+            .count()
     };
     eprintln!(
         "calls export failure proto={} pc={} line={:?} instruction={:?} active={} kind={:?} detail={}",
-        error.prototype.0, error.pc, debug.lines.get(error.pc),
-        proto.instructions.get(error.pc).map(|entry| &entry.instruction),
-        active(pc), error.kind, error.detail,
+        error.prototype.0,
+        error.pc,
+        debug.lines.get(error.pc),
+        proto
+            .instructions
+            .get(error.pc)
+            .map(|entry| &entry.instruction),
+        active(pc),
+        error.kind,
+        error.detail,
     );
-    let pending = native.temporaries_at(error.prototype, InstructionOffset(pc)).unwrap_or(&[]);
+    let pending = native
+        .temporaries_at(error.prototype, InstructionOffset(pc))
+        .unwrap_or(&[]);
     let all = native.temporaries_for(error.prototype).unwrap_or(&[]);
     for temporary in pending {
         eprintln!(
             "  pending register={:?} ordinal={} storage={:?}",
-            temporary.register, temporary.ordinal,
-            storage.iter().filter(|slot| slot.register == temporary.register).take(2).collect::<Vec<_>>(),
+            temporary.register,
+            temporary.ordinal,
+            storage
+                .iter()
+                .filter(|slot| slot.register == temporary.register)
+                .take(2)
+                .collect::<Vec<_>>(),
         );
         let same = |entry: &&rivetlua_core::bytecode::native_debug::NativeTemporary| {
             entry.register == temporary.register
         };
-        for entry in all.iter().filter(&same).filter(|entry| entry.call_pc.0 <= pc).rev().take(4) {
+        for entry in all
+            .iter()
+            .filter(&same)
+            .filter(|entry| entry.call_pc.0 <= pc)
+            .rev()
+            .take(4)
+        {
             let at = entry.call_pc.0;
             eprintln!(
                 "    prior pc={at} ordinal={} active={} instruction={:?}",
-                entry.ordinal, active(at),
-                proto.instructions.get(at as usize).map(|instruction| &instruction.instruction),
+                entry.ordinal,
+                active(at),
+                proto
+                    .instructions
+                    .get(at as usize)
+                    .map(|instruction| &instruction.instruction),
             );
         }
-        for entry in all.iter().filter(&same).filter(|entry| entry.call_pc.0 > pc).take(2) {
+        for entry in all
+            .iter()
+            .filter(&same)
+            .filter(|entry| entry.call_pc.0 > pc)
+            .take(2)
+        {
             let at = entry.call_pc.0;
             eprintln!(
                 "    later pc={at} ordinal={} active={} instruction={:?}",
-                entry.ordinal, active(at),
-                proto.instructions.get(at as usize).map(|instruction| &instruction.instruction),
+                entry.ordinal,
+                active(at),
+                proto
+                    .instructions
+                    .get(at as usize)
+                    .map(|instruction| &instruction.instruction),
             );
         }
     }
@@ -666,7 +708,12 @@ fn assert_calls_structural_roundtrip(
     let limits = OfficialChunkLimits::default();
     let mut export_work = OfficialWorkBudget::new(u64::MAX);
     let bytes = match emit_official_chunk(
-        &module, ProtoId(0), profile, false, &limits, &mut export_work,
+        &module,
+        ProtoId(0),
+        profile,
+        false,
+        &limits,
+        &mut export_work,
     ) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -698,7 +745,11 @@ fn p17_calls_open_chain_frontier_roundtrip() {
         (LanguageProfile::Lua55, LuaProfile::Lua55),
     ] {
         let (loop_module, exact_work) = match assert_calls_structural_roundtrip(
-            OPEN_CALL_LOOP, b"@open_call_loop.lua", language, profile, true,
+            OPEN_CALL_LOOP,
+            b"@open_call_loop.lua",
+            language,
+            profile,
+            true,
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -709,30 +760,47 @@ fn p17_calls_open_chain_frontier_roundtrip() {
         assert!(exact_work > 0);
         let limits = OfficialChunkLimits::default();
         emit_official_chunk(
-            &loop_module, ProtoId(0), profile, false, &limits,
+            &loop_module,
+            ProtoId(0),
+            profile,
+            false,
+            &limits,
             &mut OfficialWorkBudget::new(exact_work),
         )
         .expect("同一最小迴圈的精確匯出 work 應通過");
         let one_below = emit_official_chunk(
-            &loop_module, ProtoId(0), profile, false, &limits,
+            &loop_module,
+            ProtoId(0),
+            profile,
+            false,
+            &limits,
             &mut OfficialWorkBudget::new(exact_work - 1),
         )
         .expect_err("同一最小迴圈的 work 少一單位應拒絕");
         assert_eq!(one_below.kind, OfficialExportErrorKind::WorkExhausted);
     }
     for (language, profile, fixture) in [
-        (LanguageProfile::Lua54, LuaProfile::Lua54,
-            "../../vendor/lua54/lua-5.4.9-tests/calls.lua"),
-        (LanguageProfile::Lua55, LuaProfile::Lua55,
-            "../../vendor/lua55/lua-5.5.1-tests/calls.lua"),
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            "../../vendor/lua54/lua-5.4.9-tests/calls.lua",
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            "../../vendor/lua55/lua-5.5.1-tests/calls.lua",
+        ),
     ] {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
         let source = std::fs::read(&path).expect("無法讀取未修改的官方 calls.lua");
-        if let Err(error) = assert_calls_structural_roundtrip(
-            &source, b"@calls.lua", language, profile, true,
-        ) {
+        if let Err(error) =
+            assert_calls_structural_roundtrip(&source, b"@calls.lua", language, profile, true)
+        {
             failures.push(format!("official calls.lua {profile:?}: {error:?}"));
         }
     }
-    assert!(failures.is_empty(), "calls.lua 局部回歸仍有失敗：{failures:?}");
+    assert!(
+        failures.is_empty(),
+        "calls.lua 局部回歸仍有失敗：{failures:?}"
+    );
 }

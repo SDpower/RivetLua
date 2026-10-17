@@ -7,9 +7,7 @@ use rivetlua_core::{
     InstructionOffset, LuaProfile, OfficialChunkLimits, OfficialWorkBudget, ProtoId, Value,
     VerifiedModule, VerifyLimits, decode_official_chunk,
 };
-use rivetlua_runtime::{
-    DebugCapability, DebugPermission, HostServices, RootKind, RunOutcome, Vm,
-};
+use rivetlua_runtime::{DebugCapability, DebugPermission, HostServices, RootKind, RunOutcome, Vm};
 
 const SWITCH_SOURCE: &[u8] = br#"local trace = ""
 local count = 0
@@ -110,7 +108,9 @@ fn run(module: VerifiedModule, profile: LuaProfile) -> Vec<u8> {
 
 fn report_line_boundaries(module: &VerifiedModule, label: &str, event_line: u32) {
     for proto in &module.module().prototypes {
-        let native = module.native_debug().and_then(|debug| debug.prototype(proto.id));
+        let native = module
+            .native_debug()
+            .and_then(|debug| debug.prototype(proto.id));
         let map = module
             .official_artifact()
             .and_then(|artifact| artifact.pc_map(proto.id));
@@ -146,14 +146,20 @@ fn p17_debug_call_to_line_hook_getinfo_matches_event_line() {
         let official = official(&native, profile);
         for (label, module) in [("native", native), ("official", official)] {
             let trace = run(module.clone(), profile);
-            eprintln!("{profile:?} {label} line pairs: {}", String::from_utf8_lossy(&trace));
+            eprintln!(
+                "{profile:?} {label} line pairs: {}",
+                String::from_utf8_lossy(&trace)
+            );
             let text = String::from_utf8(trace).unwrap();
             let pairs: Vec<_> = text
                 .split(';')
                 .filter(|pair| !pair.is_empty())
                 .map(|pair| {
                     let (event, current) = pair.split_once('/').unwrap();
-                    (event.parse::<u32>().unwrap(), current.parse::<i64>().unwrap())
+                    (
+                        event.parse::<u32>().unwrap(),
+                        current.parse::<i64>().unwrap(),
+                    )
                 })
                 .collect();
             assert_eq!(pairs.len(), 3, "{profile:?} {label}: {pairs:?}");

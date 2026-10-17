@@ -1,8 +1,8 @@
 //! P19 固定版本的語言相容差異表。
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::collections::BTreeSet;
 
 use crate::LuaProfile;
 
@@ -70,13 +70,22 @@ fn parse_table(contents: &str) -> Result<Vec<CompatibilityEntry<'_>>, String> {
     for (index, line) in lines.enumerate() {
         let columns: Vec<_> = line.split(',').collect();
         if columns.len() != 6 || columns.iter().any(|field| field.trim().is_empty()) {
-            return Err(format!("P19 compatibility table 第 {} 列欄位不正確", index + 2));
+            return Err(format!(
+                "P19 compatibility table 第 {} 列欄位不正確",
+                index + 2
+            ));
         }
         if !AREAS.contains(&columns[0]) {
-            return Err(format!("P19 compatibility table 第 {} 列 area 不合法", index + 2));
+            return Err(format!(
+                "P19 compatibility table 第 {} 列 area 不合法",
+                index + 2
+            ));
         }
         if !matches!(columns[5], "specified" | "pending" | "implemented") {
-            return Err(format!("P19 compatibility table 第 {} 列 status 不合法", index + 2));
+            return Err(format!(
+                "P19 compatibility table 第 {} 列 status 不合法",
+                index + 2
+            ));
         }
         let sources: Vec<_> = columns[3].split('|').collect();
         if sources.len() != 2
@@ -84,10 +93,16 @@ fn parse_table(contents: &str) -> Result<Vec<CompatibilityEntry<'_>>, String> {
                 .iter()
                 .any(|source| !source.starts_with("https://www.lua.org/"))
         {
-            return Err(format!("P19 compatibility table 第 {} 列 source 不合法", index + 2));
+            return Err(format!(
+                "P19 compatibility table 第 {} 列 source 不合法",
+                index + 2
+            ));
         }
         if !ids.insert(columns[4]) {
-            return Err(format!("P19 compatibility table 有重複 case_id：{}", columns[4]));
+            return Err(format!(
+                "P19 compatibility table 有重複 case_id：{}",
+                columns[4]
+            ));
         }
         entries.push(CompatibilityEntry {
             area: columns[0],

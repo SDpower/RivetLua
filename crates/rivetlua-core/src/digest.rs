@@ -32,9 +32,7 @@ fn sha256_block(state: &mut [u32; 8], data: &[u8; 64]) {
             .wrapping_add(SHA256_K[index])
             .wrapping_add(word);
         let t2 = (work[0].rotate_right(2) ^ work[0].rotate_right(13) ^ work[0].rotate_right(22))
-            .wrapping_add(
-                (work[0] & work[1]) ^ (work[0] & work[2]) ^ (work[1] & work[2]),
-            );
+            .wrapping_add((work[0] & work[1]) ^ (work[0] & work[2]) ^ (work[1] & work[2]));
         work = [
             t1.wrapping_add(t2),
             work[0],

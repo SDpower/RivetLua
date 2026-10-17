@@ -30,35 +30,68 @@ pub(crate) fn preflight(code: &ValidatedCode, code_limit_bytes: usize) -> Result
     Ok(())
 }
 
-pub(crate) fn planned_usage(code: &ValidatedCode, code_limit_bytes: usize) -> Result<PlannedUsage, NativeError> {
+pub(crate) fn planned_usage(
+    code: &ValidatedCode,
+    code_limit_bytes: usize,
+) -> Result<PlannedUsage, NativeError> {
     let plan = page_plan(code, code_limit_bytes)?;
     #[cfg(target_os = "macos")]
     {
-        let free_slots = plan.capacity.checked_div(page_size()?)
-            .and_then(|n| n.checked_add(1)).ok_or(NativeError::InvalidCode)?;
-        let free_bytes = free_slots.checked_mul(core::mem::size_of::<(usize, usize)>())
+        let free_slots = plan
+            .capacity
+            .checked_div(page_size()?)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(NativeError::InvalidCode)?;
+        let free_bytes = free_slots
+            .checked_mul(core::mem::size_of::<(usize, usize)>())
             .ok_or(NativeError::InvalidCode)?;
         let metadata_bytes = core::mem::size_of::<ExecutableCode>()
-            .checked_add(core::mem::size_of::<std::sync::OnceLock<std::sync::Mutex<mac::Arena>>>())
-            .and_then(|n| n.checked_add(free_bytes)).ok_or(NativeError::InvalidCode)?;
-        Ok(PlannedUsage { code_bytes: plan.capacity, metadata_bytes })
+            .checked_add(core::mem::size_of::<
+                std::sync::OnceLock<std::sync::Mutex<mac::Arena>>,
+            >())
+            .and_then(|n| n.checked_add(free_bytes))
+            .ok_or(NativeError::InvalidCode)?;
+        Ok(PlannedUsage {
+            code_bytes: plan.capacity,
+            metadata_bytes,
+        })
     }
     #[cfg(not(target_os = "macos"))]
-    { Ok(PlannedUsage { code_bytes: plan.allocation, metadata_bytes: core::mem::size_of::<ExecutableCode>() }) }
+    {
+        Ok(PlannedUsage {
+            code_bytes: plan.allocation,
+            metadata_bytes: core::mem::size_of::<ExecutableCode>(),
+        })
+    }
 }
 
 /// 可在 codegen 前呼叫；不接觸 guest，也不分配可執行頁面。
 pub(crate) fn platform_preflight() -> Result<(), NativeError> {
     #[cfg(target_os = "macos")]
-    { return mac::preflight(); }
+    {
+        return mac::preflight();
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    { return Ok(()); }
+    {
+        return Ok(());
+    }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    { return Err(NativeError::Unsupported("Linux AArch64 指令快取同步能力尚未確認")); }
+    {
+        return Err(NativeError::Unsupported(
+            "Linux AArch64 指令快取同步能力尚未確認",
+        ));
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    { return Err(NativeError::Unsupported("此平台不支援原生碼頁面")); }
-    #[cfg(all(target_os = "linux", not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
-    { Err(NativeError::Unsupported("此 Linux 架構不支援原生碼頁面")) }
+    {
+        return Err(NativeError::Unsupported("此平台不支援原生碼頁面"));
+    }
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))]
+    {
+        Err(NativeError::Unsupported("此 Linux 架構不支援原生碼頁面"))
+    }
 }
 
 fn page_plan(code: &ValidatedCode, code_limit_bytes: usize) -> Result<PagePlan, NativeError> {
@@ -75,13 +108,20 @@ fn page_plan(code: &ValidatedCode, code_limit_bytes: usize) -> Result<PagePlan, 
         return Err(NativeError::Unsupported("原生碼目標與主機不符"));
     }
     let page = page_size()?;
-    let allocation = code.bytes().len().checked_add(page - 1)
-        .map(|n| n / page * page).ok_or(NativeError::InvalidCode)?;
+    let allocation = code
+        .bytes()
+        .len()
+        .checked_add(page - 1)
+        .map(|n| n / page * page)
+        .ok_or(NativeError::InvalidCode)?;
     let capacity = code_limit_bytes.min(HARD_CODE_LIMIT) / page * page;
     if capacity == 0 || allocation > capacity {
         return Err(NativeError::Unsupported("原生碼超出頁面配額"));
     }
-    Ok(PagePlan { allocation, capacity })
+    Ok(PagePlan {
+        allocation,
+        capacity,
+    })
 }
 
 #[cfg(unix)]
@@ -102,20 +142,30 @@ fn page_size() -> Result<usize, NativeError> {
 
 pub(crate) fn host_target() -> &'static str {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    { return "aarch64-apple-darwin"; }
+    {
+        return "aarch64-apple-darwin";
+    }
     #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    { return "x86_64-apple-darwin"; }
+    {
+        return "x86_64-apple-darwin";
+    }
     #[cfg(all(target_arch = "aarch64", target_os = "linux", target_env = "gnu"))]
-    { return "aarch64-unknown-linux-gnu"; }
+    {
+        return "aarch64-unknown-linux-gnu";
+    }
     #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
-    { return "x86_64-unknown-linux-gnu"; }
+    {
+        return "x86_64-unknown-linux-gnu";
+    }
     #[cfg(not(any(
         all(target_arch = "aarch64", target_os = "macos"),
         all(target_arch = "x86_64", target_os = "macos"),
         all(target_arch = "aarch64", target_os = "linux", target_env = "gnu"),
         all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")
     )))]
-    { "unsupported" }
+    {
+        "unsupported"
+    }
 }
 
 pub(crate) struct ExecutableCode {
@@ -131,17 +181,25 @@ pub(crate) struct ExecutableCode {
 }
 
 impl ExecutableCode {
-    pub(crate) fn publish(code: &ValidatedCode, code_limit_bytes: usize) -> Result<Self, NativeError> {
+    pub(crate) fn publish(
+        code: &ValidatedCode,
+        code_limit_bytes: usize,
+    ) -> Result<Self, NativeError> {
         preflight(code, code_limit_bytes)?;
         let plan = page_plan(code, code_limit_bytes)?;
         #[cfg(target_os = "linux")]
         {
             // SAFETY: 尺寸已由配額及頁面溢位檢查限制；匿名私有映射由 Drop 擁有。
-            let raw = unsafe { libc::mmap(
-                core::ptr::null_mut(), plan.allocation,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0,
-            ) };
+            let raw = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    plan.allocation,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
             if raw == libc::MAP_FAILED {
                 return Err(NativeError::AllocationFailed);
             }
@@ -151,43 +209,82 @@ impl ExecutableCode {
                 return Err(NativeError::AllocationFailed);
             };
             // SAFETY: 來源為已密封機器碼；映射可寫且至少 allocation 位元組。
-            unsafe { core::ptr::copy_nonoverlapping(code.bytes().as_ptr(), raw.cast::<u8>(), code.bytes().len()) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    code.bytes().as_ptr(),
+                    raw.cast::<u8>(),
+                    code.bytes().len(),
+                )
+            };
             // SAFETY: 同一映射由目前執行緒獨占；由 W 轉 RX，不建立 RWX 頁面。
-            if unsafe { libc::mprotect(raw, plan.allocation, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
+            if unsafe { libc::mprotect(raw, plan.allocation, libc::PROT_READ | libc::PROT_EXEC) }
+                != 0
+            {
                 // SAFETY: 保護切換失敗仍由本函式獨占映射。
                 unsafe { libc::munmap(raw, plan.allocation) };
                 return Err(NativeError::ProtectionFailed);
             }
             // SAFETY: offset 已檢查落在剛發布的映射內。
             let entry = unsafe { raw.cast::<u8>().add(code.entry_offset()).cast_const() };
-            return Ok(Self { entry, entry_pc: code.entry_pc(), max_pc: code.max_pc(), register_count: code.register_count(), allocation: plan.allocation, mapping });
+            return Ok(Self {
+                entry,
+                entry_pc: code.entry_pc(),
+                max_pc: code.max_pc(),
+                register_count: code.register_count(),
+                allocation: plan.allocation,
+                mapping,
+            });
         }
         #[cfg(target_os = "macos")]
         {
             let allocation = plan.allocation;
             let (entry, offset) = mac::publish(code.bytes(), code.entry_offset(), plan)?;
-            return Ok(Self { entry, entry_pc: code.entry_pc(), max_pc: code.max_pc(), register_count: code.register_count(), allocation, offset });
+            return Ok(Self {
+                entry,
+                entry_pc: code.entry_pc(),
+                max_pc: code.max_pc(),
+                register_count: code.register_count(),
+                allocation,
+                offset,
+            });
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        { let _ = plan; Err(NativeError::Unsupported("此平台不支援原生碼頁面")) }
+        {
+            let _ = plan;
+            Err(NativeError::Unsupported("此平台不支援原生碼頁面"))
+        }
     }
 
     pub(crate) fn execute(&self, state: &mut NativeState<'_>) -> Result<NativeExit, NativeError> {
-        abi::call_entry(self.entry, state, self.entry_pc, self.max_pc, self.register_count)
+        abi::call_entry(
+            self.entry,
+            state,
+            self.entry_pc,
+            self.max_pc,
+            self.register_count,
+        )
     }
 
     pub(crate) fn allocated_bytes(&self) -> usize {
         #[cfg(target_os = "macos")]
-        { mac::reserved_bytes() }
+        {
+            mac::reserved_bytes()
+        }
         #[cfg(not(target_os = "macos"))]
-        { self.allocation }
+        {
+            self.allocation
+        }
     }
 
     pub(crate) fn metadata_bytes(&self) -> usize {
         #[cfg(target_os = "macos")]
-        { core::mem::size_of::<Self>() + mac::metadata_bytes() }
+        {
+            core::mem::size_of::<Self>() + mac::metadata_bytes()
+        }
         #[cfg(not(target_os = "macos"))]
-        { core::mem::size_of::<Self>() }
+        {
+            core::mem::size_of::<Self>()
+        }
     }
 }
 
@@ -195,7 +292,9 @@ impl Drop for ExecutableCode {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         // SAFETY: 映射由此物件獨占，&self 執行借用阻止它在呼叫期間被釋放。
-        unsafe { libc::munmap(self.mapping.as_ptr(), self.allocation); }
+        unsafe {
+            libc::munmap(self.mapping.as_ptr(), self.allocation);
+        }
         #[cfg(target_os = "macos")]
         mac::release(self.offset, self.allocation);
     }
@@ -214,13 +313,19 @@ mod mac {
     #[link(name = "Security", kind = "framework")]
     unsafe extern "C" {
         fn SecTaskCreateFromSelf(allocator: *const libc::c_void) -> *const libc::c_void;
-        fn SecTaskCopyValueForEntitlement(task: *const libc::c_void, entitlement: *const libc::c_void,
-            error: *mut *const libc::c_void) -> *const libc::c_void;
+        fn SecTaskCopyValueForEntitlement(
+            task: *const libc::c_void,
+            entitlement: *const libc::c_void,
+            error: *mut *const libc::c_void,
+        ) -> *const libc::c_void;
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
-        fn CFStringCreateWithCString(allocator: *const libc::c_void, text: *const libc::c_char,
-            encoding: u32) -> *const libc::c_void;
+        fn CFStringCreateWithCString(
+            allocator: *const libc::c_void,
+            text: *const libc::c_char,
+            encoding: u32,
+        ) -> *const libc::c_void;
         fn CFGetTypeID(value: *const libc::c_void) -> usize;
         fn CFBooleanGetTypeID() -> usize;
         fn CFBooleanGetValue(value: *const libc::c_void) -> u8;
@@ -234,27 +339,39 @@ mod mac {
     impl Drop for CfOwned {
         fn drop(&mut self) {
             // SAFETY: 僅持有 Create/Copy 規則取得且非空的 CoreFoundation 參照。
-            if !self.0.is_null() { unsafe { CFRelease(self.0) }; }
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0) };
+            }
         }
     }
 
     fn entitlement(task: *const libc::c_void, name: &[u8]) -> Option<bool> {
         // SAFETY: name 是零結尾 ASCII，CoreFoundation 與 Security API 不保留借用指標。
-        let key = CfOwned(unsafe { CFStringCreateWithCString(core::ptr::null(), name.as_ptr().cast(), UTF8) });
-        if key.0.is_null() { return None; }
+        let key = CfOwned(unsafe {
+            CFStringCreateWithCString(core::ptr::null(), name.as_ptr().cast(), UTF8)
+        });
+        if key.0.is_null() {
+            return None;
+        }
         let mut error = core::ptr::null();
         // SAFETY: task/key 在呼叫期間有效；回傳值遵守 Copy 規則。
         let raw = unsafe { SecTaskCopyValueForEntitlement(task, key.0, &mut error) };
         if !error.is_null() {
             // SAFETY: 非空 error 為 Security API 傳出的 CFErrorRef。
             unsafe { CFRelease(error) };
-            if !raw.is_null() { unsafe { CFRelease(raw) } };
+            if !raw.is_null() {
+                unsafe { CFRelease(raw) }
+            };
             return None;
         }
-        if raw.is_null() { return Some(false); }
+        if raw.is_null() {
+            return Some(false);
+        }
         let value = CfOwned(raw);
         // SAFETY: 比對型別後才從 CFBoolean 讀取值。
-        if unsafe { CFGetTypeID(value.0) } != unsafe { CFBooleanGetTypeID() } { return None; }
+        if unsafe { CFGetTypeID(value.0) } != unsafe { CFBooleanGetTypeID() } {
+            return None;
+        }
         Some(unsafe { CFBooleanGetValue(value.0) != 0 })
     }
 
@@ -262,7 +379,9 @@ mod mac {
         // SAFETY: 查詢目前程序實際簽章 entitlement，不呼叫任何外部工具。
         let task = CfOwned(unsafe { SecTaskCreateFromSelf(core::ptr::null()) });
         if task.0.is_null() || entitlement(task.0, ALLOW_JIT) != Some(true) {
-            return Err(NativeError::Unsupported("目前程序沒有可確認的 allow-jit entitlement"));
+            return Err(NativeError::Unsupported(
+                "目前程序沒有可確認的 allow-jit entitlement",
+            ));
         }
         if entitlement(task.0, JIT_WRITE_ALLOWLIST) != Some(false) {
             return Err(NativeError::Unsupported("JIT 寫入保護能力不可確認"));
@@ -286,7 +405,14 @@ mod mac {
 
     fn arena() -> &'static Mutex<Arena> {
         static ARENA: OnceLock<Mutex<Arena>> = OnceLock::new();
-        ARENA.get_or_init(|| Mutex::new(Arena { base: None, capacity: 0, free: Vec::new(), live: 0 }))
+        ARENA.get_or_init(|| {
+            Mutex::new(Arena {
+                base: None,
+                capacity: 0,
+                free: Vec::new(),
+                live: 0,
+            })
+        })
     }
 
     pub(super) fn check_existing_capacity(limit: usize) -> Result<(), NativeError> {
@@ -323,12 +449,17 @@ mod mac {
         }
     }
 
-    pub(super) fn publish(bytes: &[u8], entry_offset: usize, plan: PagePlan)
-        -> Result<(*const u8, usize), NativeError> {
+    pub(super) fn publish(
+        bytes: &[u8],
+        entry_offset: usize,
+        plan: PagePlan,
+    ) -> Result<(*const u8, usize), NativeError> {
         let mut arena = arena().lock().map_err(|_| NativeError::ProtectionFailed)?;
         if arena.base.is_none() {
             let page = super::page_size()?;
-            arena.free.try_reserve_exact(plan.capacity / page + 1)
+            arena
+                .free
+                .try_reserve_exact(plan.capacity / page + 1)
                 .map_err(|_| NativeError::AllocationFailed)?;
             // 事前 RAM 預算以此上界計費；allocator 若給更多容量就不能發布映射。
             if arena.free.capacity() > plan.capacity / page + 1 {
@@ -336,9 +467,16 @@ mod mac {
                 return Err(NativeError::AllocationFailed);
             }
             // SAFETY: quota/頁面對齊已檢查；MAP_JIT 映射只在這個 arena 建立一次。
-            let raw = unsafe { libc::mmap(core::ptr::null_mut(), plan.capacity,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT, -1, 0) };
+            let raw = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    plan.capacity,
+                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+                    -1,
+                    0,
+                )
+            };
             if raw == libc::MAP_FAILED {
                 arena.free = Vec::new();
                 return Err(NativeError::AllocationFailed);
@@ -355,11 +493,17 @@ mod mac {
         if arena.capacity > plan.capacity {
             return Err(NativeError::Unsupported("現有 MAP_JIT arena 超出本次配額"));
         }
-        let index = arena.free.iter().position(|&(_, len)| len >= plan.allocation)
+        let index = arena
+            .free
+            .iter()
+            .position(|&(_, len)| len >= plan.allocation)
             .ok_or(NativeError::AllocationFailed)?;
         let (offset, len) = arena.free[index];
-        if len == plan.allocation { arena.free.remove(index); }
-        else { arena.free[index] = (offset + plan.allocation, len - plan.allocation); }
+        if len == plan.allocation {
+            arena.free.remove(index);
+        } else {
+            arena.free[index] = (offset + plan.allocation, len - plan.allocation);
+        }
         let base = arena.base.expect("映射已建立");
         // SAFETY: free list 保證 [offset, offset+allocation) 落於有效映射且沒有重疊 lease。
         let destination = unsafe { base.as_ptr().add(offset) };
@@ -372,7 +516,10 @@ mod mac {
         unsafe { sys_icache_invalidate(destination.cast(), bytes.len()) };
         arena.live += 1;
         // SAFETY: entry_offset 已在 page_plan 驗證小於 bytes.len()。
-        Ok((unsafe { destination.add(entry_offset).cast_const() }, offset))
+        Ok((
+            unsafe { destination.add(entry_offset).cast_const() },
+            offset,
+        ))
     }
 
     pub(super) fn release(offset: usize, len: usize) {

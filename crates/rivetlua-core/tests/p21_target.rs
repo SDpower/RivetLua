@@ -43,7 +43,10 @@ fn p21_target_and_board_schemas_roundtrip_and_reject_identity_changes() {
     assert_eq!(board.validate(), Ok(()));
     let descriptor_bytes = descriptor.to_bytes().unwrap();
     let board_bytes = board.to_bytes().unwrap();
-    assert_eq!(TargetDescriptor::from_bytes(&descriptor_bytes).unwrap(), descriptor);
+    assert_eq!(
+        TargetDescriptor::from_bytes(&descriptor_bytes).unwrap(),
+        descriptor
+    );
     assert_eq!(BoardConfig::from_bytes(&board_bytes).unwrap(), board);
 
     let with_features = |features: &[&str]| {

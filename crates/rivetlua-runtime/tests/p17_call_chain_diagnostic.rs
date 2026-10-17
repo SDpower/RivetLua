@@ -103,7 +103,13 @@ const CASES: [Case; 5] = [
         language: LanguageProfile::Lua54,
         profile: LuaProfile::Lua54,
         body: LUA54_CHAIN,
-        expected: Expected::Booleans(&["table.pack precondition", "table result", "n=23", "chain order", "original arguments"]),
+        expected: Expected::Booleans(&[
+            "table.pack precondition",
+            "table result",
+            "n=23",
+            "chain order",
+            "original arguments",
+        ]),
         needs_table: true,
     },
     Case {
@@ -111,7 +117,11 @@ const CASES: [Case; 5] = [
         language: LanguageProfile::Lua54,
         profile: LuaProfile::Lua54,
         body: LUA54_CLOSURES,
-        expected: Expected::Booleans(&["anonymous direct calls", "fixed-point factorial", "captured closure"]),
+        expected: Expected::Booleans(&[
+            "anonymous direct calls",
+            "fixed-point factorial",
+            "captured closure",
+        ]),
         needs_table: false,
     },
     Case {
@@ -162,8 +172,7 @@ fn compile(source: &[u8], language: LanguageProfile) -> Result<VerifiedModule, S
     let syntax = parse(&chunk, language, &limits).map_err(|error| format!("parse: {error:?}"))?;
     let resolved = resolve(&syntax, &chunk, language, &limits)
         .map_err(|error| format!("resolve: {error:?}"))?;
-    let ir = lower(&resolved, &IrLimits::default())
-        .map_err(|error| format!("lower: {error:?}"))?;
+    let ir = lower(&resolved, &IrLimits::default()).map_err(|error| format!("lower: {error:?}"))?;
     emit_with_native_debug(
         &ir,
         &resolved,
@@ -196,14 +205,18 @@ fn check_outcome(vm: &Vm, outcome: RunOutcome, expected: Expected) -> Vec<String
                 if values.len() != names.len() {
                     failures.push(format!(
                         "returned {} values; expected {} named checks; values={:?}",
-                        values.len(), names.len(), values
+                        values.len(),
+                        names.len(),
+                        values
                     ));
                 }
                 for (index, name) in names.iter().enumerate() {
                     if values.get(index) != Some(&Value::Boolean(true)) {
                         failures.push(format!(
                             "{name}: expected true; actual={}",
-                            values.get(index).map_or("missing".to_owned(), |value| describe_value(vm, *value))
+                            values
+                                .get(index)
+                                .map_or("missing".to_owned(), |value| describe_value(vm, *value))
                         ));
                     }
                 }
@@ -212,14 +225,21 @@ fn check_outcome(vm: &Vm, outcome: RunOutcome, expected: Expected) -> Vec<String
                 if values.first() != Some(&Value::Boolean(false)) {
                     failures.push(format!(
                         "pcall status: expected false; actual={}",
-                        values.first().map_or("missing".to_owned(), |value| describe_value(vm, *value))
+                        values
+                            .first()
+                            .map_or("missing".to_owned(), |value| describe_value(vm, *value))
                     ));
                 }
                 match values.get(1).copied() {
                     Some(Value::Object(object)) => match vm.with_byte_string(object, |text| {
                         let bytes = text.as_bytes();
-                        (bytes.windows(b"too long".len()).any(|part| part == b"too long"),
-                         bytes[..bytes.len().min(160)].to_vec(), bytes.len())
+                        (
+                            bytes
+                                .windows(b"too long".len())
+                                .any(|part| part == b"too long"),
+                            bytes[..bytes.len().min(160)].to_vec(),
+                            bytes.len(),
+                        )
                     }) {
                         Ok((true, _, _)) => {}
                         Ok((false, visible, len)) => failures.push(format!(
@@ -233,7 +253,10 @@ fn check_outcome(vm: &Vm, outcome: RunOutcome, expected: Expected) -> Vec<String
                     other => failures.push(format!("pcall message is not an object: {other:?}")),
                 }
                 if values.len() != 2 {
-                    failures.push(format!("pcall returned {} values; expected 2", values.len()));
+                    failures.push(format!(
+                        "pcall returned {} values; expected 2",
+                        values.len()
+                    ));
                 }
             }
         },
@@ -252,7 +275,11 @@ fn check_outcome(vm: &Vm, outcome: RunOutcome, expected: Expected) -> Vec<String
 }
 
 fn run_case(case: Case, official: bool) -> Result<(), String> {
-    let origin = if official { "official_dump_load" } else { "native" };
+    let origin = if official {
+        "official_dump_load"
+    } else {
+        "native"
+    };
     let source = source(case, official);
     let module = compile(&source, case.language)
         .map_err(|error| format!("{} {origin} compile: {error}", case.name))?;
@@ -266,11 +293,20 @@ fn run_case(case: Case, official: bool) -> Result<(), String> {
         ..LoadLimits::default()
     };
     let services = HostServices::deny_all()
-        .and_dump(DumpCapability::deny_all().with_official_bytecode(true).with_limits(dump_limits))
-        .and_load(LoadCapability::deny_all().with_official_bytecode(true).with_limits(load_limits));
+        .and_dump(
+            DumpCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(dump_limits),
+        )
+        .and_load(
+            LoadCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(load_limits),
+        );
     let mut vm = Vm::new_with_services(case.profile, services)
         .map_err(|error| format!("{} {origin} VM creation: {error:?}", case.name))?;
-    let environment = vm.allocate_table()
+    let environment = vm
+        .allocate_table()
         .map_err(|error| format!("{} {origin} environment: {error:?}", case.name))?;
     vm.install_basic_builtins(environment)
         .map_err(|error| format!("{} {origin} basic builtins: {error:?}", case.name))?;
@@ -281,7 +317,8 @@ fn run_case(case: Case, official: bool) -> Result<(), String> {
             .map_err(|error| format!("{} {origin} table builtins: {error:?}", case.name))?;
     }
     let baseline = RootKind::ALL.map(|kind| vm.roots().count(kind));
-    let environment_root = vm.add_root(RootKind::Host, environment)
+    let environment_root = vm
+        .add_root(RootKind::Host, environment)
         .map_err(|error| format!("{} {origin} environment root: {error:?}", case.name))?;
     vm.set_collect_every_allocation(true);
 
@@ -301,8 +338,12 @@ fn run_case(case: Case, official: bool) -> Result<(), String> {
         Ok(outcome) => check_outcome(&vm, outcome, case.expected),
         Err((stage, error)) => vec![format!(
             "{stage} kind={:?} id={} proto={:?} pc={:?} depth={:?} value={}",
-            error.kind, error.diagnostic_id, error.source_prototype,
-            error.source_pc, error.source_depth, describe_value(&vm, error.value)
+            error.kind,
+            error.diagnostic_id,
+            error.source_prototype,
+            error.source_pc,
+            error.source_depth,
+            describe_value(&vm, error.value)
         )],
     };
     if let Err(error) = vm.remove_root(environment_root) {
@@ -312,7 +353,8 @@ fn run_case(case: Case, official: bool) -> Result<(), String> {
         let actual = vm.roots().count(kind);
         if actual != baseline[index] {
             failures.push(format!(
-                "{kind:?} roots after execution={actual}; baseline={}", baseline[index]
+                "{kind:?} roots after execution={actual}; baseline={}",
+                baseline[index]
             ));
         }
     }

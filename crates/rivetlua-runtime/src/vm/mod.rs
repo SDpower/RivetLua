@@ -5,6 +5,8 @@ use crate::rust_alloc::vec::Vec;
 mod numeric_for;
 mod ops;
 
+use crate::rust_alloc::sync::Arc;
+use core::sync::atomic::AtomicBool;
 use rivetlua_core::bytecode::native_debug::NativeSemanticUpvalue;
 use rivetlua_core::bytecode::official_export::{OfficialExportErrorKind, emit_official_chunk};
 use rivetlua_core::{
@@ -19,8 +21,6 @@ use rivetlua_core::{
 };
 #[cfg(feature = "std")]
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use crate::rust_alloc::sync::Arc;
-use core::sync::atomic::AtomicBool;
 
 use crate::alloc::{
     AllocationCharge, AllocationCharges, AllocationLedger, FailPoint, Reservation, checked_bytes,
@@ -191,7 +191,9 @@ fn debug_last_definition_metered(
     before: usize,
     charge: &mut impl FnMut(usize) -> bool,
 ) -> Option<usize> {
-    charge(before.min(128)).then(|| debug_last_definition(prototype, register, before)).flatten()
+    charge(before.min(128))
+        .then(|| debug_last_definition(prototype, register, before))
+        .flatten()
 }
 
 fn debug_pending_metamethod_name(
@@ -258,7 +260,10 @@ fn debug_for_iterator_call(
         base,
         arg_count: 2,
         result_mode: ResultMode::Fixed(count),
-    }) = prototype.instructions.get(call_pc).map(|entry| &entry.instruction)
+    }) = prototype
+        .instructions
+        .get(call_pc)
+        .map(|entry| &entry.instruction)
     else {
         return false;
     };
@@ -286,12 +291,17 @@ fn debug_for_iterator_call(
         let Some(next_pc) = call_pc.checked_add(1) else {
             return false;
         };
-        let Some(Instruction::Move { dest: result, src }) =
-            prototype.instructions.get(next_pc).map(|entry| &entry.instruction)
+        let Some(Instruction::Move { dest: result, src }) = prototype
+            .instructions
+            .get(next_pc)
+            .map(|entry| &entry.instruction)
         else {
             return false;
         };
-        let Some(Instruction::LoadNil { start: nil, count: 1 }) = prototype
+        let Some(Instruction::LoadNil {
+            start: nil,
+            count: 1,
+        }) = prototype
             .instructions
             .get(next_pc + 1)
             .map(|entry| &entry.instruction)
@@ -359,7 +369,10 @@ fn debug_for_iterator_call(
                     left,
                     right,
                 } if (*left == *result && *right == *nil)
-                    || (*left == *nil && *right == *result) => Some((pc, *dest)),
+                    || (*left == *nil && *right == *result) =>
+                {
+                    Some((pc, *dest))
+                }
                 _ => None,
             }
         }) else {
@@ -385,7 +398,10 @@ fn debug_for_iterator_call(
                     head >= prefix_start
                         && head <= control_pc
                         && matches!(
-                            prototype.instructions.get(head).map(|entry| &entry.instruction),
+                            prototype
+                                .instructions
+                                .get(head)
+                                .map(|entry| &entry.instruction),
                             Some(Instruction::Move { .. })
                         )
                 }
@@ -398,11 +414,17 @@ fn debug_for_iterator_call(
         if first_branch.0 as usize <= comparison_pc + 1
             || first_branch.0 as usize > backedge_pc
             || !matches!(
-                prototype.instructions.get(exit_pc).map(|entry| &entry.instruction),
+                prototype
+                    .instructions
+                    .get(exit_pc)
+                    .map(|entry| &entry.instruction),
                 Some(Instruction::LoadNil { count: 1, .. })
             )
             || !matches!(
-                prototype.instructions.get(exit_pc + 1).map(|entry| &entry.instruction),
+                prototype
+                    .instructions
+                    .get(exit_pc + 1)
+                    .map(|entry| &entry.instruction),
                 Some(Instruction::Close { .. })
             )
         {
@@ -413,8 +435,8 @@ fn debug_for_iterator_call(
         for entry in &prototype.instructions[comparison_pc + 2..backedge_pc] {
             match &entry.instruction {
                 Instruction::Move { dest, src }
-                    if (*dest == control || relay_control == Some(*dest))
-                        && *src == *result => {
+                    if (*dest == control || relay_control == Some(*dest)) && *src == *result =>
+                {
                     control_updated = true;
                 }
                 Instruction::Jump { target } if target.0 as usize == exit_pc => {
@@ -425,29 +447,59 @@ fn debug_for_iterator_call(
         }
         return control_updated && exit_branch;
     }
-    let preceding = call_pc.checked_sub(3).and_then(|pc| prototype.instructions.get(pc..call_pc));
+    let preceding = call_pc
+        .checked_sub(3)
+        .and_then(|pc| prototype.instructions.get(pc..call_pc));
     let following = prototype.instructions.get(call_pc + 1..call_pc + 5);
     let (Some(preceding), Some(following)) = (preceding, following) else {
         return false;
     };
-    let same_span = preceding.iter().chain(following.iter()).all(|entry| {
-        entry.span == prototype.instructions[call_pc].span
-    });
+    let same_span = preceding
+        .iter()
+        .chain(following.iter())
+        .all(|entry| entry.span == prototype.instructions[call_pc].span);
     if !same_span {
         return false;
     }
-    let (Instruction::Move { dest: function, .. }, Instruction::Move { dest: state, .. },
-         Instruction::Move { dest: control_arg, .. }) =
-        (&preceding[0].instruction, &preceding[1].instruction, &preceding[2].instruction)
+    let (
+        Instruction::Move { dest: function, .. },
+        Instruction::Move { dest: state, .. },
+        Instruction::Move {
+            dest: control_arg, ..
+        },
+    ) = (
+        &preceding[0].instruction,
+        &preceding[1].instruction,
+        &preceding[2].instruction,
+    )
     else {
         return false;
     };
-    let (Instruction::LoadNil { start: nil, count: 1 },
-         Instruction::BinaryOp { dest: comparison, op: BinaryOperation::NotEqual, left, right },
-         Instruction::JumpIfFalse { condition, target: exit },
-         Instruction::Move { dest: control, src: result }) =
-        (&following[0].instruction, &following[1].instruction,
-         &following[2].instruction, &following[3].instruction)
+    let (
+        Instruction::LoadNil {
+            start: nil,
+            count: 1,
+        },
+        Instruction::BinaryOp {
+            dest: comparison,
+            op: BinaryOperation::NotEqual,
+            left,
+            right,
+        },
+        Instruction::JumpIfFalse {
+            condition,
+            target: exit,
+        },
+        Instruction::Move {
+            dest: control,
+            src: result,
+        },
+    ) = (
+        &following[0].instruction,
+        &following[1].instruction,
+        &following[2].instruction,
+        &following[3].instruction,
+    )
     else {
         return false;
     };
@@ -463,9 +515,9 @@ fn debug_for_iterator_call(
     let loop_shape = exit_pc > call_pc + 5
         && exit_pc < prototype.instructions.len()
         && back_edge.0 as usize == loop_start
-        && verified.native_debug().is_some_and(|debug| {
-            debug.is_non_counted_pc(prototype.id, *exit)
-        });
+        && verified
+            .native_debug()
+            .is_some_and(|debug| debug.is_non_counted_pc(prototype.id, *exit));
     loop_shape
         && *function == *base
         && state.0.checked_sub(base.0) == Some(1)
@@ -474,7 +526,11 @@ fn debug_for_iterator_call(
         && *right == *nil
         && *condition == *comparison
         && *result == *base
-        && preceding[2].instruction == Instruction::Move { dest: *control_arg, src: *control }
+        && preceding[2].instruction
+            == Instruction::Move {
+                dest: *control_arg,
+                src: *control,
+            }
 }
 
 fn debug_native_call_name<'a>(
@@ -526,9 +582,7 @@ fn debug_native_call_name_metered<'a>(
     let Instruction::Move { dest, src } = prototype.instructions.get(move_pc)?.instruction else {
         return None;
     };
-    if dest != base
-        || debug_branch_enters_between_metered(prototype, move_pc, call_pc, charge)?
-    {
+    if dest != base || debug_branch_enters_between_metered(prototype, move_pc, call_pc, charge)? {
         return None;
     }
     if !charge(debug.locals.len()) {
@@ -542,9 +596,7 @@ fn debug_native_call_name_metered<'a>(
     let Instruction::GetTable { dest, table, key } = get.instruction else {
         return None;
     };
-    if dest != src
-        || debug_branch_enters_between_metered(prototype, get_pc, call_pc, charge)?
-    {
+    if dest != src || debug_branch_enters_between_metered(prototype, get_pc, call_pc, charge)? {
         return None;
     }
     let key_pc = debug_last_definition_metered(prototype, key, get_pc, charge)?;
@@ -552,9 +604,7 @@ fn debug_native_call_name_metered<'a>(
     else {
         return None;
     };
-    if dest != key
-        || debug_branch_enters_between_metered(prototype, key_pc, call_pc, charge)?
-    {
+    if dest != key || debug_branch_enters_between_metered(prototype, key_pc, call_pc, charge)? {
         return None;
     }
     // native 編譯器將 method 的取欄位與 self 搬移標成整個呼叫的 span；
@@ -577,8 +627,7 @@ fn debug_native_call_name_metered<'a>(
             }
             let first = debug_last_definition_metered(prototype, table, self_pc, charge);
             let second = debug_last_definition_metered(prototype, table, get_pc, charge);
-            (first == second)
-            .then_some(())
+            (first == second).then_some(())
         })()
         .is_some();
     match prototype.constants.get(constant.0 as usize)? {
@@ -2116,7 +2165,10 @@ impl Vm {
     }
 
     /// VM 所有的 C API bridge 僅在同 VM 內傳值；物件不會序列化為宿主輸出。
-    fn measure_native_internal_values(&self, values: &[Value]) -> Result<(usize, usize), RuntimeError> {
+    fn measure_native_internal_values(
+        &self,
+        values: &[Value],
+    ) -> Result<(usize, usize), RuntimeError> {
         let mut bytes = 0_usize;
         for &value in values {
             let size = match value {
@@ -2143,7 +2195,10 @@ impl Vm {
             };
             bytes = bytes.checked_add(size).ok_or(VmError::ArithmeticOverflow)?;
         }
-        let work = values.len().checked_add(bytes).ok_or(VmError::ArithmeticOverflow)?;
+        let work = values
+            .len()
+            .checked_add(bytes)
+            .ok_or(VmError::ArithmeticOverflow)?;
         Ok((bytes, work.max(1)))
     }
 
@@ -2479,9 +2534,7 @@ impl Vm {
             });
         if let Some(request) = self.exit_request.filter(|request| {
             !shutdown_close_callback
-                && (!request.close
-                    || !self.finalizer_running()
-                    || self.exit_in_current_finalizer)
+                && (!request.close || !self.finalizer_running() || self.exit_in_current_finalizer)
         }) {
             if !request.close {
                 self.cleanup_parked_on_drop();
@@ -2820,9 +2873,7 @@ impl Vm {
         let core = self.take_top_external_core(token)?;
         let mut execution = Execution::from_core(self, core);
         #[cfg_attr(feature = "std", allow(unused_mut))]
-        let mut action = || {
-            execution.complete_external_self_close(error, boundaries)
-        };
+        let mut action = || execution.complete_external_self_close(error, boundaries);
         #[cfg(feature = "std")]
         let outcome = catch_unwind(AssertUnwindSafe(action));
         #[cfg(not(feature = "std"))]
@@ -3532,7 +3583,10 @@ impl<'vm> Execution<'vm> {
         Ok(())
     }
 
-    fn complete_external_error(&mut self, value: Value) -> Result<ExternalCompletion, RuntimeError> {
+    fn complete_external_error(
+        &mut self,
+        value: Value,
+    ) -> Result<ExternalCompletion, RuntimeError> {
         if self.external_pending.is_none() {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
         }
@@ -3590,10 +3644,9 @@ impl<'vm> Execution<'vm> {
                         Ok(ExternalCompletion::Pending(RunOutcome::Returned(values)))
                     }
                 }
-                ProtectedErrorResult::Uncaught(error) if !self.external_nested.is_empty() => {
-                    self.finish_external_nested_error(error)
-                        .map(ExternalCompletion::Pending)
-                }
+                ProtectedErrorResult::Uncaught(error) if !self.external_nested.is_empty() => self
+                    .finish_external_nested_error(error)
+                    .map(ExternalCompletion::Pending),
                 ProtectedErrorResult::Uncaught(error) => {
                     let preserved = crate::LuaError::from_runtime(
                         self.vm,
@@ -7202,7 +7255,9 @@ impl Execution<'_> {
                 error.value = Value::Object(self.vm.allocate_byte_string(b"call chain too long")?);
                 return Err(error);
             }
-            let event = self.vm.lookup_metamethod_value(current, MetamethodEvent::Call)?;
+            let event = self
+                .vm
+                .lookup_metamethod_value(current, MetamethodEvent::Call)?;
             if event == Value::Nil {
                 return Err(RuntimeError::new(RuntimeErrorKind::NotCallable));
             }
@@ -7353,17 +7408,20 @@ impl Execution<'_> {
     }
 
     /// 將宿主的 message handler 包在原入口 frame 外，不新增 Lua wrapper frame。
-    pub fn install_host_entry_error_handler(
-        &mut self,
-        handler: Value,
-    ) -> Result<(), RuntimeError> {
+    pub fn install_host_entry_error_handler(&mut self, handler: Value) -> Result<(), RuntimeError> {
         if self.state != ExecutionState::Ready
             || !self.protected.is_empty()
             || self.error_root.is_some()
         {
             return Err(RuntimeError::new(RuntimeErrorKind::TerminalExecution));
         }
-        self.push_protected_boundary(Register(0), ResultMode::All, false, Some(handler), self.frame.pc)?;
+        self.push_protected_boundary(
+            Register(0),
+            ResultMode::All,
+            false,
+            Some(handler),
+            self.frame.pc,
+        )?;
         let boundary = self
             .protected
             .last_mut()
@@ -7720,9 +7778,9 @@ impl Execution<'_> {
     }
 
     fn official_named_count(&mut self, table: ObjectRef) -> Result<usize, RuntimeError> {
-        let field = self.vm.with_temporary_byte_string(b"n", |vm, key| {
-            vm.raw_get(table, Value::Object(key))
-        })?;
+        let field = self
+            .vm
+            .with_temporary_byte_string(b"n", |vm, key| vm.raw_get(table, Value::Object(key)))?;
         let count = match field {
             Value::Integer(count) if (0..=i64::from(i32::MAX / 2)).contains(&count) => count,
             _ => return Err(self.invalid_official_named_count()?),
@@ -9060,16 +9118,20 @@ impl Execution<'_> {
                             _ => {
                                 let error = self.coroutine_message(b"E_WRONG_OBJECT_TYPE")?;
                                 return self.start_native_protected_error(
-                                    object, protected, error, destination, mode, tail_return, next,
+                                    object,
+                                    protected,
+                                    error,
+                                    destination,
+                                    mode,
+                                    tail_return,
+                                    next,
                                 );
                             }
                         };
                         return self.finish_native_protected_direct(
                             object,
                             protected,
-                            Ok(&[Value::Boolean(
-                                self.coroutine_object_yieldable(selected),
-                            )]),
+                            Ok(&[Value::Boolean(self.coroutine_object_yieldable(selected))]),
                             destination,
                             mode,
                             tail_return,
@@ -9914,9 +9976,8 @@ impl Execution<'_> {
                         };
                         match selected {
                             Ok(target) => {
-                                values.push(Value::Boolean(
-                                    self.coroutine_object_yieldable(target),
-                                ));
+                                values
+                                    .push(Value::Boolean(self.coroutine_object_yieldable(target)));
                                 (true, CoroutineState::Dead, None)
                             }
                             Err(_) => {
@@ -10212,8 +10273,7 @@ impl Execution<'_> {
                     Some(_) => return Err(VmError::WrongObjectType.into()),
                 };
                 let yieldable = self.coroutine_object_yieldable(target);
-                let (values, ticket) =
-                    string_lib::values(self.vm, &[Value::Boolean(yieldable)])?;
+                let (values, ticket) = string_lib::values(self.vm, &[Value::Boolean(yieldable)])?;
                 self.complete_builtin_values(destination, mode, tail_return, next, values, ticket)
             }
             Builtin::CoroutineResume => {
@@ -10250,7 +10310,13 @@ impl Execution<'_> {
                     return Ok(RegularCallAction::Completed(DispatchResult::Continue));
                 }
                 self.start_coroutine_close(
-                    object, destination, mode, tail_return, next, false, host_reset,
+                    object,
+                    destination,
+                    mode,
+                    tail_return,
+                    next,
+                    false,
+                    host_reset,
                 )
             }
             Builtin::CoroutineWrap => {
@@ -13323,7 +13389,9 @@ impl Execution<'_> {
         }
 
         let thread = match args.first().copied() {
-            Some(Value::Object(object)) if self.vm.object_kind(object)? == ObjectKind::Coroutine => {
+            Some(Value::Object(object))
+                if self.vm.object_kind(object)? == ObjectKind::Coroutine =>
+            {
                 Some(object)
             }
             _ => None,
@@ -13360,19 +13428,26 @@ impl Execution<'_> {
                 };
                 // 活躍的 native 錯誤函式及 message handler 位於其實際停泊的 Lua
                 // caller 上方；只在 handler 已進入 guest 子呼叫時參與堆疊查詢。
-                let native_calls = parked_thread.is_none().then(|| self.protected.last()).flatten().and_then(|boundary| {
-                    (boundary.stage == ProtectedStage::Handler)
-                        .then_some(boundary.handler_depth?)
-                        .filter(|depth| self.callers.len() > *depth)
-                        .map(|depth| (self.callers.len() - depth, boundary))
-                });
+                let native_calls = parked_thread
+                    .is_none()
+                    .then(|| self.protected.last())
+                    .flatten()
+                    .and_then(|boundary| {
+                        (boundary.stage == ProtectedStage::Handler)
+                            .then_some(boundary.handler_depth?)
+                            .filter(|depth| self.callers.len() > *depth)
+                            .map(|depth| (self.callers.len() - depth, boundary))
+                    });
                 let mut lua_level = level;
                 let mut native_function = None;
                 if let Some((above, boundary)) = native_calls {
                     let handler_count = usize::from(boundary.handler_native);
-                    let fault_count = usize::from(boundary.faulting_native.as_ref().is_some_and(
-                        |call| call.caller_depth == self.callers.len() - above,
-                    ));
+                    let fault_count = usize::from(
+                        boundary
+                            .faulting_native
+                            .as_ref()
+                            .is_some_and(|call| call.caller_depth == self.callers.len() - above),
+                    );
                     let total = handler_count + fault_count;
                     if level > above && level <= above + total {
                         native_function = if level == above + 1 && boundary.handler_native {
@@ -13417,7 +13492,12 @@ impl Execution<'_> {
                     if !present {
                         let (values, ticket) = math_lib::values(self.vm, &[Value::Nil])?;
                         return self.complete_builtin_values(
-                            destination, mode, tail_return, next, values, ticket,
+                            destination,
+                            mode,
+                            tail_return,
+                            next,
+                            values,
+                            ticket,
                         );
                     }
                 }
@@ -13459,7 +13539,12 @@ impl Execution<'_> {
                     let Some((value, module, prototype, pc, tail, extraargs)) = projection else {
                         let (values, ticket) = math_lib::values(self.vm, &[Value::Nil])?;
                         return self.complete_builtin_values(
-                            destination, mode, tail_return, next, values, ticket,
+                            destination,
+                            mode,
+                            tail_return,
+                            next,
+                            values,
+                            ticket,
                         );
                     };
                     function = value;
@@ -13510,14 +13595,16 @@ impl Execution<'_> {
                             function = frame.closure.map(Value::Object).unwrap_or(Value::Nil);
                             module_ref = frame.module;
                             prototype_index = Some(frame.prototype);
-                            frame_pc = Some(if lua_level == 1
-                                || self.debug_hook_uses_current_local_pc(None, lua_level)
-                            {
-                                // line/count hook 停在待執行指令，行號須與事件的 PC 一致。
-                                frame.pc
-                            } else {
-                                frame.pc.saturating_sub(1)
-                            });
+                            frame_pc = Some(
+                                if lua_level == 1
+                                    || self.debug_hook_uses_current_local_pc(None, lua_level)
+                                {
+                                    // line/count hook 停在待執行指令，行號須與事件的 PC 一致。
+                                    frame.pc
+                                } else {
+                                    frame.pc.saturating_sub(1)
+                                },
+                            );
                             Some(ObjectKind::Closure)
                         } else {
                             None
@@ -13616,9 +13703,12 @@ impl Execution<'_> {
                         .iter()
                         .rev()
                         .find(|boundary| boundary.finalizer.is_some())
-                        .map_or(self.module.is_none() && self.callers.is_empty(), |boundary| {
-                            boundary.caller_depth.checked_add(1) == Some(self.callers.len())
-                        });
+                        .map_or(
+                            self.module.is_none() && self.callers.is_empty(),
+                            |boundary| {
+                                boundary.caller_depth.checked_add(1) == Some(self.callers.len())
+                            },
+                        );
                 if inferred_kind.is_empty() && direct_finalizer {
                     spend!(b"__gc".len());
                     inferred_ticket = Some(reserve_vec(
@@ -13691,8 +13781,7 @@ impl Execution<'_> {
                                 .then(|| self.pending_ops.last())
                                 .flatten()
                                 .filter(|pending| {
-                                    pending.caller_depth.checked_add(1)
-                                        == Some(self.callers.len())
+                                    pending.caller_depth.checked_add(1) == Some(self.callers.len())
                                 })
                                 .and_then(|pending| {
                                     debug_pending_metamethod_name(
@@ -13711,11 +13800,19 @@ impl Execution<'_> {
                                 .and_then(|debug| debug.prototype(prototype.id))
                             {
                                 debug_native_call_name(
-                                    prototype, debug, &self.callers[caller_index], function, call_pc,
+                                    prototype,
+                                    debug,
+                                    &self.callers[caller_index],
+                                    function,
+                                    call_pc,
                                 )
                             } else if verified.official_artifact().is_some() {
                                 debug_official_call_name(
-                                    verified, prototype, &self.callers[caller_index], function, call_pc,
+                                    verified,
+                                    prototype,
+                                    &self.callers[caller_index],
+                                    function,
+                                    call_pc,
                                 )
                             } else {
                                 None
@@ -13764,28 +13861,32 @@ impl Execution<'_> {
                     spend!(metadata_work);
                     let additional_work = {
                         let verified = self.vm.module(module)?;
-                        verified.module().prototypes.get(caller_prototype).map(|proto| {
-                            if let Some(debug) = verified
-                                .native_debug()
-                                .and_then(|debug| debug.prototype(proto.id))
-                            {
-                                candidate_work
-                                    .saturating_mul(3)
-                                    .saturating_add(384)
-                                    .saturating_add(debug.locals.len().saturating_mul(2))
-                            } else if let Some(artifact) = verified.official_artifact() {
-                                let local_count = artifact
-                                    .prototype(proto.id)
-                                    .map(|guest| guest.debug.locals.len())
-                                    .unwrap_or(0);
-                                candidate_work
-                                    .saturating_mul(3)
-                                    .saturating_add(local_count)
-                                    .saturating_add(32)
-                            } else {
-                                0
-                            }
-                        })
+                        verified
+                            .module()
+                            .prototypes
+                            .get(caller_prototype)
+                            .map(|proto| {
+                                if let Some(debug) = verified
+                                    .native_debug()
+                                    .and_then(|debug| debug.prototype(proto.id))
+                                {
+                                    candidate_work
+                                        .saturating_mul(3)
+                                        .saturating_add(384)
+                                        .saturating_add(debug.locals.len().saturating_mul(2))
+                                } else if let Some(artifact) = verified.official_artifact() {
+                                    let local_count = artifact
+                                        .prototype(proto.id)
+                                        .map(|guest| guest.debug.locals.len())
+                                        .unwrap_or(0);
+                                    candidate_work
+                                        .saturating_mul(3)
+                                        .saturating_add(local_count)
+                                        .saturating_add(32)
+                                } else {
+                                    0
+                                }
+                            })
                     };
                     if let Some(additional_work) = additional_work {
                         spend!(additional_work);
@@ -13817,7 +13918,9 @@ impl Execution<'_> {
                             {
                                 debug_native_call_name(prototype, debug, caller, function, call_pc)
                             } else if verified.official_artifact().is_some() {
-                                debug_official_call_name(verified, prototype, caller, function, call_pc)
+                                debug_official_call_name(
+                                    verified, prototype, caller, function, call_pc,
+                                )
                             } else {
                                 None
                             }
@@ -14009,43 +14112,43 @@ impl Execution<'_> {
         let info_root = self.vm.add_root(RootKind::Temporary, info)?;
         let output = (|| {
             if has_s {
-                let (what, source_bytes, short, defined, last) = if matches!(
-                    object_kind,
-                    ObjectKind::Builtin | ObjectKind::CClosure
-                )
-                {
-                    (
-                        b"C".as_slice(),
-                        b"=[C]".as_slice(),
-                        b"[C]".as_slice(),
-                        -1,
-                        -1,
-                    )
-                } else {
-                    let (short, size) = official_short_source(&source);
-                    let what = if main {
-                        b"main".as_slice()
+                let (what, source_bytes, short, defined, last) =
+                    if matches!(object_kind, ObjectKind::Builtin | ObjectKind::CClosure) {
+                        (
+                            b"C".as_slice(),
+                            b"=[C]".as_slice(),
+                            b"[C]".as_slice(),
+                            -1,
+                            -1,
+                        )
                     } else {
-                        b"Lua".as_slice()
+                        let (short, size) = official_short_source(&source);
+                        let what = if main {
+                            b"main".as_slice()
+                        } else {
+                            b"Lua".as_slice()
+                        };
+                        let source_value = self.vm.allocate_byte_string(&source)?;
+                        self.vm
+                            .set_string_field(info, b"source", Value::Object(source_value))?;
+                        let short_value = self.vm.allocate_byte_string(&short[..size])?;
+                        self.vm
+                            .set_string_field(info, b"short_src", Value::Object(short_value))?;
+                        let what_value = self.vm.allocate_byte_string(what)?;
+                        self.vm
+                            .set_string_field(info, b"what", Value::Object(what_value))?;
+                        self.vm.set_string_field(
+                            info,
+                            b"linedefined",
+                            Value::Integer(line_defined),
+                        )?;
+                        self.vm.set_string_field(
+                            info,
+                            b"lastlinedefined",
+                            Value::Integer(last_line_defined),
+                        )?;
+                        (b"".as_slice(), b"".as_slice(), b"".as_slice(), 0, 0)
                     };
-                    let source_value = self.vm.allocate_byte_string(&source)?;
-                    self.vm
-                        .set_string_field(info, b"source", Value::Object(source_value))?;
-                    let short_value = self.vm.allocate_byte_string(&short[..size])?;
-                    self.vm
-                        .set_string_field(info, b"short_src", Value::Object(short_value))?;
-                    let what_value = self.vm.allocate_byte_string(what)?;
-                    self.vm
-                        .set_string_field(info, b"what", Value::Object(what_value))?;
-                    self.vm
-                        .set_string_field(info, b"linedefined", Value::Integer(line_defined))?;
-                    self.vm.set_string_field(
-                        info,
-                        b"lastlinedefined",
-                        Value::Integer(last_line_defined),
-                    )?;
-                    (b"".as_slice(), b"".as_slice(), b"".as_slice(), 0, 0)
-                };
                 if matches!(object_kind, ObjectKind::Builtin | ObjectKind::CClosure) {
                     let source_value = self.vm.allocate_byte_string(source_bytes)?;
                     self.vm
@@ -14760,7 +14863,9 @@ impl Execution<'_> {
                     Value::Object(object) => match self.vm.object_kind(object)? {
                         ObjectKind::Table | ObjectKind::Userdata => (true, false),
                         ObjectKind::File if kind == DebugBuiltin::GetMetatable => (true, false),
-                        ObjectKind::ByteString if kind == DebugBuiltin::GetMetatable => (false, true),
+                        ObjectKind::ByteString if kind == DebugBuiltin::GetMetatable => {
+                            (false, true)
+                        }
                         ObjectKind::File
                         | ObjectKind::Value
                         | ObjectKind::Upvalue
@@ -14771,8 +14876,11 @@ impl Execution<'_> {
                     },
                     _ => (false, false),
                 };
-                if !(capability.allows(if original_scope { permission } else { type_permission })
-                    || (either_scope && capability.allows(permission)))
+                if !(capability.allows(if original_scope {
+                    permission
+                } else {
+                    type_permission
+                }) || (either_scope && capability.allows(permission)))
                 {
                     return Err(RuntimeError::new(RuntimeErrorKind::HostPolicyDebug));
                 }
@@ -15337,7 +15445,9 @@ impl Execution<'_> {
         next: usize,
     ) -> Result<RegularCallAction, RuntimeError> {
         let (thread, offset) = match args.first().copied() {
-            Some(Value::Object(object)) if self.vm.object_kind(object)? == ObjectKind::Coroutine => {
+            Some(Value::Object(object))
+                if self.vm.object_kind(object)? == ObjectKind::Coroutine =>
+            {
                 (Some(object), 1)
             }
             _ => (None, 0),
@@ -15357,7 +15467,12 @@ impl Execution<'_> {
             other => {
                 let (values, ticket) = math_lib::values(self.vm, &[other])?;
                 return self.complete_builtin_values(
-                    destination, mode, tail_return, next, values, ticket,
+                    destination,
+                    mode,
+                    tail_return,
+                    next,
+                    values,
+                    ticket,
                 );
             }
         };
@@ -15400,7 +15515,11 @@ impl Execution<'_> {
                 top_c: Some(top),
                 hook,
             };
-            let mut sink = TracebackSink { output: None, len: 0, limit: limits.max_trace_bytes };
+            let mut sink = TracebackSink {
+                output: None,
+                len: 0,
+                limit: limits.max_trace_bytes,
+            };
             let work = stack.render(level, &mut sink, limits)?;
             (sink.len, work)
         } else {
@@ -15429,7 +15548,11 @@ impl Execution<'_> {
                     top_c,
                     hook: false,
                 };
-                let mut sink = TracebackSink { output: None, len: 0, limit: limits.max_trace_bytes };
+                let mut sink = TracebackSink {
+                    output: None,
+                    len: 0,
+                    limit: limits.max_trace_bytes,
+                };
                 let work = stack.render(level, &mut sink, limits)?;
                 Ok::<_, RuntimeError>((sink.len, work))
             })??
@@ -15449,10 +15572,14 @@ impl Execution<'_> {
         }
         let mut output = Vec::new();
         let ticket = reserve_vec(
-            self.vm.allocation_ledger(), &mut output, total, FailPoint::WorkReserve,
+            self.vm.allocation_ledger(),
+            &mut output,
+            total,
+            FailPoint::WorkReserve,
         )?;
         if let Some(object) = message_object {
-            self.vm.with_byte_string(object, |text| output.extend_from_slice(text.as_bytes()))?;
+            self.vm
+                .with_byte_string(object, |text| output.extend_from_slice(text.as_bytes()))?;
         } else if number_len > 0 {
             output.extend_from_slice(&number[..number_len]);
         }
@@ -15468,7 +15595,11 @@ impl Execution<'_> {
                 top_c: Some(top),
                 hook,
             };
-            let mut sink = TracebackSink { output: Some(&mut output), len: 0, limit: limits.max_trace_bytes };
+            let mut sink = TracebackSink {
+                output: Some(&mut output),
+                len: 0,
+                limit: limits.max_trace_bytes,
+            };
             stack.render(level, &mut sink, limits)?;
             debug_assert_eq!(sink.len, stack_len);
         } else {
@@ -15497,7 +15628,11 @@ impl Execution<'_> {
                     top_c,
                     hook: false,
                 };
-                let mut sink = TracebackSink { output: Some(&mut output), len: 0, limit: limits.max_trace_bytes };
+                let mut sink = TracebackSink {
+                    output: Some(&mut output),
+                    len: 0,
+                    limit: limits.max_trace_bytes,
+                };
                 stack.render(level, &mut sink, limits)?;
                 debug_assert_eq!(sink.len, stack_len);
                 Ok::<_, RuntimeError>(())
@@ -18195,9 +18330,13 @@ impl Execution<'_> {
                     return Ok(RegularCallAction::Aborted);
                 }
                 let (object, root) =
-                    self.vm.with_unpublished_byte_string(&buffer.bytes, |vm, object| {
-                        Ok::<_, RuntimeError>((object, vm.add_root(RootKind::Temporary, object)?))
-                    })?;
+                    self.vm
+                        .with_unpublished_byte_string(&buffer.bytes, |vm, object| {
+                            Ok::<_, RuntimeError>((
+                                object,
+                                vm.add_root(RootKind::Temporary, object)?,
+                            ))
+                        })?;
                 let completed = (|| {
                     let (values, ticket) = string_lib::values(self.vm, &[Value::Object(object)])?;
                     self.complete_builtin_values(
@@ -19212,7 +19351,11 @@ impl Execution<'_> {
             expanded_path.append(part, limits.max_temporary_bytes)?;
         }
         let mut diagnostics = LoadBuffer::new(self.vm);
-        for (index, candidate) in expanded_path.as_bytes().split(|byte| *byte == b';').enumerate() {
+        for (index, candidate) in expanded_path
+            .as_bytes()
+            .split(|byte| *byte == b';')
+            .enumerate()
+        {
             if index >= limits.max_path_candidates && !candidate.is_empty() {
                 return Err(RuntimeError::new(RuntimeErrorKind::HostLoadBudget));
             }
@@ -19226,15 +19369,10 @@ impl Execution<'_> {
                     self.vm.finalizer_running(),
                     ledger,
                 );
-                let found = match budget.spend_work(
-                    name.len()
-                        .saturating_add(candidate.len())
-                        .saturating_add(1),
-                ) {
-                    Ok(()) => {
-                        self.vm
-                            .host_search_repository(name, candidate, &mut budget)
-                    }
+                let found = match budget
+                    .spend_work(name.len().saturating_add(candidate.len()).saturating_add(1))
+                {
+                    Ok(()) => self.vm.host_search_repository(name, candidate, &mut budget),
                     Err(error) => Err(LoadServiceError::Host(error)),
                 };
                 if let Some(stop) = budget.stop() {
@@ -19316,14 +19454,7 @@ impl Execution<'_> {
         let result = (|| {
             let (values, ticket) =
                 string_lib::values(self.vm, &[Value::Nil, Value::Object(message)])?;
-            self.complete_builtin_values(
-                destination,
-                mode,
-                tail_return,
-                next,
-                values,
-                ticket,
-            )
+            self.complete_builtin_values(destination, mode, tail_return, next, values, ticket)
         })();
         self.vm.remove_root(root)?;
         result
@@ -21015,16 +21146,17 @@ impl Execution<'_> {
         next: usize,
     ) -> Result<RegularCallAction, RuntimeError> {
         const MAX_BASIC_CALLBACK_DEPTH: usize = 32;
-        if matches!(&basic, BasicPending::Pairs { .. } | BasicPending::ToString { .. })
-            && self.pending_ops.contains_basic_callback_cycle(
-                held,
-                event,
-                self.callers.len(),
-                self.frame.stack_base,
-                self.frame.prototype,
-                self.frame.module,
-            )
-        {
+        if matches!(
+            &basic,
+            BasicPending::Pairs { .. } | BasicPending::ToString { .. }
+        ) && self.pending_ops.contains_basic_callback_cycle(
+            held,
+            event,
+            self.callers.len(),
+            self.frame.stack_base,
+            self.frame.prototype,
+            self.frame.module,
+        ) {
             basic.clear(self.vm)?;
             return Err(RuntimeError::new(RuntimeErrorKind::StackLimit));
         }
@@ -21164,9 +21296,10 @@ impl Execution<'_> {
         let debug_console = self.pending_ops.last().is_some_and(|pending| {
             matches!(pending.basic, Some(BasicPending::DebugConsole { .. }))
         });
-        let load_reader = self.pending_ops.last().is_some_and(|pending| {
-            matches!(pending.basic, Some(BasicPending::LoadReader { .. }))
-        });
+        let load_reader = self
+            .pending_ops
+            .last()
+            .is_some_and(|pending| matches!(pending.basic, Some(BasicPending::LoadReader { .. })));
         if debug_console || load_reader {
             if let Err(error) =
                 self.push_protected_boundary(destination, ResultMode::Fixed(1), false, None, next)
@@ -23867,17 +24000,20 @@ impl Execution<'_> {
                     || top.core.as_ref().is_some_and(|core| {
                         core.external_close_boundary_a5 && core.close_unwind.is_some()
                     })
-                    || self.capi_resume_parent_yieldability.is_some_and(|(parent, _)| {
-                        top.core.as_ref().is_some_and(|core| {
-                            (core.active_coroutine == Some(parent)
-                                || (main == Some(parent) && core.active_coroutine.is_none()))
-                                && core.external_pending.is_some()
+                    || self
+                        .capi_resume_parent_yieldability
+                        .is_some_and(|(parent, _)| {
+                            top.core.as_ref().is_some_and(|core| {
+                                (core.active_coroutine == Some(parent)
+                                    || (main == Some(parent) && core.active_coroutine.is_none()))
+                                    && core.external_pending.is_some()
+                            })
                         })
-                    })
             }
             (Some(top), Some(origin)) => top.token == origin && top.core.is_none(),
             _ => false,
-        } || (shutdown_close_run && self.vm.exit_request.is_some_and(|request| request.close))
+        } || (shutdown_close_run
+            && self.vm.exit_request.is_some_and(|request| request.close))
             || (self.gc_finalizer_parent
                 && self.nested_origin.is_some_and(|origin| {
                     self.vm
@@ -23940,11 +24076,9 @@ impl Execution<'_> {
     ) -> (Result<RunOutcome, RuntimeError>, u64) {
         let was_nested = matches!(
             &outcome,
-            Ok(
-                RunOutcome::NestedReturned(_)
-                    | RunOutcome::NestedErrored(_)
-                    | RunOutcome::NestedFailed(_)
-            )
+            Ok(RunOutcome::NestedReturned(_)
+                | RunOutcome::NestedErrored(_)
+                | RunOutcome::NestedFailed(_))
         );
         let outcome = self.present_host_outcome(outcome);
         let remaining = self.fuel;
@@ -23980,7 +24114,8 @@ impl Execution<'_> {
         if !self.vm.meter_host_results() {
             return outcome;
         }
-        let restricted = self.vm.policy() != VmPolicy::Compatibility && !self.native_internal_output;
+        let restricted =
+            self.vm.policy() != VmPolicy::Compatibility && !self.native_internal_output;
         match outcome {
             Ok(RunOutcome::Returned(values)) => {
                 if let Some(reason) = self.meter_execution_values(&values)? {
@@ -24063,9 +24198,7 @@ impl Execution<'_> {
         match self.meter_execution_output(bytes, work)? {
             None => Ok(true),
             Some(AbortReason::FuelExhausted) => Ok(false),
-            Some(AbortReason::OutputLimit) => {
-                Err(RuntimeError::new(RuntimeErrorKind::OutputLimit))
-            }
+            Some(AbortReason::OutputLimit) => Err(RuntimeError::new(RuntimeErrorKind::OutputLimit)),
         }
     }
 
@@ -24073,9 +24206,7 @@ impl Execution<'_> {
         match self.meter_execution_values(values)? {
             None => Ok(true),
             Some(AbortReason::FuelExhausted) => Ok(false),
-            Some(AbortReason::OutputLimit) => {
-                Err(RuntimeError::new(RuntimeErrorKind::OutputLimit))
-            }
+            Some(AbortReason::OutputLimit) => Err(RuntimeError::new(RuntimeErrorKind::OutputLimit)),
         }
     }
 
@@ -24097,18 +24228,19 @@ impl Execution<'_> {
         &mut self,
         public_code: &'static str,
     ) -> Result<Option<AbortReason>, RuntimeError> {
-        let bytes = public_code.len().saturating_add(core::mem::size_of::<u64>());
+        let bytes = public_code
+            .len()
+            .saturating_add(core::mem::size_of::<u64>());
         self.meter_execution_output(bytes, bytes)
     }
 
-    fn public_diagnostic(
-        &mut self,
-        public_code: &'static str,
-    ) -> Result<RunOutcome, RuntimeError> {
+    fn public_diagnostic(&mut self, public_code: &'static str) -> Result<RunOutcome, RuntimeError> {
         if let Some(reason) = self.meter_execution_diagnostic(public_code)? {
             return Ok(RunOutcome::Aborted(reason));
         }
-        Ok(RunOutcome::SafeDiagnostic(self.vm.safe_diagnostic(public_code)))
+        Ok(RunOutcome::SafeDiagnostic(
+            self.vm.safe_diagnostic(public_code),
+        ))
     }
 
     fn finish_active_table_sort(&mut self, stop: TableSortStop) {
@@ -24205,11 +24337,16 @@ impl Execution<'_> {
         stats.code_bytes = self.vm.jit_state.code_bytes();
         stats.metadata_bytes = self.vm.jit_state.metadata_bytes();
         if let Some(prepared) = self.jit_prepared.as_ref() {
-            stats.metadata_bytes = stats.metadata_bytes
+            stats.metadata_bytes = stats
+                .metadata_bytes
                 .saturating_add(core::mem::size_of::<crate::jit::JitPrepared>())
                 .saturating_add(prepared.mask.capacity())
-                .saturating_add(prepared.scratch.capacity()
-                    .saturating_mul(core::mem::size_of::<rivetlua_native::NumericValue>()));
+                .saturating_add(
+                    prepared
+                        .scratch
+                        .capacity()
+                        .saturating_mul(core::mem::size_of::<rivetlua_native::NumericValue>()),
+                );
         }
         stats
     }
@@ -24218,7 +24355,9 @@ impl Execution<'_> {
     fn jit_runtime_guard(&self) -> Option<crate::jit::JitEligibility> {
         use crate::jit::{JitEligibility as E, JitFallbackReason as R, JitPolicy};
         if self.vm.jit_state.policy == JitPolicy::Disabled {
-            return Some(E::Unsupported { reason: R::Disabled });
+            return Some(E::Unsupported {
+                reason: R::Disabled,
+            });
         }
         if self.state != ExecutionState::Ready
             || self.vm.finalizer_running()
@@ -24234,11 +24373,21 @@ impl Execution<'_> {
             || self.external_pending.is_some()
             || self.vm.debug_hook_running()
         {
-            return Some(E::Rejected { reason: R::StateConflict });
+            return Some(E::Rejected {
+                reason: R::StateConflict,
+            });
         }
         match self.vm.debug_hook_for(self.active_coroutine) {
-            Ok(Some(_)) => return Some(E::Unsupported { reason: R::DebugHook }),
-            Err(_) => return Some(E::Rejected { reason: R::StateConflict }),
+            Ok(Some(_)) => {
+                return Some(E::Unsupported {
+                    reason: R::DebugHook,
+                });
+            }
+            Err(_) => {
+                return Some(E::Rejected {
+                    reason: R::StateConflict,
+                });
+            }
             Ok(None) => {}
         }
         None
@@ -24258,32 +24407,53 @@ impl Execution<'_> {
                 #[cfg(not(feature = "jit"))]
                 if prepared.eligibility == E::Supported {
                     let Ok(module) = self.current_module() else {
-                        return E::Rejected { reason: R::StateConflict };
+                        return E::Rejected {
+                            reason: R::StateConflict,
+                        };
                     };
-                    if !self.vm.jit_state.cache.iter().any(|artifact| artifact.matches_identity(
-                        module, prepared.module_digest, self.frame.prototype,
-                        self.frame.pc, self.vm_id,
-                    )) {
-                        return E::Unsupported { reason: R::ArtifactUnavailable };
+                    if !self.vm.jit_state.cache.iter().any(|artifact| {
+                        artifact.matches_identity(
+                            module,
+                            prepared.module_digest,
+                            self.frame.prototype,
+                            self.frame.pc,
+                            self.vm_id,
+                        )
+                    }) {
+                        return E::Unsupported {
+                            reason: R::ArtifactUnavailable,
+                        };
                     }
                 }
                 return prepared.eligibility;
             }
         }
         let Ok(module) = self.current_module() else {
-            return E::Rejected { reason: R::StateConflict };
+            return E::Rejected {
+                reason: R::StateConflict,
+            };
         };
         match rivetlua_native::NativeArtifact::validate(module, self.frame.prototype) {
             Ok(()) => {
                 #[cfg(not(feature = "jit"))]
                 {
                     let Some(digest) = crate::jit::module_digest(module) else {
-                        return E::Rejected { reason: R::ResourceLimit };
+                        return E::Rejected {
+                            reason: R::ResourceLimit,
+                        };
                     };
-                    if !self.vm.jit_state.cache.iter().any(|artifact| artifact.matches_identity(
-                        module, digest, self.frame.prototype, self.frame.pc, self.vm_id,
-                    )) {
-                        return E::Unsupported { reason: R::ArtifactUnavailable };
+                    if !self.vm.jit_state.cache.iter().any(|artifact| {
+                        artifact.matches_identity(
+                            module,
+                            digest,
+                            self.frame.prototype,
+                            self.frame.pc,
+                            self.vm_id,
+                        )
+                    }) {
+                        return E::Unsupported {
+                            reason: R::ArtifactUnavailable,
+                        };
                     }
                 }
                 E::Supported
@@ -24307,14 +24477,26 @@ impl Execution<'_> {
             }
         }
         let (eligibility, digest) = match self.current_module() {
-            Ok(module) => match rivetlua_native::NativeArtifact::validate(module, self.frame.prototype) {
-                Err(error) => (crate::jit::classify(&error), [0; 32]),
-                Ok(()) => match crate::jit::module_digest(module) {
-                    Some(digest) => (E::Supported, digest),
-                    None => (E::Rejected { reason: R::ResourceLimit }, [0; 32]),
+            Ok(module) => {
+                match rivetlua_native::NativeArtifact::validate(module, self.frame.prototype) {
+                    Err(error) => (crate::jit::classify(&error), [0; 32]),
+                    Ok(()) => match crate::jit::module_digest(module) {
+                        Some(digest) => (E::Supported, digest),
+                        None => (
+                            E::Rejected {
+                                reason: R::ResourceLimit,
+                            },
+                            [0; 32],
+                        ),
+                    },
+                }
+            }
+            Err(_) => (
+                E::Rejected {
+                    reason: R::StateConflict,
                 },
-            },
-            Err(_) => (E::Rejected { reason: R::StateConflict }, [0; 32]),
+                [0; 32],
+            ),
         };
         self.jit_prepared = Some(JitPrepared {
             module_ref: self.frame.module,
@@ -24331,9 +24513,9 @@ impl Execution<'_> {
     #[cfg(any(feature = "jit", feature = "aot"))]
     fn try_native_quantum(&mut self) -> Result<bool, RuntimeError> {
         use crate::jit::{JitEligibility, JitFallbackReason as R};
-        use rivetlua_native::{NativeError, NativeExit, NativeState, NumericValue};
         #[cfg(feature = "jit")]
         use rivetlua_native::{NativeArtifact, NativeCompileError, NativeCompileInput};
+        use rivetlua_native::{NativeError, NativeExit, NativeState, NumericValue};
 
         if self.jit_cooldown {
             self.jit_cooldown = false;
@@ -24354,7 +24536,9 @@ impl Execution<'_> {
             self.jit_stats.fallback_reason = Some(R::StateConflict);
             return Ok(false);
         }
-        let digest = self.jit_prepared.as_ref()
+        let digest = self
+            .jit_prepared
+            .as_ref()
             .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?
             .module_digest;
         let vm_id = self.vm_id;
@@ -24376,7 +24560,9 @@ impl Execution<'_> {
                     if !self.vm.jit_state.make_room_for_compile() {
                         self.jit_stats.fallback_reason = Some(R::ResourceLimit);
                         if let Some(prepared) = self.jit_prepared.as_mut() {
-                            prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+                            prepared.eligibility = JitEligibility::Rejected {
+                                reason: R::ResourceLimit,
+                            };
                         }
                         return Ok(false);
                     }
@@ -24395,7 +24581,8 @@ impl Execution<'_> {
                         match result {
                             Ok(artifact) => break artifact,
                             Err(NativeCompileError::Native(NativeError::AllocationFailed))
-                                if !self.vm.jit_state.cache.is_empty() => {
+                                if !self.vm.jit_state.cache.is_empty() =>
+                            {
                                 self.vm.jit_state.cache.remove(0);
                                 self.vm.jit_state.cache.shrink_to_fit();
                             }
@@ -24414,7 +24601,9 @@ impl Execution<'_> {
                             }
                         }
                     };
-                    self.jit_stats.jit_compile_ns = self.jit_stats.jit_compile_ns
+                    self.jit_stats.jit_compile_ns = self
+                        .jit_stats
+                        .jit_compile_ns
                         .saturating_add(artifact.compile_ns());
                     let prepared_bytes = register_count
                         .saturating_mul(core::mem::size_of::<NumericValue>())
@@ -24423,7 +24612,9 @@ impl Execution<'_> {
                     if !self.vm.jit_state.admit(artifact, prepared_bytes) {
                         self.jit_stats.fallback_reason = Some(R::ResourceLimit);
                         if let Some(prepared) = self.jit_prepared.as_mut() {
-                            prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+                            prepared.eligibility = JitEligibility::Rejected {
+                                reason: R::ResourceLimit,
+                            };
                         }
                         return Ok(false);
                     }
@@ -24435,15 +24626,23 @@ impl Execution<'_> {
             .saturating_mul(core::mem::size_of::<NumericValue>())
             .saturating_add(core::mem::size_of::<crate::jit::JitPrepared>())
             .saturating_add(self.vm.jit_state.cache[index].register_mask().len());
-        let Some(index) = self.vm.jit_state.make_room_for_metadata(index, prepared_bytes) else {
+        let Some(index) = self
+            .vm
+            .jit_state
+            .make_room_for_metadata(index, prepared_bytes)
+        else {
             self.jit_stats.fallback_reason = Some(R::ResourceLimit);
             if let Some(prepared) = self.jit_prepared.as_mut() {
-                prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+                prepared.eligibility = JitEligibility::Rejected {
+                    reason: R::ResourceLimit,
+                };
             }
             return Ok(false);
         };
         let (mask, mut scratch) = {
-            let prepared = self.jit_prepared.as_mut()
+            let prepared = self
+                .jit_prepared
+                .as_mut()
                 .ok_or(RuntimeError::new(RuntimeErrorKind::TerminalExecution))?;
             if prepared.mask.is_empty() {
                 prepared.mask = self.vm.jit_state.cache[index].register_mask().to_vec();
@@ -24454,11 +24653,17 @@ impl Execution<'_> {
             if scratch.try_reserve_exact(register_count).is_err() {
                 prepared.mask = mask;
                 prepared.scratch = scratch;
-                prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+                prepared.eligibility = JitEligibility::Rejected {
+                    reason: R::ResourceLimit,
+                };
                 self.jit_stats.fallback_reason = Some(R::ResourceLimit);
                 return Ok(false);
             }
-            for (slot, value) in self.frame.registers[..register_count].iter().copied().enumerate() {
+            for (slot, value) in self.frame.registers[..register_count]
+                .iter()
+                .copied()
+                .enumerate()
+            {
                 match NumericValue::from_value(value) {
                     Some(value) => scratch.push(value),
                     None if !mask[slot] => scratch.push(NumericValue::nil()),
@@ -24475,13 +24680,22 @@ impl Execution<'_> {
         };
         let actual_prepared_bytes = core::mem::size_of::<crate::jit::JitPrepared>()
             .saturating_add(mask.capacity())
-            .saturating_add(scratch.capacity()
-                .saturating_mul(core::mem::size_of::<NumericValue>()));
-        let Some(index) = self.vm.jit_state.make_room_for_metadata(index, actual_prepared_bytes) else {
+            .saturating_add(
+                scratch
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<NumericValue>()),
+            );
+        let Some(index) = self
+            .vm
+            .jit_state
+            .make_room_for_metadata(index, actual_prepared_bytes)
+        else {
             if let Some(prepared) = self.jit_prepared.as_mut() {
                 prepared.mask = mask;
                 prepared.scratch = scratch;
-                prepared.eligibility = JitEligibility::Rejected { reason: R::ResourceLimit };
+                prepared.eligibility = JitEligibility::Rejected {
+                    reason: R::ResourceLimit,
+                };
             }
             self.jit_stats.fallback_reason = Some(R::ResourceLimit);
             return Ok(false);
@@ -24528,17 +24742,24 @@ impl Execution<'_> {
         }
         if executed > 0 {
             for (slot, value) in scratch.iter().copied().enumerate() {
-                if !mask[slot] { continue; }
-                let value = value.to_value().ok_or(RuntimeError::new(
-                    RuntimeErrorKind::MissingEntryPoint,
-                ))?;
-                self.frame.write(self.vm, rivetlua_core::Register(slot as u16), value)?;
+                if !mask[slot] {
+                    continue;
+                }
+                let value = value
+                    .to_value()
+                    .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?;
+                self.frame
+                    .write(self.vm, rivetlua_core::Register(slot as u16), value)?;
             }
             self.frame.pc = next_pc as usize;
             self.fuel = fuel_remaining;
-            self.jit_stats.total_logical_instructions = self.jit_stats.total_logical_instructions
+            self.jit_stats.total_logical_instructions = self
+                .jit_stats
+                .total_logical_instructions
                 .saturating_add(executed);
-            self.jit_stats.native_executed_instructions = self.jit_stats.native_executed_instructions
+            self.jit_stats.native_executed_instructions = self
+                .jit_stats
+                .native_executed_instructions
                 .saturating_add(executed);
         }
         scratch.clear();
@@ -24566,7 +24787,9 @@ impl Execution<'_> {
                 self.jit_cooldown = true;
             }
             NativeExit::Safepoint | NativeExit::FuelExhausted => {
-                if executed == 0 { self.jit_cooldown = true; }
+                if executed == 0 {
+                    self.jit_cooldown = true;
+                }
             }
         }
         Ok(executed > 0)
@@ -24872,11 +25095,10 @@ impl Execution<'_> {
                                     let close_handler = matches!(
                                         unwind.finish,
                                         CloseFinish::Protected | CloseFinish::ProtectedHandler
-                                    )
-                                        && self
-                                            .protected
-                                            .last()
-                                            .is_some_and(|boundary| boundary.handler.is_some());
+                                    ) && self
+                                        .protected
+                                        .last()
+                                        .is_some_and(|boundary| boundary.handler.is_some());
                                     if close_handler {
                                         if let Some(boundary) = self.protected.last_mut() {
                                             boundary.handler_completed = false;
@@ -24898,12 +25120,10 @@ impl Execution<'_> {
                                 }
                             }
                         }
-                        let body_handler_before_close = self.protected.last().is_some_and(
-                            |boundary| {
-                                boundary.handler.is_some()
-                                    && boundary.stage == ProtectedStage::Body
-                            },
-                        );
+                        let body_handler_before_close =
+                            self.protected.last().is_some_and(|boundary| {
+                                boundary.handler.is_some() && boundary.stage == ProtectedStage::Body
+                            });
                         if !body_handler_before_close {
                             match self.begin_close_unwind(error) {
                                 Ok(true) => continue,
@@ -25075,9 +25295,9 @@ impl Execution<'_> {
         let (caller_depth, include_root, finish) = if let Some(boundary) = self.protected.last() {
             if boundary.stage == ProtectedStage::Handler && !boundary.handler_completed {
                 (
-                    boundary.handler_depth.ok_or(RuntimeError::new(
-                        RuntimeErrorKind::MissingEntryPoint,
-                    ))?,
+                    boundary
+                        .handler_depth
+                        .ok_or(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint))?,
                     false,
                     CloseFinish::ProtectedHandler,
                 )
@@ -25319,9 +25539,10 @@ impl Execution<'_> {
         let console_boundary = self.protected.last().is_some_and(|boundary| {
             boundary.debug_console && boundary.caller_depth == caller_depth
         });
-        let reader_boundary = self.protected.last().is_some_and(|boundary| {
-            boundary.load_reader && boundary.caller_depth == caller_depth
-        });
+        let reader_boundary = self
+            .protected
+            .last()
+            .is_some_and(|boundary| boundary.load_reader && boundary.caller_depth == caller_depth);
         while self.pending_ops.last().is_some_and(|pending| {
             pending.caller_depth >= caller_depth.saturating_add(1)
                 || (pending.kind == PendingKind::Basic
@@ -25330,7 +25551,10 @@ impl Execution<'_> {
                         && ((console_boundary
                             && matches!(pending.basic, Some(BasicPending::DebugConsole { .. })))
                             || (reader_boundary
-                                && matches!(pending.basic, Some(BasicPending::LoadReader { .. }))))))
+                                && matches!(
+                                    pending.basic,
+                                    Some(BasicPending::LoadReader { .. })
+                                )))))
         }) {
             let mut pending = self
                 .pending_ops
@@ -25539,7 +25763,11 @@ impl Execution<'_> {
                                 == Some(self.callers.len())
                     }));
             if nested_protected {
-                if self.protected.last().is_some_and(|boundary| boundary.load_reader) {
+                if self
+                    .protected
+                    .last()
+                    .is_some_and(|boundary| boundary.load_reader)
+                {
                     // reader 的返回要先交回待續的 load；不可標成 pcall 結果。
                     self.return_to_caller(&result)?;
                     drop(ticket);
@@ -25758,7 +25986,8 @@ impl Execution<'_> {
                         }
                         if !self.protected[index].host_entry {
                             // guest xpcall 在界限處交還失敗結果；宿主入口仍向外傳遞。
-                            let mut loop_error = RuntimeError::new(RuntimeErrorKind::ErrorHandlerLoop);
+                            let mut loop_error =
+                                RuntimeError::new(RuntimeErrorKind::ErrorHandlerLoop);
                             loop_error.value = Value::Object(message);
                             loop_error.source_pc = error.source_pc;
                             loop_error.source_prototype = error.source_prototype;
@@ -26207,21 +26436,20 @@ impl Execution<'_> {
                     };
                 let (captures, ticket, original) = self.capture_upvalues(child_index)?;
                 let result = (|| {
-                    let captured_environment_cell = if self.current_module()?.profile()
-                        == LuaProfile::Lua55
-                    {
-                        match environment_source {
-                            EnvironmentSource::ParentLocal { upvalue }
-                            | EnvironmentSource::ParentUpvalue { upvalue } => Some(
-                                *captures.get(usize::from(upvalue.0)).ok_or(
-                                    RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds),
-                                )?,
-                            ),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
+                    let captured_environment_cell =
+                        if self.current_module()?.profile() == LuaProfile::Lua55 {
+                            match environment_source {
+                                EnvironmentSource::ParentLocal { upvalue }
+                                | EnvironmentSource::ParentUpvalue { upvalue } => {
+                                    Some(*captures.get(usize::from(upvalue.0)).ok_or(
+                                        RuntimeError::new(RuntimeErrorKind::RegisterOutOfBounds),
+                                    )?)
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
                     let mut closure = Closure::new(
                         self.frame
                             .module
@@ -26635,8 +26863,7 @@ impl Execution<'_> {
                             ProtectedStage::Body => Some(boundary.caller_depth),
                             ProtectedStage::Handler => boundary.handler_depth,
                         };
-                        (!boundary.host_entry
-                            || boundary.stage == ProtectedStage::Handler)
+                        (!boundary.host_entry || boundary.stage == ProtectedStage::Handler)
                             && depth.and_then(|depth| depth.checked_add(1))
                                 == Some(self.callers.len())
                     });
@@ -26929,7 +27156,11 @@ struct TracebackWork {
 
 impl TracebackWork {
     fn new(limit: usize) -> Self {
-        Self { used: 0, limit, exhausted: false }
+        Self {
+            used: 0,
+            limit,
+            exhausted: false,
+        }
     }
 
     fn try_charge(&mut self, units: usize) -> bool {
@@ -27041,7 +27272,8 @@ impl TracebackStack<'_> {
                     && !boundary.host_entry
                     && !boundary.debug_console
                     && !boundary.load_reader
-                    && boundary.finalizer.is_none()) {
+                    && boundary.finalizer.is_none())
+                {
                     continue;
                 }
                 if index == ordinal {
@@ -27112,7 +27344,9 @@ impl TracebackStack<'_> {
             work.charge(verified.module().prototypes.len())?;
             artifact.effective_source(proto.id).unwrap_or(b"=?")
         } else {
-            verified.native_debug().map_or(b"=?".as_slice(), |debug| debug.source_name())
+            verified
+                .native_debug()
+                .map_or(b"=?".as_slice(), |debug| debug.source_name())
         };
         work.charge(source.len())?;
         let (short, short_len) = official_short_source(source);
@@ -27120,7 +27354,11 @@ impl TracebackStack<'_> {
         let line = if let Some(artifact) = verified.official_artifact() {
             u32::try_from(visible_pc)
                 .ok()
-                .and_then(|pc| artifact.pc_map(proto.id)?.line_at_rvlu(InstructionOffset(pc)))
+                .and_then(|pc| {
+                    artifact
+                        .pc_map(proto.id)?
+                        .line_at_rvlu(InstructionOffset(pc))
+                })
                 .unwrap_or(0)
         } else {
             if let Some(debug) = verified.native_debug() {
@@ -27171,11 +27409,21 @@ impl TracebackStack<'_> {
                     .and_then(|debug| debug.prototype(caller_proto.id))
                 {
                     debug_native_call_name_metered(
-                        caller_proto, debug, caller, target, call_pc, &mut charge,
+                        caller_proto,
+                        debug,
+                        caller,
+                        target,
+                        call_pc,
+                        &mut charge,
                     )
                 } else {
                     debug_official_call_name_metered(
-                        caller_module, caller_proto, caller, target, call_pc, &mut charge,
+                        caller_module,
+                        caller_proto,
+                        caller,
+                        target,
+                        call_pc,
+                        &mut charge,
                     )
                 }
             });
@@ -27213,7 +27461,9 @@ impl TracebackStack<'_> {
             } else {
                 let defined = if let Some(artifact) = verified.official_artifact() {
                     work.charge(verified.module().prototypes.len())?;
-                    artifact.prototype(proto.id).map_or(0, |guest| guest.line_defined)
+                    artifact
+                        .prototype(proto.id)
+                        .map_or(0, |guest| guest.line_defined)
                 } else {
                     if let Some(debug) = verified.native_debug() {
                         work.charge(debug.prototypes().len())?;
@@ -27274,7 +27524,11 @@ impl TracebackStack<'_> {
                     sink.add(name)?;
                     sink.add(b"'")?;
                 }
-                TracebackFrame::Lua { frame, caller, hook } => {
+                TracebackFrame::Lua {
+                    frame,
+                    caller,
+                    hook,
+                } => {
                     self.write_lua(frame, caller, hook, sink, &mut work)?;
                 }
             }
@@ -36870,7 +37124,10 @@ mod tests {
         assert_eq!(observed, Some(Value::Object(shared)));
         assert_eq!(vm.object_kind(shared), Ok(ObjectKind::ByteString));
         assert_eq!(vm.ledger_snapshot().lua_heap_bytes, before.lua_heap_bytes);
-        assert_eq!(vm.ledger_snapshot().host_allocation_bytes, before.host_allocation_bytes);
+        assert_eq!(
+            vm.ledger_snapshot().host_allocation_bytes,
+            before.host_allocation_bytes
+        );
         assert_eq!(vm.ledger_snapshot().reserved, 0);
 
         let other = vm.allocate_byte_string(b"c").unwrap();
@@ -36896,7 +37153,10 @@ mod tests {
         };
         assert_eq!(vm.object_kind(unpublished), Err(VmError::StaleObject));
         assert_eq!(vm.ledger_snapshot().lua_heap_bytes, before.lua_heap_bytes);
-        assert_eq!(vm.ledger_snapshot().host_allocation_bytes, before.host_allocation_bytes);
+        assert_eq!(
+            vm.ledger_snapshot().host_allocation_bytes,
+            before.host_allocation_bytes
+        );
         assert_eq!(vm.ledger_snapshot().reserved, 0);
 
         vm.remove_root(other_root).unwrap();
@@ -38469,9 +38729,10 @@ mod tests {
                 panic!("中斷錯誤須有 Lua 字串值")
             };
             drop(execution);
-            assert!(vm
-                .with_byte_string(message, |text| text.as_bytes() == b"interrupted!")
-                .unwrap());
+            assert!(
+                vm.with_byte_string(message, |text| text.as_bytes() == b"interrupted!")
+                    .unwrap()
+            );
             assert_eq!(vm.roots().total_count(), 1);
             drop(error);
             vm.collect().unwrap();
@@ -38482,7 +38743,9 @@ mod tests {
             flag.store(true, Ordering::Release);
             let mut execution = vm.load(verified.clone()).unwrap();
             execution.set_interrupt_flag(flag.clone()).unwrap();
-            execution.vm.inject_failure_once(FailPoint::StringBytesReserve);
+            execution
+                .vm
+                .inject_failure_once(FailPoint::StringBytesReserve);
             assert_eq!(
                 execution.run().unwrap_err().kind,
                 RuntimeErrorKind::Heap(VmError::InjectedFailure(FailPoint::StringBytesReserve))
@@ -38542,9 +38805,10 @@ mod tests {
             assert!(execution.close_unwind.is_none());
             assert!(!flag.load(Ordering::Acquire));
             drop(execution);
-            assert!(vm
-                .with_byte_string(message, |text| text.as_bytes() == b"interrupted!")
-                .unwrap());
+            assert!(
+                vm.with_byte_string(message, |text| text.as_bytes() == b"interrupted!")
+                    .unwrap()
+            );
             assert_eq!(vm.roots().total_count(), 1);
             vm.remove_root(env_root).unwrap();
             vm.collect().unwrap();

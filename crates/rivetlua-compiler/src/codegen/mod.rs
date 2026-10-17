@@ -321,67 +321,124 @@ fn collect_statement_bodies<'a>(
 // 因此必須在 lower 它以前切換世代。
 fn expression_may_emit_open_call(expression: &ResolvedExpr) -> bool {
     match expression {
-        ResolvedExpr::Call { callee, arguments, .. } => {
-            arguments.last().is_some_and(|last| matches!(
-                last, ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }
-            )) || expression_may_emit_open_call(callee)
+        ResolvedExpr::Call {
+            callee, arguments, ..
+        } => {
+            arguments.last().is_some_and(|last| {
+                matches!(
+                    last,
+                    ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }
+                )
+            }) || expression_may_emit_open_call(callee)
                 || arguments.iter().any(expression_may_emit_open_call)
         }
-        ResolvedExpr::MethodCall { receiver, arguments, .. } => {
-            arguments.last().is_some_and(|last| matches!(
-                last, ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }
-            )) || expression_may_emit_open_call(receiver)
+        ResolvedExpr::MethodCall {
+            receiver,
+            arguments,
+            ..
+        } => {
+            arguments.last().is_some_and(|last| {
+                matches!(
+                    last,
+                    ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }
+                )
+            }) || expression_may_emit_open_call(receiver)
                 || arguments.iter().any(expression_may_emit_open_call)
         }
-        ResolvedExpr::Unary { expression, .. } | ResolvedExpr::Paren { expression, .. }
-        | ResolvedExpr::Field { base: expression, .. } => {
-            expression_may_emit_open_call(expression)
-        }
+        ResolvedExpr::Unary { expression, .. }
+        | ResolvedExpr::Paren { expression, .. }
+        | ResolvedExpr::Field {
+            base: expression, ..
+        } => expression_may_emit_open_call(expression),
         ResolvedExpr::Binary { left, right, .. }
-        | ResolvedExpr::Index { base: left, index: right, .. } => {
-            expression_may_emit_open_call(left) || expression_may_emit_open_call(right)
+        | ResolvedExpr::Index {
+            base: left,
+            index: right,
+            ..
+        } => expression_may_emit_open_call(left) || expression_may_emit_open_call(right),
+        ResolvedExpr::TableConstructor { fields, .. } => {
+            fields.iter().enumerate().any(|(index, field)| {
+                let last_open_array = index + 1 == fields.len()
+                    && matches!(
+                        field,
+                        ResolvedTableField::Array {
+                            value: ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. },
+                            ..
+                        }
+                    );
+                last_open_array
+                    || match field {
+                        ResolvedTableField::Array { value, .. }
+                        | ResolvedTableField::Named { value, .. } => {
+                            expression_may_emit_open_call(value)
+                        }
+                        ResolvedTableField::Indexed { key, value, .. } => {
+                            expression_may_emit_open_call(key)
+                                || expression_may_emit_open_call(value)
+                        }
+                    }
+            })
         }
-        ResolvedExpr::TableConstructor { fields, .. } => fields.iter().enumerate().any(|(index, field)| {
-            let last_open_array = index + 1 == fields.len() && matches!(field,
-                ResolvedTableField::Array { value: ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }, .. });
-            last_open_array || match field {
-                ResolvedTableField::Array { value, .. } | ResolvedTableField::Named { value, .. } =>
-                    expression_may_emit_open_call(value),
-                ResolvedTableField::Indexed { key, value, .. } =>
-                    expression_may_emit_open_call(key) || expression_may_emit_open_call(value),
-            }
-        }),
-        ResolvedExpr::Function { .. } | ResolvedExpr::Literal { .. }
-        | ResolvedExpr::Nil { .. } | ResolvedExpr::Bool { .. }
-        | ResolvedExpr::Name { .. } | ResolvedExpr::Vararg { .. } => false,
+        ResolvedExpr::Function { .. }
+        | ResolvedExpr::Literal { .. }
+        | ResolvedExpr::Nil { .. }
+        | ResolvedExpr::Bool { .. }
+        | ResolvedExpr::Name { .. }
+        | ResolvedExpr::Vararg { .. } => false,
     }
 }
 
 fn statement_may_emit_open_call(statement: &ResolvedStmt) -> bool {
     match statement {
-        ResolvedStmt::Return { values, .. } => values.last().is_some_and(|last| matches!(
-            last, ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }
-        )) || values.iter().any(expression_may_emit_open_call),
-        ResolvedStmt::Local { values, .. } | ResolvedStmt::GenericFor { values, .. } =>
-            values.iter().any(expression_may_emit_open_call),
-        ResolvedStmt::Assignment { targets, values, .. } =>
-            targets.iter().chain(values).any(expression_may_emit_open_call),
-        ResolvedStmt::Call { call, .. } | ResolvedStmt::Function { name: call, .. } =>
-            expression_may_emit_open_call(call),
-        ResolvedStmt::If { clauses, .. } => clauses.iter().any(|clause|
-            expression_may_emit_open_call(&clause.condition)),
-        ResolvedStmt::While { condition, .. } | ResolvedStmt::Repeat { condition, .. } =>
-            expression_may_emit_open_call(condition),
-        ResolvedStmt::NumericFor { initial, limit, step, .. } =>
-            expression_may_emit_open_call(initial) || expression_may_emit_open_call(limit)
-                || step.as_ref().is_some_and(expression_may_emit_open_call),
+        ResolvedStmt::Return { values, .. } => {
+            values.last().is_some_and(|last| {
+                matches!(
+                    last,
+                    ResolvedExpr::Call { .. } | ResolvedExpr::MethodCall { .. }
+                )
+            }) || values.iter().any(expression_may_emit_open_call)
+        }
+        ResolvedStmt::Local { values, .. } | ResolvedStmt::GenericFor { values, .. } => {
+            values.iter().any(expression_may_emit_open_call)
+        }
+        ResolvedStmt::Assignment {
+            targets, values, ..
+        } => targets
+            .iter()
+            .chain(values)
+            .any(expression_may_emit_open_call),
+        ResolvedStmt::Call { call, .. } | ResolvedStmt::Function { name: call, .. } => {
+            expression_may_emit_open_call(call)
+        }
+        ResolvedStmt::If { clauses, .. } => clauses
+            .iter()
+            .any(|clause| expression_may_emit_open_call(&clause.condition)),
+        ResolvedStmt::While { condition, .. } | ResolvedStmt::Repeat { condition, .. } => {
+            expression_may_emit_open_call(condition)
+        }
+        ResolvedStmt::NumericFor {
+            initial,
+            limit,
+            step,
+            ..
+        } => {
+            expression_may_emit_open_call(initial)
+                || expression_may_emit_open_call(limit)
+                || step.as_ref().is_some_and(expression_may_emit_open_call)
+        }
         ResolvedStmt::Global { declaration, .. } => match declaration {
-            ResolvedGlobalDeclaration::Names { values, .. } =>
-                values.iter().any(expression_may_emit_open_call),
-            ResolvedGlobalDeclaration::Function { .. } | ResolvedGlobalDeclaration::Star { .. } => false,
+            ResolvedGlobalDeclaration::Names { values, .. } => {
+                values.iter().any(expression_may_emit_open_call)
+            }
+            ResolvedGlobalDeclaration::Function { .. } | ResolvedGlobalDeclaration::Star { .. } => {
+                false
+            }
         },
-        ResolvedStmt::Empty { .. } | ResolvedStmt::Break { .. } | ResolvedStmt::Goto { .. }
-        | ResolvedStmt::Label { .. } | ResolvedStmt::Do { .. }
+        ResolvedStmt::Empty { .. }
+        | ResolvedStmt::Break { .. }
+        | ResolvedStmt::Goto { .. }
+        | ResolvedStmt::Label { .. }
+        | ResolvedStmt::Do { .. }
         | ResolvedStmt::LocalFunction { .. } => false,
     }
 }
@@ -722,7 +779,9 @@ impl<'a> Builder<'a> {
             return Err(limit(span, "native debug local 數超過 IR register 限制"));
         }
         let register = self.binding_register(binding, span)?;
-        let next_epoch = self.debug_binding_epoch.checked_add(1)
+        let next_epoch = self
+            .debug_binding_epoch
+            .checked_add(1)
             .ok_or_else(|| limit(span, "native debug binding 世代溢位"))?;
         let slot = u16::try_from(self.debug_active.len())
             .map_err(|_| limit(span, "native debug local slot 溢位"))?;
@@ -753,8 +812,11 @@ impl<'a> Builder<'a> {
         let end_pc = u32::try_from(self.instructions.len())
             .map_err(|_| limit(span, "native debug 結束 PC 溢位"))?;
         let next_epoch = if self.debug_active.len() > count {
-            Some(self.debug_binding_epoch.checked_add(1)
-                .ok_or_else(|| limit(span, "native debug binding 世代溢位"))?)
+            Some(
+                self.debug_binding_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| limit(span, "native debug binding 世代溢位"))?,
+            )
         } else {
             None
         };
@@ -773,8 +835,10 @@ impl<'a> Builder<'a> {
     }
 
     fn isolate_open_call_generation_after_binding_change(&mut self) {
-        if self.open_call_generation_epoch.is_some_and(|epoch|
-            self.debug_binding_epoch.checked_sub(1) == Some(epoch)) {
+        if self
+            .open_call_generation_epoch
+            .is_some_and(|epoch| self.debug_binding_epoch.checked_sub(1) == Some(epoch))
+        {
             // 僅在剛離開實際發出 open Call 的版圖時隔離一次；沒有新
             // open Call 的連續 local 宣告仍可共用同一批暫存 home。
             self.open_call_generation_floor =
@@ -1514,9 +1578,13 @@ impl<'a> Builder<'a> {
             self.lower_statement(statement)?;
             if self.open_call_generation_epoch != Some(generation_epoch)
                 && self.instructions[instruction_start..].iter().any(|entry| {
-                    matches!(entry.instruction, Instruction::Call {
-                        result_mode: ResultMode::All, ..
-                    })
+                    matches!(
+                        entry.instruction,
+                        Instruction::Call {
+                            result_mode: ResultMode::All,
+                            ..
+                        }
+                    )
                 })
             {
                 // 開放結果呼叫先隔離舊暫存世代；同一批活躍 local 的後續
@@ -1536,7 +1604,10 @@ impl<'a> Builder<'a> {
             .statements
             .iter()
             .rposition(|statement| {
-                !matches!(statement, ResolvedStmt::Empty { .. } | ResolvedStmt::Label { .. })
+                !matches!(
+                    statement,
+                    ResolvedStmt::Empty { .. } | ResolvedStmt::Label { .. }
+                )
             })
             .map_or(0, |index| index + 1);
         let terminal_label = block.statements[terminal_suffix_start..]
@@ -3689,17 +3760,27 @@ mod tests {
             let resolved = resolve(&ast, &tokens, profile, &limits).unwrap();
             let ir = lower(&resolved, &IrLimits::default()).unwrap();
             let function = &resolved.functions[0];
-            let hidden = function.bindings.iter()
+            let hidden = function
+                .bindings
+                .iter()
                 .find(|binding| binding.kind == BindingKind::GenericForClose)
                 .unwrap();
-            let visible = function.bindings.iter()
+            let visible = function
+                .bindings
+                .iter()
                 .find(|binding| binding.kind == BindingKind::GenericFor)
                 .unwrap();
             let debug = ir.prototypes[0].native_debug.as_ref().unwrap();
-            let hidden_local = debug.locals.iter()
-                .find(|local| local.binding == hidden.id).unwrap();
-            let visible_local = debug.locals.iter()
-                .find(|local| local.binding == visible.id).unwrap();
+            let hidden_local = debug
+                .locals
+                .iter()
+                .find(|local| local.binding == hidden.id)
+                .unwrap();
+            let visible_local = debug
+                .locals
+                .iter()
+                .find(|local| local.binding == visible.id)
+                .unwrap();
             assert!(hidden_local.slot < visible_local.slot);
             assert!(hidden_local.start_pc <= visible_local.start_pc);
             assert!(hidden_local.end_pc > visible_local.end_pc);
@@ -3954,7 +4035,8 @@ mod tests {
 
     #[test]
     fn p17_nested_open_argument_fixed_window_reserves_frame() {
-        let source = b"local c='return 1'; local function read1(x) return x end; return load(read1(c))";
+        let source =
+            b"local c='return 1'; local function read1(x) return x end; return load(read1(c))";
         for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
             let compile_limits = CompileLimits::default();
             let chunk = lex(source, profile, &compile_limits).unwrap();
@@ -3963,8 +4045,19 @@ mod tests {
             let ir = lower(&resolved, &IrLimits::default()).unwrap();
             assert!(ir.prototypes.iter().any(|prototype| {
                 prototype.instructions.windows(2).any(|pair| {
-                    matches!(pair[0].instruction, Instruction::Call { result_mode: ResultMode::All, .. })
-                        && matches!(pair[1].instruction, Instruction::TailCall { arg_count: u16::MAX, .. })
+                    matches!(
+                        pair[0].instruction,
+                        Instruction::Call {
+                            result_mode: ResultMode::All,
+                            ..
+                        }
+                    ) && matches!(
+                        pair[1].instruction,
+                        Instruction::TailCall {
+                            arg_count: u16::MAX,
+                            ..
+                        }
+                    )
                 })
             }));
             let encoded = emit(&ir, &rivetlua_core::VerifyLimits::default());
@@ -4007,12 +4100,25 @@ mod tests {
                     assert_eq!(result.unwrap(), (Register(2), 1));
                     assert_eq!(builder.next_register, 4);
                     assert_eq!(builder.instructions.len(), 2);
-                    assert!(matches!(builder.instructions[0].instruction,
-                        Instruction::Move { dest: Register(2), src: Register(1) }));
-                    assert!(matches!(builder.instructions[1].instruction,
-                        Instruction::Move { dest: Register(3), src: Register(1) }));
+                    assert!(matches!(
+                        builder.instructions[0].instruction,
+                        Instruction::Move {
+                            dest: Register(2),
+                            src: Register(1)
+                        }
+                    ));
+                    assert!(matches!(
+                        builder.instructions[1].instruction,
+                        Instruction::Move {
+                            dest: Register(3),
+                            src: Register(1)
+                        }
+                    ));
                 } else {
-                    assert!(result.is_err(), "{profile:?}: max_registers={max_registers}");
+                    assert!(
+                        result.is_err(),
+                        "{profile:?}: max_registers={max_registers}"
+                    );
                     assert_eq!(builder.next_register, 2);
                     assert!(builder.instructions.is_empty());
                 }
@@ -4199,9 +4305,12 @@ mod tests {
                 let resolved = resolve(&parsed, &chunk, profile, &limits).unwrap();
                 let ir = lower(&resolved, &IrLimits::default()).unwrap();
                 let root = ir.prototype_for(FunctionId(0)).unwrap();
-                assert!(root.close_paths.iter().any(|path| {
-                    path.kind == ExitKind::Goto && !path.bindings.is_empty()
-                }), "{profile:?}");
+                assert!(
+                    root.close_paths
+                        .iter()
+                        .any(|path| { path.kind == ExitKind::Goto && !path.bindings.is_empty() }),
+                    "{profile:?}"
+                );
                 if source == sources[0] {
                     let ResolvedStmt::Do { body, .. } = &resolved.root.statements[0] else {
                         panic!("預期 do block");
@@ -4219,11 +4328,14 @@ mod tests {
                         "{profile:?}"
                     );
                 } else {
-                    assert!(root.close_paths.iter().any(|path| {
-                        path.kind == ExitKind::Goto
-                            && path.target_scope == Some(path.from_scope)
-                            && path.bindings.len() == 1
-                    }), "{profile:?}");
+                    assert!(
+                        root.close_paths.iter().any(|path| {
+                            path.kind == ExitKind::Goto
+                                && path.target_scope == Some(path.from_scope)
+                                && path.bindings.len() == 1
+                        }),
+                        "{profile:?}"
+                    );
                 }
                 let encoded = emit_with_native_debug(
                     &ir,

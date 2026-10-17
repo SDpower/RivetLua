@@ -1,8 +1,10 @@
 //! P21 平台 metadata 清單；狀態不代表已在實機執行。
 
+use rivetlua_core::{
+    DeploymentStatus, Endian, ExecMemoryPolicy, LuaProfile, RVLU_NUMERIC_I64_F64, TargetDescriptor,
+    TargetError,
+};
 use std::collections::BTreeSet;
-use rivetlua_core::{DeploymentStatus, Endian, ExecMemoryPolicy, LuaProfile,
-    RVLU_NUMERIC_I64_F64, TargetDescriptor, TargetError};
 
 mod arm;
 mod x86;
@@ -27,20 +29,35 @@ pub fn platform_targets() -> Vec<PlatformTarget> {
 }
 
 pub fn platform_target(triple: &str) -> Option<PlatformTarget> {
-    platform_targets().into_iter().find(|target| target.target_triple == triple)
+    platform_targets()
+        .into_iter()
+        .find(|target| target.target_triple == triple)
 }
 
 impl PlatformTarget {
-    pub fn descriptor(&self, profile: LuaProfile, ram_cap: u64, code_cap: u64,
-        flash_cap: Option<u64>, provenance: &str) -> Result<TargetDescriptor, TargetError> {
+    pub fn descriptor(
+        &self,
+        profile: LuaProfile,
+        ram_cap: u64,
+        code_cap: u64,
+        flash_cap: Option<u64>,
+        provenance: &str,
+    ) -> Result<TargetDescriptor, TargetError> {
         if self.isa == "unspecified" || self.abi == "unspecified" {
             return Err(TargetError::InvalidField("isa/abi"));
         }
         let target = TargetDescriptor {
-            target_triple: self.target_triple.into(), isa: self.isa.into(),
-            cpu_features: BTreeSet::new(), os: self.os.into(), abi: self.abi.into(),
-            endian: Endian::Little, lua_profile: profile,
-            numeric_config: RVLU_NUMERIC_I64_F64, flash_cap, ram_cap, code_cap,
+            target_triple: self.target_triple.into(),
+            isa: self.isa.into(),
+            cpu_features: BTreeSet::new(),
+            os: self.os.into(),
+            abi: self.abi.into(),
+            endian: Endian::Little,
+            lua_profile: profile,
+            numeric_config: RVLU_NUMERIC_I64_F64,
+            flash_cap,
+            ram_cap,
+            code_cap,
             exec_memory_policy: self.exec_memory_policy,
             runtime_version: env!("CARGO_PKG_VERSION").into(),
             compiler_version: env!("CARGO_PKG_VERSION").into(),

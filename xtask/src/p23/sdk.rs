@@ -8,11 +8,7 @@ const WORK_PER_DEPTH: u64 = 4;
 const BASE_HEAP_BYTES: usize = 16 * 1024;
 const TABLE_HEAP_BYTES: usize = 4096;
 
-pub(super) fn sdk_values(
-    profile: LuaProfile,
-    input: &[u8],
-    limits: &HarnessLimits,
-) -> CaseOutcome {
+pub(super) fn sdk_values(profile: LuaProfile, input: &[u8], limits: &HarnessLimits) -> CaseOutcome {
     if limits.max_input_bytes == 0
         || limits.max_depth == 0
         || limits.fuel < BASE_WORK
@@ -33,18 +29,17 @@ pub(super) fn sdk_values(
         return CaseOutcome::Limit;
     }
 
-    let fuel_depth = usize::try_from((limits.fuel - BASE_WORK) / WORK_PER_DEPTH)
-        .unwrap_or(usize::MAX);
+    let fuel_depth =
+        usize::try_from((limits.fuel - BASE_WORK) / WORK_PER_DEPTH).unwrap_or(usize::MAX);
     let heap_depth = (limits.heap_bytes - base_charge) / TABLE_HEAP_BYTES;
     let depth = limits.max_depth.min(fuel_depth).min(heap_depth);
 
     let engine = Engine::new(profile);
-    let mut vm = match engine.new_vm_with_services(
-        HostServices::deny_all().and_policy(VmPolicy::Sandbox),
-    ) {
-        Ok(vm) => vm,
-        Err(_) => return CaseOutcome::Limit,
-    };
+    let mut vm =
+        match engine.new_vm_with_services(HostServices::deny_all().and_policy(VmPolicy::Sandbox)) {
+            Ok(vm) => vm,
+            Err(_) => return CaseOutcome::Limit,
+        };
     vm.set_allocation_limit(limits.heap_bytes);
     if vm.policy() != VmPolicy::Sandbox {
         return CaseOutcome::Finding("SDK_POLICY_CONFIGURATION");
@@ -144,7 +139,10 @@ pub(super) fn sdk_values(
             Ok(value) => value,
             Err(_) => return CaseOutcome::Finding("SDK_ROOT_VALUE"),
         };
-        let key = match i64::try_from(index).ok().and_then(|index| index.checked_add(1)) {
+        let key = match i64::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+        {
             Some(key) => key,
             None => return CaseOutcome::Limit,
         };
@@ -154,12 +152,11 @@ pub(super) fn sdk_values(
         current = next;
     }
 
-    let mut foreign_vm = match engine.new_vm_with_services(
-        HostServices::deny_all().and_policy(VmPolicy::Sandbox),
-    ) {
-        Ok(vm) => vm,
-        Err(_) => return CaseOutcome::Limit,
-    };
+    let mut foreign_vm =
+        match engine.new_vm_with_services(HostServices::deny_all().and_policy(VmPolicy::Sandbox)) {
+            Ok(vm) => vm,
+            Err(_) => return CaseOutcome::Limit,
+        };
     foreign_vm.set_allocation_limit(limits.heap_bytes);
     if current.value(&foreign_vm).is_ok() {
         return CaseOutcome::Finding("SDK_CROSS_VM_ROOT");

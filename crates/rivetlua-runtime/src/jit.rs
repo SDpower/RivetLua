@@ -2,9 +2,9 @@
 
 use crate::rust_alloc::vec::Vec;
 
+use crate::heap::Vm;
 use rivetlua_core::ObjectRef;
 use rivetlua_native::{NativeArtifact, NativeCompileError, NumericValue};
-use crate::heap::Vm;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JitPolicy {
@@ -102,7 +102,9 @@ impl JitVmState {
     }
 
     pub(crate) fn metadata_bytes(&self) -> usize {
-        self.cache.capacity().saturating_mul(core::mem::size_of::<NativeArtifact>())
+        self.cache
+            .capacity()
+            .saturating_mul(core::mem::size_of::<NativeArtifact>())
             .saturating_add(self.cache.iter().fold(0usize, |used, artifact| {
                 used.saturating_add(artifact.metadata_bytes())
             }))
@@ -127,8 +129,11 @@ impl JitVmState {
         let metadata = artifact.metadata_bytes();
         while !self.cache.is_empty()
             && (self.code_bytes().saturating_add(code) > self.cache_code_limit_bytes
-                || self.metadata_bytes().saturating_add(metadata)
-                    .saturating_add(prepared_bytes) > self.cache_metadata_limit_bytes)
+                || self
+                    .metadata_bytes()
+                    .saturating_add(metadata)
+                    .saturating_add(prepared_bytes)
+                    > self.cache_metadata_limit_bytes)
         {
             self.cache.remove(0);
             self.cache.shrink_to_fit();
@@ -137,8 +142,11 @@ impl JitVmState {
             return false;
         }
         if self.code_bytes().saturating_add(code) > self.cache_code_limit_bytes
-            || self.metadata_bytes().saturating_add(metadata)
-                .saturating_add(prepared_bytes) > self.cache_metadata_limit_bytes
+            || self
+                .metadata_bytes()
+                .saturating_add(metadata)
+                .saturating_add(prepared_bytes)
+                > self.cache_metadata_limit_bytes
         {
             return false;
         }
@@ -156,8 +164,7 @@ impl JitVmState {
         mut protected_index: usize,
         prepared_bytes: usize,
     ) -> Option<usize> {
-        while self.metadata_bytes().saturating_add(prepared_bytes)
-            > self.cache_metadata_limit_bytes
+        while self.metadata_bytes().saturating_add(prepared_bytes) > self.cache_metadata_limit_bytes
         {
             let victim = if protected_index == 0 { 1 } else { 0 };
             if victim >= self.cache.len() {
@@ -205,7 +212,9 @@ impl Vm {
         if target.code_cap > self.jit_state.cache_code_limit_bytes as u64 {
             return Err(AotError::Unsupported("VM native arena cap"));
         }
-        let register_count = module.module().prototypes
+        let register_count = module
+            .module()
+            .prototypes
             .get(manifest.prototype_index)
             .ok_or(AotError::Mismatch("prototype index"))?
             .register_count as usize;
@@ -232,15 +241,23 @@ impl Vm {
             return Err(AotError::Unsupported("VM native arena cap"));
         }
         if !artifact.matches_identity(
-            module, artifact.module_digest(), manifest.prototype_index,
-            manifest.entry_pc, self.id(),
+            module,
+            artifact.module_digest(),
+            manifest.prototype_index,
+            manifest.entry_pc,
+            self.id(),
         ) {
             return Err(AotError::Mismatch("VM native identity"));
         }
-        if self.jit_state.cache.iter().any(|existing| existing.matches_identity(
-            module, artifact.module_digest(), manifest.prototype_index,
-            manifest.entry_pc, self.id(),
-        )) {
+        if self.jit_state.cache.iter().any(|existing| {
+            existing.matches_identity(
+                module,
+                artifact.module_digest(),
+                manifest.prototype_index,
+                manifest.entry_pc,
+                self.id(),
+            )
+        }) {
             return Ok(());
         }
         if !self.jit_state.admit(artifact, prepared_bytes) {
@@ -273,6 +290,7 @@ pub(crate) fn module_digest(module: &rivetlua_core::VerifiedModule) -> Option<[u
         module,
         &rivetlua_core::TransportLimits::default(),
         &mut work,
-    ).ok()?;
+    )
+    .ok()?;
     rivetlua_core::sha256_bytes(encoded.rvlu())
 }

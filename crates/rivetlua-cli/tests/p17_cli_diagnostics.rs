@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
-const USAGE: &str =
-    "用法：rivetlua [--profile lua55|lua54] [-E] [-v] [-i] [-e 程式] [-l 模組] [--] [檔案 [參數...]]";
+const USAGE: &str = "用法：rivetlua [--profile lua55|lua54] [-E] [-v] [-i] [-e 程式] [-l 模組] [--] [檔案 [參數...]]";
 
 struct ScratchDir {
     path: PathBuf,
@@ -59,17 +58,17 @@ fn run_lua(profile: &str, args: &[&str], cwd: Option<&Path>) -> Output {
 
 fn assert_cli_error<'a>(output: &'a Output, exit_code: i32, label: &str) -> &'a str {
     assert_eq!(output.status.code(), Some(exit_code), "{label}: {output:?}");
-    assert!(output.stdout.is_empty(), "{label}: stdout={:?}", output.stdout);
+    assert!(
+        output.stdout.is_empty(),
+        "{label}: stdout={:?}",
+        output.stdout
+    );
     std::str::from_utf8(&output.stderr).expect("命令列診斷應為 UTF-8")
 }
 
 fn assert_option_diagnostic(stderr: &str, message: &str, label: &str) {
     let expected = format!("{message}\n{USAGE}\n");
-    assert_eq!(
-        stderr,
-        expected.as_str(),
-        "{label}: 命令列診斷與用法不符"
-    );
+    assert_eq!(stderr, expected.as_str(), "{label}: 命令列診斷與用法不符");
 }
 
 #[test]
@@ -86,9 +85,7 @@ fn p17_cli_unknown_options_report_lua_compatible_diagnostics() {
         for (flag, args) in unknown_options {
             let output = run_lua(profile, args, None);
             let stderr = assert_cli_error(&output, 2, &format!("{profile} {flag}"));
-            let message = format!(
-                "rivetlua: 不支援的選項：{flag} (unrecognized option '{flag}')"
-            );
+            let message = format!("rivetlua: 不支援的選項：{flag} (unrecognized option '{flag}')");
             assert_option_diagnostic(stderr, &message, &format!("{profile} {flag}"));
         }
     }

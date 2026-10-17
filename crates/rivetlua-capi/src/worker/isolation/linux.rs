@@ -69,15 +69,23 @@ fn pinned(path: &Path) -> Result<File, PolicyDenied> {
     let opened = File::open(path).map_err(|_| PolicyDenied::InvalidWorker)?;
     // SAFETY：新 fd 由 F_DUPFD_CLOEXEC 唯一建立；確保 stdio 重定向不覆寫 bind 來源。
     let fd = unsafe { libc::fcntl(opened.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-    if fd < 0 { return Err(PolicyDenied::Resource); }
+    if fd < 0 {
+        return Err(PolicyDenied::Resource);
+    }
     // SAFETY：fcntl 成功回傳尚無 Rust owner 的新 fd，交給 File 獨占關閉。
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn normal_absolute(path: &Path) -> bool {
     path.is_absolute()
-        && path.components().all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
-        && path.to_str().is_some_and(|text| !text.bytes().any(|byte| matches!(byte, b' ' | b'\\' | b'\n' | b'\t')))
+        && path
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+        && path.to_str().is_some_and(|text| {
+            !text
+                .bytes()
+                .any(|byte| matches!(byte, b' ' | b'\\' | b'\n' | b'\t'))
+        })
 }
 
 fn identity(path: &Path) -> Result<(u64, u64), PolicyDenied> {
@@ -103,8 +111,11 @@ fn add_directories(path: &Path, directories: &mut Vec<CString>) -> Result<(), Po
     Ok(())
 }
 
-fn prepare(binary: &Path, run_dir: &Path, artifacts: &[PathBuf])
-    -> Result<(Setup, Vec<(String, (u64, u64))>), PolicyDenied> {
+fn prepare(
+    binary: &Path,
+    run_dir: &Path,
+    artifacts: &[PathBuf],
+) -> Result<(Setup, Vec<(String, (u64, u64))>), PolicyDenied> {
     if artifacts.len() > 16 {
         return Err(PolicyDenied::InvalidWorker);
     }
@@ -120,7 +131,9 @@ fn prepare(binary: &Path, run_dir: &Path, artifacts: &[PathBuf])
         if binary.starts_with(path) || run_dir.starts_with(path) {
             return Err(PolicyDenied::InvalidWorker);
         }
-        let target = path.strip_prefix("/").map_err(|_| PolicyDenied::InvalidWorker)?;
+        let target = path
+            .strip_prefix("/")
+            .map_err(|_| PolicyDenied::InvalidWorker)?;
         add_directories(target, &mut directories)?;
         let opened = pinned(path).map_err(|_| PolicyDenied::Unsupported)?;
         let meta = opened.metadata().map_err(|_| PolicyDenied::Unsupported)?;
@@ -133,8 +146,13 @@ fn prepare(binary: &Path, run_dir: &Path, artifacts: &[PathBuf])
         });
         mounts.push((name.to_owned(), (meta.dev(), meta.ino())));
     }
-    let binary_target = binary.strip_prefix("/").map_err(|_| PolicyDenied::InvalidWorker)?;
-    add_directories(binary_target.parent().ok_or(PolicyDenied::InvalidWorker)?, &mut directories)?;
+    let binary_target = binary
+        .strip_prefix("/")
+        .map_err(|_| PolicyDenied::InvalidWorker)?;
+    add_directories(
+        binary_target.parent().ok_or(PolicyDenied::InvalidWorker)?,
+        &mut directories,
+    )?;
     let opened = pinned(binary)?;
     let meta = opened.metadata().map_err(|_| PolicyDenied::InvalidWorker)?;
     binds.push(Bind {
@@ -144,18 +162,36 @@ fn prepare(binary: &Path, run_dir: &Path, artifacts: &[PathBuf])
         file: true,
         _opened: opened,
     });
-    mounts.push((binary.to_str().ok_or(PolicyDenied::InvalidWorker)?.to_owned(),
-        (meta.dev(), meta.ino())));
+    mounts.push((
+        binary
+            .to_str()
+            .ok_or(PolicyDenied::InvalidWorker)?
+            .to_owned(),
+        (meta.dev(), meta.ino()),
+    ));
     for artifact in artifacts {
-        if !normal_absolute(artifact) || artifact == binary || artifact.starts_with(run_dir)
-            || library_paths.iter().any(|path| artifact.starts_with(Path::new(path)))
-            || mounts.iter().any(|(path, _)| Path::new(path.as_str()) == artifact)
-            || !fs::symlink_metadata(artifact).map_err(|_| PolicyDenied::InvalidWorker)?.is_file()
+        if !normal_absolute(artifact)
+            || artifact == binary
+            || artifact.starts_with(run_dir)
+            || library_paths
+                .iter()
+                .any(|path| artifact.starts_with(Path::new(path)))
+            || mounts
+                .iter()
+                .any(|(path, _)| Path::new(path.as_str()) == artifact)
+            || !fs::symlink_metadata(artifact)
+                .map_err(|_| PolicyDenied::InvalidWorker)?
+                .is_file()
         {
             return Err(PolicyDenied::InvalidWorker);
         }
-        let target = artifact.strip_prefix("/").map_err(|_| PolicyDenied::InvalidWorker)?;
-        add_directories(target.parent().ok_or(PolicyDenied::InvalidWorker)?, &mut directories)?;
+        let target = artifact
+            .strip_prefix("/")
+            .map_err(|_| PolicyDenied::InvalidWorker)?;
+        add_directories(
+            target.parent().ok_or(PolicyDenied::InvalidWorker)?,
+            &mut directories,
+        )?;
         let opened = pinned(artifact)?;
         let meta = opened.metadata().map_err(|_| PolicyDenied::InvalidWorker)?;
         if !meta.is_file() {
@@ -168,10 +204,17 @@ fn prepare(binary: &Path, run_dir: &Path, artifacts: &[PathBuf])
             file: true,
             _opened: opened,
         });
-        mounts.push((artifact.to_str().ok_or(PolicyDenied::InvalidWorker)?.to_owned(),
-            (meta.dev(), meta.ino())));
+        mounts.push((
+            artifact
+                .to_str()
+                .ok_or(PolicyDenied::InvalidWorker)?
+                .to_owned(),
+            (meta.dev(), meta.ino()),
+        ));
     }
-    let cache = run_dir.strip_prefix("/").map_err(|_| PolicyDenied::InvalidWorker)?;
+    let cache = run_dir
+        .strip_prefix("/")
+        .map_err(|_| PolicyDenied::InvalidWorker)?;
     add_directories(cache, &mut directories)?;
     let cap_last = fs::read_to_string("/proc/sys/kernel/cap_last_cap")
         .map_err(|_| PolicyDenied::Unsupported)?
@@ -181,13 +224,16 @@ fn prepare(binary: &Path, run_dir: &Path, artifacts: &[PathBuf])
     if cap_last > 63 {
         return Err(PolicyDenied::Unsupported);
     }
-    Ok((Setup {
-        root: c_path(run_dir)?,
-        directories,
-        cache: c_path(cache)?,
-        binds,
-        cap_last,
-    }, mounts))
+    Ok((
+        Setup {
+            root: c_path(run_dir)?,
+            directories,
+            cache: c_path(cache)?,
+            binds,
+            cap_last,
+        },
+        mounts,
+    ))
 }
 
 pub(super) fn configure(
@@ -197,7 +243,9 @@ pub(super) fn configure(
     policy: VmPolicy,
     artifacts: &[PathBuf],
 ) -> Result<PlatformLaunch, PolicyDenied> {
-    if policy == VmPolicy::Compatibility || !normal_absolute(binary) || !normal_absolute(run_dir)
+    if policy == VmPolicy::Compatibility
+        || !normal_absolute(binary)
+        || !normal_absolute(run_dir)
         || !run_dir.is_dir()
     {
         return Err(PolicyDenied::InvalidWorker);
@@ -217,79 +265,177 @@ pub(super) fn configure(
         return Err(PolicyDenied::Unsupported);
     }
     let root = fs::canonicalize(run_dir).map_err(|_| PolicyDenied::InvalidWorker)?;
-    let parent_namespaces = ["user", "mnt", "net"].map(|name| {
-        fs::read_link(format!("/proc/self/ns/{name}"))
-    });
+    let parent_namespaces =
+        ["user", "mnt", "net"].map(|name| fs::read_link(format!("/proc/self/ns/{name}")));
     let parent_namespaces = [
-        parent_namespaces[0].as_ref().map_err(|_| PolicyDenied::Unsupported)?.clone(),
-        parent_namespaces[1].as_ref().map_err(|_| PolicyDenied::Unsupported)?.clone(),
-        parent_namespaces[2].as_ref().map_err(|_| PolicyDenied::Unsupported)?.clone(),
+        parent_namespaces[0]
+            .as_ref()
+            .map_err(|_| PolicyDenied::Unsupported)?
+            .clone(),
+        parent_namespaces[1]
+            .as_ref()
+            .map_err(|_| PolicyDenied::Unsupported)?
+            .clone(),
+        parent_namespaces[2]
+            .as_ref()
+            .map_err(|_| PolicyDenied::Unsupported)?
+            .clone(),
     ];
     let (setup, mounts) = prepare(binary, run_dir, artifacts)?;
     // SAFETY：callback 只操作已預製 C 字串與裸 syscall，不配置、不鎖定、不觸碰 Rust I/O。
     unsafe {
         command.pre_exec(move || setup_child(&setup));
     }
-    Ok(PlatformLaunch { policy, binary_id, root, mounts, parent_namespaces })
+    Ok(PlatformLaunch {
+        policy,
+        binary_id,
+        root,
+        mounts,
+        parent_namespaces,
+    })
 }
 
 fn syscall_ok(value: libc::c_int) -> io::Result<()> {
-    if value == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    if value == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 unsafe fn write_map(path: &std::ffi::CStr, data: &[u8]) -> io::Result<()> {
     // SAFETY：固定 /proc/self 路徑及預先格式化 bytes；僅呼叫 open/write/close。
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-    if fd < 0 { return Err(io::Error::last_os_error()); }
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
     let count = unsafe { libc::write(fd, data.as_ptr().cast::<c_void>(), data.len()) };
-    let write_error = if count == data.len() as isize { None } else { Some(io::Error::last_os_error()) };
+    let write_error = if count == data.len() as isize {
+        None
+    } else {
+        Some(io::Error::last_os_error())
+    };
     let closed = unsafe { libc::close(fd) };
-    if let Some(error) = write_error { Err(error) } else { syscall_ok(closed) }
+    if let Some(error) = write_error {
+        Err(error)
+    } else {
+        syscall_ok(closed)
+    }
 }
 
 #[repr(C)]
-struct CapHeader { version: u32, pid: i32 }
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
 #[repr(C)]
-struct CapData { effective: u32, permitted: u32, inheritable: u32 }
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
 
 unsafe fn drop_capabilities(last: u32) -> io::Result<()> {
     // SAFETY：只改本子程序的 securebits、ambient/bounding set 與 v3 capability set。
-    syscall_ok(unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) })?;
+    syscall_ok(unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    })?;
     syscall_ok(unsafe { libc::prctl(libc::PR_SET_SECUREBITS, 0x0f, 0, 0, 0) })?;
     for cap in 0..=last {
         syscall_ok(unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap) })?;
     }
-    let header = CapHeader { version: 0x2008_0522, pid: 0 };
-    let data = [CapData { effective: 0, permitted: 0, inheritable: 0 },
-                CapData { effective: 0, permitted: 0, inheritable: 0 }];
+    let header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let data = [
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
     let result = unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) };
-    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 unsafe fn setup_child(setup: &Setup) -> io::Result<()> {
     // SAFETY：先建立獨立 mount namespace，避免任何掛載傳回宿主。
     syscall_ok(unsafe { libc::unshare(libc::CLONE_NEWNS) })?;
-    syscall_ok(unsafe { libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(),
-        (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong, std::ptr::null()) })?;
-    syscall_ok(unsafe { libc::mount(c"tmpfs".as_ptr(), setup.root.as_ptr(), c"tmpfs".as_ptr(),
-        ROOT_FLAGS, c"size=67108864,mode=0700".as_ptr().cast()) })?;
+    syscall_ok(unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            std::ptr::null(),
+        )
+    })?;
+    syscall_ok(unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            setup.root.as_ptr(),
+            c"tmpfs".as_ptr(),
+            ROOT_FLAGS,
+            c"size=67108864,mode=0700".as_ptr().cast(),
+        )
+    })?;
     // SAFETY：覆掛後以絕對路徑重新進入新 tmpfs；不能沿用指向舊 mount 的 cwd。
     syscall_ok(unsafe { libc::chdir(setup.root.as_ptr()) })?;
     syscall_ok(unsafe { libc::chown(c".".as_ptr(), WORKER_UID, WORKER_GID) })?;
     for directory in &setup.directories {
         let result = unsafe { libc::mkdir(directory.as_ptr(), 0o755) };
-        if result != 0 { return Err(io::Error::last_os_error()); }
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     for bind in &setup.binds {
         if bind.file {
-            let fd = unsafe { libc::open(bind.target.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_WRONLY, 0o555) };
-            if fd < 0 { return Err(io::Error::last_os_error()); }
+            let fd = unsafe {
+                libc::open(
+                    bind.target.as_ptr(),
+                    libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_WRONLY,
+                    0o555,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
             syscall_ok(unsafe { libc::close(fd) })?;
         }
-        syscall_ok(unsafe { libc::mount(bind.source.as_ptr(), bind.target.as_ptr(),
-            std::ptr::null(), libc::MS_BIND as libc::c_ulong, std::ptr::null()) })?;
-        syscall_ok(unsafe { libc::mount(std::ptr::null(), bind.target.as_ptr(),
-            std::ptr::null(), BIND_FLAGS, std::ptr::null()) })?;
+        syscall_ok(unsafe {
+            libc::mount(
+                bind.source.as_ptr(),
+                bind.target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND as libc::c_ulong,
+                std::ptr::null(),
+            )
+        })?;
+        syscall_ok(unsafe {
+            libc::mount(
+                std::ptr::null(),
+                bind.target.as_ptr(),
+                std::ptr::null(),
+                BIND_FLAGS,
+                std::ptr::null(),
+            )
+        })?;
     }
     syscall_ok(unsafe { libc::chmod(setup.cache.as_ptr(), 0o700) })?;
     syscall_ok(unsafe { libc::chown(setup.cache.as_ptr(), WORKER_UID, WORKER_GID) })?;
@@ -304,22 +450,32 @@ unsafe fn setup_child(setup: &Setup) -> io::Result<()> {
     unsafe { write_map(c"/proc/self/setgroups", b"deny\n")? };
     unsafe { write_map(c"/proc/self/uid_map", b"65534 65534 1\n")? };
     unsafe { write_map(c"/proc/self/gid_map", b"65534 65534 1\n")? };
-    syscall_ok(unsafe { libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS) })?;
+    syscall_ok(unsafe {
+        libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS)
+    })?;
     syscall_ok(unsafe { libc::chroot(c".".as_ptr()) })?;
     syscall_ok(unsafe { libc::chdir(c"/".as_ptr()) })?;
     for &(resource, maximum) in LIMITS {
-        let value = libc::rlimit { rlim_cur: maximum, rlim_max: maximum };
+        let value = libc::rlimit {
+            rlim_cur: maximum,
+            rlim_max: maximum,
+        };
         syscall_ok(unsafe { libc::setrlimit(resource as _, &value) })?;
     }
     unsafe { drop_capabilities(setup.cap_last)? };
     // SAFETY：CLOEXEC 保留 Rust spawn 的錯誤通道至 exec，其他繼承 fd 均在 exec 關閉。
-    let closed = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) };
-    if closed != 0 { return Err(io::Error::last_os_error()); }
+    let closed =
+        unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) };
+    if closed != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
 fn status_value<'a>(status: &'a str, name: &str) -> Result<&'a str, PolicyDenied> {
-    status.lines().find_map(|line| line.strip_prefix(name).map(str::trim))
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(name).map(str::trim))
         .ok_or(PolicyDenied::MissingEvidence)
 }
 
@@ -330,15 +486,25 @@ fn zero_hex(status: &str, name: &str) -> Result<bool, PolicyDenied> {
 
 fn check_status(status: &str, cap_last: u32) -> Result<(), PolicyDenied> {
     let expected = [WORKER_UID; 4];
-    let uids: Vec<u32> = status_value(status, "Uid:")?.split_whitespace()
-        .map(str::parse).collect::<Result<_, _>>().map_err(|_| PolicyDenied::MissingEvidence)?;
-    let gids: Vec<u32> = status_value(status, "Gid:")?.split_whitespace()
-        .map(str::parse).collect::<Result<_, _>>().map_err(|_| PolicyDenied::MissingEvidence)?;
-    if uids.as_slice() != expected.as_slice() || gids.as_slice() != expected.as_slice()
+    let uids: Vec<u32> = status_value(status, "Uid:")?
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .map_err(|_| PolicyDenied::MissingEvidence)?;
+    let gids: Vec<u32> = status_value(status, "Gid:")?
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .map_err(|_| PolicyDenied::MissingEvidence)?;
+    if uids.as_slice() != expected.as_slice()
+        || gids.as_slice() != expected.as_slice()
         || !status_value(status, "Groups:")?.is_empty()
         || status_value(status, "NoNewPrivs:")? != "1"
         || status_value(status, "Seccomp:")? != "2"
-        || status_value(status, "Seccomp_filters:")?.parse::<u32>().unwrap_or(0) == 0
+        || status_value(status, "Seccomp_filters:")?
+            .parse::<u32>()
+            .unwrap_or(0)
+            == 0
         || status_value(status, "TracerPid:")? != "0"
         || !zero_hex(status, "CapInh:")?
         || !zero_hex(status, "CapPrm:")?
@@ -355,7 +521,9 @@ fn check_status(status: &str, cap_last: u32) -> Result<(), PolicyDenied> {
 fn check_mounts(text: &str, expected: &[(String, (u64, u64))]) -> Result<(), PolicyDenied> {
     let mut seen = Vec::new();
     for line in text.lines() {
-        let (left, right) = line.split_once(" - ").ok_or(PolicyDenied::MissingEvidence)?;
+        let (left, right) = line
+            .split_once(" - ")
+            .ok_or(PolicyDenied::MissingEvidence)?;
         let fields: Vec<_> = left.split_whitespace().collect();
         let mount = *fields.get(4).ok_or(PolicyDenied::MissingEvidence)?;
         let options = *fields.get(5).ok_or(PolicyDenied::MissingEvidence)?;
@@ -379,8 +547,11 @@ fn check_mounts(text: &str, expected: &[(String, (u64, u64))]) -> Result<(), Pol
         }
         seen.push(mount);
     }
-    if seen.len() != expected.len() + 1 || !seen.contains(&"/")
-        || expected.iter().any(|(item, _)| !seen.contains(&item.as_str()))
+    if seen.len() != expected.len() + 1
+        || !seen.contains(&"/")
+        || expected
+            .iter()
+            .any(|(item, _)| !seen.contains(&item.as_str()))
     {
         return Err(PolicyDenied::MissingEvidence);
     }
@@ -389,10 +560,14 @@ fn check_mounts(text: &str, expected: &[(String, (u64, u64))]) -> Result<(), Pol
 
 fn check_limits(pid: libc::pid_t) -> Result<(), PolicyDenied> {
     for &(resource, maximum) in LIMITS {
-        let mut actual = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut actual = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         // SAFETY：只讀取指定子程序的 OS rlimit，不修改其狀態。
         if unsafe { libc::prlimit(pid, resource as _, std::ptr::null(), &mut actual) } != 0
-            || actual.rlim_cur != maximum || actual.rlim_max != maximum
+            || actual.rlim_cur != maximum
+            || actual.rlim_max != maximum
         {
             return Err(PolicyDenied::MissingEvidence);
         }
@@ -414,32 +589,50 @@ pub(super) fn parent_probe(
     }
     let proc = PathBuf::from(format!("/proc/{pid}"));
     if identity(&proc.join("exe"))? != launch.binary_id
-        || fs::read_link(proc.join("root")).map_err(|_| PolicyDenied::MissingEvidence)? != launch.root
-        || fs::read_to_string(proc.join("uid_map")).map_err(|_| PolicyDenied::MissingEvidence)?
-            .split_whitespace().collect::<Vec<_>>() != ["65534", "65534", "1"]
-        || fs::read_to_string(proc.join("gid_map")).map_err(|_| PolicyDenied::MissingEvidence)?
-            .split_whitespace().collect::<Vec<_>>() != ["65534", "65534", "1"]
-        || fs::read_to_string(proc.join("setgroups")).map_err(|_| PolicyDenied::MissingEvidence)?.trim() != "deny"
+        || fs::read_link(proc.join("root")).map_err(|_| PolicyDenied::MissingEvidence)?
+            != launch.root
+        || fs::read_to_string(proc.join("uid_map"))
+            .map_err(|_| PolicyDenied::MissingEvidence)?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            != ["65534", "65534", "1"]
+        || fs::read_to_string(proc.join("gid_map"))
+            .map_err(|_| PolicyDenied::MissingEvidence)?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            != ["65534", "65534", "1"]
+        || fs::read_to_string(proc.join("setgroups"))
+            .map_err(|_| PolicyDenied::MissingEvidence)?
+            .trim()
+            != "deny"
     {
         return Err(PolicyDenied::MissingEvidence);
     }
-    for (name, previous) in ["user", "mnt", "net"].into_iter().zip(&launch.parent_namespaces) {
-        let current = fs::read_link(proc.join("ns").join(name))
-            .map_err(|_| PolicyDenied::MissingEvidence)?;
+    for (name, previous) in ["user", "mnt", "net"]
+        .into_iter()
+        .zip(&launch.parent_namespaces)
+    {
+        let current =
+            fs::read_link(proc.join("ns").join(name)).map_err(|_| PolicyDenied::MissingEvidence)?;
         if current == *previous {
             return Err(PolicyDenied::MissingEvidence);
         }
     }
     let cap_last = fs::read_to_string("/proc/sys/kernel/cap_last_cap")
-        .map_err(|_| PolicyDenied::MissingEvidence)?.trim().parse::<u32>()
+        .map_err(|_| PolicyDenied::MissingEvidence)?
+        .trim()
+        .parse::<u32>()
         .map_err(|_| PolicyDenied::MissingEvidence)?;
-    let status = fs::read_to_string(proc.join("status")).map_err(|_| PolicyDenied::MissingEvidence)?;
+    let status =
+        fs::read_to_string(proc.join("status")).map_err(|_| PolicyDenied::MissingEvidence)?;
     check_status(&status, cap_last)?;
-    let mountinfo = fs::read_to_string(proc.join("mountinfo"))
-        .map_err(|_| PolicyDenied::MissingEvidence)?;
+    let mountinfo =
+        fs::read_to_string(proc.join("mountinfo")).map_err(|_| PolicyDenied::MissingEvidence)?;
     check_mounts(&mountinfo, &launch.mounts)?;
     for (path, expected_id) in &launch.mounts {
-        let relative = path.strip_prefix('/').ok_or(PolicyDenied::MissingEvidence)?;
+        let relative = path
+            .strip_prefix('/')
+            .ok_or(PolicyDenied::MissingEvidence)?;
         let actual = fs::metadata(proc.join("root").join(relative))
             .map_err(|_| PolicyDenied::MissingEvidence)?;
         if (actual.dev(), actual.ino()) != *expected_id {
@@ -453,7 +646,10 @@ pub(super) fn parent_probe(
     }
     for entry in fs::read_dir(proc.join("fd")).map_err(|_| PolicyDenied::MissingEvidence)? {
         let entry = entry.map_err(|_| PolicyDenied::MissingEvidence)?;
-        let number = entry.file_name().to_string_lossy().parse::<u32>()
+        let number = entry
+            .file_name()
+            .to_string_lossy()
+            .parse::<u32>()
             .map_err(|_| PolicyDenied::MissingEvidence)?;
         if number > 2 {
             return Err(PolicyDenied::MissingEvidence);
@@ -472,35 +668,81 @@ fn syscall_filter() -> Result<(), PolicyDenied> {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let allowed: &[libc::c_long] = &[
-            libc::SYS_read, libc::SYS_write, libc::SYS_readv, libc::SYS_writev,
-            libc::SYS_pread64, libc::SYS_pwrite64, libc::SYS_close, libc::SYS_lseek,
-            libc::SYS_fstat, libc::SYS_newfstatat, libc::SYS_statx,
-            libc::SYS_openat, libc::SYS_faccessat, libc::SYS_faccessat2,
-            libc::SYS_readlinkat, libc::SYS_getdents64, libc::SYS_getcwd,
-            libc::SYS_mkdirat, libc::SYS_unlinkat, libc::SYS_fchmodat,
-            libc::SYS_ftruncate, libc::SYS_fsync, libc::SYS_fdatasync,
-            libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_munmap,
-            libc::SYS_mremap, libc::SYS_madvise, libc::SYS_brk,
-            libc::SYS_ioctl, libc::SYS_fcntl, libc::SYS_dup, libc::SYS_dup3,
-            libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask,
-            libc::SYS_rt_sigreturn, libc::SYS_sigaltstack,
-            libc::SYS_futex, libc::SYS_set_robust_list, libc::SYS_rseq,
-            libc::SYS_getpid, libc::SYS_getppid, libc::SYS_gettid,
-            libc::SYS_getuid, libc::SYS_geteuid, libc::SYS_getgid,
-            libc::SYS_getegid, libc::SYS_getgroups, libc::SYS_getpgid,
-            libc::SYS_clock_gettime, libc::SYS_clock_getres,
-            libc::SYS_clock_nanosleep, libc::SYS_nanosleep,
-            libc::SYS_gettimeofday, libc::SYS_getrandom,
-            libc::SYS_sched_yield, libc::SYS_sched_getaffinity,
-            libc::SYS_prctl, libc::SYS_capget, libc::SYS_statfs,
-            libc::SYS_fstatfs, libc::SYS_prlimit64,
-            libc::SYS_uname, libc::SYS_getrusage,
-            libc::SYS_exit, libc::SYS_exit_group,
+            libc::SYS_read,
+            libc::SYS_write,
+            libc::SYS_readv,
+            libc::SYS_writev,
+            libc::SYS_pread64,
+            libc::SYS_pwrite64,
+            libc::SYS_close,
+            libc::SYS_lseek,
+            libc::SYS_fstat,
+            libc::SYS_newfstatat,
+            libc::SYS_statx,
+            libc::SYS_openat,
+            libc::SYS_faccessat,
+            libc::SYS_faccessat2,
+            libc::SYS_readlinkat,
+            libc::SYS_getdents64,
+            libc::SYS_getcwd,
+            libc::SYS_mkdirat,
+            libc::SYS_unlinkat,
+            libc::SYS_fchmodat,
+            libc::SYS_ftruncate,
+            libc::SYS_fsync,
+            libc::SYS_fdatasync,
+            libc::SYS_mmap,
+            libc::SYS_mprotect,
+            libc::SYS_munmap,
+            libc::SYS_mremap,
+            libc::SYS_madvise,
+            libc::SYS_brk,
+            libc::SYS_ioctl,
+            libc::SYS_fcntl,
+            libc::SYS_dup,
+            libc::SYS_dup3,
+            libc::SYS_rt_sigaction,
+            libc::SYS_rt_sigprocmask,
+            libc::SYS_rt_sigreturn,
+            libc::SYS_sigaltstack,
+            libc::SYS_futex,
+            libc::SYS_set_robust_list,
+            libc::SYS_rseq,
+            libc::SYS_getpid,
+            libc::SYS_getppid,
+            libc::SYS_gettid,
+            libc::SYS_getuid,
+            libc::SYS_geteuid,
+            libc::SYS_getgid,
+            libc::SYS_getegid,
+            libc::SYS_getgroups,
+            libc::SYS_getpgid,
+            libc::SYS_clock_gettime,
+            libc::SYS_clock_getres,
+            libc::SYS_clock_nanosleep,
+            libc::SYS_nanosleep,
+            libc::SYS_gettimeofday,
+            libc::SYS_getrandom,
+            libc::SYS_sched_yield,
+            libc::SYS_sched_getaffinity,
+            libc::SYS_prctl,
+            libc::SYS_capget,
+            libc::SYS_statfs,
+            libc::SYS_fstatfs,
+            libc::SYS_prlimit64,
+            libc::SYS_uname,
+            libc::SYS_getrusage,
+            libc::SYS_exit,
+            libc::SYS_exit_group,
         ];
         #[cfg(target_arch = "x86_64")]
         let arch_allowed: &[libc::c_long] = &[
-            libc::SYS_open, libc::SYS_readlink, libc::SYS_access,
-            libc::SYS_poll, libc::SYS_arch_prctl, libc::SYS_getpgrp,
+            libc::SYS_open,
+            libc::SYS_readlink,
+            libc::SYS_access,
+            libc::SYS_poll,
+            libc::SYS_arch_prctl,
+            libc::SYS_getpgrp,
         ];
         #[cfg(target_arch = "aarch64")]
         let arch_allowed: &[libc::c_long] = &[];
@@ -522,8 +764,15 @@ fn syscall_filter() -> Result<(), PolicyDenied> {
             filter: code.as_mut_ptr(),
         };
         // SAFETY：BPF 陣列在同步 prctl 呼叫期間存活；架構不符與未知 syscall 一律終止。
-        if unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER,
-            &program as *const _ as libc::c_ulong, 0, 0) } != 0
+        if unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &program as *const _ as libc::c_ulong,
+                0,
+                0,
+            )
+        } != 0
         {
             return Err(PolicyDenied::Unsupported);
         }
@@ -533,42 +782,69 @@ fn syscall_filter() -> Result<(), PolicyDenied> {
 }
 
 fn own_capabilities_empty() -> bool {
-    let mut header = CapHeader { version: 0x2008_0522, pid: 0 };
-    let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 },
-                    CapData { effective: 0, permitted: 0, inheritable: 0 }];
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let mut data = [
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
     // SAFETY：capget 只填寫本函式持有的 v3 header 與兩筆 data。
     if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
         return false;
     }
-    data.iter().all(|part| part.effective == 0 && part.permitted == 0 && part.inheritable == 0)
+    data.iter()
+        .all(|part| part.effective == 0 && part.permitted == 0 && part.inheritable == 0)
         && (0..=63).all(|cap| {
             // SAFETY：只查詢本程序的 bounding set；未知 cap 回 EINVAL，既有 cap 必須為零。
             let result = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap) };
-            result == 0 || (result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL))
+            result == 0
+                || (result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL))
         })
 }
 
 fn tmpfs(path: &Path) -> bool {
-    let Ok(path) = c_path(path) else { return false; };
+    let Ok(path) = c_path(path) else {
+        return false;
+    };
     let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY：有效 C 路徑；statfs 成功才讀取已初始化的輸出緩衝區。
-    unsafe { libc::statfs(path.as_ptr(), info.as_mut_ptr()) == 0
-        && info.assume_init().f_type == TMPFS_MAGIC }
+    unsafe {
+        libc::statfs(path.as_ptr(), info.as_mut_ptr()) == 0
+            && info.assume_init().f_type == TMPFS_MAGIC
+    }
 }
 
-pub(super) fn child_probe(policy: VmPolicy, run_dir: &Path)
-    -> Result<PlatformEvidence, PolicyDenied> {
-    if policy == VmPolicy::Compatibility || !normal_absolute(run_dir)
-        || !tmpfs(Path::new("/")) || !tmpfs(run_dir)
+pub(super) fn child_probe(
+    policy: VmPolicy,
+    run_dir: &Path,
+) -> Result<PlatformEvidence, PolicyDenied> {
+    if policy == VmPolicy::Compatibility
+        || !normal_absolute(run_dir)
+        || !tmpfs(Path::new("/"))
+        || !tmpfs(run_dir)
     {
         return Err(PolicyDenied::MissingEvidence);
     }
     // SAFETY：只讀取本程序身分與已建立的程序群組、NNP、seccomp 模式。
-    let credentials = unsafe { libc::getuid() == WORKER_UID && libc::geteuid() == WORKER_UID
-        && libc::getgid() == WORKER_GID && libc::getegid() == WORKER_GID
-        && libc::getgroups(0, std::ptr::null_mut()) == 0
-        && libc::getpgrp() == libc::getpid()
-        && libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1 };
+    let credentials = unsafe {
+        libc::getuid() == WORKER_UID
+            && libc::geteuid() == WORKER_UID
+            && libc::getgid() == WORKER_GID
+            && libc::getegid() == WORKER_GID
+            && libc::getgroups(0, std::ptr::null_mut()) == 0
+            && libc::getpgrp() == libc::getpid()
+            && libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1
+    };
     if !credentials || !own_capabilities_empty() {
         return Err(PolicyDenied::MissingEvidence);
     }
@@ -588,10 +864,14 @@ pub(super) fn child_probe(policy: VmPolicy, run_dir: &Path)
         return Err(PolicyDenied::MissingEvidence);
     }
     for &(resource, maximum) in LIMITS {
-        let mut actual = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut actual = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         // SAFETY：只查詢本程序的 resource limit。
         if unsafe { libc::getrlimit(resource as _, &mut actual) } != 0
-            || actual.rlim_cur != maximum || actual.rlim_max != maximum
+            || actual.rlim_cur != maximum
+            || actual.rlim_max != maximum
         {
             return Err(PolicyDenied::MissingEvidence);
         }

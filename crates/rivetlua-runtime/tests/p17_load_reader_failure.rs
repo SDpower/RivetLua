@@ -155,8 +155,7 @@ fn compile_runner(source: &[u8], language: LanguageProfile) -> Result<VerifiedMo
     let syntax = parse(&chunk, language, &limits).map_err(|error| format!("parse: {error:?}"))?;
     let resolved = resolve(&syntax, &chunk, language, &limits)
         .map_err(|error| format!("resolve: {error:?}"))?;
-    let ir = lower(&resolved, &IrLimits::default())
-        .map_err(|error| format!("lower: {error:?}"))?;
+    let ir = lower(&resolved, &IrLimits::default()).map_err(|error| format!("lower: {error:?}"))?;
     emit_with_native_debug(
         &ir,
         &resolved,
@@ -249,9 +248,11 @@ fn native_instruction_window(
     };
     let start = pc.saturating_sub(4);
     let end = pc.saturating_add(1).min(code.instructions.len());
-    let debug = u32::try_from(prototype)
-        .ok()
-        .and_then(|id| module.native_debug().and_then(|entry| entry.prototype(ProtoId(id))));
+    let debug = u32::try_from(prototype).ok().and_then(|id| {
+        module
+            .native_debug()
+            .and_then(|entry| entry.prototype(ProtoId(id)))
+    });
     let mut window = Vec::new();
     for index in start..end {
         window.push(format!(
@@ -281,7 +282,11 @@ fn run_case(
     profile: LuaProfile,
     official: bool,
 ) -> Result<(), String> {
-    let origin = if official { "official_dump_load" } else { "native" };
+    let origin = if official {
+        "official_dump_load"
+    } else {
+        "native"
+    };
     let source = source(case, official);
     let module = compile_runner(&source, language)
         .map_err(|error| format!("{profile:?} {} {origin} compile: {error}", case.name))?;
@@ -299,7 +304,11 @@ fn run_case(
         ..LoadLimits::default()
     };
     let services = HostServices::deny_all()
-        .and_dump(DumpCapability::deny_all().with_official_bytecode(true).with_limits(dump_limits))
+        .and_dump(
+            DumpCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(dump_limits),
+        )
         .and_load(
             LoadCapability::deny_all()
                 .and_compiler(MemoryCompiler)
@@ -308,14 +317,16 @@ fn run_case(
         );
     let mut vm = Vm::new_with_services(profile, services)
         .map_err(|error| format!("{profile:?} {} {origin} VM: {error:?}", case.name))?;
-    let environment = vm.allocate_table()
+    let environment = vm
+        .allocate_table()
         .map_err(|error| format!("{profile:?} {} {origin} environment: {error:?}", case.name))?;
     vm.install_basic_builtins(environment)
         .map_err(|error| format!("{profile:?} {} {origin} basic: {error:?}", case.name))?;
     vm.install_string_builtins(environment)
         .map_err(|error| format!("{profile:?} {} {origin} string: {error:?}", case.name))?;
     let baseline = RootKind::ALL.map(|kind| vm.roots().count(kind));
-    let environment_root = vm.add_root(RootKind::Host, environment)
+    let environment_root = vm
+        .add_root(RootKind::Host, environment)
         .map_err(|error| format!("{profile:?} {} {origin} root: {error:?}", case.name))?;
     vm.set_collect_every_allocation(true);
 
@@ -335,7 +346,8 @@ fn run_case(
         Ok(outcome) => {
             let mut failures = check_outcome(&vm, &outcome, case.expected);
             if !failures.is_empty() {
-                if let (Some(module), RunOutcome::LuaError(error)) = (&diagnostic_module, &outcome) {
+                if let (Some(module), RunOutcome::LuaError(error)) = (&diagnostic_module, &outcome)
+                {
                     failures.push(native_instruction_window(
                         module,
                         error.source_prototype,

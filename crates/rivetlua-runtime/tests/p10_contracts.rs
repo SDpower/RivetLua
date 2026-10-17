@@ -1784,12 +1784,7 @@ fn p10_5_reentry_gc_cleanup() {
         panic!("__call 事件鏈須受控終止")
     };
     assert_eq!(error.diagnostic_id, "E_METATABLE_CHAIN_LIMIT");
-    release_implicit_error_message(
-        &mut vm,
-        error,
-        baseline_roots,
-        Some(b"call chain too long"),
-    );
+    release_implicit_error_message(&mut vm, error, baseline_roots, Some(b"call chain too long"));
     assert_eq!(vm.ledger_snapshot().reserved, 0);
     drop(table_root);
     drop(env_root);

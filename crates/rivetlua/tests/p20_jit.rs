@@ -33,9 +33,7 @@ fn limited_jit_matches_interpreter_and_falls_back_before_table_side_effects() {
         let numeric_module = engine.compile(numeric_loop).unwrap();
 
         let mut interpreter_vm = engine.new_vm().unwrap();
-        interpreter_vm
-            .set_jit_policy(JitPolicy::Disabled)
-            .unwrap();
+        interpreter_vm.set_jit_policy(JitPolicy::Disabled).unwrap();
         let mut interpreter = interpreter_vm.load_module(&numeric_module).unwrap();
         assert!(matches!(
             interpreter.jit_eligibility(),
@@ -47,9 +45,7 @@ fn limited_jit_matches_interpreter_and_falls_back_before_table_side_effects() {
         assert!(matches!(&interpreted, RunOutcome::Returned(_)));
 
         let mut enabled_vm = engine.new_vm().unwrap();
-        enabled_vm
-            .set_jit_policy(JitPolicy::Enabled)
-            .unwrap();
+        enabled_vm.set_jit_policy(JitPolicy::Enabled).unwrap();
         let mut enabled = enabled_vm.load_module(&numeric_module).unwrap();
         let eligibility = enabled.jit_eligibility();
         let native_result = enabled.run().unwrap();
@@ -69,7 +65,9 @@ fn limited_jit_matches_interpreter_and_falls_back_before_table_side_effects() {
                     Some(JitFallbackReason::Platform)
                 ));
             }
-            _ => panic!("numeric while loop should be supported or explicitly rejected by platform"),
+            _ => {
+                panic!("numeric while loop should be supported or explicitly rejected by platform")
+            }
         }
 
         let table_module = engine.compile(table_side_effect).unwrap();
@@ -112,9 +110,6 @@ fn limited_jit_matches_interpreter_and_falls_back_before_table_side_effects() {
             RunOutcome::Aborted(AbortReason::FuelExhausted)
         );
         let fuel_stats = fuel_execution.jit_stats();
-        assert!(
-            fuel_stats.native_executed_instructions
-                <= fuel_stats.total_logical_instructions
-        );
+        assert!(fuel_stats.native_executed_instructions <= fuel_stats.total_logical_instructions);
     }
 }

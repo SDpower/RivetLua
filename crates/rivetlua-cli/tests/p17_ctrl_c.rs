@@ -181,7 +181,10 @@ impl CliChild {
 
     fn join_readers(&mut self) {
         for reader in self.readers.drain(..) {
-            reader.join().expect("管線讀者執行緒結束").expect("讀取 CLI 管線");
+            reader
+                .join()
+                .expect("管線讀者執行緒結束")
+                .expect("讀取 CLI 管線");
         }
         self.drain_chunks();
     }
@@ -242,7 +245,9 @@ fn p17_ctrl_c_unprotected_loop_reports_interrupt() {
         );
         assert_eq!(stdout, b"12\n", "{profile}: stdout 不符");
         assert!(
-            stderr.windows(b"interrupted!".len()).any(|part| part == b"interrupted!"),
+            stderr
+                .windows(b"interrupted!".len())
+                .any(|part| part == b"interrupted!"),
             "{profile}: stderr 應包含 interrupted!；stderr={stderr:?}"
         );
     }

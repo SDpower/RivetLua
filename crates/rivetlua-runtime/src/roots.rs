@@ -2,9 +2,9 @@
 
 use crate::rust_alloc::vec::Vec;
 
+use crate::rust_alloc::rc::Rc;
 use core::cell::{Cell, RefCell};
 use core::mem::size_of;
-use crate::rust_alloc::rc::Rc;
 
 use rivetlua_core::{ObjectRef, VmId};
 

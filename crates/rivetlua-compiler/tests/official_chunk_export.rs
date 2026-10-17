@@ -213,19 +213,20 @@ fn native_pending_call_uses_visible_official_slots_before_callee_in_both_profile
                 .collect();
             assert_eq!(call_slots, [u32::try_from(2 + pending_count).unwrap()]);
             assert!(
-                full.main.code.iter().filter(|word| **word & 0x7f == 34).count()
+                full.main
+                    .code
+                    .iter()
+                    .filter(|word| **word & 0x7f == 34)
+                    .count()
                     >= pending_count,
                 "{profile:?}: 待用值缺少算術來源"
             );
             for slot in 2..2 + pending_count {
                 let slot = u32::try_from(slot).unwrap();
                 assert!(
-                    full.main
-                        .code
-                        .iter()
-                        .any(|word| {
-                            matches!(*word & 0x7f, 0 | 34) && (word >> 7) & 0xff == slot
-                        }),
+                    full.main.code.iter().any(|word| {
+                        matches!(*word & 0x7f, 0 | 34) && (word >> 7) & 0xff == slot
+                    }),
                     "{profile:?}: pending slot {slot} 缺少算術值寫入"
                 );
             }
@@ -908,8 +909,10 @@ fn native_open_chain_respects_255_slot_boundary() {
                         decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default())
                             .unwrap();
                     let slots = usize::from(chunk.main.max_stack_size);
-                    assert!((fixed + 2..=255).contains(&slots),
-                        "{profile:?} fixed={fixed} strip={strip} slots={slots}");
+                    assert!(
+                        (fixed + 2..=255).contains(&slots),
+                        "{profile:?} fixed={fixed} strip={strip} slots={slots}"
+                    );
                 } else {
                     assert_eq!(
                         result.unwrap_err().kind,
@@ -2944,11 +2947,17 @@ return result"#, b"20\n"),
             std::fs::remove_file(source_path).unwrap();
             std::fs::remove_file(path).unwrap();
             for (mode, raw, output) in results {
-                assert!(raw.status.success(), "原始來源 {profile:?} {case} {mode}: {}",
-                    String::from_utf8_lossy(&raw.stderr));
+                assert!(
+                    raw.status.success(),
+                    "原始來源 {profile:?} {case} {mode}: {}",
+                    String::from_utf8_lossy(&raw.stderr)
+                );
                 assert_eq!(raw.stdout, expected, "原始來源 {profile:?} {case} {mode}");
-                assert!(output.status.success(), "匯出chunk {profile:?} {case} {mode}: {}",
-                    String::from_utf8_lossy(&output.stderr));
+                assert!(
+                    output.status.success(),
+                    "匯出chunk {profile:?} {case} {mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
                 assert_eq!(output.stdout, raw.stdout, "{profile:?} {case} {mode}");
             }
         }

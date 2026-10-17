@@ -6,13 +6,38 @@ use crate::{StrictJsonParser, StrictJsonValue};
 
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const TOP_KEYS: [&str; 24] = [
-    "version", "phase", "batch", "experiment_id", "commit", "dirty", "crate", "features",
-    "profile", "numeric", "target", "cpu", "os", "toolchain", "tools", "target_id", "seed",
-    "corpus_sha256", "scenario_sha256", "input_sha256", "budget", "fault_plan",
-    "worker_policy", "started_at",
+    "version",
+    "phase",
+    "batch",
+    "experiment_id",
+    "commit",
+    "dirty",
+    "crate",
+    "features",
+    "profile",
+    "numeric",
+    "target",
+    "cpu",
+    "os",
+    "toolchain",
+    "tools",
+    "target_id",
+    "seed",
+    "corpus_sha256",
+    "scenario_sha256",
+    "input_sha256",
+    "budget",
+    "fault_plan",
+    "worker_policy",
+    "started_at",
 ];
 const BUDGET_KEYS: [&str; 6] = [
-    "max_input_bytes", "max_depth", "fuel", "heap_bytes", "cases", "seconds",
+    "max_input_bytes",
+    "max_depth",
+    "fuel",
+    "heap_bytes",
+    "cases",
+    "seconds",
 ];
 const TOOL_KEYS: [&str; 5] = ["name", "version", "scope", "status", "alternative"];
 const FAULT_KEYS: [&str; 3] = ["point_id", "occurrence", "action"];
@@ -20,7 +45,8 @@ const RELEASE_SEED_STEP: u64 = 1_000_000;
 pub(super) const MAX_RELEASE_SEEDS: usize = 3600;
 
 pub(super) fn release_seed(primary: u64, index: usize) -> Option<u64> {
-    (index < MAX_RELEASE_SEEDS).then_some(index)
+    (index < MAX_RELEASE_SEEDS)
+        .then_some(index)
         .and_then(|index| u64::try_from(index).ok())
         .and_then(|index| index.checked_mul(RELEASE_SEED_STEP))
         .and_then(|offset| primary.checked_add(offset))
@@ -153,7 +179,10 @@ impl ToolScope {
         if !public_id(&self.name, 64)
             || !public_metadata(&self.version, 64)
             || !public_id(&self.scope, 64)
-            || self.alternative.as_ref().is_some_and(|value| !public_id(value, 64))
+            || self
+                .alternative
+                .as_ref()
+                .is_some_and(|value| !public_id(value, 64))
             || (self.status == ToolStatus::Pass && self.alternative.is_some())
             || (self.status == ToolStatus::Pass && !supports_pass(&self.name, &self.scope))
         {
@@ -202,7 +231,12 @@ impl ExperimentManifest {
             .as_array()
             .ok_or("E_MANIFEST_SCHEMA")?
             .iter()
-            .map(|entry| entry.as_str().map(str::to_owned).ok_or("E_MANIFEST_SCHEMA".into()))
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or("E_MANIFEST_SCHEMA".into())
+            })
             .collect::<Result<Vec<_>, String>>()?;
         let tools = field(&value, "tools")?
             .as_array()
@@ -254,15 +288,20 @@ impl ExperimentManifest {
         if self.version != 1 || self.phase != "P23" {
             return Err("E_MANIFEST_VERSION".into());
         }
-        if !matches!(self.batch.as_str(), "P23-B01" | "P23-B02" | "P23-B03" | "P23-B04")
-            || !public_id(&self.experiment_id, 96)
+        if !matches!(
+            self.batch.as_str(),
+            "P23-B01" | "P23-B02" | "P23-B03" | "P23-B04"
+        ) || !public_id(&self.experiment_id, 96)
             || !hex(&self.commit, 40)
             || !public_id(&self.crate_name, 64)
             || !matches!(self.profile.as_str(), "lua55-i64f64" | "lua54-i64f64")
             || self.numeric != "i64f64"
             || !public_metadata(&self.cpu, 128)
             || !public_metadata(&self.toolchain, 128)
-            || !matches!(self.worker_policy.as_str(), "Compatibility" | "Sandbox" | "PrivateService")
+            || !matches!(
+                self.worker_policy.as_str(),
+                "Compatibility" | "Sandbox" | "PrivateService"
+            )
             || !utc_timestamp(&self.started_at)
         {
             return Err("E_MANIFEST_IDENTITY".into());
@@ -270,7 +309,9 @@ impl ExperimentManifest {
         if target_os(&self.target) != Some(self.os.as_str()) {
             return Err("E_MANIFEST_TARGET".into());
         }
-        if select_target(&self.target_id).is_none_or(|target| !seed_in_family(target.seed, self.seed)) {
+        if select_target(&self.target_id)
+            .is_none_or(|target| !seed_in_family(target.seed, self.seed))
+        {
             return Err("E_MANIFEST_SELECTOR".into());
         }
         if !hex(&self.corpus_sha256, 64)
@@ -316,7 +357,9 @@ impl ExperimentManifest {
             value.scenario_sha256.make_ascii_lowercase();
             value.input_sha256.make_ascii_lowercase();
             value.features.sort();
-            value.tools.sort_by(|a, b| (&a.name, &a.scope).cmp(&(&b.name, &b.scope)));
+            value
+                .tools
+                .sort_by(|a, b| (&a.name, &a.scope).cmp(&(&b.name, &b.scope)));
         }
         left == right
     }
@@ -331,13 +374,48 @@ pub struct FuzzTarget {
 }
 
 static TARGETS: [FuzzTarget; 7] = [
-    FuzzTarget { id: "FZ-001", seed: 23001, input_kind: "source", oracle: "parser" },
-    FuzzTarget { id: "FZ-002", seed: 23002, input_kind: "ast", oracle: "compiler" },
-    FuzzTarget { id: "FZ-003", seed: 23003, input_kind: "rvlu-bytecode", oracle: "p05-verifier" },
-    FuzzTarget { id: "FZ-004", seed: 23004, input_kind: "rvlu-header", oracle: "p05-codec" },
-    FuzzTarget { id: "FZ-005", seed: 23005, input_kind: "sdk-values", oracle: "sdk-conversion" },
-    FuzzTarget { id: "FZ-006", seed: 23006, input_kind: "c-api-sequence", oracle: "c-api" },
-    FuzzTarget { id: "FZ-CHUNK-001", seed: 23007, input_kind: "official-lua-chunk", oracle: "p05-verifier" },
+    FuzzTarget {
+        id: "FZ-001",
+        seed: 23001,
+        input_kind: "source",
+        oracle: "parser",
+    },
+    FuzzTarget {
+        id: "FZ-002",
+        seed: 23002,
+        input_kind: "ast",
+        oracle: "compiler",
+    },
+    FuzzTarget {
+        id: "FZ-003",
+        seed: 23003,
+        input_kind: "rvlu-bytecode",
+        oracle: "p05-verifier",
+    },
+    FuzzTarget {
+        id: "FZ-004",
+        seed: 23004,
+        input_kind: "rvlu-header",
+        oracle: "p05-codec",
+    },
+    FuzzTarget {
+        id: "FZ-005",
+        seed: 23005,
+        input_kind: "sdk-values",
+        oracle: "sdk-conversion",
+    },
+    FuzzTarget {
+        id: "FZ-006",
+        seed: 23006,
+        input_kind: "c-api-sequence",
+        oracle: "c-api",
+    },
+    FuzzTarget {
+        id: "FZ-CHUNK-001",
+        seed: 23007,
+        input_kind: "official-lua-chunk",
+        oracle: "p05-verifier",
+    },
 ];
 
 pub fn target_registry() -> &'static [FuzzTarget; 7] {
@@ -349,7 +427,12 @@ pub fn select_target(id: &str) -> Option<&'static FuzzTarget> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReportKind { Fuzz, Fault, Tool, Performance }
+pub enum ReportKind {
+    Fuzz,
+    Fault,
+    Tool,
+    Performance,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Finding {
@@ -370,7 +453,9 @@ fn exact_object(value: &StrictJsonValue, expected: &[&str]) -> Result<(), String
         return Err("E_MANIFEST_SCHEMA".into());
     };
     if entries.len() != expected.len()
-        || entries.iter().any(|(key, _)| !expected.contains(&key.as_str()))
+        || entries
+            .iter()
+            .any(|(key, _)| !expected.contains(&key.as_str()))
     {
         return Err("E_MANIFEST_SCHEMA".into());
     }
@@ -400,13 +485,18 @@ fn integer(value: &StrictJsonValue, name: &str) -> Result<u64, String> {
 fn public_id(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value.len() <= max
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn public_metadata(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value.len() <= max
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_' | b'.' | b'+' | b':' | b'(' | b')'))
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b' ' | b'-' | b'_' | b'.' | b'+' | b':' | b'(' | b')')
+        })
 }
 
 fn hex(value: &str, len: usize) -> bool {
@@ -431,7 +521,13 @@ fn supports_pass(name: &str, scope: &str) -> bool {
         "tsan" => matches!(scope, "pure-rust" | "ffi" | "native"),
         "cargo-fuzz" | "libfuzzer" => matches!(
             scope,
-            "source" | "ast" | "rvlu-bytecode" | "rvlu-header" | "sdk" | "c-api" | "official-lua-chunk"
+            "source"
+                | "ast"
+                | "rvlu-bytecode"
+                | "rvlu-header"
+                | "sdk"
+                | "c-api"
+                | "official-lua-chunk"
         ),
         "native-jit" => matches!(scope, "jit" | "native"),
         "worker-os" => scope == "os-worker",
@@ -442,16 +538,20 @@ fn supports_pass(name: &str, scope: &str) -> bool {
 
 fn utc_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
-    if bytes.len() != 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T'
-        || bytes[13] != b':' || bytes[16] != b':' || bytes[19] != b'Z'
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
         || [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
-            .iter().any(|&index| !bytes[index].is_ascii_digit())
+            .iter()
+            .any(|&index| !bytes[index].is_ascii_digit())
     {
         return false;
     }
-    let number = |range: std::ops::Range<usize>| -> u32 {
-        value[range].parse().unwrap_or(0)
-    };
+    let number = |range: std::ops::Range<usize>| -> u32 { value[range].parse().unwrap_or(0) };
     let year = number(0..4);
     let month = number(5..7);
     let day = number(8..10);

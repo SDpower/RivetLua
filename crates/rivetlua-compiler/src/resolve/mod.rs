@@ -565,11 +565,14 @@ impl<'a> Resolver<'a> {
         for statement in &block.statements {
             statements.push(self.resolve_statement(statement)?);
         }
-        let terminal_suffix_start = block.statements.iter().rposition(|statement| {
-            !matches!(statement, Stmt::Empty { .. } | Stmt::Label { .. })
-        }).map_or(0, |index| index + 1);
+        let terminal_suffix_start = block
+            .statements
+            .iter()
+            .rposition(|statement| !matches!(statement, Stmt::Empty { .. } | Stmt::Label { .. }))
+            .map_or(0, |index| index + 1);
         let root_terminal_label = self.scopes.len() == 1
-            && block.statements[terminal_suffix_start..].iter()
+            && block.statements[terminal_suffix_start..]
+                .iter()
                 .any(|statement| matches!(statement, Stmt::Label { .. }));
         let target_scope = if root_terminal_label {
             None
@@ -616,11 +619,8 @@ impl<'a> Resolver<'a> {
                     .map_err(|_| self.limit(*span, "binding 配置超過編譯限制"))?;
                 let mut close_count = 0;
                 for name in names {
-                    let binding = self.declare_local(
-                        name.name.clone(),
-                        name.span,
-                        name.attribute.clone(),
-                    )?;
+                    let binding =
+                        self.declare_local(name.name.clone(), name.span, name.attribute.clone())?;
                     if name
                         .attribute
                         .as_ref()
@@ -628,10 +628,9 @@ impl<'a> Resolver<'a> {
                     {
                         close_count += 1;
                         if close_count > 1 {
-                            return Err(self.resolve_error(
-                                name.span,
-                                "local 宣告含多個 close 變數",
-                            ));
+                            return Err(
+                                self.resolve_error(name.span, "local 宣告含多個 close 變數")
+                            );
                         }
                     }
                     bindings.push(binding);
@@ -1887,9 +1886,10 @@ impl<'a> Resolver<'a> {
             .declaration_spans
             .try_reserve(declaration_count)
             .map_err(|_| declaration_reserve_error)?;
-        let last_non_void = block.statements.iter().rposition(|statement| {
-            !matches!(statement, Stmt::Empty { .. } | Stmt::Label { .. })
-        });
+        let last_non_void = block
+            .statements
+            .iter()
+            .rposition(|statement| !matches!(statement, Stmt::Empty { .. } | Stmt::Label { .. }));
         for (index, statement) in block.statements.iter().enumerate() {
             match statement {
                 Stmt::Local { names, .. } => frame
@@ -2136,7 +2136,10 @@ mod tests {
 
         for (source, profile) in [
             (b"local <close> a, b".as_slice(), LanguageProfile::Lua55),
-            (b"local a <close>, b <close>".as_slice(), LanguageProfile::Lua54),
+            (
+                b"local a <close>, b <close>".as_slice(),
+                LanguageProfile::Lua54,
+            ),
         ] {
             let chunk = lex(source, profile, &limits).unwrap();
             let parsed = parse(&chunk, profile, &limits).unwrap();
@@ -2153,7 +2156,10 @@ mod tests {
             let source = b"do goto done; local x = 1; ::done:: ; end";
             let chunk = lex(source, profile, &limits).unwrap();
             let parsed = parse(&chunk, profile, &limits).unwrap();
-            assert!(resolve(&parsed, &chunk, profile, &limits).is_ok(), "{profile:?}");
+            assert!(
+                resolve(&parsed, &chunk, profile, &limits).is_ok(),
+                "{profile:?}"
+            );
 
             for source in [
                 b"do goto live; local x = 1; ::live:: x = 2 end".as_slice(),
@@ -2241,7 +2247,11 @@ mod tests {
             let ResolvedStmt::Goto { close_path, .. } = body_statements[1] else {
                 panic!("預期 forward goto");
             };
-            assert_eq!(close_path.bindings, vec![inner_close, outer_close], "{profile:?}");
+            assert_eq!(
+                close_path.bindings,
+                vec![inner_close, outer_close],
+                "{profile:?}"
+            );
             assert_eq!(
                 close_path.exited_bindings,
                 vec![inner_close, outer_close, captured, outer],
@@ -2249,10 +2259,15 @@ mod tests {
             );
             assert!(!close_path.exited_bindings.contains(&skipped));
             assert_eq!(close_path.target_scope, Some(resolved.root.scope));
-            assert_eq!(resolved.root.normal_close_path.bindings, vec![skipped, outer_close]);
+            assert_eq!(
+                resolved.root.normal_close_path.bindings,
+                vec![skipped, outer_close]
+            );
             assert_eq!(resolved.root.normal_close_path.target_scope, None);
-            assert_eq!(resolved.root.normal_close_path.exited_bindings,
-                vec![skipped, outer_close, captured, outer]);
+            assert_eq!(
+                resolved.root.normal_close_path.exited_bindings,
+                vec![skipped, outer_close, captured, outer]
+            );
         }
     }
 

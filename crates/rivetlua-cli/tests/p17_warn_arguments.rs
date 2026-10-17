@@ -27,12 +27,7 @@ fn run_lua(profile: &str, source: &str) -> Output {
         .expect("啟動 RivetLua 命令列程式")
 }
 
-fn assert_output(
-    output: &Output,
-    expected_stdout: &[u8],
-    expected_stderr: &[u8],
-    profile: &str,
-) {
+fn assert_output(output: &Output, expected_stdout: &[u8], expected_stderr: &[u8], profile: &str) {
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -55,12 +50,7 @@ fn assert_output(
 fn p17_warn_missing_argument_reports_string_expected() {
     for profile in ["lua55", "lua54"] {
         let output = run_lua(profile, MISSING_ARGUMENT_SOURCE);
-        assert_output(
-            &output,
-            b"missing-argument-ok\n",
-            b"",
-            profile,
-        );
+        assert_output(&output, b"missing-argument-ok\n", b"", profile);
     }
 }
 

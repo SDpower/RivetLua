@@ -340,7 +340,11 @@ impl GcState {
                 break;
             }
             let page = &self.slot_bits[page_index];
-            let mut bits = if free { page.reusable_free } else { page.occupied };
+            let mut bits = if free {
+                page.reusable_free
+            } else {
+                page.occupied
+            };
             bits &= u64::MAX << offset;
             let remaining = end - base;
             if remaining < 64 {

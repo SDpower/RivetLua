@@ -3,9 +3,9 @@
 use rivetlua_core::{
     BytecodeError, BytecodeErrorCode, OfficialChunkError, OfficialChunkErrorKind,
     OfficialChunkLimits, OfficialTranslationError, OfficialTranslationErrorKind,
-    OfficialWorkBudget, RVLU_MAGIC, RVLU_V2, VerifiedModule, VerifyLimits,
-    decode_module, decode_official_chunk, encode_module, encode_official_chunk,
-    preflight_official_chunk, translate_official_chunk_with_work,
+    OfficialWorkBudget, RVLU_MAGIC, RVLU_V2, VerifiedModule, VerifyLimits, decode_module,
+    decode_official_chunk, encode_module, encode_official_chunk, preflight_official_chunk,
+    translate_official_chunk_with_work,
 };
 use rivetlua_runtime::{AbortReason, RunOutcome, RuntimeErrorKind, Vm, VmError};
 
@@ -33,7 +33,10 @@ fn verify_limits(limits: &HarnessLimits, byte_cap: usize) -> VerifyLimits {
 }
 
 fn byte_cap(limits: &HarnessLimits, fixed_cap: usize) -> usize {
-    limits.max_input_bytes.min(fixed_cap).min(limits.heap_bytes / 8)
+    limits
+        .max_input_bytes
+        .min(fixed_cap)
+        .min(limits.heap_bytes / 8)
 }
 
 fn bytecode_failure(error: BytecodeError) -> CaseOutcome {
@@ -229,7 +232,10 @@ pub(super) fn official_chunk(
         Some(work) => work as u64,
         None => return CaseOutcome::Limit,
     };
-    let required_memory = match preflight.temporary_bytes.checked_add(preflight.retained_bytes) {
+    let required_memory = match preflight
+        .temporary_bytes
+        .checked_add(preflight.retained_bytes)
+    {
         Some(bytes) => bytes,
         None => return CaseOutcome::Limit,
     };
@@ -272,10 +278,11 @@ pub(super) fn official_chunk(
         }
         if strip {
             let mut stripped_work = OfficialWorkBudget::new(work.remaining());
-            let stripped = match translate_official_chunk_with_work(&decoded, &verify, &mut stripped_work) {
-                Ok(translation) => translation,
-                Err(error) => return translation_failure(error),
-            };
+            let stripped =
+                match translate_official_chunk_with_work(&decoded, &verify, &mut stripped_work) {
+                    Ok(translation) => translation,
+                    Err(error) => return translation_failure(error),
+                };
             match canonical_roundtrip(stripped.verified(), profile, &verify) {
                 CaseOutcome::Accepted => {}
                 other => return other,
@@ -292,7 +299,12 @@ mod tests {
 
     #[test]
     fn rvlu_header_rejects_other_language_formats() {
-        let limits = HarnessLimits { max_input_bytes: 1024, max_depth: 8, fuel: 100_000, heap_bytes: 1024 * 1024 };
+        let limits = HarnessLimits {
+            max_input_bytes: 1024,
+            max_depth: 8,
+            fuel: 100_000,
+            heap_bytes: 1024 * 1024,
+        };
         assert!(matches!(
             rvlu_header(rivetlua_core::LuaProfile::Lua55, b"\x1bLua", &limits),
             CaseOutcome::Rejected
@@ -308,18 +320,26 @@ mod tests {
         const NAN_BITS: u64 = 0x7ff8_0000_0000_0042;
         let limits = OfficialChunkLimits::default();
         let mut chunk = decode_official_chunk(
-            include_bytes!("../../../crates/rivetlua-core/tests/official_chunk_fixtures/lua55-debug.luac"),
+            include_bytes!(
+                "../../../crates/rivetlua-core/tests/official_chunk_fixtures/lua55-debug.luac"
+            ),
             LuaProfile::Lua55,
             &limits,
         )
         .unwrap();
-        chunk.main.constants.push(OfficialConstant::Number(f64::from_bits(NAN_BITS)));
+        chunk
+            .main
+            .constants
+            .push(OfficialConstant::Number(f64::from_bits(NAN_BITS)));
         let encoded = encode_official_chunk(&chunk, false, &limits).unwrap();
         let decoded = decode_official_chunk(&encoded, LuaProfile::Lua55, &limits).unwrap();
         assert!(matches!(
             decoded.main.constants.last(),
             Some(OfficialConstant::Number(value)) if value.to_bits() == NAN_BITS
         ));
-        assert_eq!(encode_official_chunk(&decoded, false, &limits).unwrap(), encoded);
+        assert_eq!(
+            encode_official_chunk(&decoded, false, &limits).unwrap(),
+            encoded
+        );
     }
 }

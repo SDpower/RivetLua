@@ -682,7 +682,10 @@ impl ResolveShape {
         // resolver 的名稱表只含目前 function 與建立 child 時的祖先
         // prefix；兄弟 function 的 key 不可能出現在這次碰撞比較。
         let operations = add(
-            add(mul(self.current_references, 4)?, mul(self.current_bindings, 4)?)?,
+            add(
+                mul(self.current_references, 4)?,
+                mul(self.current_bindings, 4)?,
+            )?,
             add(self.current_gotos, self.current_labels)?,
         )?;
         self.key_compare_ops = add(self.key_compare_ops, operations)?;
@@ -766,10 +769,7 @@ impl ResolveShape {
         // child 的兩張 parent map 僅複製此刻可見的祖先 prefix。
         let clone_ops = mul(inherited, 2)?;
         self.key_compare_ops = add(self.key_compare_ops, clone_ops)?;
-        self.key_compare_work = add(
-            self.key_compare_work,
-            mul(clone_ops, inherited_keys)?,
-        )?;
+        self.key_compare_work = add(self.key_compare_work, mul(clone_ops, inherited_keys)?)?;
         let saved_distinct_names = self.distinct_global_names.take();
         let saved = (
             self.inherited_bindings,
@@ -984,7 +984,10 @@ impl ResolveShape {
                     // readonly 狀態最多建立兩個 BindingMeta。scope 與
                     // 兄弟 function 不會增加同名 key 的數量。
                     let new_name = if let Some(names) = self.distinct_global_names.as_mut() {
-                        if names.iter().any(|prior| prior.as_slice() == name.as_slice()) {
+                        if names
+                            .iter()
+                            .any(|prior| prior.as_slice() == name.as_slice())
+                        {
                             false
                         } else {
                             let mut owned = Vec::new();
@@ -1004,7 +1007,11 @@ impl ResolveShape {
                     if new_name {
                         self.current_bindings = add(
                             self.current_bindings,
-                            if self.distinct_global_names.is_some() { 2 } else { 1 },
+                            if self.distinct_global_names.is_some() {
+                                2
+                            } else {
+                                1
+                            },
                         )?;
                         self.current_key_bytes = add(self.current_key_bytes, name.capacity())?;
                     }
@@ -1285,10 +1292,7 @@ pub(crate) fn resolve_with_budget<S: CompileBudgetSink>(
         // 上界預付；第二輪才可配置暫存名稱表。所有 live function 名稱
         // 都來自互斥的 AST 參照，Vec grow 舊＋新 buffer 至多 4R handles。
         let distinct_temporary = add(
-            mul(
-                mul(shape.references, size_of::<Vec<u8>>())?,
-                4,
-            )?,
+            mul(mul(shape.references, size_of::<Vec<u8>>())?, 4)?,
             mul(shape.reference_name_bytes, 4)?,
         )?;
         admit(
@@ -4687,7 +4691,9 @@ mod tests {
         let mut source = b"return {".to_vec();
         for index in 0..48 {
             let name = format!("private_{index}_{}", "x".repeat(64));
-            source.extend_from_slice(format!("function() local {name}=1; return {name} end,").as_bytes());
+            source.extend_from_slice(
+                format!("function() local {name}=1; return {name} end,").as_bytes(),
+            );
         }
         source.extend_from_slice(b"}");
         for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
@@ -4746,64 +4752,41 @@ mod tests {
             deep.extend_from_slice(b" end");
         }
         for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
-            for (source, expected_depth, expected_functions) in [
-                (siblings.as_slice(), 2, 65),
-                (deep.as_slice(), 9, 9),
-            ] {
+            for (source, expected_depth, expected_functions) in
+                [(siblings.as_slice(), 2, 65), (deep.as_slice(), 9, 9)]
+            {
                 let mut ample = Probe::unlimited();
-                let frontend = lex_parse_with_budget(
-                    source,
-                    profile,
-                    &CompileLimits::default(),
-                    &mut ample,
-                )
-                .unwrap();
-                let resolved = resolve_with_budget(
-                    frontend,
-                    profile,
-                    &CompileLimits::default(),
-                    &mut ample,
-                )
-                .unwrap();
+                let frontend =
+                    lex_parse_with_budget(source, profile, &CompileLimits::default(), &mut ample)
+                        .unwrap();
+                let resolved =
+                    resolve_with_budget(frontend, profile, &CompileLimits::default(), &mut ample)
+                        .unwrap();
                 assert_eq!(resolved.max_function_depth, expected_depth);
                 assert_eq!(resolved.resolved.functions.len(), expected_functions);
                 let mut shape = LowerShape::default();
                 shape.block::<()>(&resolved.resolved.root).unwrap();
-                let (work, temporary, _) = lower_admission::<()>(
-                    &resolved,
-                    &rivetlua_core::IrLimits::default(),
-                    &shape,
-                )
-                .unwrap();
+                let (work, temporary, _) =
+                    lower_admission::<()>(&resolved, &rivetlua_core::IrLimits::default(), &shape)
+                        .unwrap();
                 let total_work = ample.work + 1024 * (resolved.lexed.tokens.len() + 1) + work;
                 let total_temporary = ample.temporary + temporary;
                 ample.work_limit = total_work;
                 ample.temporary_limit = total_temporary;
-                let lowered = lower_with_budget(
-                    resolved,
-                    &rivetlua_core::IrLimits::default(),
-                    &mut ample,
-                )
-                .unwrap();
+                let lowered =
+                    lower_with_budget(resolved, &rivetlua_core::IrLimits::default(), &mut ample)
+                        .unwrap();
                 assert_eq!(ample.work, total_work);
                 assert_eq!(ample.temporary, total_temporary);
                 assert!(ir_allocation_bytes::<()>(&lowered.ir).unwrap() <= temporary);
 
                 let mut short = Probe::unlimited();
-                let frontend = lex_parse_with_budget(
-                    source,
-                    profile,
-                    &CompileLimits::default(),
-                    &mut short,
-                )
-                .unwrap();
-                let resolved = resolve_with_budget(
-                    frontend,
-                    profile,
-                    &CompileLimits::default(),
-                    &mut short,
-                )
-                .unwrap();
+                let frontend =
+                    lex_parse_with_budget(source, profile, &CompileLimits::default(), &mut short)
+                        .unwrap();
+                let resolved =
+                    resolve_with_budget(frontend, profile, &CompileLimits::default(), &mut short)
+                        .unwrap();
                 short.work_limit = total_work - 1;
                 short.temporary_limit = total_temporary;
                 assert!(matches!(
@@ -4853,33 +4836,29 @@ mod tests {
         for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
             for source in sources {
                 let mut sink = Probe::unlimited();
-                let frontend = lex_parse_with_budget(
-                    source,
-                    profile,
-                    &CompileLimits::default(),
-                    &mut sink,
-                )
-                .unwrap();
-                let resolved = resolve_with_budget(
-                    frontend,
-                    profile,
-                    &CompileLimits::default(),
-                    &mut sink,
-                )
-                .unwrap();
+                let frontend =
+                    lex_parse_with_budget(source, profile, &CompileLimits::default(), &mut sink)
+                        .unwrap();
+                let resolved =
+                    resolve_with_budget(frontend, profile, &CompileLimits::default(), &mut sink)
+                        .unwrap();
                 let mut shape = LowerShape::default();
                 shape.block::<()>(&resolved.resolved.root).unwrap();
-                let (_, temporary, local_limits) = lower_admission::<()>(
-                    &resolved,
-                    &rivetlua_core::IrLimits::default(),
-                    &shape,
-                )
-                .unwrap();
-                let ir = crate::lower(&resolved.resolved, &rivetlua_core::IrLimits::default())
-                    .unwrap();
-                assert!(ir.prototypes.iter().all(|p| p.instructions.len() <= local_limits.max_instructions));
+                let (_, temporary, local_limits) =
+                    lower_admission::<()>(&resolved, &rivetlua_core::IrLimits::default(), &shape)
+                        .unwrap();
+                let ir =
+                    crate::lower(&resolved.resolved, &rivetlua_core::IrLimits::default()).unwrap();
+                assert!(
+                    ir.prototypes
+                        .iter()
+                        .all(|p| p.instructions.len() <= local_limits.max_instructions)
+                );
                 assert!(ir_allocation_bytes::<()>(&ir).unwrap() <= temporary);
-                assert!(lower_with_budget(resolved, &rivetlua_core::IrLimits::default(), &mut sink).is_ok());
+                assert!(
+                    lower_with_budget(resolved, &rivetlua_core::IrLimits::default(), &mut sink)
+                        .is_ok()
+                );
             }
         }
         let mut sink = Probe::unlimited();

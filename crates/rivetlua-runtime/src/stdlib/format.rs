@@ -14,10 +14,7 @@ fn format_error() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::StringFormat)
 }
 
-fn format_error_with_message(
-    vm: &mut Vm,
-    message: &[u8],
-) -> Result<RuntimeError, RuntimeError> {
+fn format_error_with_message(vm: &mut Vm, message: &[u8]) -> Result<RuntimeError, RuntimeError> {
     let mut error = format_error();
     error.value = Value::Object(vm.allocate_byte_string(message)?);
     Ok(error)

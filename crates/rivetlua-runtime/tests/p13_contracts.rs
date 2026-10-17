@@ -276,7 +276,10 @@ fn p13_h_primitive_type_metatables_keep_policy_and_guest_events() {
     assert_eq!(values[5], Value::Integer(7));
     assert_eq!(values[6..11], [Value::Boolean(true); 5]);
     assert_eq!(values[11..13], [Value::Boolean(false); 2]);
-    let number_metatable = vm.get_metatable_for_value(Value::Integer(2)).unwrap().unwrap();
+    let number_metatable = vm
+        .get_metatable_for_value(Value::Integer(2))
+        .unwrap()
+        .unwrap();
     vm.collect_major().unwrap();
     assert_eq!(vm.object_kind(number_metatable), Ok(ObjectKind::Table));
     assert_eq!(
@@ -335,7 +338,10 @@ fn p13_h_existing_userdata_metatable_grant_keeps_instance_scope() {
     drop(execution);
     assert_eq!(outcome, RunOutcome::Returned(vec![Value::Boolean(true); 4]));
     vm.collect_major().unwrap();
-    let metatable = vm.get_metatable_for_value(Value::Object(first)).unwrap().unwrap();
+    let metatable = vm
+        .get_metatable_for_value(Value::Object(first))
+        .unwrap()
+        .unwrap();
     assert_eq!(vm.object_kind(metatable), Ok(ObjectKind::Table));
     assert_eq!(vm.get_metatable_for_value(Value::Object(second)), Ok(None));
     vm.remove_root(first_root).unwrap();
@@ -1089,8 +1095,18 @@ return a,b";
     assert_eq!(values.len(), 2);
     let trace = bytes(&vm, values[0]);
     assert!(trace.starts_with(b"42\nstack traceback:\n"), "{trace:?}");
-    assert!(trace.windows(b"p13-h.lua:2: in".len()).any(|window| window == b"p13-h.lua:2: in"), "{trace:?}");
-    assert!(trace.windows(b"p13-h.lua:4: in main chunk".len()).any(|window| window == b"p13-h.lua:4: in main chunk"), "{trace:?}");
+    assert!(
+        trace
+            .windows(b"p13-h.lua:2: in".len())
+            .any(|window| window == b"p13-h.lua:2: in"),
+        "{trace:?}"
+    );
+    assert!(
+        trace
+            .windows(b"p13-h.lua:4: in main chunk".len())
+            .any(|window| window == b"p13-h.lua:4: in main chunk"),
+        "{trace:?}"
+    );
     assert_eq!(values[1], Value::Boolean(true));
 
     let debug = debug.with_limits(DebugLimits {
@@ -4010,9 +4026,8 @@ fn p13_package_config_reports_target_path_markers_without_host_capability() {
 #[test]
 fn p13_package_searchpath_returns_name_or_diagnostic_without_loading() {
     let paths = Rc::new(RefCell::new(Vec::new()));
-    let services = HostServices::deny_all().and_load(
-        LoadCapability::deny_all().and_repository(TestRepository(paths.clone())),
-    );
+    let services = HostServices::deny_all()
+        .and_load(LoadCapability::deny_all().and_repository(TestRepository(paths.clone())));
     let (vm, outcome) = run_with_load(
         b"local found=package.searchpath('pkg.item','?/init.lua;?.lua'); \
           local missing,why=package.searchpath('ghost.a','?.lua;?/init.lua'); \
@@ -4072,13 +4087,9 @@ impl HostModuleRepository for SplitNameRepository {
 #[test]
 fn p13_package_searchpath_splits_after_name_expansion() {
     let paths = Rc::new(RefCell::new(Vec::new()));
-    let services = HostServices::deny_all().and_load(
-        LoadCapability::deny_all().and_repository(SplitNameRepository(paths.clone())),
-    );
-    let (vm, outcome) = run_with_load(
-        b"return package.searchpath('a;b','?', '', '/')",
-        services,
-    );
+    let services = HostServices::deny_all()
+        .and_load(LoadCapability::deny_all().and_repository(SplitNameRepository(paths.clone())));
+    let (vm, outcome) = run_with_load(b"return package.searchpath('a;b','?', '', '/')", services);
     let RunOutcome::Returned(values) = outcome else {
         panic!("searchpath 應於展開後分割候選: {outcome:?}");
     };
@@ -4096,7 +4107,8 @@ fn p13_package_searchpath_rejects_invalid_arguments_and_missing_capability() {
           local c=pcall(package.searchpath,'item','?.lua',false); \
           return a,b,c",
         HostServices::deny_all().and_load(
-            LoadCapability::deny_all().and_repository(TestRepository(Rc::new(RefCell::new(Vec::new())))),
+            LoadCapability::deny_all()
+                .and_repository(TestRepository(Rc::new(RefCell::new(Vec::new())))),
         ),
     );
     assert_eq!(
@@ -4120,9 +4132,8 @@ fn p13_package_searchpath_rejects_invalid_arguments_and_missing_capability() {
 
 #[test]
 fn p13_package_searchpath_preserves_host_error_and_candidate_limit() {
-    let services = HostServices::deny_all().and_load(
-        LoadCapability::deny_all().and_repository(FailingRepository(3)),
-    );
+    let services = HostServices::deny_all()
+        .and_load(LoadCapability::deny_all().and_repository(FailingRepository(3)));
     let (vm, outcome) = run_with_load(b"return package.searchpath('item','?.lua')", services);
     let RunOutcome::LuaError(error) = outcome else {
         panic!("repository 錯誤應保留: {outcome:?}");
@@ -5729,7 +5740,9 @@ fn p13_f_mode_scan_exhausts_fuel_before_host_compile() {
 }
 
 fn assert_main_coroutine_root_and_nonmain_count(vm: &Vm, expected_nonmain: usize) {
-    let main = vm.main_thread_identity().expect("coroutine 庫須保留主 thread");
+    let main = vm
+        .main_thread_identity()
+        .expect("coroutine 庫須保留主 thread");
     assert_eq!(vm.object_kind(main), Ok(ObjectKind::Coroutine));
     assert_eq!(vm.roots().total_count(), expected_nonmain + 1);
     assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
@@ -11231,7 +11244,10 @@ selected(2, 0, {tag=11}, {tag=22})"#;
     let RunOutcome::LuaError(error) = outcome else {
         panic!("return hook 應中止: {outcome:?}");
     };
-    assert_eq!(bytes(&vm, error.value), b"p13-h-transfer.lua:5: transfer-stop");
+    assert_eq!(
+        bytes(&vm, error.value),
+        b"p13-h-transfer.lua:5: transfer-stop"
+    );
 }
 
 #[test]
@@ -11519,7 +11535,11 @@ fn p13_h_step3_lua55_parent_capture_environment_join_stays_coherent() {
         return;
     }
     let source = b"local d,gc=debug,collectgarbage\nlocal function exercise()\n  local function child() return marker end\n  return marker,_ENV,child\nend\nlocal replacement={marker=47}\nlocal function donor() return replacement end\nlocal name=d.getupvalue(exercise,1)\nlocal before=exercise()\nd.upvaluejoin(exercise,1,donor,1)\ngc('collect')\nlocal current,environment,child=exercise()\nreturn name,before,current,environment==replacement,child(),d.upvalueid(exercise,1)==d.upvalueid(donor,1)";
-    let verified = compile_debug(source, b"@p13-h-captured-env-join.lua", LanguageProfile::Lua55);
+    let verified = compile_debug(
+        source,
+        b"@p13-h-captured-env-join.lua",
+        LanguageProfile::Lua55,
+    );
     let exercise = verified
         .module()
         .prototypes
@@ -11527,7 +11547,10 @@ fn p13_h_step3_lua55_parent_capture_environment_join_stays_coherent() {
         .find(|proto| {
             proto.parent == Some(rivetlua_core::ProtoId(0))
                 && proto.instructions.iter().any(|entry| {
-                    matches!(entry.instruction, rivetlua_core::Instruction::Closure { .. })
+                    matches!(
+                        entry.instruction,
+                        rivetlua_core::Instruction::Closure { .. }
+                    )
                 })
                 && proto.instructions.iter().any(|entry| {
                     matches!(
@@ -12727,12 +12750,15 @@ fn p13_a_pairs_accepts_native_builtin_metamethod() {
 }
 
 fn assert_only_main_coroutine_root(vm: &Vm) {
-    let main = vm.main_thread_identity().expect("coroutine 庫須保留主 thread");
+    let main = vm
+        .main_thread_identity()
+        .expect("coroutine 庫須保留主 thread");
     assert_eq!(vm.object_kind(main), Ok(ObjectKind::Coroutine));
     assert_eq!(vm.roots().total_count(), 1);
     assert_eq!(vm.roots().count(RootKind::Coroutine), 1);
     let mut rooted = None;
-    vm.roots().visit(RootKind::Coroutine, |object| rooted = Some(object));
+    vm.roots()
+        .visit(RootKind::Coroutine, |object| rooted = Some(object));
     assert_eq!(rooted, Some(main));
 }
 
@@ -12746,7 +12772,14 @@ fn p13_a_lua55_coroutine_close_without_argument_stops_current_thread() {
         b"local closed=0; local mt={__close=function() closed=closed+1 end}; local co=coroutine.create(function() local x <close> =setmetatable({},mt); coroutine.close(); closed=99 end); local ok,value=coroutine.resume(co); local wrapped=coroutine.wrap(function() coroutine.close(); return 99 end); return ok,value==nil,closed,coroutine.status(co),select('#',wrapped())",
     );
     assert_eq!(values.len(), 5);
-    assert_eq!(values[0..3], [Value::Boolean(true), Value::Boolean(true), Value::Integer(1)]);
+    assert_eq!(
+        values[0..3],
+        [
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Integer(1)
+        ]
+    );
     assert_eq!(bytes(&vm, values[3]), b"dead");
     assert_eq!(values[4], Value::Integer(0));
     assert_only_main_coroutine_root(&vm);
@@ -12766,7 +12799,14 @@ fn p13_a_lua55_native_and_protected_self_close_do_not_return_to_child() {
     assert_eq!(values[0..2], [Value::Boolean(true); 2]);
     assert_eq!(bytes(&vm, values[2]), b"dead");
     assert_eq!(values[3], Value::Integer(0));
-    assert_eq!(values[4..7], [Value::Boolean(true), Value::Boolean(true), Value::Integer(0)]);
+    assert_eq!(
+        values[4..7],
+        [
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Integer(0)
+        ]
+    );
     assert_eq!(bytes(&vm, values[7]), b"dead");
     assert_only_main_coroutine_root(&vm);
     assert_eq!(vm.ledger_snapshot().reserved, 0);
@@ -12776,7 +12816,8 @@ fn p13_a_lua55_native_and_protected_self_close_do_not_return_to_child() {
 fn p13_a_pairs_recursive_builtin_reports_protected_stack_limit() {
     for source in [
         b"local t=setmetatable({},{__pairs=pairs}); return pcall(pairs,t)".as_slice(),
-        b"local t=setmetatable({},{__pairs=tostring,__tostring=pairs}); return pcall(pairs,t)".as_slice(),
+        b"local t=setmetatable({},{__pairs=tostring,__tostring=pairs}); return pcall(pairs,t)"
+            .as_slice(),
     ] {
         let (vm, values) = run_with_basic(source);
         assert_eq!(values[0], Value::Boolean(false));

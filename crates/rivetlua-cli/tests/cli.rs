@@ -579,7 +579,10 @@ fn cli_rejects_missing_option_values_and_version_does_not_consume_stdin() {
         &[],
     );
     assert!(version.status.success());
-    assert_eq!(version.stdout, b"RivetLua 0.0.0 (Lua 5.4.9); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n");
+    assert_eq!(
+        version.stdout,
+        b"RivetLua 0.0.0 (Lua 5.4.9); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n"
+    );
     assert!(
         !version
             .stdout
@@ -654,7 +657,11 @@ fn cli_reports_unversioned_init_error_with_default_source_line() {
             &[("LUA_INIT", "error('msg')")],
         );
 
-        assert_eq!(output.status.code(), Some(1), "profile={profile}: {output:?}");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "profile={profile}: {output:?}"
+        );
         assert!(output.stdout.is_empty(), "profile={profile}: {output:?}");
         assert!(
             output
@@ -1603,9 +1610,7 @@ fn cli_repl_prints_returned_values_through_vm_local_print_for_both_profiles() {
             String::from_utf8_lossy(&overridden_print.stderr)
         );
         let mut expected = version.to_vec();
-        expected.extend_from_slice(
-            b"> select(1, 1, nil, 3)\nreplacement\t3\t1\tnil\t3\n> \n",
-        );
+        expected.extend_from_slice(b"> select(1, 1, nil, 3)\nreplacement\t3\t1\tnil\t3\n> \n");
         assert_eq!(overridden_print.stdout, expected, "profile={profile}");
 
         let print_error = run_lua(

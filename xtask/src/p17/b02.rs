@@ -1946,16 +1946,20 @@ mod tests {
     #[test]
     fn p17_b02_parser_rejects_empty_and_old_family() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        assert!(parse_mapping(
-            root,
-            r#"{"schema":"rivetlua-internal-mapping-v1","items":[]}"#
-        )
-        .is_err());
-        assert!(parse_mapping(
-            root,
-            r#"{"schema":"rivetlua-internal-mapping-v1","items":[],"pass":true}"#
-        )
-        .is_err());
+        assert!(
+            parse_mapping(
+                root,
+                r#"{"schema":"rivetlua-internal-mapping-v1","items":[]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_mapping(
+                root,
+                r#"{"schema":"rivetlua-internal-mapping-v1","items":[],"pass":true}"#
+            )
+            .is_err()
+        );
         assert!(parse_cases(r#"{"schema":"rivetlua-internal-cases-v1","cases":[]}"#).is_err());
         let old = r#"{"schema":"rivetlua-internal-cases-v1","cases":[{"case_id":"function-params","profiles":["lua55-i64f64"],"runs":[{"crate":"rivetlua-capi","target":"p17_internal_replacements","selector":"p17_internal_function_params","expected_matched":1}],"evidence":null}]}"#;
         assert!(parse_cases(old).is_err());
@@ -2026,8 +2030,11 @@ mod tests {
         assert!(super::report::validate_b01(root, &prior).is_err());
         let impacts = super::report::validate_b01_for_b02(root, &prior).unwrap();
         assert_eq!(impacts.len(), 2);
-        assert!(impacts
-            .iter()
-            .all(|impact| impact.path.ends_with("/mod.rs") || impact.path.ends_with("/report.rs")));
+        assert!(
+            impacts
+                .iter()
+                .all(|impact| impact.path.ends_with("/mod.rs")
+                    || impact.path.ends_with("/report.rs"))
+        );
     }
 }

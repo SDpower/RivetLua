@@ -707,7 +707,9 @@ impl HostServices {
     }
 
     pub(crate) fn policy_issuer(&self) -> Option<VmId> {
-        self.policy_capabilities.as_ref().map(|capabilities| capabilities.issuer)
+        self.policy_capabilities
+            .as_ref()
+            .map(|capabilities| capabilities.issuer)
     }
 
     pub(crate) fn policy_now(&self) -> Option<u64> {

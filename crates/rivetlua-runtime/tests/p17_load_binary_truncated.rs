@@ -112,14 +112,19 @@ impl HostLoadCompiler for MemoryCompiler {
             Err(BudgetedCompileError::Budget(error)) => Err(error),
             Err(BudgetedCompileError::Frontend(error)) => {
                 let message = error.message.as_bytes();
-                let work = message.len().checked_add(1)
+                let work = message
+                    .len()
+                    .checked_add(1)
                     .ok_or_else(|| HostLoadError::new(HostLoadErrorKind::Budget, Vec::new()))?;
-                let capacity_upper = message.len().checked_mul(2)
+                let capacity_upper = message
+                    .len()
+                    .checked_mul(2)
                     .ok_or_else(|| HostLoadError::new(HostLoadErrorKind::Budget, Vec::new()))?;
                 budget.spend_work(work)?;
                 budget.claim_temporary(capacity_upper)?;
                 let mut diagnostic = Vec::new();
-                diagnostic.try_reserve_exact(message.len())
+                diagnostic
+                    .try_reserve_exact(message.len())
                     .map_err(|_| HostLoadError::new(HostLoadErrorKind::Failed, Vec::new()))?;
                 if diagnostic.capacity() > capacity_upper {
                     return Err(HostLoadError::new(HostLoadErrorKind::Budget, Vec::new()));
@@ -147,8 +152,7 @@ fn compile_runner(source: &[u8], language: LanguageProfile) -> Result<VerifiedMo
     let syntax = parse(&chunk, language, &limits).map_err(|error| format!("parse: {error:?}"))?;
     let resolved = resolve(&syntax, &chunk, language, &limits)
         .map_err(|error| format!("resolve: {error:?}"))?;
-    let ir = lower(&resolved, &IrLimits::default())
-        .map_err(|error| format!("lower: {error:?}"))?;
+    let ir = lower(&resolved, &IrLimits::default()).map_err(|error| format!("lower: {error:?}"))?;
     emit_with_native_debug(
         &ir,
         &resolved,
@@ -190,9 +194,13 @@ fn source(case: Case, official_origin: bool) -> Vec<u8> {
 }
 
 fn diagnostic_contains(vm: &Vm, value: Value, expected: &[u8]) -> bool {
-    let Value::Object(object) = value else { return false };
+    let Value::Object(object) = value else {
+        return false;
+    };
     vm.with_byte_string(object, |text| {
-        text.as_bytes().windows(expected.len()).any(|part| part == expected)
+        text.as_bytes()
+            .windows(expected.len())
+            .any(|part| part == expected)
     })
     .unwrap_or(false)
 }
@@ -200,20 +208,35 @@ fn diagnostic_contains(vm: &Vm, value: Value, expected: &[u8]) -> bool {
 fn check_outcome(vm: &Vm, case: Case, outcome: &RunOutcome) -> Result<(), String> {
     match (case, outcome) {
         (Case::Prefixes, RunOutcome::Returned(values)) => match values.as_slice() {
-            [Value::Integer(10), Value::Integer(10), Value::Integer(count), Value::Integer(len)]
-                if *len > 4 && *count == *len - 1 => Ok(()),
-            _ => Err(format!("full load and every direct/reader prefix: {values:?}")),
+            [
+                Value::Integer(10),
+                Value::Integer(10),
+                Value::Integer(count),
+                Value::Integer(len),
+            ] if *len > 4 && *count == *len - 1 => Ok(()),
+            _ => Err(format!(
+                "full load and every direct/reader prefix: {values:?}"
+            )),
         },
         (Case::TextMode, RunOutcome::Returned(values)) => match values.as_slice() {
             [Value::Nil, first, Value::Nil, second]
                 if diagnostic_contains(vm, *first, b"attempt to load a binary chunk")
-                    && diagnostic_contains(vm, *second, b"attempt to load a binary chunk") => Ok(()),
+                    && diagnostic_contains(vm, *second, b"attempt to load a binary chunk") =>
+            {
+                Ok(())
+            }
             _ => Err(format!("binary text-mode diagnostics: {values:?}")),
         },
         (Case::PolicyDirect | Case::PolicyReader, RunOutcome::LuaError(error))
-            if error.kind == RuntimeErrorKind::HostPolicyLoad => Ok(()),
+            if error.kind == RuntimeErrorKind::HostPolicyLoad =>
+        {
+            Ok(())
+        }
         (Case::BudgetDirect | Case::BudgetReader, RunOutcome::LuaError(error))
-            if error.kind == RuntimeErrorKind::HostLoadBudget => Ok(()),
+            if error.kind == RuntimeErrorKind::HostLoadBudget =>
+        {
+            Ok(())
+        }
         (Case::Fuel, RunOutcome::Aborted(AbortReason::FuelExhausted)) => Ok(()),
         (_, other) => Err(format!("unexpected {case:?} outcome: {other:?}")),
     }
@@ -225,7 +248,14 @@ fn run_case(
     case: Case,
     official_origin: bool,
 ) -> Result<(), String> {
-    let label = format!("{profile:?} {case:?} {}", if official_origin { "official" } else { "native" });
+    let label = format!(
+        "{profile:?} {case:?} {}",
+        if official_origin {
+            "official"
+        } else {
+            "native"
+        }
+    );
     let module = compile_runner(&source(case, official_origin), language)
         .map_err(|error| format!("{label} compile: {error}"))?;
     let dump_limits = DumpLimits {
@@ -252,11 +282,16 @@ fn run_case(
         load = load.with_official_bytecode(true);
     }
     let services = HostServices::deny_all()
-        .and_dump(DumpCapability::deny_all().with_official_bytecode(true).with_limits(dump_limits))
+        .and_dump(
+            DumpCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(dump_limits),
+        )
         .and_load(load);
     let mut vm = Vm::new_with_services(profile, services)
         .map_err(|error| format!("{label} VM: {error:?}"))?;
-    let environment = vm.allocate_table()
+    let environment = vm
+        .allocate_table()
         .map_err(|error| format!("{label} environment: {error:?}"))?;
     vm.install_basic_builtins(environment)
         .map_err(|error| format!("{label} basic: {error:?}"))?;
@@ -264,25 +299,36 @@ fn run_case(
         .map_err(|error| format!("{label} string: {error:?}"))?;
     if matches!(case, Case::Fuel) {
         let fixture = match profile {
-            LuaProfile::Lua54 => include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice(),
-            LuaProfile::Lua55 => include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice(),
+            LuaProfile::Lua54 => {
+                include_bytes!("official_chunk_fixtures/lua54-small-return.luac").as_slice()
+            }
+            LuaProfile::Lua55 => {
+                include_bytes!("official_chunk_fixtures/lua55-small-return.luac").as_slice()
+            }
         };
-        let key = vm.allocate_byte_string(b"chunk")
+        let key = vm
+            .allocate_byte_string(b"chunk")
             .map_err(|error| format!("{label} key: {error:?}"))?;
-        let value = vm.allocate_byte_string(fixture)
+        let value = vm
+            .allocate_byte_string(fixture)
             .map_err(|error| format!("{label} fixture: {error:?}"))?;
         vm.raw_set(environment, Value::Object(key), Value::Object(value))
             .map_err(|error| format!("{label} fixture global: {error:?}"))?;
     }
     let baseline = RootKind::ALL.map(|kind| vm.roots().count(kind));
-    let environment_root = vm.add_root(RootKind::Host, environment)
+    let environment_root = vm
+        .add_root(RootKind::Host, environment)
         .map_err(|error| format!("{label} root: {error:?}"))?;
     vm.set_collect_every_allocation(true);
     let run_result = {
         match vm.load_with_environment(module, Value::Object(environment)) {
             Ok(mut execution) => {
                 let result = execution
-                    .set_fuel(if matches!(case, Case::Fuel) { 100 } else { EXECUTION_FUEL })
+                    .set_fuel(if matches!(case, Case::Fuel) {
+                        100
+                    } else {
+                        EXECUTION_FUEL
+                    })
                     .and_then(|()| execution.run());
                 drop(execution);
                 result.map_err(|error| ("run", error))
@@ -298,8 +344,12 @@ fn run_case(
         }
         Err((stage, error)) => vec![format!(
             "{stage} kind={:?} id={} proto={:?} pc={:?} depth={:?} value={:?}",
-            error.kind, error.diagnostic_id, error.source_prototype,
-            error.source_pc, error.source_depth, error.value
+            error.kind,
+            error.diagnostic_id,
+            error.source_prototype,
+            error.source_pc,
+            error.source_depth,
+            error.value
         )],
     };
     if let Err(error) = vm.remove_root(environment_root) {
@@ -308,14 +358,21 @@ fn run_case(
     for (index, kind) in RootKind::ALL.into_iter().enumerate() {
         let actual = vm.roots().count(kind);
         if actual != baseline[index] {
-            failures.push(format!("{kind:?} roots={actual}; baseline={}", baseline[index]));
+            failures.push(format!(
+                "{kind:?} roots={actual}; baseline={}",
+                baseline[index]
+            ));
         }
     }
     let reserved = vm.ledger_snapshot().reserved;
     if reserved != 0 {
         failures.push(format!("ledger reserved={reserved}; expected 0"));
     }
-    if failures.is_empty() { Ok(()) } else { Err(format!("{label}: {}", failures.join("; "))) }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{label}: {}", failures.join("; ")))
+    }
 }
 
 #[test]
@@ -368,11 +425,13 @@ assert(#values == 254 and values[254] == 10)
 local bad, message = load(code .. ",10")
 assert(not bad and type(message) == "string" and string.find(message, "too many returns"))
 return #values, values[254], bad, message
-"#.as_slice(),
+"#
+        .as_slice(),
         ReturnLimitCase::Policy | ReturnLimitCase::Budget => br#"
 local code = "return 10" .. string.rep(",10", 254)
 return load(code)
-"#.as_slice(),
+"#
+        .as_slice(),
     };
     let mut source = b"local function exercise()\n".to_vec();
     source.extend_from_slice(body);
@@ -429,18 +488,24 @@ fn run_return_limit_case(case: ReturnLimitCase) -> Result<(), String> {
         load = load.with_official_bytecode(true);
     }
     let services = HostServices::deny_all()
-        .and_dump(DumpCapability::deny_all().with_official_bytecode(true).with_limits(dump_limits))
+        .and_dump(
+            DumpCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(dump_limits),
+        )
         .and_load(load);
     let mut vm = Vm::new_with_services(LuaProfile::Lua55, services)
         .map_err(|error| format!("{label} VM: {error:?}"))?;
-    let environment = vm.allocate_table()
+    let environment = vm
+        .allocate_table()
         .map_err(|error| format!("{label} environment: {error:?}"))?;
     vm.install_basic_builtins(environment)
         .map_err(|error| format!("{label} basic: {error:?}"))?;
     vm.install_string_builtins(environment)
         .map_err(|error| format!("{label} string: {error:?}"))?;
     let baseline = RootKind::ALL.map(|kind| vm.roots().count(kind));
-    let environment_root = vm.add_root(RootKind::Host, environment)
+    let environment_root = vm
+        .add_root(RootKind::Host, environment)
         .map_err(|error| format!("{label} root: {error:?}"))?;
     vm.set_collect_every_allocation(true);
     let run_result = {
@@ -467,13 +532,22 @@ fn run_return_limit_case(case: ReturnLimitCase) -> Result<(), String> {
                     RunOutcome::Returned(values),
                 ) => match values.as_slice() {
                     [Value::Integer(254), Value::Integer(10), Value::Nil, message]
-                        if diagnostic_contains(&vm, *message, b"too many returns") => Ok(()),
+                        if diagnostic_contains(&vm, *message, b"too many returns") =>
+                    {
+                        Ok(())
+                    }
                     _ => Err(format!("254/255 return boundary: {values:?}")),
                 },
                 (ReturnLimitCase::Policy, RunOutcome::LuaError(error))
-                    if error.kind == RuntimeErrorKind::HostPolicyLoad => Ok(()),
+                    if error.kind == RuntimeErrorKind::HostPolicyLoad =>
+                {
+                    Ok(())
+                }
                 (ReturnLimitCase::Budget, RunOutcome::LuaError(error))
-                    if error.kind == RuntimeErrorKind::HostLoadBudget => Ok(()),
+                    if error.kind == RuntimeErrorKind::HostLoadBudget =>
+                {
+                    Ok(())
+                }
                 (_, other) => Err(format!("unexpected return-limit outcome: {other:?}")),
             };
             drop(outcome);
@@ -481,8 +555,12 @@ fn run_return_limit_case(case: ReturnLimitCase) -> Result<(), String> {
         }
         Err((stage, error)) => vec![format!(
             "{stage} kind={:?} id={} proto={:?} pc={:?} depth={:?} value={:?}",
-            error.kind, error.diagnostic_id, error.source_prototype,
-            error.source_pc, error.source_depth, error.value
+            error.kind,
+            error.diagnostic_id,
+            error.source_prototype,
+            error.source_pc,
+            error.source_depth,
+            error.value
         )],
     };
     if let Err(error) = vm.remove_root(environment_root) {
@@ -491,14 +569,21 @@ fn run_return_limit_case(case: ReturnLimitCase) -> Result<(), String> {
     for (index, kind) in RootKind::ALL.into_iter().enumerate() {
         let actual = vm.roots().count(kind);
         if actual != baseline[index] {
-            failures.push(format!("{kind:?} roots={actual}; baseline={}", baseline[index]));
+            failures.push(format!(
+                "{kind:?} roots={actual}; baseline={}",
+                baseline[index]
+            ));
         }
     }
     let reserved = vm.ledger_snapshot().reserved;
     if reserved != 0 {
         failures.push(format!("ledger reserved={reserved}; expected 0"));
     }
-    if failures.is_empty() { Ok(()) } else { Err(format!("{label}: {}", failures.join("; "))) }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{label}: {}", failures.join("; ")))
+    }
 }
 
 #[test]

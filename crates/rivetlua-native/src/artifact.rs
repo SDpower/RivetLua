@@ -1,9 +1,12 @@
 //! P20 JIT 與 P21 AOT 共用的密封碼身分與白名單。
 
-use rivetlua_core::bytecode::{BinaryOperation, BytecodeConstant, BytecodePrototype, Instruction, InstructionEffects, UnaryOperation};
-use rivetlua_core::{LuaProfile, ProtoId, RVLU_V2, VerifiedModule, VmId};
 use crate::abi::{NativeError, NativeExit, NativeState};
 use crate::execmem::{self, ExecutableCode};
+use rivetlua_core::bytecode::{
+    BinaryOperation, BytecodeConstant, BytecodePrototype, Instruction, InstructionEffects,
+    UnaryOperation,
+};
+use rivetlua_core::{LuaProfile, ProtoId, RVLU_V2, VerifiedModule, VmId};
 
 pub const BACKEND_VERSION: &str = "cranelift-0.134.2-rvlu-v2-1";
 pub const CODE_VERSION: u32 = 1;
@@ -37,13 +40,27 @@ pub(crate) struct ValidatedCode {
 }
 
 impl ValidatedCode {
-    pub(crate) fn bytes(&self) -> &[u8] { &self.bytes }
-    pub(crate) fn entry_offset(&self) -> usize { self.entry_offset }
-    pub(crate) fn entry_pc(&self) -> u64 { self.entry_pc }
-    pub(crate) fn max_pc(&self) -> u64 { self.max_pc }
-    pub(crate) fn register_count(&self) -> usize { self.register_count }
-    pub(crate) fn target(&self) -> &str { &self.target }
-    pub(crate) fn required_cpu_features(&self) -> &[&str] { &self.required_cpu_features }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(crate) fn entry_offset(&self) -> usize {
+        self.entry_offset
+    }
+    pub(crate) fn entry_pc(&self) -> u64 {
+        self.entry_pc
+    }
+    pub(crate) fn max_pc(&self) -> u64 {
+        self.max_pc
+    }
+    pub(crate) fn register_count(&self) -> usize {
+        self.register_count
+    }
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+    pub(crate) fn required_cpu_features(&self) -> &[&str] {
+        &self.required_cpu_features
+    }
 }
 
 pub struct NativeArtifact {
@@ -65,17 +82,27 @@ pub struct NativeArtifact {
 }
 
 impl NativeArtifact {
-    pub fn validate(module: &VerifiedModule, prototype_index: usize) -> Result<(), NativeCompileError> {
+    pub fn validate(
+        module: &VerifiedModule,
+        prototype_index: usize,
+    ) -> Result<(), NativeCompileError> {
         if module.format_version() != RVLU_V2 {
             return Err(NativeCompileError::Rejected("RVLU version"));
         }
-        let prototype = module.module().prototypes.get(prototype_index)
+        let prototype = module
+            .module()
+            .prototypes
+            .get(prototype_index)
             .ok_or(NativeCompileError::Rejected("prototype index"))?;
-        if prototype.register_count == 0 || prototype.register_count > 4096
-            || prototype.instructions.is_empty() || prototype.instructions.len() > 100_000
+        if prototype.register_count == 0
+            || prototype.register_count > 4096
+            || prototype.instructions.is_empty()
+            || prototype.instructions.len() > 100_000
             || !prototype.close_paths.is_empty()
         {
-            return Err(NativeCompileError::Rejected("function limits or close path"));
+            return Err(NativeCompileError::Rejected(
+                "function limits or close path",
+            ));
         }
         check_prototype(prototype)?;
         execmem::platform_preflight().map_err(NativeCompileError::Native)
@@ -84,27 +111,60 @@ impl NativeArtifact {
     pub fn execute(&self, state: &mut NativeState<'_>) -> Result<NativeExit, NativeError> {
         self.code.execute(state)
     }
-    pub fn module_digest(&self) -> [u8; 32] { self.module_digest }
-    pub fn vm_id(&self) -> VmId { self.vm_id }
-    pub fn function_id(&self) -> ProtoId { self.function_id }
-    pub fn function(&self) -> u32 { self.function }
-    pub fn format_version(&self) -> rivetlua_core::BytecodeVersion { self.format_version }
-    pub fn code_version(&self) -> u32 { self.code_version }
-    pub fn profile(&self) -> LuaProfile { self.profile }
-    pub fn numeric_config(&self) -> u8 { self.numeric_config }
-    pub fn entry_pc(&self) -> usize { self.entry_pc }
-    pub fn register_mask(&self) -> &[bool] { &self.register_mask }
-    pub fn code_bytes(&self) -> usize { self.code_bytes }
-    pub fn allocated_bytes(&self) -> usize { self.code.allocated_bytes() }
+    pub fn module_digest(&self) -> [u8; 32] {
+        self.module_digest
+    }
+    pub fn vm_id(&self) -> VmId {
+        self.vm_id
+    }
+    pub fn function_id(&self) -> ProtoId {
+        self.function_id
+    }
+    pub fn function(&self) -> u32 {
+        self.function
+    }
+    pub fn format_version(&self) -> rivetlua_core::BytecodeVersion {
+        self.format_version
+    }
+    pub fn code_version(&self) -> u32 {
+        self.code_version
+    }
+    pub fn profile(&self) -> LuaProfile {
+        self.profile
+    }
+    pub fn numeric_config(&self) -> u8 {
+        self.numeric_config
+    }
+    pub fn entry_pc(&self) -> usize {
+        self.entry_pc
+    }
+    pub fn register_mask(&self) -> &[bool] {
+        &self.register_mask
+    }
+    pub fn code_bytes(&self) -> usize {
+        self.code_bytes
+    }
+    pub fn allocated_bytes(&self) -> usize {
+        self.code.allocated_bytes()
+    }
     pub fn metadata_bytes(&self) -> usize {
-        self.code.metadata_bytes()
+        self.code
+            .metadata_bytes()
             .saturating_add(self.register_mask.capacity())
             .saturating_add(self.target.capacity())
     }
-    pub fn compile_ns(&self) -> u64 { self.compile_ns }
-    pub fn target(&self) -> &str { &self.target }
-    pub fn cpu_features(&self) -> &'static [&'static str] { self.cpu_features }
-    pub fn backend_version(&self) -> &'static str { BACKEND_VERSION }
+    pub fn compile_ns(&self) -> u64 {
+        self.compile_ns
+    }
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+    pub fn cpu_features(&self) -> &'static [&'static str] {
+        self.cpu_features
+    }
+    pub fn backend_version(&self) -> &'static str {
+        BACKEND_VERSION
+    }
     pub fn matches_identity(
         &self,
         module: &VerifiedModule,
@@ -132,7 +192,9 @@ impl NativeArtifact {
     }
 }
 
-pub(crate) fn check_prototype(prototype: &BytecodePrototype) -> Result<Vec<bool>, NativeCompileError> {
+pub(crate) fn check_prototype(
+    prototype: &BytecodePrototype,
+) -> Result<Vec<bool>, NativeCompileError> {
     let mut mask = vec![false; usize::from(prototype.register_count)];
     let count = prototype.instructions.len();
     for (pc, entry) in prototype.instructions.iter().enumerate() {
@@ -143,29 +205,51 @@ pub(crate) fn check_prototype(prototype: &BytecodePrototype) -> Result<Vec<bool>
         let flags = instruction.effects().encoded_flags();
         let allowed = match instruction {
             Instruction::LoadConst { constant, .. } => {
-                matches!(prototype.constants.get(constant.0 as usize),
-                    Some(BytecodeConstant::Integer(_) | BytecodeConstant::FloatBits(_)
-                        | BytecodeConstant::Boolean(_))) && flags == 0
+                matches!(
+                    prototype.constants.get(constant.0 as usize),
+                    Some(
+                        BytecodeConstant::Integer(_)
+                            | BytecodeConstant::FloatBits(_)
+                            | BytecodeConstant::Boolean(_)
+                    )
+                ) && flags == 0
             }
-            Instruction::LoadNil { .. } | Instruction::Move { .. }
-            | Instruction::Jump { .. } | Instruction::JumpIfFalse { .. }
+            Instruction::LoadNil { .. }
+            | Instruction::Move { .. }
+            | Instruction::Jump { .. }
+            | Instruction::JumpIfFalse { .. }
             | Instruction::Return { .. } => flags == 0,
-            Instruction::UnaryOp { op: UnaryOperation::Negate | UnaryOperation::Not, .. }
-            | Instruction::BinaryOp { op: BinaryOperation::Add | BinaryOperation::Subtract
-                | BinaryOperation::Multiply | BinaryOperation::Equal
-                | BinaryOperation::NotEqual | BinaryOperation::Less
-                | BinaryOperation::LessEqual | BinaryOperation::Greater
-                | BinaryOperation::GreaterEqual, .. } => {
-                    flags == (InstructionEffects::MAY_CALL | InstructionEffects::MAY_YIELD
-                        | InstructionEffects::MAY_ERROR | InstructionEffects::SAFE_POINT)
-                }
+            Instruction::UnaryOp {
+                op: UnaryOperation::Negate | UnaryOperation::Not,
+                ..
+            }
+            | Instruction::BinaryOp {
+                op:
+                    BinaryOperation::Add
+                    | BinaryOperation::Subtract
+                    | BinaryOperation::Multiply
+                    | BinaryOperation::Equal
+                    | BinaryOperation::NotEqual
+                    | BinaryOperation::Less
+                    | BinaryOperation::LessEqual
+                    | BinaryOperation::Greater
+                    | BinaryOperation::GreaterEqual,
+                ..
+            } => {
+                flags
+                    == (InstructionEffects::MAY_CALL
+                        | InstructionEffects::MAY_YIELD
+                        | InstructionEffects::MAY_ERROR
+                        | InstructionEffects::SAFE_POINT)
+            }
             _ => false,
         };
         if !allowed {
             return Err(NativeCompileError::Unsupported("instruction or effect"));
         }
         if let Instruction::LoadNil { start, count } = instruction {
-            if usize::from(start.0).checked_add(usize::from(*count))
+            if usize::from(start.0)
+                .checked_add(usize::from(*count))
                 .is_none_or(|end| end > mask.len())
             {
                 return Err(NativeCompileError::Rejected("nil register range"));
@@ -173,17 +257,21 @@ pub(crate) fn check_prototype(prototype: &BytecodePrototype) -> Result<Vec<bool>
         }
         let effects = instruction.effects();
         for register in effects.reads.iter().chain(effects.writes.iter()) {
-            let slot = mask.get_mut(usize::from(register.0))
+            let slot = mask
+                .get_mut(usize::from(register.0))
                 .ok_or(NativeCompileError::Rejected("register effect"))?;
             *slot = true;
         }
         match instruction {
             Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. }
                 if target.0 as usize >= count =>
-                    return Err(NativeCompileError::Rejected("jump target")),
+            {
+                return Err(NativeCompileError::Rejected("jump target"));
+            }
             Instruction::Return { .. } => {}
-            _ if pc + 1 == count && !matches!(instruction, Instruction::Jump { .. }) =>
-                return Err(NativeCompileError::Rejected("fallthrough")),
+            _ if pc + 1 == count && !matches!(instruction, Instruction::Jump { .. }) => {
+                return Err(NativeCompileError::Rejected("fallthrough"));
+            }
             _ => {}
         }
     }

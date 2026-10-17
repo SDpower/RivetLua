@@ -7,9 +7,7 @@ use rivetlua_core::{
     Instruction, LuaProfile, OfficialChunkLimits, OfficialWorkBudget, ProtoId, Value,
     VerifiedModule, VerifyLimits, decode_official_chunk,
 };
-use rivetlua_runtime::{
-    DebugCapability, DebugPermission, HostServices, RootKind, RunOutcome, Vm,
-};
+use rivetlua_runtime::{DebugCapability, DebugPermission, HostServices, RootKind, RunOutcome, Vm};
 
 const SOURCE: &[u8] = br#"
 local trace = ''
@@ -115,7 +113,11 @@ fn relocate_official_iterator_nil(chunk: &mut rivetlua_core::OfficialChunk) {
             Some((call_pc + 2, comparison_pc, old_nil))
         })
         .collect();
-    assert_eq!(candidates.len(), 1, "須有唯一的官方 iterator CALL/MOVE/LOADNIL/EQ");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "須有唯一的官方 iterator CALL/MOVE/LOADNIL/EQ"
+    );
     let (nil_pc, comparison_pc, old_nil) = candidates[0];
     let spare = u32::from(chunk.main.max_stack_size);
     assert!(spare < 255, "官方 maxstack 須容許新增一個未命名槽");
@@ -186,8 +188,7 @@ fn relay_official_iterator_control(chunk: &mut rivetlua_core::OfficialChunk) {
         })
         .collect();
     assert!(!jumps.iter().any(|(_, target)| *target == insert_pc as i64));
-    code[control_move_pc] =
-        (code[control_move_pc] & !(0xff << 16)) | (relay << 16);
+    code[control_move_pc] = (code[control_move_pc] & !(0xff << 16)) | (relay << 16);
     code.insert(insert_pc, (relay << 7) | (control << 16));
     for (old_pc, old_target) in jumps {
         let pc = old_pc + if old_pc >= insert_pc { 1 } else { 0 };
@@ -227,26 +228,36 @@ fn official_call_uses_separate_iterator_nil(module: &VerifiedModule) -> bool {
         let Some(guest) = artifact.prototype(prototype.id) else {
             return false;
         };
-        prototype.instructions.windows(3).enumerate().any(|(pc, window)| {
-            let (
-                Instruction::Call { base, arg_count: 2, .. },
-                Instruction::Move { dest: result, src },
-                Instruction::LoadNil { start: nil, count: 1 },
-            ) = (
-                &window[0].instruction,
-                &window[1].instruction,
-                &window[2].instruction,
-            ) else {
-                return false;
-            };
-            *src == *base
-                && *result != *nil
-                && *nil != *base
-                && map.rvlu_to_official()[pc]
-                    .source_pc()
-                    .and_then(|source_pc| guest.code.get(source_pc as usize))
-                    .is_some_and(|word| word & 0x7f == 68)
-        })
+        prototype
+            .instructions
+            .windows(3)
+            .enumerate()
+            .any(|(pc, window)| {
+                let (
+                    Instruction::Call {
+                        base, arg_count: 2, ..
+                    },
+                    Instruction::Move { dest: result, src },
+                    Instruction::LoadNil {
+                        start: nil,
+                        count: 1,
+                    },
+                ) = (
+                    &window[0].instruction,
+                    &window[1].instruction,
+                    &window[2].instruction,
+                )
+                else {
+                    return false;
+                };
+                *src == *base
+                    && *result != *nil
+                    && *nil != *base
+                    && map.rvlu_to_official()[pc]
+                        .source_pc()
+                        .and_then(|source_pc| guest.code.get(source_pc as usize))
+                        .is_some_and(|word| word & 0x7f == 68)
+            })
     })
 }
 
@@ -304,17 +315,26 @@ fn diagnose(module: &VerifiedModule, label: &str) {
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                matches!(entry.instruction, Instruction::Call { .. } | Instruction::TailCall { .. })
+                matches!(
+                    entry.instruction,
+                    Instruction::Call { .. } | Instruction::TailCall { .. }
+                )
             })
             .map(|(pc, entry)| (pc, &entry.instruction))
             .collect();
         eprintln!("{label} {:?} calls={calls:?}", proto.id);
-        if let Some(native) = module.native_debug().and_then(|debug| debug.prototype(proto.id)) {
+        if let Some(native) = module
+            .native_debug()
+            .and_then(|debug| debug.prototype(proto.id))
+        {
             eprintln!("{label} {:?} native locals={:?}", proto.id, native.locals);
         }
         if let Some(artifact) = module.official_artifact() {
             if let Some(guest) = artifact.prototype(proto.id) {
-                eprintln!("{label} {:?} official locals={:?}", proto.id, guest.debug.locals);
+                eprintln!(
+                    "{label} {:?} official locals={:?}",
+                    proto.id, guest.debug.locals
+                );
             }
             if let Some(map) = artifact.pc_map(proto.id) {
                 if let Some(plan) = module.official_execution() {
@@ -338,7 +358,10 @@ fn diagnose(module: &VerifiedModule, label: &str) {
                 if (proto.id == ProtoId(0) && (452..=507).contains(&pc))
                     || (proto.id == ProtoId(4) && pc <= 24)
                 {
-                    eprintln!("{label} {:?} instruction {pc}: {:?}", proto.id, entry.instruction);
+                    eprintln!(
+                        "{label} {:?} instruction {pc}: {:?}",
+                        proto.id, entry.instruction
+                    );
                 }
             }
         }
@@ -367,14 +390,18 @@ fn p17_debug_rebound_local_call_names_survive_control_flow_and_full_dump() {
             &mut OfficialWorkBudget::new(u64::MAX),
         )
         .unwrap();
-        let chunk = decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
+        let chunk =
+            decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
         let official = translate_official_chunk(&chunk, &VerifyLimits::default())
             .unwrap()
             .verified()
             .clone();
         for (label, module) in [("native", native), ("official", official)] {
             let actual = run(module.clone(), profile);
-            eprintln!("{profile:?} {label} call names: {}", String::from_utf8_lossy(&actual));
+            eprintln!(
+                "{profile:?} {label} call names: {}",
+                String::from_utf8_lossy(&actual)
+            );
             if actual != expected {
                 diagnose(&module, label);
                 mismatches.push(format!(
@@ -418,7 +445,11 @@ fn p17_debug_stripped_dump_does_not_invent_local_call_name() {
                 .unwrap()
                 .verified()
                 .clone();
-            assert_eq!(run(official, profile), *expected, "{profile:?} strip={strip}");
+            assert_eq!(
+                run(official, profile),
+                *expected,
+                "{profile:?} strip={strip}"
+            );
         }
     }
 }
@@ -444,7 +475,8 @@ fn p17_debug_iterator_name_survives_separate_nil_slot_and_plain_call() {
             &mut OfficialWorkBudget::new(u64::MAX),
         )
         .unwrap();
-        let mut chunk = decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
+        let mut chunk =
+            decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
         let original = translate_official_chunk(&chunk, &VerifyLimits::default())
             .unwrap()
             .verified()

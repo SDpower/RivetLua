@@ -30,7 +30,8 @@ fn p17_sequential_statements_reuse_temporary_registers() {
 
 #[test]
 fn p17_helper_private_slots_survive_statement_reuse() {
-    let source = b"local function f() return 1, 2 end\nlocal t = {f()}\nlocal x = 3\nreturn t[1], t[2], x\n";
+    let source =
+        b"local function f() return 1, 2 end\nlocal t = {f()}\nlocal x = 3\nreturn t[1], t[2], x\n";
     let limits = CompileLimits::default();
     for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
         let tokens = lex(source, profile, &limits).unwrap();

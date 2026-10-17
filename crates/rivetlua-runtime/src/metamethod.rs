@@ -289,7 +289,10 @@ mod tests {
         );
         assert_eq!(vm.ledger_snapshot(), limited);
         assert_eq!(vm.roots().total_count(), roots_before);
-        assert_eq!(vm.allocate_byte_string(b"still-allocated"), Err(VmError::AllocationFailed));
+        assert_eq!(
+            vm.allocate_byte_string(b"still-allocated"),
+            Err(VmError::AllocationFailed)
+        );
         assert_eq!(vm.ledger_snapshot(), limited);
         vm.set_allocation_limit(before.limit);
 

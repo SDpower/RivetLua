@@ -1,13 +1,13 @@
 //! 官方 Lua 指令的驗證與 RVLU_V2 轉譯。
 
 use alloc::string::String;
-use alloc::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::string::ToString;
+use alloc::vec::Vec;
 
-use core::mem::size_of;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
+use core::mem::size_of;
 
 use super::official::{
     OfficialChunk, OfficialChunkError, OfficialChunkErrorKind, OfficialChunkLimits,
@@ -4573,9 +4573,10 @@ fn translate_prototype(
             // 官方條件指令在同一次 dispatch 內消費緊接的 JMP；保留原 JMP 的
             // 獨立 anchor，讓其他合法入邊直接進入時仍以一般指令計數。
             let jump_pc = pc + 1;
-            let next = validated.ops.get(jump_pc).ok_or_else(|| {
-                invalid(entry.id, pc, "條件 opcode 缺少 JMP")
-            })?;
+            let next = validated
+                .ops
+                .get(jump_pc)
+                .ok_or_else(|| invalid(entry.id, pc, "條件 opcode 缺少 JMP"))?;
             if next.opcode != 56 {
                 return Err(invalid(entry.id, pc, "條件 opcode 必須緊接 JMP"));
             }
@@ -4591,7 +4592,12 @@ fn translate_prototype(
                 limits,
                 entry.id,
                 pc,
-                entry_at(pc, Instruction::Jump { target: InstructionOffset(0) }),
+                entry_at(
+                    pc,
+                    Instruction::Jump {
+                        target: InstructionOffset(0),
+                    },
+                ),
             )?;
         }
         if decoded.opcode == 78 || decoded.opcode == 82 && profile == LuaProfile::Lua55 {

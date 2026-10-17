@@ -7,9 +7,7 @@ use rivetlua_core::{
     LuaProfile, OfficialChunkLimits, OfficialWorkBudget, ProtoId, Value, VerifyLimits,
     decode_official_chunk,
 };
-use rivetlua_runtime::{
-    DebugCapability, DebugPermission, HostServices, RootKind, RunOutcome, Vm,
-};
+use rivetlua_runtime::{DebugCapability, DebugPermission, HostServices, RootKind, RunOutcome, Vm};
 use std::env;
 
 fn profile() -> (&'static str, LanguageProfile, LuaProfile) {
@@ -122,15 +120,8 @@ fn official_root_roundtrip(
     let verify_limits = VerifyLimits::default();
     let chunk_limits = OfficialChunkLimits::default();
     let mut work = OfficialWorkBudget::for_limits(&verify_limits).unwrap();
-    let bytes = emit_official_chunk(
-        module,
-        ProtoId(0),
-        profile,
-        strip,
-        &chunk_limits,
-        &mut work,
-    )
-    .unwrap();
+    let bytes =
+        emit_official_chunk(module, ProtoId(0), profile, strip, &chunk_limits, &mut work).unwrap();
     let decoded = decode_official_chunk(&bytes, profile, &chunk_limits).unwrap();
     translate_official_chunk(&decoded, &verify_limits)
         .unwrap()
@@ -143,11 +134,7 @@ fn p17_debug_temporary_operands_survive_select_hooks_and_dump_roundtrip() {
     for nested_select in [false, true] {
         for hook_enabled in [false, true] {
             let source = case_source(nested_select, hook_enabled);
-            let native = compile_debug(
-                source.as_bytes(),
-                b"@p17-debug-temporaries.lua",
-                language,
-            );
+            let native = compile_debug(source.as_bytes(), b"@p17-debug-temporaries.lua", language);
             for mode in ["direct", "full", "strip"] {
                 let module = match mode {
                     "direct" => native.clone(),
@@ -161,11 +148,8 @@ fn p17_debug_temporary_operands_survive_select_hooks_and_dump_roundtrip() {
                     .allow(DebugPermission::LocalInspection)
                     .allow(DebugPermission::LocalMutation)
                     .allow(DebugPermission::EventHook);
-                let (vm, outcome) = run_with_h_debug(
-                    module,
-                    HostServices::deny_all().and_debug(debug),
-                    2_000_000,
-                );
+                let (vm, outcome) =
+                    run_with_h_debug(module, HostServices::deny_all().and_debug(debug), 2_000_000);
                 let RunOutcome::Returned(values) = outcome else {
                     panic!(
                         "profile={}: mode={mode}, nested_select={nested_select}, hook={hook_enabled}: {outcome:?}",
@@ -189,8 +173,7 @@ fn p17_debug_temporary_operands_survive_select_hooks_and_dump_roundtrip() {
                     );
                 };
                 assert_eq!(
-                    hook_seen,
-                    hook_enabled,
+                    hook_seen, hook_enabled,
                     "hook call dictionary 狀態: mode={mode}, nested_select={nested_select}"
                 );
                 assert_eq!(

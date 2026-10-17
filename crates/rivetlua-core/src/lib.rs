@@ -71,7 +71,9 @@ pub use number::{
     multiply, negate, number_from_value, power, shift_left, shift_right, subtract,
 };
 pub use profile::ProfileRules;
-pub use target::{BoardConfig, DeploymentStatus, Endian, ExecMemoryPolicy, TargetDescriptor, TargetError};
+pub use target::{
+    BoardConfig, DeploymentStatus, Endian, ExecMemoryPolicy, TargetDescriptor, TargetError,
+};
 pub use value::{
     Generation, HostFunctionId, ObjectId, ObjectRef, SlotId, Value, ValueKind, VmId, select_and,
     select_or,

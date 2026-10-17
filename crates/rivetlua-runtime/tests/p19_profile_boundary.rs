@@ -1,4 +1,6 @@
-use rivetlua_compiler::{CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve};
+use rivetlua_compiler::{
+    CompileLimits, IrLimits, LanguageProfile, emit, lex, lower, parse, resolve,
+};
 use rivetlua_core::{LuaProfile, Value, VerifyLimits};
 use rivetlua_runtime::{RunOutcome, Vm};
 

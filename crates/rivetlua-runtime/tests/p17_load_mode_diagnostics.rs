@@ -115,12 +115,36 @@ struct Case {
 }
 
 const CASES: [Case; 6] = [
-    Case { name: "text_direct_binary_mode", body: TEXT_DIRECT_BINARY_MODE, diagnostic: b"attempt to load a text chunk" },
-    Case { name: "text_reader_binary_mode", body: TEXT_READER_BINARY_MODE, diagnostic: b"attempt to load a text chunk" },
-    Case { name: "binary_direct_text_mode", body: BINARY_DIRECT_TEXT_MODE, diagnostic: b"attempt to load a binary chunk" },
-    Case { name: "binary_reader_text_mode", body: BINARY_READER_TEXT_MODE, diagnostic: b"attempt to load a binary chunk" },
-    Case { name: "invalid_prefix_direct", body: INVALID_PREFIX_DIRECT, diagnostic: b"unexpected symbol" },
-    Case { name: "invalid_prefix_reader", body: INVALID_PREFIX_READER, diagnostic: b"unexpected symbol" },
+    Case {
+        name: "text_direct_binary_mode",
+        body: TEXT_DIRECT_BINARY_MODE,
+        diagnostic: b"attempt to load a text chunk",
+    },
+    Case {
+        name: "text_reader_binary_mode",
+        body: TEXT_READER_BINARY_MODE,
+        diagnostic: b"attempt to load a text chunk",
+    },
+    Case {
+        name: "binary_direct_text_mode",
+        body: BINARY_DIRECT_TEXT_MODE,
+        diagnostic: b"attempt to load a binary chunk",
+    },
+    Case {
+        name: "binary_reader_text_mode",
+        body: BINARY_READER_TEXT_MODE,
+        diagnostic: b"attempt to load a binary chunk",
+    },
+    Case {
+        name: "invalid_prefix_direct",
+        body: INVALID_PREFIX_DIRECT,
+        diagnostic: b"unexpected symbol",
+    },
+    Case {
+        name: "invalid_prefix_reader",
+        body: INVALID_PREFIX_READER,
+        diagnostic: b"unexpected symbol",
+    },
 ];
 
 struct MemoryCompiler;
@@ -210,8 +234,7 @@ fn compile_runner(source: &[u8], language: LanguageProfile) -> Result<VerifiedMo
     let syntax = parse(&chunk, language, &limits).map_err(|error| format!("parse: {error:?}"))?;
     let resolved = resolve(&syntax, &chunk, language, &limits)
         .map_err(|error| format!("resolve: {error:?}"))?;
-    let ir = lower(&resolved, &IrLimits::default())
-        .map_err(|error| format!("lower: {error:?}"))?;
+    let ir = lower(&resolved, &IrLimits::default()).map_err(|error| format!("lower: {error:?}"))?;
     emit_with_native_debug(
         &ir,
         &resolved,
@@ -252,23 +275,37 @@ fn check_outcome(vm: &Vm, outcome: &RunOutcome, case: Case) -> Vec<String> {
             }
             for (slot, label) in [(0, "direct a"), (2, "forwarded a")] {
                 if values.get(slot) != Some(&Value::Nil) {
-                    failures.push(format!("{label} expected nil; actual={:?}", values.get(slot).map(|value| describe_value(vm, *value))));
+                    failures.push(format!(
+                        "{label} expected nil; actual={:?}",
+                        values.get(slot).map(|value| describe_value(vm, *value))
+                    ));
                 }
             }
             for (slot, label) in [(1, "direct b"), (3, "forwarded b")] {
                 match values.get(slot).copied() {
                     Some(Value::Object(object)) => match vm.with_byte_string(object, |text| {
                         let bytes = text.as_bytes();
-                        (bytes.windows(case.diagnostic.len()).any(|window| window == case.diagnostic),
-                         bytes[..bytes.len().min(160)].to_vec(), bytes.len())
+                        (
+                            bytes
+                                .windows(case.diagnostic.len())
+                                .any(|window| window == case.diagnostic),
+                            bytes[..bytes.len().min(160)].to_vec(),
+                            bytes.len(),
+                        )
                     }) {
                         Ok((true, _, _)) => {}
                         Ok((false, visible, len)) => failures.push(format!(
-                            "{label} missing {:?}; actual_bytes={visible:?} total_len={len}", case.diagnostic
+                            "{label} missing {:?}; actual_bytes={visible:?} total_len={len}",
+                            case.diagnostic
                         )),
-                        Err(error) => failures.push(format!("{label} not a byte string: {error:?}")),
+                        Err(error) => {
+                            failures.push(format!("{label} not a byte string: {error:?}"))
+                        }
                     },
-                    other => failures.push(format!("{label} expected byte string; actual={:?}", other.map(|value| describe_value(vm, value)))),
+                    other => failures.push(format!(
+                        "{label} expected byte string; actual={:?}",
+                        other.map(|value| describe_value(vm, value))
+                    )),
                 }
             }
             match values.get(4).copied() {
@@ -287,7 +324,10 @@ fn check_outcome(vm: &Vm, outcome: &RunOutcome, case: Case) -> Vec<String> {
                     "forwarded msg missing: actual={:?}", other.map(|value| describe_value(vm, value))
                 )),
             }
-            if matches!(values.get(5).copied(), None | Some(Value::Nil | Value::Boolean(false))) {
+            if matches!(
+                values.get(5).copied(),
+                None | Some(Value::Nil | Value::Boolean(false))
+            ) {
                 failures.push(format!(
                     "original cannotload predicate is false/nil: actual={:?}",
                     values.get(5).map(|value| describe_value(vm, *value))
@@ -296,8 +336,12 @@ fn check_outcome(vm: &Vm, outcome: &RunOutcome, case: Case) -> Vec<String> {
         }
         RunOutcome::LuaError(error) => failures.push(format!(
             "LuaError kind={:?} id={} proto={:?} pc={:?} depth={:?} value={}",
-            error.kind, error.diagnostic_id, error.source_prototype,
-            error.source_pc, error.source_depth, describe_value(vm, error.value)
+            error.kind,
+            error.diagnostic_id,
+            error.source_prototype,
+            error.source_pc,
+            error.source_depth,
+            describe_value(vm, error.value)
         )),
         other => failures.push(format!("unexpected outcome={other:?}")),
     }
@@ -310,7 +354,11 @@ fn run_case(
     profile: LuaProfile,
     official: bool,
 ) -> Result<(), String> {
-    let origin = if official { "official_dump_load" } else { "native" };
+    let origin = if official {
+        "official_dump_load"
+    } else {
+        "native"
+    };
     let source = source(case, official);
     let module = compile_runner(&source, language)
         .map_err(|error| format!("{profile:?} {} {origin} compile: {error}", case.name))?;
@@ -324,7 +372,11 @@ fn run_case(
         ..LoadLimits::default()
     };
     let services = HostServices::deny_all()
-        .and_dump(DumpCapability::deny_all().with_official_bytecode(true).with_limits(dump_limits))
+        .and_dump(
+            DumpCapability::deny_all()
+                .with_official_bytecode(true)
+                .with_limits(dump_limits),
+        )
         .and_load(
             LoadCapability::deny_all()
                 .and_compiler(MemoryCompiler)
@@ -333,14 +385,16 @@ fn run_case(
         );
     let mut vm = Vm::new_with_services(profile, services)
         .map_err(|error| format!("{profile:?} {} {origin} VM: {error:?}", case.name))?;
-    let environment = vm.allocate_table()
+    let environment = vm
+        .allocate_table()
         .map_err(|error| format!("{profile:?} {} {origin} environment: {error:?}", case.name))?;
     vm.install_basic_builtins(environment)
         .map_err(|error| format!("{profile:?} {} {origin} basic: {error:?}", case.name))?;
     vm.install_string_builtins(environment)
         .map_err(|error| format!("{profile:?} {} {origin} string: {error:?}", case.name))?;
     let baseline = RootKind::ALL.map(|kind| vm.roots().count(kind));
-    let environment_root = vm.add_root(RootKind::Host, environment)
+    let environment_root = vm
+        .add_root(RootKind::Host, environment)
         .map_err(|error| format!("{profile:?} {} {origin} root: {error:?}", case.name))?;
     vm.set_collect_every_allocation(true);
 

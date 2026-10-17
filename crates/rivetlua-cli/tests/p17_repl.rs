@@ -215,11 +215,17 @@ fn p17_repl_stringifies_non_string_prompt_for_each_input_and_eof() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("RivetLua "), "{PROFILE}: stdout={stdout:?}");
+    assert!(
+        stdout.starts_with("RivetLua "),
+        "{PROFILE}: stdout={stdout:?}"
+    );
     let (_, transcript) = stdout
         .split_once('\n')
         .expect("REPL stdout 包含版本列與提示字串");
-    assert_eq!(transcript, "1 --\n2a = 2\n3\n", "{PROFILE}: stdout={stdout:?}");
+    assert_eq!(
+        transcript, "1 --\n2a = 2\n3\n",
+        "{PROFILE}: stdout={stdout:?}"
+    );
 }
 
 #[test]
@@ -285,8 +291,5 @@ fn p17_repl_eof_prefix_waits_for_continuation() {
         stderr.contains("未完成的 REPL 輸入"),
         "{PROFILE}: stderr={stderr:?}"
     );
-    assert!(
-        !stderr.contains("編譯失敗"),
-        "{PROFILE}: stderr={stderr:?}"
-    );
+    assert!(!stderr.contains("編譯失敗"), "{PROFILE}: stderr={stderr:?}");
 }

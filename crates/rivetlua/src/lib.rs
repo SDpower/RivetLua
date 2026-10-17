@@ -18,35 +18,35 @@ mod transport;
 
 pub use compile::{CompileBudget, CompileBudgetErrorKind, CompileBudgetLimits};
 pub use rivetlua_compiler::{CompileLimits, IrLimits};
-pub use rivetlua_core::{
-    BytecodeVersion, COMPATIBILITY_VERSION, CompatibilityEntry, InputErrorKind, InputFormat,
-    BoardConfig, DeploymentStatus, Endian, ExecMemoryPolicy, LuaProfile, ModuleOrigin,
-    OfficialChunkLimits, RVLU_NUMERIC_I64_F64, RVLU_V2, TargetDescriptor, TargetError, TransportErrorKind,
-    TransportLimits, Value, ValueKind, VerifyLimits, classify_input, compatibility_entries,
-};
 pub use rivetlua_core::sha256_bytes;
-#[cfg(any(feature = "jit", feature = "aot"))]
-pub use rivetlua_runtime::{JitEligibility, JitFallbackReason, JitPolicy, JitStats};
+pub use rivetlua_core::{
+    BoardConfig, BytecodeVersion, COMPATIBILITY_VERSION, CompatibilityEntry, DeploymentStatus,
+    Endian, ExecMemoryPolicy, InputErrorKind, InputFormat, LuaProfile, ModuleOrigin,
+    OfficialChunkLimits, RVLU_NUMERIC_I64_F64, RVLU_V2, TargetDescriptor, TargetError,
+    TransportErrorKind, TransportLimits, Value, ValueKind, VerifyLimits, classify_input,
+    compatibility_entries,
+};
 #[cfg(feature = "aot")]
 pub use rivetlua_native::{AotArtifact, AotError, AotManifest, NativeError, TrustedAotBuild};
 pub use rivetlua_runtime::{
     AbortReason, AllocationAttempt, AllocationFailure, AllocationFailureKind, AllocationLedger,
-    AllocationPeaks,
-    AllocationTrace, CallbackContext, CallbackContinuation, CallbackFn, CallbackResult,
-    DebugCapability, DebugLimits, DebugPermission, DumpCapability, DumpLimits, Execution,
-    ExternalCommand, ExternalEventView, ExternalToken, FileOperation, FileReadFormat,
-    FileSeekOrigin, ForeignNativeKind, HostCalendar, HostCloseResult, HostDeadline, HostEntropy,
-    HostEntropyError, HostExitRequest, HostExitStatus, HostFileLease, HostIo, HostIoFailure,
-    HostLoadCompiler, HostLoadError, HostLoadErrorKind, HostModuleBytes, HostModuleRepository,
-    HostNativeLoader, HostNativeModule, HostOs, HostOsOperation, HostOsValue, HostOutput,
-    HostOutputError, HostResourceError, HostResourceErrorKind, HostServices, HostSourceReader,
-    GcTrace, HostWarning, HostWarningError, LedgerSnapshot, LoadBudget, LoadCapability, LoadFormat,
-    LoadLimits, LuaError, PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
-    RunOutcome, RuntimeError, RuntimeErrorKind, VmError,
-    CapabilityGrant, OpaqueServiceHandle, PolicyCapabilities, PolicyClock, PrivateService,
-    ServiceAccessError, ServiceAudience, ServiceOperation, VmPolicy,
-    ExportPolicy, OutputAudit, OutputBudget, OutputError, SafeDiagnostic,
+    AllocationPeaks, AllocationTrace, CallbackContext, CallbackContinuation, CallbackFn,
+    CallbackResult, CapabilityGrant, DebugCapability, DebugLimits, DebugPermission, DumpCapability,
+    DumpLimits, Execution, ExportPolicy, ExternalCommand, ExternalEventView, ExternalToken,
+    FileOperation, FileReadFormat, FileSeekOrigin, ForeignNativeKind, GcTrace, HostCalendar,
+    HostCloseResult, HostDeadline, HostEntropy, HostEntropyError, HostExitRequest, HostExitStatus,
+    HostFileLease, HostIo, HostIoFailure, HostLoadCompiler, HostLoadError, HostLoadErrorKind,
+    HostModuleBytes, HostModuleRepository, HostNativeLoader, HostNativeModule, HostOs,
+    HostOsOperation, HostOsValue, HostOutput, HostOutputError, HostResourceError,
+    HostResourceErrorKind, HostServices, HostSourceReader, HostWarning, HostWarningError,
+    LedgerSnapshot, LoadBudget, LoadCapability, LoadFormat, LoadLimits, LuaError,
+    OpaqueServiceHandle, OutputAudit, OutputBudget, OutputError, PathEncoding, PolicyCapabilities,
+    PolicyClock, PrivateService, ResourceBudget, ResourceCapability, ResourceLimits, RunOutcome,
+    RuntimeError, RuntimeErrorKind, SafeDiagnostic, ServiceAccessError, ServiceAudience,
+    ServiceOperation, VmError, VmPolicy,
 };
+#[cfg(any(feature = "jit", feature = "aot"))]
+pub use rivetlua_runtime::{JitEligibility, JitFallbackReason, JitPolicy, JitStats};
 pub use transport::{ContainerError, ContainerErrorKind, ContainerLimits, TransportBudget};
 
 /// 可轉換為 SDK Lua 值的 primitive host 值。
@@ -387,7 +387,10 @@ impl Vm {
         target: &TargetDescriptor,
         trust: &TrustedAotBuild,
     ) -> Result<(), AotError> {
-        let runtime = self.runtime.0.as_mut()
+        let runtime = self
+            .runtime
+            .0
+            .as_mut()
             .ok_or(AotError::Unsupported("SDK VM busy"))?;
         runtime.install_aot(module.verified.as_ref(), bytes, target, trust)
     }
@@ -588,7 +591,10 @@ impl Vm {
         let runtime = self.runtime.0.as_ref().ok_or(ExportError::Denied)?;
         let identity = Arc::downgrade(&module.verified);
         if !runtime.authorizes_module_export(issuer)
-            || !self.owned_modules.iter().any(|owned| owned.ptr_eq(&identity))
+            || !self
+                .owned_modules
+                .iter()
+                .any(|owned| owned.ptr_eq(&identity))
         {
             return Err(ExportError::Denied);
         }
@@ -615,7 +621,10 @@ impl Vm {
             || request.destination != ExportDestination::HostBytes
             || !runtime.authorizes_module_export(&request.issuer)
             || !request.module.ptr_eq(&identity)
-            || !self.owned_modules.iter().any(|owned| owned.ptr_eq(&identity))
+            || !self
+                .owned_modules
+                .iter()
+                .any(|owned| owned.ptr_eq(&identity))
         {
             return Err(ExportError::Denied);
         }
@@ -630,7 +639,9 @@ impl Vm {
         self.charge_output(len, 0, len.max(1))
             .map_err(|_| ExportError::OutputLimit)?;
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(len).map_err(|_| ExportError::Denied)?;
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| ExportError::Denied)?;
         bytes.extend_from_slice(encoded.bytes());
         Ok(ExportResult { bytes })
     }
@@ -1492,7 +1503,9 @@ mod p17_host_entry_tests {
             assert_eq!(calls.get(), 1);
 
             let callable_module = engine
-                .compile(b"return function(a,b) local n=(function() return 7 end)(); return n,a,b end")
+                .compile(
+                    b"return function(a,b) local n=(function() return 7 end)(); return n,a,b end",
+                )
                 .unwrap();
             let RunOutcome::Returned(function_values) =
                 vm.load_module(&callable_module).unwrap().run().unwrap()
@@ -1640,7 +1653,10 @@ mod p17_host_entry_tests {
                 panic!("handler 結果須保留為 LuaError");
             };
             assert_eq!(error.value, marker_value);
-            assert_eq!(events.borrow().as_slice(), [b"handler".as_slice(), b"close\n"]);
+            assert_eq!(
+                events.borrow().as_slice(),
+                [b"handler".as_slice(), b"close\n"]
+            );
             drop(error);
 
             events.borrow_mut().clear();
@@ -1661,12 +1677,7 @@ mod p17_host_entry_tests {
             assert_eq!(error.value, marker_value);
             assert_eq!(
                 events.borrow().as_slice(),
-                [
-                    b"handler".as_slice(),
-                    b"later\n",
-                    b"handler",
-                    b"earlier\n",
-                ]
+                [b"handler".as_slice(), b"later\n", b"handler", b"earlier\n",]
             );
             drop(error);
 
@@ -1676,8 +1687,11 @@ mod p17_host_entry_tests {
                     b"local co=coroutine.create(function() collectgarbage('collect'); coroutine.yield(3); collectgarbage('collect'); return 4 end)\nreturn function(e) local ok,n=coroutine.resume(co); assert(ok); print(n); return e end",
                 )
                 .unwrap();
-            let RunOutcome::Returned(handler_values) =
-                vm.load_module(&coroutine_handler_module).unwrap().run().unwrap()
+            let RunOutcome::Returned(handler_values) = vm
+                .load_module(&coroutine_handler_module)
+                .unwrap()
+                .run()
+                .unwrap()
             else {
                 panic!("須取得有 coroutine 狀態的 Lua handler");
             };
@@ -1692,12 +1706,7 @@ mod p17_host_entry_tests {
             };
             assert_eq!(
                 events.borrow().as_slice(),
-                [
-                    b"3\n".as_slice(),
-                    b"later\n",
-                    b"4\n",
-                    b"earlier\n",
-                ]
+                [b"3\n".as_slice(), b"later\n", b"4\n", b"earlier\n",]
             );
             drop(error);
             drop(coroutine_handler);
@@ -1720,7 +1729,11 @@ mod p17_host_entry_tests {
                 )
                 .unwrap();
             let mut execution = vm
-                .load_module_with_args_and_error_handler(&gc_module, &[gc_marker_value], &gc_handler)
+                .load_module_with_args_and_error_handler(
+                    &gc_module,
+                    &[gc_marker_value],
+                    &gc_handler,
+                )
                 .unwrap();
             drop(gc_marker);
             let outcome = execution.run().unwrap();
@@ -1755,8 +1768,11 @@ mod p17_host_entry_tests {
                     b"return function(e) local x <close> = setmetatable({}, {__close=function() print('handler-close') end}); return e end",
                 )
                 .unwrap();
-            let RunOutcome::Returned(handler_values) =
-                vm.load_module(&closing_handler_module).unwrap().run().unwrap()
+            let RunOutcome::Returned(handler_values) = vm
+                .load_module(&closing_handler_module)
+                .unwrap()
+                .run()
+                .unwrap()
             else {
                 panic!("須取得帶 close 的 Lua handler");
             };
@@ -1787,8 +1803,11 @@ mod p17_host_entry_tests {
                     b"local count=0\nreturn function(e) count=count+1; if count==1 then local x <close> = setmetatable({}, {__close=function() print('handler-error-close') end}); error('handler-fail') end; print('retry'); return e end",
                 )
                 .unwrap();
-            let RunOutcome::Returned(handler_values) =
-                vm.load_module(&throwing_handler_module).unwrap().run().unwrap()
+            let RunOutcome::Returned(handler_values) = vm
+                .load_module(&throwing_handler_module)
+                .unwrap()
+                .run()
+                .unwrap()
             else {
                 panic!("須取得第一次會失敗的 Lua handler");
             };
@@ -1820,8 +1839,11 @@ mod p17_host_entry_tests {
                     b"local count=0\nreturn function(e) count=count+1; if count==1 then local x <close> = setmetatable({}, {__close=function() print('handler-close-throws'); error('handler-close-fail') end}); error('handler-fail') end; print('retry'); return e end",
                 )
                 .unwrap();
-            let RunOutcome::Returned(handler_values) =
-                vm.load_module(&throwing_closer_module).unwrap().run().unwrap()
+            let RunOutcome::Returned(handler_values) = vm
+                .load_module(&throwing_closer_module)
+                .unwrap()
+                .run()
+                .unwrap()
             else {
                 panic!("須取得關閉期間再次出錯的 Lua handler");
             };
@@ -1852,8 +1874,11 @@ mod p17_host_entry_tests {
                     b"return function(e) local x <close> = setmetatable({}, {__close=function() error('close-loop') end}); error('again') end",
                 )
                 .unwrap();
-            let RunOutcome::Returned(handler_values) =
-                vm.load_module(&recursive_closer_module).unwrap().run().unwrap()
+            let RunOutcome::Returned(handler_values) = vm
+                .load_module(&recursive_closer_module)
+                .unwrap()
+                .run()
+                .unwrap()
             else {
                 panic!("須取得持續失敗的 close handler");
             };
@@ -1876,8 +1901,11 @@ mod p17_host_entry_tests {
                     b"local count=0\nreturn function(e) count=count+1; if count==2 then local x <close> = setmetatable({}, {__close=function() print('nested-handler-close'); error('nested-close-fail') end}); error('handler-fail') end; print('retry'); return e end",
                 )
                 .unwrap();
-            let RunOutcome::Returned(handler_values) =
-                vm.load_module(&nested_closer_module).unwrap().run().unwrap()
+            let RunOutcome::Returned(handler_values) = vm
+                .load_module(&nested_closer_module)
+                .unwrap()
+                .run()
+                .unwrap()
             else {
                 panic!("須取得在外層 close 已暫停時再次出錯的 handler");
             };
@@ -2287,7 +2315,10 @@ mod p17_exit_shutdown_tests {
             assert!(matches!(error, SdkError::NativeSession(_)), "{error:?}");
             vm.set_allocation_limit(usize::MAX);
             drop(vm);
-            assert!(output.borrow().is_empty(), "native fatal 後不得重跑 GC callback");
+            assert!(
+                output.borrow().is_empty(),
+                "native fatal 後不得重跑 GC callback"
+            );
             assert_eq!(probe.snapshot().committed, 0);
             assert_eq!(probe.snapshot().reserved, 0);
         }

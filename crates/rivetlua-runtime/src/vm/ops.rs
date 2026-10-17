@@ -226,9 +226,7 @@ pub(super) fn raw_concat(
     let result = (|| {
         append_concat_piece(vm, left, &a, &mut bytes)?;
         append_concat_piece(vm, right, &b, &mut bytes)?;
-        vm.with_unpublished_byte_string(&bytes, |vm, object| {
-            publish(vm, Value::Object(object))
-        })
+        vm.with_unpublished_byte_string(&bytes, |vm, object| publish(vm, Value::Object(object)))
     })();
     drop(bytes);
     drop(ticket);

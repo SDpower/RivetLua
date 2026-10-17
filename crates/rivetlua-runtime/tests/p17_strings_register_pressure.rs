@@ -53,7 +53,11 @@ fn p17_reused_temporaries_preserve_calls_results_and_captured_locals() {
         execution.set_fuel(1_000_000).unwrap();
         assert_eq!(
             execution.run().unwrap(),
-            RunOutcome::Returned(vec![Value::Integer(2), Value::Integer(2), Value::Integer(6)]),
+            RunOutcome::Returned(vec![
+                Value::Integer(2),
+                Value::Integer(2),
+                Value::Integer(6)
+            ]),
             "{runtime_profile:?}"
         );
         drop(execution);
@@ -322,7 +326,6 @@ fn p17_stringification_honors_metatable_name_and_preserves_protected_key() {
     }
 }
 
-
 const COROUTINE_RUNNING_SOURCE: &[u8] = br#"
 local main, is_main = coroutine.running()
 assert(type(main) == "thread" and is_main == true)
@@ -408,7 +411,6 @@ fn p17_coroutine_running_preserves_main_and_child_identity_across_gc() {
     }
 }
 
-
 #[test]
 fn p17_short_string_interning_and_long_identity_preserve_gc_lifecycle() {
     const SHORT: &[u8] = b"short-0001";
@@ -423,13 +425,19 @@ fn p17_short_string_interning_and_long_identity_preserve_gc_lifecycle() {
         let short_first_root = vm.add_root(RootKind::Host, short_first).unwrap();
         let short_second = vm.allocate_byte_string(SHORT).unwrap();
         let short_second_root = vm.add_root(RootKind::Host, short_second).unwrap();
-        assert_eq!(short_first, short_second, "{profile:?}: short bytes share identity");
+        assert_eq!(
+            short_first, short_second,
+            "{profile:?}: short bytes share identity"
+        );
 
         let long_first = vm.allocate_byte_string(&LONG).unwrap();
         let long_first_root = vm.add_root(RootKind::Host, long_first).unwrap();
         let long_second = vm.allocate_byte_string(&LONG).unwrap();
         let long_second_root = vm.add_root(RootKind::Host, long_second).unwrap();
-        assert_ne!(long_first, long_second, "{profile:?}: long bytes keep distinct identity");
+        assert_ne!(
+            long_first, long_second,
+            "{profile:?}: long bytes keep distinct identity"
+        );
         assert_eq!(vm.object_kind(long_first), Ok(ObjectKind::ByteString));
         assert_eq!(vm.object_kind(long_second), Ok(ObjectKind::ByteString));
 
@@ -443,8 +451,7 @@ fn p17_short_string_interning_and_long_identity_preserve_gc_lifecycle() {
         let short_recreated = vm.allocate_byte_string(SHORT).unwrap();
         let short_recreated_root = vm.add_root(RootKind::Host, short_recreated).unwrap();
         assert_ne!(
-            short_recreated,
-            short_first,
+            short_recreated, short_first,
             "{profile:?}: collected short bytes get new identity"
         );
         assert_eq!(vm.object_kind(short_recreated), Ok(ObjectKind::ByteString));

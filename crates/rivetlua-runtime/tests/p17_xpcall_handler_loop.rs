@@ -33,7 +33,11 @@ fn run_case(profile: LanguageProfile, name: &str, source: &[u8], expected: &[Val
         .unwrap()
         .run()
         .unwrap();
-    assert_eq!(outcome, RunOutcome::Returned(expected.to_vec()), "{profile:?} {name}");
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(expected.to_vec()),
+        "{profile:?} {name}"
+    );
     assert_eq!(
         RootKind::ALL.map(|kind| vm.roots().count(kind)),
         roots_with_environment,
@@ -49,7 +53,11 @@ fn run_case(profile: LanguageProfile, name: &str, source: &[u8], expected: &[Val
             "{profile:?} {name} {kind:?} root 清理",
         );
     }
-    assert_eq!(vm.ledger_snapshot().reserved, 0, "{profile:?} {name} ledger 保留量");
+    assert_eq!(
+        vm.ledger_snapshot().reserved,
+        0,
+        "{profile:?} {name} ledger 保留量"
+    );
 }
 
 const NON_TAIL_WITH_CLOSE: &[u8] = br#"

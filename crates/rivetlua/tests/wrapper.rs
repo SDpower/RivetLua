@@ -720,9 +720,14 @@ fn sdk_wrapper_decode_container_allocation_and_work_limits_accept_exact_and_reje
         let sidecar = &bytes[40 + rvlu_len..40 + rvlu_len + sidecar_len];
         let transport_limits = TransportLimits::default();
         let scan = transport_scan_admission(rvlu.len(), sidecar.len()).unwrap();
-        let admission = preflight_transport_decode(rvlu, sidecar, profile, &transport_limits).unwrap();
-        let exact_work =
-            40u64 + (bytes.len() as u64) * 8 + scan.work + scan.work + admission.subsequent_work + 1;
+        let admission =
+            preflight_transport_decode(rvlu, sidecar, profile, &transport_limits).unwrap();
+        let exact_work = 40u64
+            + (bytes.len() as u64) * 8
+            + scan.work
+            + scan.work
+            + admission.subsequent_work
+            + 1;
 
         let exact = ContainerLimits {
             max_container_bytes: bytes.len(),

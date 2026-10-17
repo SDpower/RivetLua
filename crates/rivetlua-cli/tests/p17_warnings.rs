@@ -447,8 +447,7 @@ fn warning_probe_fixture() -> WarningProbeFixture {
     const MACOS_LD: &str = "/Library/Developer/CommandLineTools/usr/bin/ld";
     const MACOS_LD_SHA256: &str =
         "374d9f0713bce2c8a9e1e82bde51615d5433516a10d99b63107eb6ee70542e4c";
-    const MACOS_SDKROOT: &str =
-        "/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk";
+    const MACOS_SDKROOT: &str = "/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk";
 
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -474,9 +473,21 @@ fn warning_probe_fixture() -> WarningProbeFixture {
         let clang = PathBuf::from(MACOS_CLANG);
         let linker = PathBuf::from(MACOS_LD);
         let sdkroot = PathBuf::from(MACOS_SDKROOT);
-        assert!(clang.is_file(), "固定 macOS clang 不存在：{}", clang.display());
-        assert!(linker.is_file(), "固定 macOS linker 不存在：{}", linker.display());
-        assert!(sdkroot.is_dir(), "固定 macOS SDK 不存在：{}", sdkroot.display());
+        assert!(
+            clang.is_file(),
+            "固定 macOS clang 不存在：{}",
+            clang.display()
+        );
+        assert!(
+            linker.is_file(),
+            "固定 macOS linker 不存在：{}",
+            linker.display()
+        );
+        assert!(
+            sdkroot.is_dir(),
+            "固定 macOS SDK 不存在：{}",
+            sdkroot.display()
+        );
         assert_eq!(
             sdkroot.canonicalize().expect("解析固定 macOS SDK 路徑"),
             sdkroot,
@@ -533,10 +544,7 @@ fn warning_probe_fixture() -> WarningProbeFixture {
     ];
     if cfg!(target_os = "macos") {
         explicit_env.push(("SDKROOT".to_owned(), MACOS_SDKROOT.to_owned()));
-        explicit_env.push((
-            "MACOSX_DEPLOYMENT_TARGET".to_owned(),
-            "11.0".to_owned(),
-        ));
+        explicit_env.push(("MACOSX_DEPLOYMENT_TARGET".to_owned(), "11.0".to_owned()));
     } else {
         for key in ["SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET"] {
             if let Some(value) = env::var_os(key) {

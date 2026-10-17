@@ -5,8 +5,7 @@ use rivetlua_compiler::{
 use rivetlua_core::bytecode::official_export::emit_official_chunk;
 use rivetlua_core::{
     HostFunctionId, LuaProfile, OfficialChunkLimits, OfficialWorkBudget, ProtoId, Value,
-    VerifiedModule,
-    VerifyLimits, decode_official_chunk,
+    VerifiedModule, VerifyLimits, decode_official_chunk,
 };
 use rivetlua_runtime::{
     DebugCapability, DebugLimits, DebugPermission, DumpCapability, HostServices, LoadCapability,
@@ -431,7 +430,11 @@ fn official(module: &VerifiedModule, profile: LuaProfile) -> VerifiedModule {
         .clone()
 }
 
-fn run_with_debug(module: VerifiedModule, profile: LuaProfile, debug: DebugCapability) -> RunOutcome {
+fn run_with_debug(
+    module: VerifiedModule,
+    profile: LuaProfile,
+    debug: DebugCapability,
+) -> RunOutcome {
     let mut vm = Vm::new_with_services(profile, HostServices::deny_all().and_debug(debug)).unwrap();
     let environment = vm.allocate_table().unwrap();
     let root = vm.add_root(RootKind::Host, environment).unwrap();
@@ -451,10 +454,7 @@ fn run_with_debug(module: VerifiedModule, profile: LuaProfile, debug: DebugCapab
     outcome
 }
 
-fn run_with_stripped_line_hook_services(
-    module: VerifiedModule,
-    profile: LuaProfile,
-) -> RunOutcome {
+fn run_with_stripped_line_hook_services(module: VerifiedModule, profile: LuaProfile) -> RunOutcome {
     let services = HostServices::deny_all()
         .and_load(
             LoadCapability::deny_all()
@@ -610,9 +610,8 @@ fn p17_getinfo_c_closure_u_preserves_real_upvalue_count_in_both_profiles_and_for
         for (format, module) in [("native", native), ("official", imported)] {
             let mut vm = Vm::new_with_services(
                 profile,
-                HostServices::deny_all().and_debug(
-                    DebugCapability::deny_all().allow(DebugPermission::Info),
-                ),
+                HostServices::deny_all()
+                    .and_debug(DebugCapability::deny_all().allow(DebugPermission::Info)),
             )
             .unwrap();
             let environment = vm.allocate_table().unwrap();
@@ -895,12 +894,8 @@ fn run_with_stripped_debug_dump_services(
 
     let key = vm.allocate_byte_string(b"chunk").unwrap();
     let value = vm.allocate_byte_string(chunk).unwrap();
-    vm.raw_set(
-        environment,
-        Value::Object(key),
-        Value::Object(value),
-    )
-    .unwrap();
+    vm.raw_set(environment, Value::Object(key), Value::Object(value))
+        .unwrap();
 
     let mut execution = vm
         .load_with_environment(module, Value::Object(environment))

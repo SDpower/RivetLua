@@ -70,8 +70,11 @@ pub(super) fn run_case(
     input: &[u8],
     limits: &HarnessLimits,
 ) -> CaseOutcome {
-    if input.len() > limits.max_input_bytes || limits.max_input_bytes == 0
-        || limits.max_depth == 0 || limits.fuel == 0 || limits.heap_bytes == 0
+    if input.len() > limits.max_input_bytes
+        || limits.max_input_bytes == 0
+        || limits.max_depth == 0
+        || limits.fuel == 0
+        || limits.heap_bytes == 0
     {
         return CaseOutcome::Limit;
     }
@@ -94,16 +97,25 @@ pub(super) fn run_case(
     }
 }
 
-pub(super) fn fuzz(
-    manifest: &ExperimentManifest,
-    input: &[u8],
-) -> Result<FuzzSummary, String> {
+pub(super) fn fuzz(manifest: &ExperimentManifest, input: &[u8]) -> Result<FuzzSummary, String> {
     manifest.validate()?;
     let limits = HarnessLimits {
-        max_input_bytes: manifest.budget.max_input_bytes.try_into().map_err(|_| "E_FUZZ_BUDGET")?,
-        max_depth: manifest.budget.max_depth.try_into().map_err(|_| "E_FUZZ_BUDGET")?,
+        max_input_bytes: manifest
+            .budget
+            .max_input_bytes
+            .try_into()
+            .map_err(|_| "E_FUZZ_BUDGET")?,
+        max_depth: manifest
+            .budget
+            .max_depth
+            .try_into()
+            .map_err(|_| "E_FUZZ_BUDGET")?,
         fuel: manifest.budget.fuel,
-        heap_bytes: manifest.budget.heap_bytes.try_into().map_err(|_| "E_FUZZ_BUDGET")?,
+        heap_bytes: manifest
+            .budget
+            .heap_bytes
+            .try_into()
+            .map_err(|_| "E_FUZZ_BUDGET")?,
     };
     if input.len() > limits.max_input_bytes || limits.max_input_bytes > limits.heap_bytes / 4 {
         return Err("E_FUZZ_BUDGET".into());
@@ -158,10 +170,18 @@ pub(super) fn fuzz(
             CaseOutcome::Finding(raw_code) => {
                 summary.status = "FINDING";
                 summary.code = Some(public_code(raw_code));
-                let minimized = minimize(manifest, profile, &limits, deadline, &candidate, raw_code, &mut summary);
+                let minimized = minimize(
+                    manifest,
+                    profile,
+                    &limits,
+                    deadline,
+                    &candidate,
+                    raw_code,
+                    &mut summary,
+                );
                 summary.minimized_sha256 = Some(
                     crate::p17::package_sha256_bytes(&minimized)
-                        .map_err(|_| "E_FUZZ_DIGEST".to_owned())?
+                        .map_err(|_| "E_FUZZ_DIGEST".to_owned())?,
                 );
                 summary.minimized_len = Some(minimized.len());
                 break;
@@ -187,18 +207,24 @@ fn minimize(
 ) -> Vec<u8> {
     let mut current = original.to_vec();
     let mut parts = 2usize;
-    while !current.is_empty() && summary.cases < manifest.budget.cases && Instant::now() < deadline {
+    while !current.is_empty() && summary.cases < manifest.budget.cases && Instant::now() < deadline
+    {
         let chunk = current.len().div_ceil(parts);
         let mut changed = false;
         let mut start = 0;
-        while start < current.len() && summary.cases < manifest.budget.cases && Instant::now() < deadline {
+        while start < current.len()
+            && summary.cases < manifest.budget.cases
+            && Instant::now() < deadline
+        {
             let end = (start + chunk).min(current.len());
             let mut candidate = Vec::with_capacity(current.len() - (end - start));
             candidate.extend_from_slice(&current[..start]);
             candidate.extend_from_slice(&current[end..]);
             let outcome = run_caught(&manifest.target_id, profile, &candidate, limits);
             summary.cases += 1;
-            if Instant::now() >= deadline { break; }
+            if Instant::now() >= deadline {
+                break;
+            }
             if outcome == CaseOutcome::Finding(code) {
                 current = candidate;
                 parts = 2;
@@ -208,7 +234,9 @@ fn minimize(
             start = end;
         }
         if !changed {
-            if parts >= current.len() { break; }
+            if parts >= current.len() {
+                break;
+            }
             parts = (parts * 2).min(current.len());
         }
     }
@@ -227,8 +255,12 @@ fn mutate(original: &[u8], max: usize, rng: &mut u64) -> Vec<u8> {
         let index = choice % candidate.len();
         match choice % 3 {
             0 => candidate[index] ^= 1 << ((choice >> 8) % 8),
-            1 if candidate.len() > 1 => { candidate.remove(index); },
-            _ if candidate.len() < max => { candidate.insert(index, (choice >> 8) as u8); },
+            1 if candidate.len() > 1 => {
+                candidate.remove(index);
+            }
+            _ if candidate.len() < max => {
+                candidate.insert(index, (choice >> 8) as u8);
+            }
             _ => candidate[index] ^= 1,
         }
     }
@@ -236,8 +268,11 @@ fn mutate(original: &[u8], max: usize, rng: &mut u64) -> Vec<u8> {
 }
 
 fn public_code(code: &'static str) -> &'static str {
-    if code.len() <= 64 && code.starts_with("E_")
-        && code.bytes().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    if code.len() <= 64
+        && code.starts_with("E_")
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
     {
         code
     } else {

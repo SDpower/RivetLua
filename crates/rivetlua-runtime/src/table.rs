@@ -2,13 +2,13 @@
 
 use crate::rust_alloc::vec::Vec;
 
+use crate::hash::new_default_hasher;
 use core::hash::{Hash, Hasher};
 use core::mem::size_of;
-use crate::hash::new_default_hasher;
 
-use rivetlua_core::{ObjectId, ObjectRef, Value};
 #[cfg(not(feature = "std"))]
 use rivetlua_core::number::NoStdFloat;
+use rivetlua_core::{ObjectId, ObjectRef, Value};
 
 use crate::alloc::{
     AllocationCharge, AllocationLedger, FailPoint, PairedLuaCharges, Reservation, checked_bytes,
@@ -318,9 +318,10 @@ impl Table {
             }
         }
         for entry in &mut self.hash {
-            if clear_values && entry
-                .as_ref()
-                .is_some_and(|(_, value)| *value == Value::Nil)
+            if clear_values
+                && entry
+                    .as_ref()
+                    .is_some_and(|(_, value)| *value == Value::Nil)
             {
                 // 弱表的死鍵只供下次 GC 前的 next 邊界使用；GC 可釋放長字串副本。
                 *entry = None;
@@ -1729,7 +1730,10 @@ mod tests {
                     )
                 })
                 .unwrap();
-            assert_eq!(shared, crate::ByteString::managed_sharing_is_cheaper(bytes.len()));
+            assert_eq!(
+                shared,
+                crate::ByteString::managed_sharing_is_cheaper(bytes.len())
+            );
             if shared {
                 assert!(backing_bytes > bytes.len());
             } else {
@@ -3134,7 +3138,10 @@ mod tests {
                 .unwrap();
             vm.collect_major().unwrap();
             assert_eq!(vm.object_kind(key), Ok(ObjectKind::ByteString));
-            assert_eq!(vm.raw_get(table, Value::Object(key)), Ok(Value::Integer(25)));
+            assert_eq!(
+                vm.raw_get(table, Value::Object(key)),
+                Ok(Value::Integer(25))
+            );
             vm.raw_set(table, Value::Object(key), Value::Nil).unwrap();
             assert_eq!(vm.raw_next_value(table, Value::Object(key)).unwrap(), None);
             vm.collect_major().unwrap();
@@ -3149,14 +3156,20 @@ mod tests {
             let table = strong.allocate_table().unwrap();
             let table_root = strong.add_root(RootKind::Host, table).unwrap();
             let key = strong.allocate_byte_string(&bytes).unwrap();
-            strong.raw_set(table, Value::Object(key), Value::Integer(25))
+            strong
+                .raw_set(table, Value::Object(key), Value::Integer(25))
                 .unwrap();
-            strong.raw_set(table, Value::Object(key), Value::Nil).unwrap();
+            strong
+                .raw_set(table, Value::Object(key), Value::Nil)
+                .unwrap();
             strong.collect_major().unwrap();
             assert_eq!(strong.object_kind(key), Err(VmError::StaleObject));
             assert!(strong.ledger_snapshot().lua_heap_bytes >= bytes.len());
             let equal = strong.allocate_byte_string(&bytes).unwrap();
-            assert_eq!(strong.raw_next_value(table, Value::Object(equal)).unwrap(), None);
+            assert_eq!(
+                strong.raw_next_value(table, Value::Object(equal)).unwrap(),
+                None
+            );
             strong.remove_root(table_root).unwrap();
             strong.collect_major().unwrap();
             assert_eq!(strong.ledger_snapshot().reserved, 0);
@@ -3180,8 +3193,14 @@ mod tests {
 
             let shared = vm.allocate_byte_string(&[b's'; 4096]).unwrap();
             let owned = vm.allocate_byte_string(&[b'o'; 100]).unwrap();
-            assert!(vm.with_byte_string(shared, |key| key.shared_table_key().is_some()).unwrap());
-            assert!(vm.with_byte_string(owned, |key| key.shared_table_key().is_none()).unwrap());
+            assert!(
+                vm.with_byte_string(shared, |key| key.shared_table_key().is_some())
+                    .unwrap()
+            );
+            assert!(
+                vm.with_byte_string(owned, |key| key.shared_table_key().is_none())
+                    .unwrap()
+            );
             let object = vm.allocate_table().unwrap();
             let roots = [
                 vm.add_root(RootKind::Host, shared).unwrap(),
@@ -3277,12 +3296,18 @@ mod tests {
         for dead in [b_key, b_value, table_key] {
             assert_eq!(vm.object_kind(dead), Err(VmError::StaleObject));
         }
-        assert_eq!(vm.raw_get(table, Value::Object(a_key)), Ok(Value::Integer(25)));
+        assert_eq!(
+            vm.raw_get(table, Value::Object(a_key)),
+            Ok(Value::Integer(25))
+        );
         assert_eq!(
             vm.raw_next_value(table, Value::Nil).unwrap(),
             Some((Value::Object(a_key), Value::Integer(25)))
         );
-        assert_eq!(vm.raw_next_value(table, Value::Object(a_key)).unwrap(), None);
+        assert_eq!(
+            vm.raw_next_value(table, Value::Object(a_key)).unwrap(),
+            None
+        );
         let b_lookup = vm.allocate_byte_string(&b_bytes).unwrap();
         assert_eq!(vm.raw_get(table, Value::Object(b_lookup)), Ok(Value::Nil));
         vm.raw_set(table, Value::Object(a_key), Value::Nil).unwrap();
@@ -3293,11 +3318,17 @@ mod tests {
             "final={final_bytes} setup={setup_baseline} a={:?} b_lookup={:?} hash={:?}",
             vm.object_kind(a_key),
             vm.object_kind(b_lookup),
-            vm.with_table(table, |stored| (stored.hash.len(), stored.live_hash_count()))
+            vm.with_table(table, |stored| (
+                stored.hash.len(),
+                stored.live_hash_count()
+            ))
         );
         assert_eq!(vm.object_kind(a_key), Err(VmError::StaleObject));
         assert_eq!(vm.object_kind(b_lookup), Err(VmError::StaleObject));
-        assert!(vm.with_table(table, |stored| stored.hash.iter().all(Option::is_none)).unwrap());
+        assert!(
+            vm.with_table(table, |stored| stored.hash.iter().all(Option::is_none))
+                .unwrap()
+        );
         assert_eq!(vm.ledger_snapshot().reserved, 0);
         vm.remove_root(table_root).unwrap();
         drop(vm);

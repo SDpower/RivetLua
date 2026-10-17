@@ -1,9 +1,9 @@
 //! VM 建立時固定的宿主政策與僅供宿主使用的私有服務授權。
 
+use crate::AllocationCharge;
 use crate::host::{HostResourceError, ResourceBudget, ResourceLimits};
 use crate::rust_alloc::boxed::Box;
 use crate::rust_alloc::vec::Vec;
-use crate::AllocationCharge;
 use rivetlua_core::VmId;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

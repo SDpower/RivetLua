@@ -3,9 +3,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use rivetlua_compiler::{
-    BudgetedCompileError, CompileBudgetSink, compile_with_budget,
-};
+use rivetlua_compiler::{BudgetedCompileError, CompileBudgetSink, compile_with_budget};
 use rivetlua_core::{LuaProfile, VerifiedModule};
 use rivetlua_runtime::{
     AllocationLedger, AllocationTrace, HostLoadCompiler, HostLoadError, HostLoadErrorKind,

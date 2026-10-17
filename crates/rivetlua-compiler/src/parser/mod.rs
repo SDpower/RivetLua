@@ -293,26 +293,25 @@ impl<'a> Parser<'a> {
                     span: join(start, self.previous().span),
                 });
             }
-            let prefix_attribute = if self.profile == LanguageProfile::Lua55
-                && self.take_symbol(Symbol::Less)
-            {
-                let attribute_token = self.current().clone();
-                let attribute_name = self.name()?;
-                self.expect(Symbol::Greater)?;
-                if !matches!(attribute_name.as_slice(), b"const" | b"close") {
-                    return Err(diagnostic(
-                        Some(&attribute_token),
-                        DiagnosticCode::Parse,
-                        "未知 local attribute",
-                    ));
-                }
-                Some(crate::ast::Attribute {
-                    name: attribute_name,
-                    span: join(attribute_token.span, self.previous().span),
-                })
-            } else {
-                None
-            };
+            let prefix_attribute =
+                if self.profile == LanguageProfile::Lua55 && self.take_symbol(Symbol::Less) {
+                    let attribute_token = self.current().clone();
+                    let attribute_name = self.name()?;
+                    self.expect(Symbol::Greater)?;
+                    if !matches!(attribute_name.as_slice(), b"const" | b"close") {
+                        return Err(diagnostic(
+                            Some(&attribute_token),
+                            DiagnosticCode::Parse,
+                            "未知 local attribute",
+                        ));
+                    }
+                    Some(crate::ast::Attribute {
+                        name: attribute_name,
+                        span: join(attribute_token.span, self.previous().span),
+                    })
+                } else {
+                    None
+                };
             let mut names = Vec::new();
             loop {
                 if names.len() >= self.limits.max_list_entries {
@@ -1058,7 +1057,10 @@ mod tests {
             };
             assert_eq!(names.len(), expected.len());
             for (name, expected_attribute) in names.iter().zip(expected.iter()) {
-                assert_eq!(name.attribute.as_ref().unwrap().name.as_slice(), *expected_attribute);
+                assert_eq!(
+                    name.attribute.as_ref().unwrap().name.as_slice(),
+                    *expected_attribute
+                );
             }
         }
         let source = b"local <unknown> value <const> = 1";
@@ -1083,7 +1085,10 @@ mod tests {
         let Stmt::Local { names, .. } = &module.root.statements[0] else {
             panic!("Lua 5.4 後置 attribute local 未保留為宣告");
         };
-        assert_eq!(names[0].attribute.as_ref().unwrap().name.as_slice(), b"const");
+        assert_eq!(
+            names[0].attribute.as_ref().unwrap().name.as_slice(),
+            b"const"
+        );
     }
 
     #[test]
@@ -1200,16 +1205,21 @@ mod tests {
             assert_eq!(values.len(), 1, "{profile:?}");
             assert!(matches!(&values[0], Expr::Nil { .. }), "{profile:?}");
             let Stmt::Call {
-                call: Expr::Call { callee, arguments, .. },
+                call: Expr::Call {
+                    callee, arguments, ..
+                },
                 ..
             } = &module.root.statements[1]
             else {
                 panic!("parenthesized anonymous call was not a call statement ({profile:?})");
             };
-            assert!(matches!(
-                callee.as_ref(),
-                Expr::Paren { expression, .. } if matches!(expression.as_ref(), Expr::Function { .. })
-            ), "{profile:?}");
+            assert!(
+                matches!(
+                    callee.as_ref(),
+                    Expr::Paren { expression, .. } if matches!(expression.as_ref(), Expr::Function { .. })
+                ),
+                "{profile:?}"
+            );
             assert_eq!(arguments.len(), 1, "{profile:?}");
 
             let input = b"local result = (function(x) return x end)(23)";
@@ -1218,13 +1228,19 @@ mod tests {
             let Stmt::Local { values, .. } = &module.root.statements[0] else {
                 panic!("parenthesized function local was not parsed ({profile:?})");
             };
-            let Expr::Call { callee, arguments, .. } = &values[0] else {
+            let Expr::Call {
+                callee, arguments, ..
+            } = &values[0]
+            else {
                 panic!("parenthesized function did not remain callable ({profile:?})");
             };
-            assert!(matches!(
-                callee.as_ref(),
-                Expr::Paren { expression, .. } if matches!(expression.as_ref(), Expr::Function { .. })
-            ), "{profile:?}");
+            assert!(
+                matches!(
+                    callee.as_ref(),
+                    Expr::Paren { expression, .. } if matches!(expression.as_ref(), Expr::Function { .. })
+                ),
+                "{profile:?}"
+            );
             assert_eq!(arguments.len(), 1, "{profile:?}");
 
             let input = b"local result = f\n(23)";
@@ -1233,7 +1249,10 @@ mod tests {
             let Stmt::Local { values, .. } = &module.root.statements[0] else {
                 panic!("identifier call across a newline was not parsed ({profile:?})");
             };
-            let Expr::Call { callee, arguments, .. } = &values[0] else {
+            let Expr::Call {
+                callee, arguments, ..
+            } = &values[0]
+            else {
                 panic!("identifier across a newline did not remain callable ({profile:?})");
             };
             assert!(matches!(callee.as_ref(), Expr::Name { .. }), "{profile:?}");

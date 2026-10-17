@@ -3,13 +3,13 @@
 use crate::rust_alloc::boxed::Box;
 use crate::rust_alloc::vec::Vec;
 
-use core::cell::Cell;
-use core::mem::size_of;
-use core::ops::{Deref, DerefMut};
-use core::any::Any;
-use core::hash::{Hash, Hasher};
 use crate::rust_alloc::rc::Rc;
 use crate::rust_alloc::sync::Arc;
+use core::any::Any;
+use core::cell::Cell;
+use core::hash::{Hash, Hasher};
+use core::mem::size_of;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use rivetlua_core::bytecode::native_debug::NativeSemanticUpvalue;
@@ -19,9 +19,9 @@ use rivetlua_core::{
 };
 
 use crate::alloc::{
-    AllocationAttempt, AllocationCharge, AllocationCharges, AllocationLedger, AllocationTrace,
-    AllocationPeaks, FailPoint, LedgerProbe, LedgerSnapshot, PairedLuaCharges, Reservation, checked_bytes,
-    reserve_vec,
+    AllocationAttempt, AllocationCharge, AllocationCharges, AllocationLedger, AllocationPeaks,
+    AllocationTrace, FailPoint, LedgerProbe, LedgerSnapshot, PairedLuaCharges, Reservation,
+    checked_bytes, reserve_vec,
 };
 use crate::callback::CallbackFn;
 use crate::closure::{CClosure, Closure};
@@ -39,9 +39,9 @@ use crate::host::{
     PathEncoding, ResourceBudget, ResourceLimits,
 };
 use crate::policy::{
-    CapabilityGrant, OpaqueServiceHandle, PolicyCapabilities, PrivateService, ServiceAccessError,
-    ServiceAudience, ServiceOperation, ServiceSlot, VmPolicy, ExportPolicy, OutputAudit,
-    OutputError, OutputMeter, SafeDiagnostic,
+    CapabilityGrant, ExportPolicy, OpaqueServiceHandle, OutputAudit, OutputError, OutputMeter,
+    PolicyCapabilities, PrivateService, SafeDiagnostic, ServiceAccessError, ServiceAudience,
+    ServiceOperation, ServiceSlot, VmPolicy,
 };
 use crate::roots::{RootId, RootKind, RootLease, RootSet};
 use crate::stdlib::basic::BasicBuiltin;
@@ -118,11 +118,20 @@ mod p17_short_string_index_tests {
         vm.short_strings.reserve_slot(&vm.ledger).unwrap();
         vm.short_strings.insert(collision_hash, first).unwrap();
         vm.short_strings.insert(collision_hash, second).unwrap();
-        assert_eq!(vm.find_short_string(b"first", collision_hash), Ok(Some(first)));
-        assert_eq!(vm.find_short_string(b"second", collision_hash), Ok(Some(second)));
+        assert_eq!(
+            vm.find_short_string(b"first", collision_hash),
+            Ok(Some(first))
+        );
+        assert_eq!(
+            vm.find_short_string(b"second", collision_hash),
+            Ok(Some(second))
+        );
         assert_eq!(vm.find_short_string(b"third", collision_hash), Ok(None));
         vm.short_strings.remove(collision_hash, first);
-        assert_eq!(vm.find_short_string(b"second", collision_hash), Ok(Some(second)));
+        assert_eq!(
+            vm.find_short_string(b"second", collision_hash),
+            Ok(Some(second))
+        );
         vm.short_strings.remove(collision_hash, second);
         assert!(vm.short_strings.buckets.is_empty());
         vm.reclaim(first).unwrap();
@@ -159,7 +168,8 @@ mod p17_short_string_index_tests {
         assert_eq!(vm.ledger_snapshot(), before);
         assert_eq!(vm.object_kind(shared), Ok(ObjectKind::ByteString));
         let table = vm.allocate_table().unwrap();
-        vm.raw_set_byte_string_key(table, b"shared", Value::Nil).unwrap();
+        vm.raw_set_byte_string_key(table, b"shared", Value::Nil)
+            .unwrap();
         assert_eq!(vm.object_kind(shared), Ok(ObjectKind::ByteString));
         let mut retained = Vec::new();
         for byte in b'a'..=b'g' {
@@ -372,7 +382,10 @@ mod p17_gc_indirect_payload_tests {
                 let before = vm.ledger_snapshot();
                 let closure = Closure::new(module, ProtoId(0), &[], None, &vm.ledger).unwrap();
                 vm.inject_failure_once(point);
-                assert_eq!(vm.allocate_closure(closure), Err(VmError::InjectedFailure(point)));
+                assert_eq!(
+                    vm.allocate_closure(closure),
+                    Err(VmError::InjectedFailure(point))
+                );
                 assert_eq!(vm.ledger_snapshot(), before);
                 let closure = Closure::new(module, ProtoId(0), &[], None, &vm.ledger).unwrap();
                 let retry = vm.allocate_closure(closure).unwrap();
@@ -465,8 +478,14 @@ mod p17_gc_indirect_payload_tests {
                 Ok(Some(upvalue))
             );
             assert_eq!(vm.userdata_ptr(userdata), Ok(userdata_ptr));
-            assert_eq!(vm.get_uservalue(userdata, 1), Ok(Some(Value::Object(child))));
-            assert_eq!(vm.builtin(builtin), Ok(Builtin::CoroutineWrapped(coroutine)));
+            assert_eq!(
+                vm.get_uservalue(userdata, 1),
+                Ok(Some(Value::Object(child)))
+            );
+            assert_eq!(
+                vm.builtin(builtin),
+                Ok(Builtin::CoroutineWrapped(coroutine))
+            );
 
             vm.remove_root(closure_root).unwrap();
             vm.remove_root(builtin_root).unwrap();
@@ -525,7 +544,10 @@ mod p17_gc_tail_free_span_tests {
                 assert_eq!(vm.object_kind(stale), Err(VmError::StaleObject));
                 assert_eq!(vm.object_kind(retained), Ok(ObjectKind::Table));
                 assert_eq!(
-                    vm.slots.iter().filter(|slot| matches!(slot, Slot::Free { .. })).count(),
+                    vm.slots
+                        .iter()
+                        .filter(|slot| matches!(slot, Slot::Free { .. }))
+                        .count(),
                     1024
                 );
                 assert_eq!(
@@ -577,11 +599,16 @@ mod p17_gc_tail_free_span_tests {
 
                 vm.collect().unwrap();
                 assert_eq!(vm.gc_scan_end, physical_slots);
-                assert!(vm.slots[..physical_slots - 1]
-                    .iter()
-                    .all(|slot| matches!(slot, Slot::Free { .. })));
+                assert!(
+                    vm.slots[..physical_slots - 1]
+                        .iter()
+                        .all(|slot| matches!(slot, Slot::Free { .. }))
+                );
                 assert_eq!(vm.object_kind(retained), Ok(ObjectKind::Table));
-                assert_eq!(retained.identity().unwrap().generation, retained_id.generation);
+                assert_eq!(
+                    retained.identity().unwrap().generation,
+                    retained_id.generation
+                );
                 assert_eq!(vm.ledger_snapshot().reserved, 0);
 
                 let kind = if mode == GcMode::Generational {
@@ -703,11 +730,12 @@ mod p17_gc_tail_free_span_tests {
             );
             assert_eq!(vm.ledger_snapshot(), before);
             assert_eq!(vm.gc_scan_end, 0);
-            assert!(vm
-                .gc
-                .slot_bits
-                .iter()
-                .all(|page| page.gray == 0 && page.black == 0));
+            assert!(
+                vm.gc
+                    .slot_bits
+                    .iter()
+                    .all(|page| page.gray == 0 && page.black == 0)
+            );
             assert!(matches!(vm.slots[0], Slot::Free { .. }));
             assert_eq!(vm.object_kind(stale), Err(VmError::StaleObject));
             assert_eq!(vm.ledger_snapshot().reserved, 0);
@@ -779,7 +807,10 @@ mod p17_gc_restart_debt_tests {
                 break;
             }
         }
-        assert!(reached_two_x, "重啟後自動 GC 須在 slot 高水位超過兩倍前回收");
+        assert!(
+            reached_two_x,
+            "重啟後自動 GC 須在 slot 高水位超過兩倍前回收"
+        );
         assert!(vm.gc_trace().transition_count > transitions);
         assert_eq!(vm.object_kind(retained), Ok(ObjectKind::ByteString));
         vm.remove_root(root).unwrap();
@@ -911,15 +942,24 @@ mod p17_gc2_atomic_progress_tests {
         retained_root: RootId,
     ) {
         assert_eq!(vm.finalizer_state(child), Ok(FinalizerState::Pending));
-        assert_eq!(vm.pending_finalizer().unwrap().map(|entry| entry.0), Some(child));
-        assert_eq!(vm.raw_get(retained, Value::Integer(1)), Ok(Value::Integer(34)));
+        assert_eq!(
+            vm.pending_finalizer().unwrap().map(|entry| entry.0),
+            Some(child)
+        );
+        assert_eq!(
+            vm.raw_get(retained, Value::Integer(1)),
+            Ok(Value::Integer(34))
+        );
         vm.start_finalizer(child).unwrap();
         vm.finish_finalizer(child).unwrap();
         assert_eq!(vm.finalizer_state(child), Ok(FinalizerState::Finalized));
         vm.set_execution_running(false);
         vm.collect().unwrap();
         assert_eq!(vm.object_kind(child), Err(VmError::StaleObject));
-        assert_eq!(vm.raw_get(retained, Value::Integer(1)), Ok(Value::Integer(34)));
+        assert_eq!(
+            vm.raw_get(retained, Value::Integer(1)),
+            Ok(Value::Integer(34))
+        );
         vm.remove_root(retained_root).unwrap();
         assert_eq!(vm.ledger_snapshot().reserved, 0);
     }
@@ -972,7 +1012,10 @@ mod p17_gc2_atomic_progress_tests {
             assert_eq!(vm.ledger_snapshot(), before_ledger);
             assert_eq!(vm.gc_trace(), before_gc);
             assert_eq!(vm.slots.len(), before_slots);
-            assert_eq!(RootKind::ALL.map(|kind| vm.roots().count(kind)), before_roots);
+            assert_eq!(
+                RootKind::ALL.map(|kind| vm.roots().count(kind)),
+                before_roots
+            );
             assert_eq!(vm.finalizer_state(child), Ok(FinalizerState::Registered));
             for _ in 0..32 {
                 allocate_nested_table(&mut vm);
@@ -1012,7 +1055,10 @@ mod p17_gc2_atomic_progress_tests {
                 vm.gc.work.len(),
                 vm.slots.len(),
             );
-            assert_eq!(vm.pending_finalizer().unwrap().map(|entry| entry.0), Some(target));
+            assert_eq!(
+                vm.pending_finalizer().unwrap().map(|entry| entry.0),
+                Some(target)
+            );
             vm.start_finalizer(target).unwrap();
             vm.finish_finalizer(target).unwrap();
             assert_eq!(vm.finalizer_state(target), Ok(FinalizerState::Finalized));
@@ -1083,7 +1129,10 @@ mod p17_gc2_atomic_progress_tests {
             assert_eq!(vm.ledger_snapshot(), before_ledger);
             assert_eq!(vm.gc_trace(), before_gc);
             assert_eq!(vm.slots.len(), before_slots);
-            assert_eq!(RootKind::ALL.map(|kind| vm.roots().count(kind)), before_roots);
+            assert_eq!(
+                RootKind::ALL.map(|kind| vm.roots().count(kind)),
+                before_roots
+            );
             assert_eq!(vm.finalizer_state(target), Ok(FinalizerState::Registered));
 
             let parent = vm.allocate(Value::Object(child)).unwrap();
@@ -1094,7 +1143,10 @@ mod p17_gc2_atomic_progress_tests {
             let parent_root = vm.add_root(RootKind::Host, parent).unwrap();
             vm.collect().unwrap();
             assert_eq!(vm.object_kind(child), Ok(ObjectKind::Table));
-            assert_eq!(vm.raw_get(retained, Value::Integer(1)), Ok(Value::Integer(34)));
+            assert_eq!(
+                vm.raw_get(retained, Value::Integer(1)),
+                Ok(Value::Integer(34))
+            );
             vm.remove_root(parent_root).unwrap();
             vm.remove_root(retained_root).unwrap();
             assert_eq!(vm.ledger_snapshot().reserved, 0);
@@ -1129,7 +1181,10 @@ mod p17_gc2_atomic_progress_tests {
                 vm.gc.sweep_cursor,
                 vm.slots.len(),
             );
-            assert_eq!(vm.raw_get(retained, Value::Integer(1)), Ok(Value::Integer(34)));
+            assert_eq!(
+                vm.raw_get(retained, Value::Integer(1)),
+                Ok(Value::Integer(34))
+            );
             vm.remove_root(retained_root).unwrap();
             assert_eq!(vm.ledger_snapshot().reserved, 0);
         }
@@ -2368,9 +2423,7 @@ impl HeapObject {
                 .charge
                 .checked_add(userdata.charge_bytes()?)
                 .ok_or(VmError::ArithmeticOverflow)?,
-            HeapPayload::Value(_)
-            | HeapPayload::CClosure(_)
-            | HeapPayload::Upvalue(_) => 0,
+            HeapPayload::Value(_) | HeapPayload::CClosure(_) | HeapPayload::Upvalue(_) => 0,
             HeapPayload::Closure(closure) => closure.charge,
             HeapPayload::Builtin(builtin) => builtin.charge,
             HeapPayload::Coroutine(coroutine) => coroutine.charge,
@@ -2672,9 +2725,10 @@ impl ShortStringIndex {
             let index = (hash as usize).wrapping_add(offset) % capacity;
             match self.buckets[index] {
                 ShortStringBucket::Empty => break,
-                ShortStringBucket::Occupied { hash: stored_hash, object: stored }
-                    if stored_hash == hash && stored == object =>
-                {
+                ShortStringBucket::Occupied {
+                    hash: stored_hash,
+                    object: stored,
+                } if stored_hash == hash && stored == object => {
                     self.buckets[index] = ShortStringBucket::Deleted;
                     self.occupied -= 1;
                     self.deleted += 1;
@@ -2693,14 +2747,16 @@ impl ShortStringIndex {
 
     fn reserve_slot(&mut self, ledger: &AllocationLedger) -> Result<Option<Self>, VmError> {
         let capacity = self.buckets.len();
-        let used_after_insert = self.occupied
+        let used_after_insert = self
+            .occupied
             .checked_add(self.deleted)
             .and_then(|count| count.checked_add(1))
             .ok_or(VmError::ArithmeticOverflow)?;
         if capacity != 0 && used_after_insert <= capacity / 2 {
             return Ok(None);
         }
-        let live_after_insert = self.occupied
+        let live_after_insert = self
+            .occupied
             .checked_add(1)
             .ok_or(VmError::ArithmeticOverflow)?;
         let target = if capacity == 0 {
@@ -3677,7 +3733,11 @@ impl Vm {
         let slot_index = if let Some(index) = reusable {
             index
         } else {
-            let needed = self.private_services.len().checked_add(1).ok_or(ServiceAccessError::Denied)?;
+            let needed = self
+                .private_services
+                .len()
+                .checked_add(1)
+                .ok_or(ServiceAccessError::Denied)?;
             let minimum = checked_bytes(needed, size_of::<ServiceSlot>())
                 .map_err(|_| ServiceAccessError::Denied)?;
             let mut replacement = Vec::new();
@@ -3690,12 +3750,24 @@ impl Vm {
             .map_err(|_| ServiceAccessError::Denied)?;
             let actual = checked_bytes(replacement.capacity(), size_of::<ServiceSlot>())
                 .map_err(|_| ServiceAccessError::Denied)?;
-            let extra = self.ledger.reserve(actual.checked_sub(minimum).ok_or(ServiceAccessError::Denied)?)
+            let extra = self
+                .ledger
+                .reserve(
+                    actual
+                        .checked_sub(minimum)
+                        .ok_or(ServiceAccessError::Denied)?,
+                )
                 .map_err(|_| ServiceAccessError::Denied)?;
             let mut charges = AllocationCharges::new();
-            charges.try_reserve(2).map_err(|_| ServiceAccessError::Denied)?;
-            let base = ticket.commit_charge().map_err(|_| ServiceAccessError::Denied)?;
-            let excess = extra.commit_charge().map_err(|_| ServiceAccessError::Denied)?;
+            charges
+                .try_reserve(2)
+                .map_err(|_| ServiceAccessError::Denied)?;
+            let base = ticket
+                .commit_charge()
+                .map_err(|_| ServiceAccessError::Denied)?;
+            let excess = extra
+                .commit_charge()
+                .map_err(|_| ServiceAccessError::Denied)?;
             charges.push_prepared(base);
             charges.push_prepared(excess);
             replacement.append(&mut self.private_services);
@@ -3777,7 +3849,10 @@ impl Vm {
         {
             return Err(ServiceAccessError::Denied);
         }
-        let now = self.host_services.policy_now().ok_or(ServiceAccessError::Denied)?;
+        let now = self
+            .host_services
+            .policy_now()
+            .ok_or(ServiceAccessError::Denied)?;
         if now >= grant.expires_at || grant.work_left == 0 || input.len() > grant.read_left {
             grant.exhausted = true;
             return Err(ServiceAccessError::Denied);
@@ -3797,16 +3872,29 @@ impl Vm {
             self.ledger.clone(),
         );
         let outcome = (|| {
-            budget.spend_work(1).map_err(|_| ServiceAccessError::Denied)?;
-            budget.claim_temporary(input.len()).map_err(|_| ServiceAccessError::Denied)?;
-            let slot = self.private_services.get_mut(handle.slot).ok_or(ServiceAccessError::Denied)?;
+            budget
+                .spend_work(1)
+                .map_err(|_| ServiceAccessError::Denied)?;
+            budget
+                .claim_temporary(input.len())
+                .map_err(|_| ServiceAccessError::Denied)?;
+            let slot = self
+                .private_services
+                .get_mut(handle.slot)
+                .ok_or(ServiceAccessError::Denied)?;
             let service = slot.service.as_mut().ok_or(ServiceAccessError::Denied)?;
-            let output = service.invoke(input, &mut budget).map_err(|_| ServiceAccessError::Denied)?;
+            let output = service
+                .invoke(input, &mut budget)
+                .map_err(|_| ServiceAccessError::Denied)?;
             if output.len() > grant.write_left {
                 return Err(ServiceAccessError::Denied);
             }
-            budget.claim_temporary(output.len()).map_err(|_| ServiceAccessError::Denied)?;
-            budget.ensure_active().map_err(|_| ServiceAccessError::Denied)?;
+            budget
+                .claim_temporary(output.len())
+                .map_err(|_| ServiceAccessError::Denied)?;
+            budget
+                .ensure_active()
+                .map_err(|_| ServiceAccessError::Denied)?;
             Ok(output)
         })();
         drop(budget);
@@ -4917,7 +5005,13 @@ impl Vm {
             let mut cursor = 0;
             while let Some(index) = self.gc.next_occupied(cursor, self.gc_scan_end) {
                 cursor = index + 1;
-                if matches!(self.slots[index], Slot::Occupied { age: GcAge::Old, .. }) {
+                if matches!(
+                    self.slots[index],
+                    Slot::Occupied {
+                        age: GcAge::Old,
+                        ..
+                    }
+                ) {
                     self.gc.set_color(index, GcColor::Black);
                 }
             }
@@ -5122,73 +5216,71 @@ impl Vm {
             let owner = *owner;
             let vm = self.id;
             let gc = &self.gc;
-            let cleared = table.clear_dead_weak_pairs(
-                &self.ledger,
-                |child| {
-                    let id = child.identity().ok_or(VmError::StaleObject)?;
-                    if id.vm != vm {
-                        return Err(VmError::WrongVm);
-                    }
-                    if child == owner {
-                        return Ok(gc.color(index) == Some(GcColor::White));
-                    }
-                    let slot = if id.slot.index() < index {
-                        before.get(id.slot.index())
-                    } else {
-                        after.get(id.slot.index().saturating_sub(index + 1))
-                    };
-                    let Some(Slot::Occupied {
-                        generation,
-                        reference,
-                        object,
-                        ..
-                    }) = slot
-                    else {
-                        return Err(VmError::StaleObject);
-                    };
-                    if *generation != id.generation || *reference != child {
-                        return Err(VmError::StaleObject);
-                    }
-                    if matches!(object[0].payload, HeapPayload::ByteString(_)) {
-                        return Ok(false);
-                    }
-                    Ok(gc.color(id.slot.index()) == Some(GcColor::White))
-                },
-                |key| {
-                    let id = key.identity().ok_or(VmError::StaleObject)?;
-                    if id.vm != vm {
-                        return Err(VmError::WrongVm);
-                    }
-                    if key == owner {
-                        return Ok(
-                            gc.color(index).ok_or(VmError::LedgerInvariant)?
-                                != GcColor::White,
-                        );
-                    }
-                    let slot = if id.slot.index() < index {
-                        before.get(id.slot.index())
-                    } else {
-                        after.get(id.slot.index().saturating_sub(index + 1))
-                    };
-                    let Some(Slot::Occupied {
-                        generation,
-                        reference,
-                        ..
-                    }) = slot
-                    else {
-                        return Err(VmError::StaleObject);
-                    };
-                    if *generation != id.generation || *reference != key {
-                        return Err(VmError::StaleObject);
-                    }
-                    Ok(
-                        gc.color(id.slot.index()).ok_or(VmError::LedgerInvariant)?
-                            != GcColor::White,
-                    )
-                },
-                clear_values,
-                clear_keys,
-            )?;
+            let cleared =
+                table.clear_dead_weak_pairs(
+                    &self.ledger,
+                    |child| {
+                        let id = child.identity().ok_or(VmError::StaleObject)?;
+                        if id.vm != vm {
+                            return Err(VmError::WrongVm);
+                        }
+                        if child == owner {
+                            return Ok(gc.color(index) == Some(GcColor::White));
+                        }
+                        let slot = if id.slot.index() < index {
+                            before.get(id.slot.index())
+                        } else {
+                            after.get(id.slot.index().saturating_sub(index + 1))
+                        };
+                        let Some(Slot::Occupied {
+                            generation,
+                            reference,
+                            object,
+                            ..
+                        }) = slot
+                        else {
+                            return Err(VmError::StaleObject);
+                        };
+                        if *generation != id.generation || *reference != child {
+                            return Err(VmError::StaleObject);
+                        }
+                        if matches!(object[0].payload, HeapPayload::ByteString(_)) {
+                            return Ok(false);
+                        }
+                        Ok(gc.color(id.slot.index()) == Some(GcColor::White))
+                    },
+                    |key| {
+                        let id = key.identity().ok_or(VmError::StaleObject)?;
+                        if id.vm != vm {
+                            return Err(VmError::WrongVm);
+                        }
+                        if key == owner {
+                            return Ok(
+                                gc.color(index).ok_or(VmError::LedgerInvariant)? != GcColor::White
+                            );
+                        }
+                        let slot = if id.slot.index() < index {
+                            before.get(id.slot.index())
+                        } else {
+                            after.get(id.slot.index().saturating_sub(index + 1))
+                        };
+                        let Some(Slot::Occupied {
+                            generation,
+                            reference,
+                            ..
+                        }) = slot
+                        else {
+                            return Err(VmError::StaleObject);
+                        };
+                        if *generation != id.generation || *reference != key {
+                            return Err(VmError::StaleObject);
+                        }
+                        Ok(gc.color(id.slot.index()).ok_or(VmError::LedgerInvariant)?
+                            != GcColor::White)
+                    },
+                    clear_values,
+                    clear_keys,
+                )?;
             self.gc.weak_cleared_pairs += cleared;
         }
         Ok(())
@@ -5204,8 +5296,7 @@ impl Vm {
             let Slot::Occupied { object, .. } = &slots[index] else {
                 continue;
             };
-            if gc.color(index).ok_or(VmError::LedgerInvariant)? == GcColor::White
-            {
+            if gc.color(index).ok_or(VmError::LedgerInvariant)? == GcColor::White {
                 continue;
             }
             let HeapPayload::Table(table) = &object[0].payload else {
@@ -5221,13 +5312,15 @@ impl Vm {
         let mut cursor = 0;
         while let Some(index) = self.gc.next_occupied(cursor, self.gc_scan_end) {
             cursor = index + 1;
-            candidates += usize::from(matches!(
-                self.slots[index],
-                Slot::Occupied {
-                    finalizer: FinalizerState::Registered,
-                    ..
-                }
-            ) && self.gc.color(index) == Some(GcColor::White));
+            candidates += usize::from(
+                matches!(
+                    self.slots[index],
+                    Slot::Occupied {
+                        finalizer: FinalizerState::Registered,
+                        ..
+                    }
+                ) && self.gc.color(index) == Some(GcColor::White),
+            );
         }
         if candidates == 0 {
             return Ok(());
@@ -5304,8 +5397,7 @@ impl Vm {
         if self.gc.cycle == GcCycleKind::Minor && *age == GcAge::Old {
             return Ok(Some(GcAge::Old));
         }
-        if self.gc.color(index).ok_or(VmError::LedgerInvariant)? == GcColor::White
-        {
+        if self.gc.color(index).ok_or(VmError::LedgerInvariant)? == GcColor::White {
             return Ok(None);
         }
         if *age == GcAge::Old || self.gc.mode == GcMode::Incremental {
@@ -5562,9 +5654,11 @@ impl Vm {
             let index = (hash as usize).wrapping_add(offset) % capacity;
             match self.short_strings.buckets[index] {
                 ShortStringBucket::Empty => return Ok(None),
-                ShortStringBucket::Occupied { hash: stored_hash, object }
-                    if stored_hash == hash
-                        && self.with_byte_string(object, |string| string.as_bytes() == bytes)? =>
+                ShortStringBucket::Occupied {
+                    hash: stored_hash,
+                    object,
+                } if stored_hash == hash
+                    && self.with_byte_string(object, |string| string.as_bytes() == bytes)? =>
                 {
                     return Ok(Some(object));
                 }
@@ -5624,10 +5718,12 @@ impl Vm {
         bytes: &[u8],
     ) -> Result<ManagedByteStringAllocation, VmError> {
         if bytes.len() > MAX_SHORT_STRING_LEN {
-            return self.allocate_byte_string_fresh(bytes).map(|object| ManagedByteStringAllocation {
-                object,
-                created: true,
-                index_before_growth: None,
+            return self.allocate_byte_string_fresh(bytes).map(|object| {
+                ManagedByteStringAllocation {
+                    object,
+                    created: true,
+                    index_before_growth: None,
+                }
             });
         }
         let hash = ShortStringIndex::hash(bytes, self.hash_seed);
@@ -5685,7 +5781,8 @@ impl Vm {
 
     /// 建立完整內容的 byte string；受管短字串共用同一物件身分。
     pub fn allocate_byte_string(&mut self, bytes: &[u8]) -> Result<ObjectRef, VmError> {
-        self.allocate_byte_string_with_status(bytes).map(|allocation| allocation.object)
+        self.allocate_byte_string_with_status(bytes)
+            .map(|allocation| allocation.object)
     }
 
     /// 接收不可變 external storage；任何配置失敗都由 RAII 釋放傳入的 owner。
@@ -5709,8 +5806,13 @@ impl Vm {
         E: From<VmError>,
     {
         let previous_slots = self.slots.len();
-        let ManagedByteStringAllocation { object, created, index_before_growth } =
-            self.allocate_byte_string_with_status(bytes).map_err(E::from)?;
+        let ManagedByteStringAllocation {
+            object,
+            created,
+            index_before_growth,
+        } = self
+            .allocate_byte_string_with_status(bytes)
+            .map_err(E::from)?;
         match publish(self, object) {
             Ok(published) => Ok(published),
             Err(error) => {
@@ -5986,17 +6088,27 @@ impl Vm {
             // 僅操作尚未對外發布的物件；依配置逆序撤銷，連 slot 與 GC work/debt 一併退款。
             if let Some((key, previous_slots, key_created, index_before_growth)) = field_key {
                 if key_created {
-                    self.rollback_unpublished_created_object(key, previous_slots, ObjectKind::ByteString)
-                        .map_err(E::from)?;
+                    self.rollback_unpublished_created_object(
+                        key,
+                        previous_slots,
+                        ObjectKind::ByteString,
+                    )
+                    .map_err(E::from)?;
                 }
-                self.restore_short_string_growth(index_before_growth).map_err(E::from)?;
+                self.restore_short_string_growth(index_before_growth)
+                    .map_err(E::from)?;
             }
             if let Some((object, previous_slots, name_created, index_before_growth)) = name_object {
                 if name_created {
-                    self.rollback_unpublished_created_object(object, previous_slots, ObjectKind::ByteString)
-                        .map_err(E::from)?;
+                    self.rollback_unpublished_created_object(
+                        object,
+                        previous_slots,
+                        ObjectKind::ByteString,
+                    )
+                    .map_err(E::from)?;
                 }
-                self.restore_short_string_growth(index_before_growth).map_err(E::from)?;
+                self.restore_short_string_growth(index_before_growth)
+                    .map_err(E::from)?;
             }
             self.rollback_unpublished_created_object(
                 created,
@@ -6772,14 +6884,38 @@ impl Vm {
                     )?;
                     b"package".as_slice()
                 }
-                2 => { self.install_coroutine_builtins(environment)?; b"coroutine" }
-                3 => { self.install_table_builtins(environment)?; b"table" }
-                4 => { self.install_io_os_builtins_inner(environment, false, true, false)?; b"io" }
-                5 => { self.install_io_os_builtins_inner(environment, false, false, true)?; b"os" }
-                6 => { self.install_string_builtins(environment)?; b"string" }
-                7 => { self.install_math_builtins(environment)?; b"math" }
-                8 => { self.install_utf8_builtins(environment)?; b"utf8" }
-                9 => { self.install_debug_builtins_inner(environment, false)?; b"debug" }
+                2 => {
+                    self.install_coroutine_builtins(environment)?;
+                    b"coroutine"
+                }
+                3 => {
+                    self.install_table_builtins(environment)?;
+                    b"table"
+                }
+                4 => {
+                    self.install_io_os_builtins_inner(environment, false, true, false)?;
+                    b"io"
+                }
+                5 => {
+                    self.install_io_os_builtins_inner(environment, false, false, true)?;
+                    b"os"
+                }
+                6 => {
+                    self.install_string_builtins(environment)?;
+                    b"string"
+                }
+                7 => {
+                    self.install_math_builtins(environment)?;
+                    b"math"
+                }
+                8 => {
+                    self.install_utf8_builtins(environment)?;
+                    b"utf8"
+                }
+                9 => {
+                    self.install_debug_builtins_inner(environment, false)?;
+                    b"debug"
+                }
                 _ => return Err(VmError::WrongObjectType),
             };
             let value = self.with_temporary_byte_string(name, |vm, key| {
@@ -6802,9 +6938,8 @@ impl Vm {
         registry: ObjectRef,
         name: &[u8],
     ) -> Result<ObjectRef, VmError> {
-        let current = self.with_temporary_byte_string(name, |vm, key| {
-            vm.raw_get(registry, Value::Object(key))
-        })?;
+        let current = self
+            .with_temporary_byte_string(name, |vm, key| vm.raw_get(registry, Value::Object(key)))?;
         if let Value::Object(table) = current {
             if self.object_kind(table)? == ObjectKind::Table {
                 return Ok(table);
@@ -7110,9 +7245,8 @@ impl Vm {
                 })();
                 self.remove_root(searchers_root)?;
                 staged_searchers?;
-                let require = self.allocate_builtin_payload(Builtin::Load(
-                    LoadBuiltin::Require { package },
-                ))?;
+                let require =
+                    self.allocate_builtin_payload(Builtin::Load(LoadBuiltin::Require { package }))?;
                 let require_root = self.add_root(RootKind::Temporary, require)?;
                 let mut captured_roots: [Option<RootId>; 9] = [None; 9];
                 let published = (|| {
@@ -7300,14 +7434,16 @@ impl Vm {
                     self.install_one_builtin(library, name, Builtin::Utf8(kind))?;
                 }
 
-                let strict = self.allocate_builtin_payload(Builtin::Utf8(
-                    Utf8Builtin::Iterator { strict: true },
-                ))?;
+                let strict =
+                    self.allocate_builtin_payload(Builtin::Utf8(Utf8Builtin::Iterator {
+                        strict: true,
+                    }))?;
                 let strict_root = self.add_root(RootKind::Temporary, strict)?;
                 let iterators = (|| {
-                    let lax = self.allocate_builtin_payload(Builtin::Utf8(
-                        Utf8Builtin::Iterator { strict: false },
-                    ))?;
+                    let lax =
+                        self.allocate_builtin_payload(Builtin::Utf8(Utf8Builtin::Iterator {
+                            strict: false,
+                        }))?;
                     let lax_root = self.add_root(RootKind::Temporary, lax)?;
                     let inserted = self.install_one_builtin(
                         library,
@@ -7321,11 +7457,7 @@ impl Vm {
                 iterators?;
 
                 self.with_unpublished_byte_string(utf8_lib::CHAR_PATTERN, |vm, pattern| {
-                    vm.raw_set_byte_string_key(
-                        library,
-                        b"charpattern",
-                        Value::Object(pattern),
-                    )
+                    vm.raw_set_byte_string_key(library, b"charpattern", Value::Object(pattern))
                 })?;
 
                 self.raw_set_byte_string_key(environment, b"utf8", Value::Object(library))
@@ -7371,11 +7503,7 @@ impl Vm {
                     ] {
                         self.install_one_builtin(library, name, Builtin::String(builtin))?;
                     }
-                    self.raw_set_byte_string_key(
-                        metatable,
-                        b"__index",
-                        Value::Object(library),
-                    )?;
+                    self.raw_set_byte_string_key(metatable, b"__index", Value::Object(library))?;
                     let registry_root = self.add_root(RootKind::Registry, metatable);
                     let installed = match registry_root {
                         Ok(registry_root) => {
@@ -7718,7 +7846,14 @@ impl Vm {
     pub(crate) fn callback_snapshot(
         &self,
         id: usize,
-    ) -> Result<(crate::rust_alloc::rc::Rc<CallbackFn>, Vec<Value>, Reservation), VmError> {
+    ) -> Result<
+        (
+            crate::rust_alloc::rc::Rc<CallbackFn>,
+            Vec<Value>,
+            Reservation,
+        ),
+        VmError,
+    > {
         let entry = self
             .callbacks
             .get(id)
@@ -7732,7 +7867,11 @@ impl Vm {
             FailPoint::WorkReserve,
         )?;
         captures.extend_from_slice(&entry.captures);
-        Ok((crate::rust_alloc::rc::Rc::clone(&entry.callback), captures, ticket))
+        Ok((
+            crate::rust_alloc::rc::Rc::clone(&entry.callback),
+            captures,
+            ticket,
+        ))
     }
 
     pub(crate) fn callback_capture_len(&self, id: usize) -> Result<usize, VmError> {
@@ -8719,34 +8858,33 @@ impl Vm {
             None
         };
 
-        let work_growth = if self.gc.phase != GcPhase::Pause
-            && self.gc.occupied_count >= self.gc.work_capacity
-        {
-            self.gc
-                .charge
-                .checked_add(size_of::<ObjectRef>())
-                .ok_or(VmError::ArithmeticOverflow)?;
-            self.gc
-                .growth_charges
-                .try_reserve_exact(1)
-                .map_err(|_| VmError::AllocationFailed)?;
-            let ticket = self.ledger.reserve(size_of::<ObjectRef>())?;
-            self.ledger.checkpoint(FailPoint::WorkReserve)?;
-            let needed = self
-                .gc
-                .work_capacity
-                .checked_add(1)
-                .ok_or(VmError::ArithmeticOverflow)?
-                .checked_sub(self.gc.work.len())
-                .ok_or(VmError::LedgerInvariant)?;
-            self.gc
-                .work
-                .try_reserve_exact(needed)
-                .map_err(|_| ticket.rust_reserve_failure())?;
-            Some(ticket)
-        } else {
-            None
-        };
+        let work_growth =
+            if self.gc.phase != GcPhase::Pause && self.gc.occupied_count >= self.gc.work_capacity {
+                self.gc
+                    .charge
+                    .checked_add(size_of::<ObjectRef>())
+                    .ok_or(VmError::ArithmeticOverflow)?;
+                self.gc
+                    .growth_charges
+                    .try_reserve_exact(1)
+                    .map_err(|_| VmError::AllocationFailed)?;
+                let ticket = self.ledger.reserve(size_of::<ObjectRef>())?;
+                self.ledger.checkpoint(FailPoint::WorkReserve)?;
+                let needed = self
+                    .gc
+                    .work_capacity
+                    .checked_add(1)
+                    .ok_or(VmError::ArithmeticOverflow)?
+                    .checked_sub(self.gc.work.len())
+                    .ok_or(VmError::LedgerInvariant)?;
+                self.gc
+                    .work
+                    .try_reserve_exact(needed)
+                    .map_err(|_| ticket.rust_reserve_failure())?;
+                Some(ticket)
+            } else {
+                None
+            };
 
         let (slot, generation) = match free {
             Some(index) => {
@@ -10081,8 +10219,7 @@ impl Vm {
     fn retreat_gc_scan_end(&mut self) {
         // 撤銷尚未發布的新 slot 會先 pop 實體；上界必須先收進現有長度。
         self.gc_scan_end = self.gc_scan_end.min(self.slots.len());
-        while self.gc_scan_end > 0
-            && matches!(self.slots[self.gc_scan_end - 1], Slot::Free { .. })
+        while self.gc_scan_end > 0 && matches!(self.slots[self.gc_scan_end - 1], Slot::Free { .. })
         {
             self.gc_scan_end -= 1;
         }
@@ -10119,7 +10256,8 @@ impl Vm {
             Some(next) => Slot::Free { generation: next },
             None => Slot::Retired,
         };
-        self.gc.retire_or_free(id.slot.index(), next_generation.is_some());
+        self.gc
+            .retire_or_free(id.slot.index(), next_generation.is_some());
         self.retreat_gc_scan_end();
         if let Some(callback_id) = callback_id {
             self.callbacks.get_mut(callback_id).and_then(Option::take);
@@ -10173,9 +10311,9 @@ impl Drop for Vm {
 
 #[cfg(test)]
 mod p12_5_tests {
+    use crate::rust_alloc::rc::Rc;
     use core::cell::Cell;
     use core::num::NonZeroUsize;
-    use crate::rust_alloc::rc::Rc;
 
     use rivetlua_core::Value;
 
@@ -12044,9 +12182,9 @@ mod capi_join_lazy_environment_a43_tests {
 
 #[cfg(test)]
 mod p16_b3_host_coroutine_transaction_tests {
+    use crate::rust_alloc::rc::Rc;
     use core::any::Any;
     use core::cell::Cell;
-    use crate::rust_alloc::rc::Rc;
 
     use rivetlua_core::LuaProfile;
 
@@ -12158,8 +12296,8 @@ mod p16_b10_debug_line_table_transaction_tests {
 
 #[cfg(test)]
 mod p16_a4a_file_metatable_tests {
-    use core::cell::Cell;
     use crate::rust_alloc::rc::Rc;
+    use core::cell::Cell;
 
     use rivetlua_core::{LuaProfile, Value};
 

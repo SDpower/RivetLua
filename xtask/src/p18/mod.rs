@@ -8,7 +8,10 @@ mod runner;
 mod tree;
 
 #[derive(Clone, Copy)]
-pub(super) enum Profile { Lua54, Lua55 }
+pub(super) enum Profile {
+    Lua54,
+    Lua55,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PackageIdentity {
@@ -28,19 +31,33 @@ impl Profile {
         }
     }
     pub(super) fn name(self) -> &'static str {
-        match self { Self::Lua54 => "lua54-i64f64", Self::Lua55 => "lua55-i64f64" }
+        match self {
+            Self::Lua54 => "lua54-i64f64",
+            Self::Lua55 => "lua55-i64f64",
+        }
     }
     pub(super) fn lua_version(self) -> &'static str {
-        match self { Self::Lua54 => "5.4", Self::Lua55 => "5.5" }
+        match self {
+            Self::Lua54 => "5.4",
+            Self::Lua55 => "5.5",
+        }
     }
     pub(super) fn release(self) -> &'static str {
-        match self { Self::Lua54 => "5.4.9", Self::Lua55 => "5.5.1" }
+        match self {
+            Self::Lua54 => "5.4.9",
+            Self::Lua55 => "5.5.1",
+        }
     }
 }
 
 pub(super) fn segment(value: &str, label: &str) -> Result<(), String> {
-    if value.is_empty() || value == "." || value == ".." || value.len() > 128
-        || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         return Err(format!("{label} 含有不合法路徑字元"));
     }

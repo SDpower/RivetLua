@@ -3,7 +3,7 @@
 use rivetlua_core::{
     BytecodeBindingId, BytecodeConstant, BytecodeInstruction, BytecodeModule, BytecodePrototype,
     BytecodeSpan, ConstId, Endian, EnvironmentSource, ExecMemoryPolicy, FrameLayout, Instruction,
-    LuaProfile, ProtoId, Register, ResultMode, RVLU_NUMERIC_I64_F64, RVLU_V2, TargetDescriptor,
+    LuaProfile, ProtoId, RVLU_NUMERIC_I64_F64, RVLU_V2, Register, ResultMode, TargetDescriptor,
     VerifiedModule, VerifyLimits, VmId, decode_module, encode_module,
 };
 use rivetlua_native::{AotBuildInput, AotError, TrustedAotBuild, build_aot, inspect_aot, load_aot};
@@ -109,12 +109,10 @@ fn assert_load_rejected(
 ) {
     assert!(matches!(
         load_aot(bytes, module, target, trust, VmId::new_unique().unwrap()),
-        Err(
-            AotError::Malformed
-                | AotError::Mismatch(_)
-                | AotError::Untrusted
-                | AotError::Unsupported(_)
-        )
+        Err(AotError::Malformed
+            | AotError::Mismatch(_)
+            | AotError::Untrusted
+            | AotError::Unsupported(_))
     ));
 }
 

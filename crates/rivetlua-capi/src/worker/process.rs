@@ -141,7 +141,8 @@ fn finish(
         outcome = WorkerOutcome::Crash;
     } else if let Some(status) = &status {
         if !status.success()
-            && ((restricted && response_exit_confirmed
+            && ((restricted
+                && response_exit_confirmed
                 && !matches!(outcome, WorkerOutcome::Deadline | WorkerOutcome::Malformed))
                 || (!restricted
                     && !matches!(outcome, WorkerOutcome::Deadline | WorkerOutcome::Malformed)))
@@ -329,8 +330,15 @@ pub unsafe fn run_worker(
     deadline: Duration,
     limits: Limits,
 ) -> WorkerReport {
-    run_worker_inner(worker_binary, cache_root, request_id, request,
-        VmPolicy::Compatibility, deadline, limits)
+    run_worker_inner(
+        worker_binary,
+        cache_root,
+        request_id,
+        request,
+        VmPolicy::Compatibility,
+        deadline,
+        limits,
+    )
 }
 
 /// 在宿主選定的不可變政策下啟動 worker；受限政策缺 OS 證據即拒絕。
@@ -346,11 +354,23 @@ pub unsafe fn run_worker_with_policy(
     deadline: Duration,
     limits: Limits,
 ) -> WorkerReport {
-    run_worker_inner(worker_binary, cache_root, request_id, request, policy, deadline, limits)
+    run_worker_inner(
+        worker_binary,
+        cache_root,
+        request_id,
+        request,
+        policy,
+        deadline,
+        limits,
+    )
 }
 
 fn policy_denied() -> WorkerOutcome {
-    WorkerOutcome::Rejected(isolation::PolicyDenied::MissingEvidence.public_code().to_vec())
+    WorkerOutcome::Rejected(
+        isolation::PolicyDenied::MissingEvidence
+            .public_code()
+            .to_vec(),
+    )
 }
 
 fn run_worker_inner(
@@ -364,7 +384,9 @@ fn run_worker_inner(
 ) -> WorkerReport {
     let restricted = policy != VmPolicy::Compatibility;
     if !worker_binary.is_absolute() || !worker_binary.is_file() || deadline.is_zero() {
-        return immediate(if restricted { policy_denied() } else {
+        return immediate(if restricted {
+            policy_denied()
+        } else {
             WorkerOutcome::Rejected(b"worker binary/deadline invalid".to_vec())
         });
     }
@@ -409,27 +431,42 @@ fn run_worker_inner(
     }
     let request_bytes = match encoded {
         Ok(bytes) => bytes,
-        Err(_) => return immediate(WorkerOutcome::Rejected(if restricted {
-            b"E_WORKER_REJECTED".to_vec()
-        } else {
-            b"request rejected".to_vec()
-        })),
+        Err(_) => {
+            return immediate(WorkerOutcome::Rejected(if restricted {
+                b"E_WORKER_REJECTED".to_vec()
+            } else {
+                b"request rejected".to_vec()
+            }));
+        }
     };
     let run_dir = match private_run_dir(cache_root) {
         Ok(path) => path,
-        Err(_) => return immediate(if restricted { policy_denied() } else {
-            WorkerOutcome::Rejected(b"worker cache invalid".to_vec())
-        }),
+        Err(_) => {
+            return immediate(if restricted {
+                policy_denied()
+            } else {
+                WorkerOutcome::Rejected(b"worker cache invalid".to_vec())
+            });
+        }
     };
     if remaining_ms(started, deadline).is_none() {
         let _ = fs::remove_dir_all(&run_dir);
         return immediate(WorkerOutcome::Deadline);
     }
     let mut command = Command::new(worker_binary);
-    command.arg("--rivetlua-worker-v1")
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    command
+        .arg("--rivetlua-worker-v1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let launch = if restricted {
-        match isolation::configure(&mut command, worker_binary, &run_dir, policy, &artifact_paths) {
+        match isolation::configure(
+            &mut command,
+            worker_binary,
+            &run_dir,
+            policy,
+            &artifact_paths,
+        ) {
             Ok(plan) => Some(plan),
             Err(_) => {
                 let _ = fs::remove_dir_all(&run_dir);
@@ -445,7 +482,9 @@ fn run_worker_inner(
         Ok(child) => child,
         Err(_) => {
             let _ = fs::remove_dir_all(&run_dir);
-            return immediate(if restricted { policy_denied() } else {
+            return immediate(if restricted {
+                policy_denied()
+            } else {
                 WorkerOutcome::Rejected(b"worker spawn failed".to_vec())
             });
         }
@@ -457,9 +496,18 @@ fn run_worker_inner(
     if unsafe { rivetlua_worker_set_nonblocking(stdin.as_ref().unwrap().as_raw_fd()) } != 0
         || unsafe { rivetlua_worker_set_nonblocking(stdout.as_raw_fd()) } != 0
     {
-        return finish(child, run_dir, if restricted { policy_denied() } else {
-            WorkerOutcome::Malformed
-        }, None, false, restricted);
+        return finish(
+            child,
+            run_dir,
+            if restricted {
+                policy_denied()
+            } else {
+                WorkerOutcome::Malformed
+            },
+            None,
+            false,
+            restricted,
+        );
     }
     let mut received = Vec::new();
     let mut offset = 0;
@@ -473,8 +521,13 @@ fn run_worker_inner(
             failure = Some(WorkerOutcome::Deadline);
             break;
         };
-        let want_write = hello && (!restricted || parent_proof.as_ref()
-            .is_some_and(|proof: &isolation::IsolationProof| proof.matches(policy, pid, true)))
+        let want_write = hello
+            && (!restricted
+                || parent_proof
+                    .as_ref()
+                    .is_some_and(|proof: &isolation::IsolationProof| {
+                        proof.matches(policy, pid, true)
+                    }))
             && offset < request_bytes.len();
         let mut can_read = 0;
         let mut can_write = 0;
@@ -495,7 +548,9 @@ fn run_worker_inner(
             break;
         }
         if polled < 0 {
-            failure = Some(if restricted && !hello { policy_denied() } else {
+            failure = Some(if restricted && !hello {
+                policy_denied()
+            } else {
                 WorkerOutcome::Malformed
             });
             break;
@@ -504,13 +559,13 @@ fn run_worker_inner(
             match read_available(&mut stdout, &mut received, limits, started, deadline) {
                 Ok(is_eof) => eof = is_eof,
                 Err(error) => {
-                    failure = Some(if restricted && !hello
-                        && !matches!(error, WorkerOutcome::Deadline)
-                    {
-                        policy_denied()
-                    } else {
-                        error
-                    });
+                    failure = Some(
+                        if restricted && !hello && !matches!(error, WorkerOutcome::Deadline) {
+                            policy_denied()
+                        } else {
+                            error
+                        },
+                    );
                     break;
                 }
             }
@@ -528,7 +583,9 @@ fn run_worker_inner(
                 {
                     if let Some(plan) = &launch {
                         match isolation::parent_probe(&child, plan) {
-                            Ok(proof) if proof.matches(policy, pid, true) => parent_proof = Some(proof),
+                            Ok(proof) if proof.matches(policy, pid, true) => {
+                                parent_proof = Some(proof)
+                            }
                             _ => {
                                 failure = Some(policy_denied());
                                 break;
@@ -537,16 +594,22 @@ fn run_worker_inner(
                     }
                     hello = true
                 }
-                Ok(Some(Frame { request_id: 0, identity,
-                    kind: FrameKind::Response(Response::Rejected(code)) }))
-                    if restricted && identity == abi::current_identity()
-                        && code == b"E_POLICY_DENIED" && received.is_empty() =>
+                Ok(Some(Frame {
+                    request_id: 0,
+                    identity,
+                    kind: FrameKind::Response(Response::Rejected(code)),
+                })) if restricted
+                    && identity == abi::current_identity()
+                    && code == b"E_POLICY_DENIED"
+                    && received.is_empty() =>
                 {
                     failure = Some(policy_denied());
                     break;
                 }
                 Ok(Some(_)) => {
-                    failure = Some(if restricted { policy_denied() } else {
+                    failure = Some(if restricted {
+                        policy_denied()
+                    } else {
                         WorkerOutcome::Malformed
                     });
                     break;
@@ -560,7 +623,9 @@ fn run_worker_inner(
                     break;
                 }
                 Ok(None) if eof => {
-                    failure = Some(if restricted { policy_denied() } else {
+                    failure = Some(if restricted {
+                        policy_denied()
+                    } else {
                         WorkerOutcome::Crash
                     });
                     break;
@@ -593,11 +658,18 @@ fn run_worker_inner(
                             && frame.identity == abi::current_identity() =>
                     {
                         response = Some(match frame.kind {
-                            FrameKind::Response(response) if restricted =>
-                                restricted_outcome(response),
-                            FrameKind::Response(Response::Complete(values)) => WorkerOutcome::Complete(values),
-                            FrameKind::Response(Response::RuntimeError(bytes)) => WorkerOutcome::RuntimeError(bytes),
-                            FrameKind::Response(Response::Rejected(bytes)) => WorkerOutcome::Rejected(bytes),
+                            FrameKind::Response(response) if restricted => {
+                                restricted_outcome(response)
+                            }
+                            FrameKind::Response(Response::Complete(values)) => {
+                                WorkerOutcome::Complete(values)
+                            }
+                            FrameKind::Response(Response::RuntimeError(bytes)) => {
+                                WorkerOutcome::RuntimeError(bytes)
+                            }
+                            FrameKind::Response(Response::Rejected(bytes)) => {
+                                WorkerOutcome::Rejected(bytes)
+                            }
                             FrameKind::Response(Response::NonCopyable { index, lua_type }) => {
                                 WorkerOutcome::NonCopyable { index, lua_type }
                             }
@@ -627,13 +699,19 @@ fn run_worker_inner(
             }
         }
         if eof && !hello {
-            failure = Some(if restricted { policy_denied() } else {
+            failure = Some(if restricted {
+                policy_denied()
+            } else {
                 WorkerOutcome::Crash
             });
             break;
         }
     }
-    let mut status = if restricted { None } else { child.try_wait().ok().flatten() };
+    let mut status = if restricted {
+        None
+    } else {
+        child.try_wait().ok().flatten()
+    };
     let mut response_exit_confirmed = false;
     if failure.is_none() && response.is_some() && eof {
         if restricted {
@@ -670,7 +748,14 @@ fn run_worker_inner(
         failure = Some(WorkerOutcome::Deadline);
     }
     let outcome = failure.unwrap_or_else(|| response.unwrap_or(WorkerOutcome::Malformed));
-    finish(child, run_dir, outcome, status, response_exit_confirmed, restricted)
+    finish(
+        child,
+        run_dir,
+        outcome,
+        status,
+        response_exit_confirmed,
+        restricted,
+    )
 }
 
 fn restricted_outcome(response: Response) -> WorkerOutcome {
@@ -703,10 +788,11 @@ fn sanitize_response(response: Response) -> Response {
         Response::RuntimeError(_) => Response::RuntimeError(b"E_WORKER_RUNTIME".to_vec()),
         Response::Rejected(code) if code == b"E_POLICY_DENIED" => Response::Rejected(code),
         Response::Rejected(code) if code == b"E_WORKER_RESOURCE" => Response::Rejected(code),
-        Response::Rejected(code) if code == b"E_OUTPUT_LIMIT"
-            || code == b"response exceeds frame bound"
-            || code == b"string result exceeds bound"
-            || code == b"result count exceeds bound" =>
+        Response::Rejected(code)
+            if code == b"E_OUTPUT_LIMIT"
+                || code == b"response exceeds frame bound"
+                || code == b"string result exceeds bound"
+                || code == b"result count exceeds bound" =>
         {
             Response::Rejected(b"E_OUTPUT_LIMIT".to_vec())
         }
@@ -867,7 +953,12 @@ fn shutdown_after_response<L>(mut owner: StateOwner, libraries: L, response: Res
     response
 }
 
-fn execute_request(request: Request, cache_root: &Path, limits: Limits, policy: VmPolicy) -> Response {
+fn execute_request(
+    request: Request,
+    cache_root: &Path,
+    limits: Limits,
+    policy: VmPolicy,
+) -> Response {
     #[cfg(feature = "lua54")]
     let profile = LuaProfile::Lua54;
     #[cfg(feature = "lua55")]
@@ -986,9 +1077,9 @@ fn execute_request(request: Request, cache_root: &Path, limits: Limits, policy: 
             limits
         } else {
             Limits {
-                frame_bytes: limits.frame_bytes.min(
-                    HEADER_BYTES + 3 + OutputBudget::default().max_bytes,
-                ),
+                frame_bytes: limits
+                    .frame_bytes
+                    .min(HEADER_BYTES + 3 + OutputBudget::default().max_bytes),
                 ..limits
             }
         };
@@ -1006,7 +1097,9 @@ pub fn worker_main() -> i32 {
     let policy = match args.next().as_deref() {
         None => VmPolicy::Compatibility,
         Some(arg) if arg == std::ffi::OsStr::new("--rivetlua-policy-sandbox") => VmPolicy::Sandbox,
-        Some(arg) if arg == std::ffi::OsStr::new("--rivetlua-policy-private") => VmPolicy::PrivateService,
+        Some(arg) if arg == std::ffi::OsStr::new("--rivetlua-policy-private") => {
+            VmPolicy::PrivateService
+        }
         _ => return 2,
     };
     if args.next().is_some() {
@@ -1023,8 +1116,9 @@ pub fn worker_main() -> i32 {
     }
     let limits = Limits::default();
     if policy != VmPolicy::Compatibility
-        && (!cache_valid || !isolation::child_probe(policy, &cache)
-            .is_ok_and(|proof| proof.matches(policy, std::process::id(), false)))
+        && (!cache_valid
+            || !isolation::child_probe(policy, &cache)
+                .is_ok_and(|proof| proof.matches(policy, std::process::id(), false)))
     {
         let denial = Frame {
             request_id: 0,
@@ -1099,11 +1193,13 @@ pub fn worker_main() -> i32 {
             let fallback = Frame {
                 request_id: frame.request_id,
                 identity: abi::current_identity(),
-                kind: FrameKind::Response(Response::Rejected(if policy == VmPolicy::Compatibility {
-                    b"response exceeds frame bound".to_vec()
-                } else {
-                    b"E_OUTPUT_LIMIT".to_vec()
-                })),
+                kind: FrameKind::Response(Response::Rejected(
+                    if policy == VmPolicy::Compatibility {
+                        b"response exceeds frame bound".to_vec()
+                    } else {
+                        b"E_OUTPUT_LIMIT".to_vec()
+                    },
+                )),
             };
             match fallback.encode(limits) {
                 Ok(bytes) => bytes,

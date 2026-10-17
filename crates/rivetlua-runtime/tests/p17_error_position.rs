@@ -4,8 +4,12 @@ use rivetlua_compiler::{
 };
 use rivetlua_core::bytecode::official::{OfficialChunkLimits, decode_official_chunk};
 use rivetlua_core::bytecode::official_export::emit_official_chunk;
-use rivetlua_core::{HostFunctionId, LuaProfile, ObjectRef, OfficialWorkBudget, ProtoId, Value, VerifyLimits};
-use rivetlua_runtime::{ExternalCommand, FailPoint, RootKind, RunOutcome, RuntimeErrorKind, Vm, VmError};
+use rivetlua_core::{
+    HostFunctionId, LuaProfile, ObjectRef, OfficialWorkBudget, ProtoId, Value, VerifyLimits,
+};
+use rivetlua_runtime::{
+    ExternalCommand, FailPoint, RootKind, RunOutcome, RuntimeErrorKind, Vm, VmError,
+};
 
 fn compile_debug(
     source: &[u8],
@@ -442,7 +446,6 @@ fn p17_error_position_dispatch_lifecycle() {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OuterCallbackArtifact {
     NativeDebug,
@@ -507,7 +510,10 @@ fn park_outer_callback(
     };
     let args = vm.external_event(token).unwrap().args.to_vec();
     assert_eq!(args.len(), 1, "bridge 必須收到單一 Lua callback");
-    assert!(matches!(args[0], Value::Object(_)), "參數必須是 Lua closure");
+    assert!(
+        matches!(args[0], Value::Object(_)),
+        "參數必須是 Lua closure"
+    );
     (token, args[0])
 }
 
@@ -656,7 +662,10 @@ fn p17_outer_callback_error_position_nested_error_cleanup_complete() {
                 RunOutcome::Returned(Vec::new())
             );
             assert!(vm.external_event(token).is_err(), "完成後舊 token 須失效");
-            assert!(vm.continue_external(token, ExternalCommand::Return(Vec::new())).is_err());
+            assert!(
+                vm.continue_external(token, ExternalCommand::Return(Vec::new()))
+                    .is_err()
+            );
             assert!(vm.debug_frame_info(stale_handle).is_err());
             let probe = vm
                 .load_with_environment(

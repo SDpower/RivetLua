@@ -269,9 +269,7 @@ fn p12_6_vm_lifecycle_10_000_balances_all_domains() {
             let close_key = vm.allocate_byte_string(b"__close").unwrap();
             let close_key_root = vm.add_root(RootKind::Temporary, close_key).unwrap();
             let close_callback = p12_6_loaded_closure(&mut vm, environment, &close_module);
-            let close_callback_root = vm
-                .add_root(RootKind::Temporary, close_callback)
-                .unwrap();
+            let close_callback_root = vm.add_root(RootKind::Temporary, close_callback).unwrap();
             vm.raw_set(
                 close_mt,
                 Value::Object(close_key),
@@ -289,9 +287,7 @@ fn p12_6_vm_lifecycle_10_000_balances_all_domains() {
             let index_key = vm.allocate_byte_string(b"__index").unwrap();
             let index_key_root = vm.add_root(RootKind::Temporary, index_key).unwrap();
             let index_callback = p12_6_loaded_closure(&mut vm, environment, &index_module);
-            let index_callback_root = vm
-                .add_root(RootKind::Temporary, index_callback)
-                .unwrap();
+            let index_callback_root = vm.add_root(RootKind::Temporary, index_callback).unwrap();
             vm.raw_set(
                 observed_mt,
                 Value::Object(index_key),

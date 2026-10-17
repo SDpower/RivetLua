@@ -32,9 +32,8 @@ fn sdk_package_loadlib_uses_host_path_and_returns_host_function() {
                   assert(type(loader)=='function'); return loader()",
             )
             .unwrap();
-        let services = HostServices::deny_all().and_load(
-            LoadCapability::deny_all().with_foreign_native_cpath(b"mock/?.so".to_vec()),
-        );
+        let services = HostServices::deny_all()
+            .and_load(LoadCapability::deny_all().with_foreign_native_cpath(b"mock/?.so".to_vec()));
         let mut vm = engine.new_vm_with_services(services).unwrap();
         let fake_loader = vm
             .register_callback(
@@ -63,11 +62,8 @@ fn sdk_package_loadlib_uses_host_path_and_returns_host_function() {
         assert_eq!(vm.read_byte_string(&entrypoint).unwrap(), b"luaopen_sample");
 
         assert_eq!(
-            vm.continue_external(
-                token,
-                ExternalCommand::Return(vec![fake_loader_value]),
-            )
-            .unwrap(),
+            vm.continue_external(token, ExternalCommand::Return(vec![fake_loader_value]),)
+                .unwrap(),
             RunOutcome::Returned(vec![Value::Integer(73)]),
             "{profile:?}"
         );

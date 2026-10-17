@@ -403,12 +403,7 @@ mod tests {
     #[test]
     fn decimal_overflow_literals_preserve_float_and_syntax_contract() {
         for profile in [LanguageProfile::Lua54, LanguageProfile::Lua55] {
-            let chunk = lex(
-                b"1e9999 1.25 1e-300",
-                profile,
-                &CompileLimits::default(),
-            )
-            .unwrap();
+            let chunk = lex(b"1e9999 1.25 1e-300", profile, &CompileLimits::default()).unwrap();
             let float_at = |index: usize| match chunk.tokens[index].literal.as_ref() {
                 Some(Literal::Float(Number::Float(value))) => *value,
                 other => panic!("{profile:?}: token {index} was {other:?}"),

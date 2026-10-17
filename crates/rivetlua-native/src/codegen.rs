@@ -1,18 +1,27 @@
 //! 僅編譯已驗證、無 heap 效果的 RVLU 數值函式。
 
-use std::time::Instant;
+use crate::abi::{
+    FRAME_EXECUTED_OFFSET, FRAME_EXIT_OFFSET, FRAME_FUEL_OFFSET, FRAME_PC_OFFSET,
+    FRAME_REGISTERS_OFFSET, FRAME_STEP_BUDGET_OFFSET, NativeExit, TAG_BOOLEAN, TAG_FLOAT,
+    TAG_INTEGER, TAG_NIL, VALUE_BITS_OFFSET, VALUE_SIZE, VALUE_TAG_OFFSET,
+};
+use crate::artifact::{
+    CODE_VERSION, NativeArtifact, NativeCompileError, NativeCompileInput, ValidatedCode,
+    check_prototype,
+};
+use crate::execmem::{self, ExecutableCode};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, AbiParam, InstBuilder, MemFlagsData, Value as ClifValue, types};
 use cranelift_codegen::isa::{self, TargetIsa};
 use cranelift_codegen::settings;
 use cranelift_codegen::{Context, control::ControlPlane};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use rivetlua_core::bytecode::{BinaryOperation, BytecodeConstant, BytecodePrototype, Instruction, Register, UnaryOperation};
+use rivetlua_core::bytecode::{
+    BinaryOperation, BytecodeConstant, BytecodePrototype, Instruction, Register, UnaryOperation,
+};
 use rivetlua_core::{LuaProfile, RVLU_V2};
+use std::time::Instant;
 use target_lexicon::Triple;
-use crate::abi::{FRAME_EXECUTED_OFFSET, FRAME_EXIT_OFFSET, FRAME_FUEL_OFFSET, FRAME_PC_OFFSET, FRAME_REGISTERS_OFFSET, FRAME_STEP_BUDGET_OFFSET, TAG_BOOLEAN, TAG_FLOAT, TAG_INTEGER, TAG_NIL, VALUE_BITS_OFFSET, VALUE_SIZE, VALUE_TAG_OFFSET, NativeExit};
-use crate::artifact::{check_prototype, NativeArtifact, NativeCompileError, NativeCompileInput, ValidatedCode, CODE_VERSION};
-use crate::execmem::{self, ExecutableCode};
 
 pub(crate) fn lower_aot(
     module: &rivetlua_core::VerifiedModule,
@@ -23,20 +32,30 @@ pub(crate) fn lower_aot(
     if module.format_version() != RVLU_V2 {
         return Err(NativeCompileError::Rejected("RVLU version"));
     }
-    let prototype = module.module().prototypes.get(prototype_index)
+    let prototype = module
+        .module()
+        .prototypes
+        .get(prototype_index)
         .ok_or(NativeCompileError::Rejected("prototype index"))?;
-    if prototype.register_count == 0 || prototype.register_count > 4096
-        || prototype.instructions.is_empty() || prototype.instructions.len() > 100_000
-        || entry_pc >= prototype.instructions.len() || !prototype.close_paths.is_empty()
+    if prototype.register_count == 0
+        || prototype.register_count > 4096
+        || prototype.instructions.is_empty()
+        || prototype.instructions.len() > 100_000
+        || entry_pc >= prototype.instructions.len()
+        || !prototype.close_paths.is_empty()
     {
-        return Err(NativeCompileError::Rejected("function limits or close path"));
+        return Err(NativeCompileError::Rejected(
+            "function limits or close path",
+        ));
     }
     let mask = check_prototype(prototype)?;
-    let triple = target.parse::<Triple>()
+    let triple = target
+        .parse::<Triple>()
         .map_err(|_| NativeCompileError::Rejected("AOT target triple"))?;
-    let isa_builder = isa::lookup(triple)
-        .map_err(|_| NativeCompileError::Rejected("AOT target ISA"))?;
-    let isa = isa_builder.finish(settings::Flags::new(settings::builder()))
+    let isa_builder =
+        isa::lookup(triple).map_err(|_| NativeCompileError::Rejected("AOT target ISA"))?;
+    let isa = isa_builder
+        .finish(settings::Flags::new(settings::builder()))
         .map_err(|error| NativeCompileError::Backend(format!("{error:?}")))?;
     let code = lower(prototype, entry_pc, isa.as_ref(), target)?;
     Ok((code, mask))
@@ -49,14 +68,20 @@ impl NativeArtifact {
             return Err(NativeCompileError::Rejected("RVLU version"));
         }
         let module = input.module.module();
-        let prototype = module.prototypes.get(input.prototype_index)
+        let prototype = module
+            .prototypes
+            .get(input.prototype_index)
             .ok_or(NativeCompileError::Rejected("prototype index"))?;
-        if prototype.register_count == 0 || prototype.register_count > 4096
-            || prototype.instructions.is_empty() || prototype.instructions.len() > 100_000
+        if prototype.register_count == 0
+            || prototype.register_count > 4096
+            || prototype.instructions.is_empty()
+            || prototype.instructions.len() > 100_000
             || input.entry_pc >= prototype.instructions.len()
             || !prototype.close_paths.is_empty()
         {
-            return Err(NativeCompileError::Rejected("function limits or close path"));
+            return Err(NativeCompileError::Rejected(
+                "function limits or close path",
+            ));
         }
         if !matches!(module.profile, LuaProfile::Lua54 | LuaProfile::Lua55) {
             return Err(NativeCompileError::Rejected("Lua profile"));
@@ -64,10 +89,11 @@ impl NativeArtifact {
         let mask = check_prototype(prototype)?;
         execmem::platform_preflight().map_err(NativeCompileError::Native)?;
         let target = Triple::host().to_string();
-        let isa_builder = isa::lookup(Triple::host())
-            .map_err(|_| NativeCompileError::Rejected("host ISA"))?;
+        let isa_builder =
+            isa::lookup(Triple::host()).map_err(|_| NativeCompileError::Rejected("host ISA"))?;
         let flags = settings::Flags::new(settings::builder());
-        let isa = isa_builder.finish(flags)
+        let isa = isa_builder
+            .finish(flags)
             .map_err(|error| NativeCompileError::Backend(format!("{error:?}")))?;
         let code = lower(prototype, input.entry_pc, isa.as_ref(), target.clone())?;
         if code.bytes().len() > input.code_limit_bytes || code.bytes().len() > 16 * 1024 * 1024 {
@@ -95,20 +121,25 @@ impl NativeArtifact {
             cpu_features: &[],
         })
     }
-
 }
 
 fn field(builder: &mut FunctionBuilder<'_>, frame: ClifValue, offset: i32) -> ClifValue {
-    builder.ins().load(types::I64, MemFlagsData::trusted(), frame, offset)
+    builder
+        .ins()
+        .load(types::I64, MemFlagsData::trusted(), frame, offset)
 }
 
 fn store_field(builder: &mut FunctionBuilder<'_>, frame: ClifValue, offset: i32, value: ClifValue) {
-    builder.ins().store(MemFlagsData::trusted(), value, frame, offset);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), value, frame, offset);
 }
 
 fn slot(builder: &mut FunctionBuilder<'_>, frame: ClifValue, register: Register) -> ClifValue {
     let ptr = field(builder, frame, FRAME_REGISTERS_OFFSET);
-    builder.ins().iadd_imm_s(ptr, i64::from(register.0) * i64::from(VALUE_SIZE))
+    builder
+        .ins()
+        .iadd_imm_s(ptr, i64::from(register.0) * i64::from(VALUE_SIZE))
 }
 
 fn exit(builder: &mut FunctionBuilder<'_>, frame: ClifValue, pc: usize, reason: NativeExit) {
@@ -142,12 +173,20 @@ fn lower(
 ) -> Result<ValidatedCode, NativeCompileError> {
     let mut context = Context::new();
     context.func.signature = ir::Signature::new(isa.default_call_conv());
-    context.func.signature.params.push(AbiParam::new(types::I64));
+    context
+        .func
+        .signature
+        .params
+        .push(AbiParam::new(types::I64));
     let mut frontend = FunctionBuilderContext::new();
     {
         let mut builder = FunctionBuilder::new(&mut context.func, &mut frontend);
         let entry = builder.create_block();
-        let blocks: Vec<_> = prototype.instructions.iter().map(|_| builder.create_block()).collect();
+        let blocks: Vec<_> = prototype
+            .instructions
+            .iter()
+            .map(|_| builder.create_block())
+            .collect();
         let safepoint = builder.create_block();
         let exhausted = builder.create_block();
         builder.append_block_params_for_function_params(entry);
@@ -183,69 +222,145 @@ fn lower(
                     let ptr = slot(&mut builder, frame, *dest);
                     let tag = builder.ins().iconst(types::I64, tag as i64);
                     let bits = builder.ins().iconst(types::I64, bits as i64);
-                    builder.ins().store(MemFlagsData::trusted(), tag, ptr, VALUE_TAG_OFFSET);
-                    builder.ins().store(MemFlagsData::trusted(), bits, ptr, VALUE_BITS_OFFSET);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), tag, ptr, VALUE_TAG_OFFSET);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), bits, ptr, VALUE_BITS_OFFSET);
                     commit(&mut builder, frame, pc + 1, blocks[next]);
                 }
                 Instruction::LoadNil { start, count } => {
                     for index in 0..*count {
-                        let register = Register(start.0.checked_add(index)
-                            .ok_or(NativeCompileError::Rejected("nil register range"))?);
+                        let register = Register(
+                            start
+                                .0
+                                .checked_add(index)
+                                .ok_or(NativeCompileError::Rejected("nil register range"))?,
+                        );
                         let ptr = slot(&mut builder, frame, register);
                         let zero = builder.ins().iconst(types::I64, TAG_NIL as i64);
-                        builder.ins().store(MemFlagsData::trusted(), zero, ptr, VALUE_TAG_OFFSET);
-                        builder.ins().store(MemFlagsData::trusted(), zero, ptr, VALUE_BITS_OFFSET);
+                        builder
+                            .ins()
+                            .store(MemFlagsData::trusted(), zero, ptr, VALUE_TAG_OFFSET);
+                        builder
+                            .ins()
+                            .store(MemFlagsData::trusted(), zero, ptr, VALUE_BITS_OFFSET);
                     }
                     commit(&mut builder, frame, pc + 1, blocks[next]);
                 }
                 Instruction::Move { dest, src } => {
                     let from = slot(&mut builder, frame, *src);
                     let to = slot(&mut builder, frame, *dest);
-                    let tag = builder.ins().load(types::I64, MemFlagsData::trusted(), from, VALUE_TAG_OFFSET);
-                    let bits = builder.ins().load(types::I64, MemFlagsData::trusted(), from, VALUE_BITS_OFFSET);
-                    builder.ins().store(MemFlagsData::trusted(), tag, to, VALUE_TAG_OFFSET);
-                    builder.ins().store(MemFlagsData::trusted(), bits, to, VALUE_BITS_OFFSET);
+                    let tag = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        from,
+                        VALUE_TAG_OFFSET,
+                    );
+                    let bits = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        from,
+                        VALUE_BITS_OFFSET,
+                    );
+                    builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), tag, to, VALUE_TAG_OFFSET);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), bits, to, VALUE_BITS_OFFSET);
                     commit(&mut builder, frame, pc + 1, blocks[next]);
                 }
                 Instruction::Jump { target } => {
-                    commit(&mut builder, frame, target.0 as usize, blocks[target.0 as usize]);
+                    commit(
+                        &mut builder,
+                        frame,
+                        target.0 as usize,
+                        blocks[target.0 as usize],
+                    );
                 }
                 Instruction::JumpIfFalse { condition, target } => {
                     let from = slot(&mut builder, frame, *condition);
-                    let tag = builder.ins().load(types::I64, MemFlagsData::trusted(), from, VALUE_TAG_OFFSET);
-                    let bits = builder.ins().load(types::I64, MemFlagsData::trusted(), from, VALUE_BITS_OFFSET);
+                    let tag = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        from,
+                        VALUE_TAG_OFFSET,
+                    );
+                    let bits = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        from,
+                        VALUE_BITS_OFFSET,
+                    );
                     let nil = builder.ins().icmp_imm_s(IntCC::Equal, tag, TAG_NIL as i64);
-                    let boolean = builder.ins().icmp_imm_s(IntCC::Equal, tag, TAG_BOOLEAN as i64);
+                    let boolean = builder
+                        .ins()
+                        .icmp_imm_s(IntCC::Equal, tag, TAG_BOOLEAN as i64);
                     let zero = builder.ins().icmp_imm_s(IntCC::Equal, bits, 0);
                     let false_bool = builder.ins().band(boolean, zero);
                     let false_value = builder.ins().bor(nil, false_bool);
                     let false_block = builder.create_block();
                     let true_block = builder.create_block();
-                    builder.ins().brif(false_value, false_block, &[], true_block, &[]);
+                    builder
+                        .ins()
+                        .brif(false_value, false_block, &[], true_block, &[]);
                     builder.switch_to_block(false_block);
-                    commit(&mut builder, frame, target.0 as usize, blocks[target.0 as usize]);
+                    commit(
+                        &mut builder,
+                        frame,
+                        target.0 as usize,
+                        blocks[target.0 as usize],
+                    );
                     builder.switch_to_block(true_block);
                     commit(&mut builder, frame, pc + 1, blocks[next]);
                 }
                 Instruction::UnaryOp { dest, op, src } => {
                     let from = slot(&mut builder, frame, *src);
                     let to = slot(&mut builder, frame, *dest);
-                    let tag = builder.ins().load(types::I64, MemFlagsData::trusted(), from, VALUE_TAG_OFFSET);
-                    let bits = builder.ins().load(types::I64, MemFlagsData::trusted(), from, VALUE_BITS_OFFSET);
+                    let tag = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        from,
+                        VALUE_TAG_OFFSET,
+                    );
+                    let bits = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        from,
+                        VALUE_BITS_OFFSET,
+                    );
                     match op {
                         UnaryOperation::Not => {
                             let nil = builder.ins().icmp_imm_s(IntCC::Equal, tag, TAG_NIL as i64);
-                            let boolean = builder.ins().icmp_imm_s(IntCC::Equal, tag, TAG_BOOLEAN as i64);
+                            let boolean =
+                                builder
+                                    .ins()
+                                    .icmp_imm_s(IntCC::Equal, tag, TAG_BOOLEAN as i64);
                             let zero = builder.ins().icmp_imm_s(IntCC::Equal, bits, 0);
                             let false_bool = builder.ins().band(boolean, zero);
                             let result = builder.ins().bor(nil, false_bool);
                             let result = builder.ins().uextend(types::I64, result);
                             let bool_tag = builder.ins().iconst(types::I64, TAG_BOOLEAN as i64);
-                            builder.ins().store(MemFlagsData::trusted(), bool_tag, to, VALUE_TAG_OFFSET);
-                            builder.ins().store(MemFlagsData::trusted(), result, to, VALUE_BITS_OFFSET);
+                            builder.ins().store(
+                                MemFlagsData::trusted(),
+                                bool_tag,
+                                to,
+                                VALUE_TAG_OFFSET,
+                            );
+                            builder.ins().store(
+                                MemFlagsData::trusted(),
+                                result,
+                                to,
+                                VALUE_BITS_OFFSET,
+                            );
                         }
                         UnaryOperation::Negate => {
-                            let valid = builder.ins().icmp_imm_s(IntCC::Equal, tag, TAG_INTEGER as i64);
+                            let valid =
+                                builder
+                                    .ins()
+                                    .icmp_imm_s(IntCC::Equal, tag, TAG_INTEGER as i64);
                             let work = builder.create_block();
                             let deopt = builder.create_block();
                             builder.ins().brif(valid, work, &[], deopt, &[]);
@@ -254,21 +369,52 @@ fn lower(
                             builder.switch_to_block(work);
                             let result = builder.ins().ineg(bits);
                             let int_tag = builder.ins().iconst(types::I64, TAG_INTEGER as i64);
-                            builder.ins().store(MemFlagsData::trusted(), int_tag, to, VALUE_TAG_OFFSET);
-                            builder.ins().store(MemFlagsData::trusted(), result, to, VALUE_BITS_OFFSET);
+                            builder.ins().store(
+                                MemFlagsData::trusted(),
+                                int_tag,
+                                to,
+                                VALUE_TAG_OFFSET,
+                            );
+                            builder.ins().store(
+                                MemFlagsData::trusted(),
+                                result,
+                                to,
+                                VALUE_BITS_OFFSET,
+                            );
                         }
                         _ => return Err(NativeCompileError::Unsupported("unary")),
                     }
                     commit(&mut builder, frame, pc + 1, blocks[next]);
                 }
-                Instruction::BinaryOp { dest, op, left, right } => {
+                Instruction::BinaryOp {
+                    dest,
+                    op,
+                    left,
+                    right,
+                } => {
                     let left = slot(&mut builder, frame, *left);
                     let right = slot(&mut builder, frame, *right);
                     let dest = slot(&mut builder, frame, *dest);
-                    let left_tag = builder.ins().load(types::I64, MemFlagsData::trusted(), left, VALUE_TAG_OFFSET);
-                    let right_tag = builder.ins().load(types::I64, MemFlagsData::trusted(), right, VALUE_TAG_OFFSET);
-                    let l_int = builder.ins().icmp_imm_s(IntCC::Equal, left_tag, TAG_INTEGER as i64);
-                    let r_int = builder.ins().icmp_imm_s(IntCC::Equal, right_tag, TAG_INTEGER as i64);
+                    let left_tag = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        left,
+                        VALUE_TAG_OFFSET,
+                    );
+                    let right_tag = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        right,
+                        VALUE_TAG_OFFSET,
+                    );
+                    let l_int =
+                        builder
+                            .ins()
+                            .icmp_imm_s(IntCC::Equal, left_tag, TAG_INTEGER as i64);
+                    let r_int =
+                        builder
+                            .ins()
+                            .icmp_imm_s(IntCC::Equal, right_tag, TAG_INTEGER as i64);
                     let both_int = builder.ins().band(l_int, r_int);
                     let work = builder.create_block();
                     let deopt = builder.create_block();
@@ -276,15 +422,28 @@ fn lower(
                     builder.switch_to_block(deopt);
                     exit(&mut builder, frame, pc, NativeExit::Deopt);
                     builder.switch_to_block(work);
-                    let l = builder.ins().load(types::I64, MemFlagsData::trusted(), left, VALUE_BITS_OFFSET);
-                    let r = builder.ins().load(types::I64, MemFlagsData::trusted(), right, VALUE_BITS_OFFSET);
+                    let l = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        left,
+                        VALUE_BITS_OFFSET,
+                    );
+                    let r = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        right,
+                        VALUE_BITS_OFFSET,
+                    );
                     let (tag, result) = match op {
                         BinaryOperation::Add => (TAG_INTEGER, builder.ins().iadd(l, r)),
                         BinaryOperation::Subtract => (TAG_INTEGER, builder.ins().isub(l, r)),
                         BinaryOperation::Multiply => (TAG_INTEGER, builder.ins().imul(l, r)),
-                        BinaryOperation::Equal | BinaryOperation::NotEqual
-                        | BinaryOperation::Less | BinaryOperation::LessEqual
-                        | BinaryOperation::Greater | BinaryOperation::GreaterEqual => {
+                        BinaryOperation::Equal
+                        | BinaryOperation::NotEqual
+                        | BinaryOperation::Less
+                        | BinaryOperation::LessEqual
+                        | BinaryOperation::Greater
+                        | BinaryOperation::GreaterEqual => {
                             let condition = match op {
                                 BinaryOperation::Equal => IntCC::Equal,
                                 BinaryOperation::NotEqual => IntCC::NotEqual,
@@ -300,28 +459,39 @@ fn lower(
                         _ => return Err(NativeCompileError::Unsupported("binary")),
                     };
                     let tag = builder.ins().iconst(types::I64, tag as i64);
-                    builder.ins().store(MemFlagsData::trusted(), tag, dest, VALUE_TAG_OFFSET);
-                    builder.ins().store(MemFlagsData::trusted(), result, dest, VALUE_BITS_OFFSET);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), tag, dest, VALUE_TAG_OFFSET);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), result, dest, VALUE_BITS_OFFSET);
                     commit(&mut builder, frame, pc + 1, blocks[next]);
                 }
-                Instruction::Return { .. } => return Err(NativeCompileError::Rejected("return control flow")),
+                Instruction::Return { .. } => {
+                    return Err(NativeCompileError::Rejected("return control flow"));
+                }
                 _ => return Err(NativeCompileError::Unsupported("instruction")),
             }
         }
         builder.switch_to_block(safepoint);
         let pc = field(&mut builder, frame, FRAME_PC_OFFSET);
-        let reason = builder.ins().iconst(types::I64, NativeExit::Safepoint as i64);
+        let reason = builder
+            .ins()
+            .iconst(types::I64, NativeExit::Safepoint as i64);
         store_field(&mut builder, frame, FRAME_PC_OFFSET, pc);
         store_field(&mut builder, frame, FRAME_EXIT_OFFSET, reason);
         builder.ins().return_(&[]);
         builder.switch_to_block(exhausted);
-        let reason = builder.ins().iconst(types::I64, NativeExit::FuelExhausted as i64);
+        let reason = builder
+            .ins()
+            .iconst(types::I64, NativeExit::FuelExhausted as i64);
         store_field(&mut builder, frame, FRAME_EXIT_OFFSET, reason);
         builder.ins().return_(&[]);
         builder.seal_all_blocks();
         builder.finalize(isa.frontend_config());
     }
-    let compiled = context.compile(isa, &mut ControlPlane::default())
+    let compiled = context
+        .compile(isa, &mut ControlPlane::default())
         .map_err(|error| NativeCompileError::Backend(format!("{error:?}")))?;
     if !compiled.buffer.relocs().is_empty() || !compiled.buffer.traps().is_empty() {
         return Err(NativeCompileError::Rejected("relocation or trap"));

@@ -1,7 +1,7 @@
 //! P11 的 Lua 錯誤值、受保護呼叫邊界與三個必要內建入口。
 
-use core::mem::size_of;
 use crate::rust_alloc::rc::Rc;
+use core::mem::size_of;
 
 use rivetlua_core::{ObjectRef, Register, ResultMode, Value};
 
@@ -221,7 +221,11 @@ impl NativeCallInfo {
             Value::Object(object) => Some(vm.add_root(crate::RootKind::Temporary, object)?),
             _ => None,
         };
-        Ok(Self { function, caller_depth, root })
+        Ok(Self {
+            function,
+            caller_depth,
+            root,
+        })
     }
 
     pub(crate) fn clear(&mut self, vm: &mut Vm) -> Result<(), VmError> {

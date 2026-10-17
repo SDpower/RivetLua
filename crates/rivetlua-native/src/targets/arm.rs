@@ -1,5 +1,6 @@
-use rivetlua_core::{BoardConfig, DeploymentStatus, Endian, ExecMemoryPolicy, TargetDescriptor,
-    TargetError};
+use rivetlua_core::{
+    BoardConfig, DeploymentStatus, Endian, ExecMemoryPolicy, TargetDescriptor, TargetError,
+};
 
 pub(super) fn entries() -> Vec<super::PlatformTarget> {
     vec![
@@ -48,8 +49,10 @@ pub(super) fn entries() -> Vec<super::PlatformTarget> {
     ]
 }
 
-pub fn validate_board_target(board: &BoardConfig, target: &TargetDescriptor)
-    -> Result<(), TargetError> {
+pub fn validate_board_target(
+    board: &BoardConfig,
+    target: &TargetDescriptor,
+) -> Result<(), TargetError> {
     board.validate()?;
     target.validate()?;
 

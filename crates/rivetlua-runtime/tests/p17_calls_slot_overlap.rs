@@ -42,12 +42,10 @@ return 9
 fn compile(source: &[u8], language: LanguageProfile) -> Result<VerifiedModule, String> {
     let limits = CompileLimits::default();
     let chunk = lex(source, language, &limits).map_err(|error| format!("lex: {error:?}"))?;
-    let syntax = parse(&chunk, language, &limits)
-        .map_err(|error| format!("parse: {error:?}"))?;
+    let syntax = parse(&chunk, language, &limits).map_err(|error| format!("parse: {error:?}"))?;
     let resolved = resolve(&syntax, &chunk, language, &limits)
         .map_err(|error| format!("resolve: {error:?}"))?;
-    let ir = lower(&resolved, &IrLimits::default())
-        .map_err(|error| format!("lower: {error:?}"))?;
+    let ir = lower(&resolved, &IrLimits::default()).map_err(|error| format!("lower: {error:?}"))?;
     emit_with_native_debug(
         &ir,
         &resolved,
@@ -156,7 +154,9 @@ fn run_with_p17_finite_dump_load_limits(
     match &run_result {
         Err(_) => failures.push(format!("run_result={run_result:?}")),
         Ok(outcome) if outcome != &RunOutcome::Returned(vec![Value::Integer(9)]) => {
-            failures.push(format!("unexpected run_result={run_result:?}; expected integer 9"));
+            failures.push(format!(
+                "unexpected run_result={run_result:?}; expected integer 9"
+            ));
         }
         Ok(_) => {}
     }
@@ -178,8 +178,7 @@ fn run_with_p17_finite_dump_load_limits(
         if root_counts_after[index] != root_counts_before[index] {
             failures.push(format!(
                 "{kind:?} roots after cleanup={}; expected baseline {}",
-                root_counts_after[index],
-                root_counts_before[index]
+                root_counts_after[index], root_counts_before[index]
             ));
         }
     }

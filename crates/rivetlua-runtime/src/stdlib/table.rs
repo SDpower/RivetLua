@@ -210,7 +210,10 @@ impl TableOpState {
         args: &[Value],
     ) -> Result<Self, RuntimeError> {
         let table = match table_arg(vm, args, 0) {
-            Err(error) if kind == TableBuiltin::Concat && error.kind == RuntimeErrorKind::BasicArgument => {
+            Err(error)
+                if kind == TableBuiltin::Concat
+                    && error.kind == RuntimeErrorKind::BasicArgument =>
+            {
                 return Err(concat_table_error(vm)?);
             }
             Err(error) => return Err(error),
@@ -413,9 +416,8 @@ pub(crate) fn argument() -> RuntimeError {
 
 fn concat_table_error(vm: &mut Vm) -> Result<RuntimeError, RuntimeError> {
     let mut error = argument();
-    error.value = Value::Object(
-        vm.allocate_byte_string(b"bad argument #1 to 'concat' (table expected)")?,
-    );
+    error.value =
+        Value::Object(vm.allocate_byte_string(b"bad argument #1 to 'concat' (table expected)")?);
     Ok(error)
 }
 
@@ -439,8 +441,7 @@ pub(crate) fn concat_index_error(vm: &mut Vm, index: i64) -> Result<RuntimeError
         bytes: [0; 64],
         len: 0,
     };
-    write!(message, "invalid value (at index {index})")
-        .map_err(|_| VmError::ArithmeticOverflow)?;
+    write!(message, "invalid value (at index {index})").map_err(|_| VmError::ArithmeticOverflow)?;
     let mut error = argument();
     error.value = Value::Object(vm.allocate_byte_string(&message.bytes[..message.len])?);
     Ok(error)

@@ -66,7 +66,10 @@ fn p17_version_flag_with_execute_prints_full_banner_then_program_output() {
         let output = run_lua(profile, &["-v", "-e", "print'hello'"], b"");
         let expected = [expected_banner(profile), b"hello\n"].concat();
         assert_success(&output, &expected, profile);
-        assert!(!output.stdout.contains(&0), "{profile}: stdout 不應包含 NUL");
+        assert!(
+            !output.stdout.contains(&0),
+            "{profile}: stdout 不應包含 NUL"
+        );
     }
 }
 

@@ -1,6 +1,5 @@
 use rivetlua_compiler::{
-    CompileLimits, IrLimits, LanguageProfile, emit_with_native_debug, lex,
-    lower, parse, resolve,
+    CompileLimits, IrLimits, LanguageProfile, emit_with_native_debug, lex, lower, parse, resolve,
 };
 use rivetlua_core::bytecode::official_export::emit_official_chunk;
 use rivetlua_core::{
@@ -14,7 +13,8 @@ use rivetlua_runtime::{
 };
 
 const DUMP_WORK_CAP: usize = 512 * 1024 * 1024;
-const SOURCE: &[u8] = b"local bytes = string.dump(function() return 1 end, false); return #bytes > 0\n";
+const SOURCE: &[u8] =
+    b"local bytes = string.dump(function() return 1 end, false); return #bytes > 0\n";
 
 #[derive(Debug)]
 enum ObservedOutcome {
@@ -40,8 +40,7 @@ fn compile_source(profile: LuaProfile, source: &[u8]) -> Result<VerifiedModule, 
     let syntax = parse(&chunk, language, &limits).map_err(|error| format!("parse: {error:?}"))?;
     let resolved = resolve(&syntax, &chunk, language, &limits)
         .map_err(|error| format!("resolve: {error:?}"))?;
-    let ir = lower(&resolved, &IrLimits::default())
-        .map_err(|error| format!("lower: {error:?}"))?;
+    let ir = lower(&resolved, &IrLimits::default()).map_err(|error| format!("lower: {error:?}"))?;
     emit_with_native_debug(
         &ir,
         &resolved,
@@ -52,7 +51,6 @@ fn compile_source(profile: LuaProfile, source: &[u8]) -> Result<VerifiedModule, 
     .map(|compiled| compiled.verified().clone())
     .map_err(|error| format!("native emit: {error:?}"))
 }
-
 
 fn compile(profile: LuaProfile) -> Result<VerifiedModule, String> {
     compile_source(profile, SOURCE)
@@ -266,7 +264,6 @@ fn p17_official_export_reused_temporaries_across_open_calls() {
     }
 }
 
-
 #[test]
 fn p17_official_export_many_open_call_statements_stays_bounded() {
     let mut source = String::from(
@@ -282,7 +279,10 @@ fn p17_official_export_many_open_call_statements_stays_bounded() {
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
         let module = compile_source(profile, source.as_bytes())
             .unwrap_or_else(|error| panic!("{profile:?} compile: {error}"));
-        let root = module.module().prototypes.iter()
+        let root = module
+            .module()
+            .prototypes
+            .iter()
             .find(|proto| proto.id == ProtoId(0))
             .expect("root prototype");
         assert!(
@@ -332,8 +332,6 @@ fn p17_official_export_pending_callee_survives_short_local_scope() {
     }
 }
 
-
-
 #[derive(Clone, Copy)]
 enum P17ExpectedValues {
     Integers(i64, i64),
@@ -347,22 +345,25 @@ fn p17_run_module(
 ) -> Result<(), String> {
     let mut vm = Vm::new_with_services(profile, HostServices::deny_all())
         .map_err(|error| format!("VM creation: {error:?}"))?;
-    let environment = vm.allocate_table()
+    let environment = vm
+        .allocate_table()
         .map_err(|error| format!("environment allocation: {error:?}"))?;
     vm.install_basic_builtins(environment)
         .map_err(|error| format!("basic installation: {error:?}"))?;
     vm.install_table_builtins(environment)
         .map_err(|error| format!("table installation: {error:?}"))?;
-    let root = vm.add_root(RootKind::Host, environment)
+    let root = vm
+        .add_root(RootKind::Host, environment)
         .map_err(|error| format!("environment root: {error:?}"))?;
     let outcome = {
-        let mut execution = vm.load_with_environment(
-            module.clone(), Value::Object(environment),
-        )
-        .map_err(|error| format!("module load: {error:?}"))?;
-        execution.set_fuel(1_000_000)
+        let mut execution = vm
+            .load_with_environment(module.clone(), Value::Object(environment))
+            .map_err(|error| format!("module load: {error:?}"))?;
+        execution
+            .set_fuel(1_000_000)
             .map_err(|error| format!("set fuel: {error:?}"))?;
-        execution.run()
+        execution
+            .run()
             .map_err(|error| format!("execution: {error:?}"))?
     };
     let result = match (outcome, expected) {
@@ -374,7 +375,8 @@ fn p17_run_module(
         (RunOutcome::Returned(values), P17ExpectedValues::Bytes(expected)) => {
             match values.as_slice() {
                 [Value::Object(object)] => {
-                    let actual = vm.with_byte_string(*object, |string| string.as_bytes().to_vec())
+                    let actual = vm
+                        .with_byte_string(*object, |string| string.as_bytes().to_vec())
                         .map_err(|error| format!("returned string: {error:?}"))?;
                     if actual == expected {
                         Ok(())
@@ -382,7 +384,9 @@ fn p17_run_module(
                         Err(format!("returned bytes {actual:?}, expected {expected:?}"))
                     }
                 }
-                other => Err(format!("returned values {other:?}, expected bytes {expected:?}")),
+                other => Err(format!(
+                    "returned values {other:?}, expected bytes {expected:?}"
+                )),
             }
         }
         (other, _) => Err(format!("unexpected outcome {other:?}")),
@@ -398,13 +402,17 @@ fn p17_run_native_and_official(
     expected: P17ExpectedValues,
 ) -> Result<(), String> {
     let native = compile_source(profile, source)?;
-    p17_run_module(profile, &native, expected)
-        .map_err(|error| format!("native {error}"))?;
+    p17_run_module(profile, &native, expected).map_err(|error| format!("native {error}"))?;
     let limits = OfficialChunkLimits::default();
     let verify = VerifyLimits::default();
     let mut export_work = OfficialWorkBudget::new(DUMP_WORK_CAP as u64);
     let encoded = emit_official_chunk(
-        &native, ProtoId(0), profile, false, &limits, &mut export_work,
+        &native,
+        ProtoId(0),
+        profile,
+        false,
+        &limits,
+        &mut export_work,
     )
     .map_err(|error| format!("official export: {error:?}"))?;
     let stats = preflight_official_chunk(&encoded, profile, &limits, &verify)
@@ -412,10 +420,8 @@ fn p17_run_native_and_official(
     let decoded = decode_official_chunk(&encoded, profile, &limits)
         .map_err(|error| format!("official decode: {error:?}"))?;
     let mut translate_work = OfficialWorkBudget::new(stats.subsequent_work);
-    let translated = translate_official_chunk_with_work(
-        &decoded, &verify, &mut translate_work,
-    )
-    .map_err(|error| format!("official translate: {error:?}"))?;
+    let translated = translate_official_chunk_with_work(&decoded, &verify, &mut translate_work)
+        .map_err(|error| format!("official translate: {error:?}"))?;
     p17_run_module(profile, translated.verified(), expected)
         .map_err(|error| format!("official roundtrip {error}"))
 }
@@ -424,10 +430,8 @@ fn p17_run_native_and_official(
 fn p17_backward_goto_closes_captured_local_before_reentry() {
     let source = b"local f={}; local n=0; ::again:: local x=n; f[n+1]=function() return x end; n=n+1; if n<2 then goto again end; return f[1](), f[2]();";
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
-        p17_run_native_and_official(
-            profile, source, P17ExpectedValues::Integers(0, 1),
-        )
-        .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
+        p17_run_native_and_official(profile, source, P17ExpectedValues::Integers(0, 1))
+            .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
     }
 }
 
@@ -435,10 +439,8 @@ fn p17_backward_goto_closes_captured_local_before_reentry() {
 fn p17_backward_goto_closes_tbc_once_in_order() {
     let source = b"local log={}; do local n=0; ::again:: n=n+1; local x<close> = setmetatable({v=n},{__close=function(o) log[#log+1]=o.v end}); if n<2 then goto again end end; return table.concat(log,',')";
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
-        p17_run_native_and_official(
-            profile, source, P17ExpectedValues::Bytes(b"1,2"),
-        )
-        .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
+        p17_run_native_and_official(profile, source, P17ExpectedValues::Bytes(b"1,2"))
+            .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
     }
 }
 
@@ -464,10 +466,8 @@ run(false, second_log, second_out)
 return first .. '|' .. table.concat(second_log, ',') .. ':' .. second_out.get()
 "#;
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
-        p17_run_native_and_official(
-            profile, source, P17ExpectedValues::Bytes(b"O:11|I,O:22"),
-        )
-        .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
+        p17_run_native_and_official(profile, source, P17ExpectedValues::Bytes(b"O:11|I,O:22"))
+            .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
     }
 }
 
@@ -508,7 +508,8 @@ return table.concat(normal_log, ',')..':'..
 "#;
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
         p17_run_native_and_official(
-            profile, source,
+            profile,
+            source,
             P17ExpectedValues::Bytes(b"B1,B2,G:1,2|B1,G:1|B1,G:1|B1,G:1:caught"),
         )
         .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
@@ -522,10 +523,8 @@ fn p17_initializer_cleanup_preserves_non_nil_new_local() {
         local s,a,b,c,d = values(1,2,3,4,'alive')\n\
         return d\n";
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
-        p17_run_native_and_official(
-            profile, source, P17ExpectedValues::Bytes(b"alive"),
-        )
-        .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
+        p17_run_native_and_official(profile, source, P17ExpectedValues::Bytes(b"alive"))
+            .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
     }
 }
 
@@ -538,7 +537,9 @@ fn p17_large_table_literal_reuses_dead_register_homes() {
     source.push_str("}; return values[1], values[256]");
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
         p17_run_native_and_official(
-            profile, source.as_bytes(), P17ExpectedValues::Integers(1, 256),
+            profile,
+            source.as_bytes(),
+            P17ExpectedValues::Integers(1, 256),
         )
         .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
     }
@@ -552,12 +553,12 @@ fn p17_first_open_call_after_local_binding_uses_new_temporary_generation() {
     for _ in 0..24 {
         source.push_str("sink(1);");
     }
-    source.push_str(
-        "do local keep=7; sink(keep); return sink(pass(keep), pass(8)) end",
-    );
+    source.push_str("do local keep=7; sink(keep); return sink(pass(keep), pass(8)) end");
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
         p17_run_native_and_official(
-            profile, source.as_bytes(), P17ExpectedValues::Integers(7, 8),
+            profile,
+            source.as_bytes(),
+            P17ExpectedValues::Integers(7, 8),
         )
         .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
     }
@@ -567,10 +568,8 @@ fn p17_first_open_call_after_local_binding_uses_new_temporary_generation() {
 fn p17_open_result_tailcall_keeps_callee_in_prefix() {
     let source = b"local function identity(...) return ... end; local function choose() return identity end; return choose()(identity(1, 2))";
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
-        p17_run_native_and_official(
-            profile, source, P17ExpectedValues::Integers(1, 2),
-        )
-        .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
+        p17_run_native_and_official(profile, source, P17ExpectedValues::Integers(1, 2))
+            .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
     }
 }
 
@@ -590,10 +589,8 @@ end
 return sum, sum
 "#;
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
-        p17_run_native_and_official(
-            profile, source, P17ExpectedValues::Integers(20, 20),
-        )
-        .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
+        p17_run_native_and_official(profile, source, P17ExpectedValues::Integers(20, 20))
+            .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
     }
 }
 
@@ -606,34 +603,50 @@ fn p17_sequential_and_nested_numeric_loops_bound_official_stack() {
             for _ in 0..count {
                 source.push_str("for i=1,4 do sum=sum+i end;");
             }
-            source.push_str(
-                "for i=1,3 do for j=1,2 do sum=sum+i+j end end; return sum,sum",
-            );
+            source.push_str("for i=1,3 do for j=1,2 do sum=sum+i+j end end; return sum,sum");
             let native = compile_source(profile, source.as_bytes())
                 .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
-            let root = native.module().prototypes.iter()
-                .find(|proto| proto.id == ProtoId(0)).unwrap();
-            assert!(usize::from(root.register_count) < count * 24 + 64,
-                "{profile:?} count={count} virtual={}", root.register_count);
+            let root = native
+                .module()
+                .prototypes
+                .iter()
+                .find(|proto| proto.id == ProtoId(0))
+                .unwrap();
+            assert!(
+                usize::from(root.register_count) < count * 24 + 64,
+                "{profile:?} count={count} virtual={}",
+                root.register_count
+            );
             let mut work = OfficialWorkBudget::new(DUMP_WORK_CAP as u64);
             let encoded = emit_official_chunk(
-                &native, ProtoId(0), profile, false,
-                &OfficialChunkLimits::default(), &mut work,
-            ).unwrap_or_else(|error| panic!("{profile:?} count={count}: {error:?}"));
-            let decoded = decode_official_chunk(
-                &encoded, profile, &OfficialChunkLimits::default(),
-            ).unwrap_or_else(|error| panic!("{profile:?} count={count}: {error:?}"));
+                &native,
+                ProtoId(0),
+                profile,
+                false,
+                &OfficialChunkLimits::default(),
+                &mut work,
+            )
+            .unwrap_or_else(|error| panic!("{profile:?} count={count}: {error:?}"));
+            let decoded = decode_official_chunk(&encoded, profile, &OfficialChunkLimits::default())
+                .unwrap_or_else(|error| panic!("{profile:?} count={count}: {error:?}"));
             stacks.push(decoded.main.max_stack_size);
             p17_run_native_and_official(
-                profile, source.as_bytes(),
+                profile,
+                source.as_bytes(),
                 P17ExpectedValues::Integers((count * 10 + 21) as i64, (count * 10 + 21) as i64),
             )
             .unwrap_or_else(|error| panic!("{profile:?} count={count}: {error}"));
         }
-        assert!(stacks[1] <= stacks[0].saturating_add(8),
+        assert!(
+            stacks[1] <= stacks[0].saturating_add(8),
             "{profile:?} 8 loops stack={} 32 loops stack={}",
-            stacks[0], stacks[1]);
-        assert!(stacks[1] < 128,
-            "{profile:?} 32 loops official stack={}", stacks[1]);
+            stacks[0],
+            stacks[1]
+        );
+        assert!(
+            stacks[1] < 128,
+            "{profile:?} 32 loops official stack={}",
+            stacks[1]
+        );
     }
 }

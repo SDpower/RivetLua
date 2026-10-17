@@ -2,12 +2,12 @@ use super::{grant, manifest};
 use crate::{StrictJsonParser, StrictJsonValue};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::marker::PhantomData;
 use std::os::unix::fs::MetadataExt;
-use std::rc::Rc;
-use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 
 pub(super) fn q(value: &str) -> String {
     format!("\"{}\"", crate::json_escape(value))
@@ -881,7 +881,10 @@ struct CheckedInputIdentity {
 fn checked_input_identity(path: &Path) -> Result<CheckedInputIdentity, String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !metadata.file_type().is_file() {
-        return Err(format!("P17 scoped report input 非一般檔案：{}", path.display()));
+        return Err(format!(
+            "P17 scoped report input 非一般檔案：{}",
+            path.display()
+        ));
     }
     Ok(CheckedInputIdentity {
         dev: metadata.dev(),
@@ -923,26 +926,36 @@ pub(super) fn begin_checked_input_scope() -> Result<CheckedInputScope, String> {
             return Err("P17 checked input scope 不可巢狀".into());
         }
         *slot = Some(CheckedInputState::default());
-        Ok(CheckedInputScope { active: true, _not_send: PhantomData })
+        Ok(CheckedInputScope {
+            active: true,
+            _not_send: PhantomData,
+        })
     })
 }
 
 impl CheckedInputScope {
     pub(super) fn finish(mut self) -> Result<usize, String> {
-        let state = CHECKED_INPUT_SCOPE.with(|slot| slot.borrow_mut().take())
+        let state = CHECKED_INPUT_SCOPE
+            .with(|slot| slot.borrow_mut().take())
             .ok_or("P17 checked input scope 已失效")?;
         self.active = false;
         let mut hash_reads = state.hash_reads;
         for (path, entry) in state.entries {
             let before = checked_input_identity(&path)?;
             if before != entry.identity {
-                return Err(format!("P17 checked input scope 出口身分已變：{}", path.display()));
+                return Err(format!(
+                    "P17 checked input scope 出口身分已變：{}",
+                    path.display()
+                ));
             }
             let actual = manifest::sha256(&path)?;
             hash_reads += 1;
             let after = checked_input_identity(&path)?;
             if actual != entry.sha256 || after != entry.identity {
-                return Err(format!("P17 checked input scope 出口 SHA／身分已變：{}", path.display()));
+                return Err(format!(
+                    "P17 checked input scope 出口 SHA／身分已變：{}",
+                    path.display()
+                ));
             }
         }
         Ok(hash_reads)
@@ -975,7 +988,9 @@ fn checked_input(value: &StrictJsonValue) -> Result<String, String> {
     }
     let file = Path::new(path);
     let scoped = CHECKED_INPUT_SCOPE.with(|slot| {
-        slot.borrow().as_ref().map(|state| state.entries.get(file).cloned())
+        slot.borrow()
+            .as_ref()
+            .map(|state| state.entries.get(file).cloned())
     });
     match scoped {
         Some(Some(entry)) => {
@@ -993,9 +1008,17 @@ fn checked_input(value: &StrictJsonValue) -> Result<String, String> {
             CHECKED_INPUT_SCOPE.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let state = slot.as_mut().ok_or("P17 checked input scope 已失效")?;
-                if state.entries.insert(file.to_path_buf(), CheckedInputEntry {
-                    sha256: digest.to_owned(), identity: after,
-                }).is_some() {
+                if state
+                    .entries
+                    .insert(
+                        file.to_path_buf(),
+                        CheckedInputEntry {
+                            sha256: digest.to_owned(),
+                            identity: after,
+                        },
+                    )
+                    .is_some()
+                {
                     return Err("P17 checked input scope 重複入口".into());
                 }
                 state.hash_reads += 1;
@@ -2529,9 +2552,14 @@ mod checked_input_scope_tests {
 
     impl TestDir {
         fn new() -> Self {
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "rivetlua-p17-checked-input-{}-{nonce}", std::process::id()));
+                "rivetlua-p17-checked-input-{}-{nonce}",
+                std::process::id()
+            ));
             fs::create_dir(&path).unwrap();
             Self(path)
         }
@@ -2546,7 +2574,10 @@ mod checked_input_scope_tests {
     fn declared(path: &Path, digest: &str) -> StrictJsonValue {
         StrictJsonParser::parse(&format!(
             "{{\"path\":{},\"sha256\":{}}}",
-            q(&path.display().to_string()), q(digest))).unwrap()
+            q(&path.display().to_string()),
+            q(digest)
+        ))
+        .unwrap()
     }
 
     #[test]

@@ -14,9 +14,7 @@ fn input_is_bounded(input: &[u8], limits: &HarnessLimits) -> bool {
         && input.len() <= limits.heap_bytes
 }
 
-fn bounded_limits(
-    limits: &HarnessLimits,
-) -> (CompileLimits, IrLimits, VerifyLimits) {
+fn bounded_limits(limits: &HarnessLimits) -> (CompileLimits, IrLimits, VerifyLimits) {
     let work = usize::try_from(limits.fuel).unwrap_or(usize::MAX);
     let bytes = limits.max_input_bytes.min(limits.heap_bytes);
 
@@ -58,11 +56,7 @@ fn bounded_limits(
     (compile, ir, verify)
 }
 
-pub(super) fn source(
-    profile: LuaProfile,
-    input: &[u8],
-    limits: &HarnessLimits,
-) -> CaseOutcome {
+pub(super) fn source(profile: LuaProfile, input: &[u8], limits: &HarnessLimits) -> CaseOutcome {
     if !input_is_bounded(input, limits) {
         return CaseOutcome::Limit;
     }
@@ -93,11 +87,7 @@ pub(super) fn source(
     }
 }
 
-pub(super) fn ast(
-    profile: LuaProfile,
-    input: &[u8],
-    limits: &HarnessLimits,
-) -> CaseOutcome {
+pub(super) fn ast(profile: LuaProfile, input: &[u8], limits: &HarnessLimits) -> CaseOutcome {
     if !input_is_bounded(input, limits) {
         return CaseOutcome::Limit;
     }
@@ -149,18 +139,14 @@ pub(super) fn ast(
         return CaseOutcome::Finding("FZ002_GOTO_BINDING_VALIDATION");
     }
 
-    let resolved = match rivetlua_compiler::resolve::resolve(
-        &parsed,
-        &lexed,
-        profile,
-        &compile_limits,
-    ) {
-        Ok(resolved) => resolved,
-        Err(diagnostic) if diagnostic.code == DiagnosticCode::CompileLimit => {
-            return CaseOutcome::Limit;
-        }
-        Err(_) => return CaseOutcome::Rejected,
-    };
+    let resolved =
+        match rivetlua_compiler::resolve::resolve(&parsed, &lexed, profile, &compile_limits) {
+            Ok(resolved) => resolved,
+            Err(diagnostic) if diagnostic.code == DiagnosticCode::CompileLimit => {
+                return CaseOutcome::Limit;
+            }
+            Err(_) => return CaseOutcome::Rejected,
+        };
     let ir = match rivetlua_compiler::lower(&resolved, &ir_limits) {
         Ok(ir) => ir,
         Err(_) => return CaseOutcome::Rejected,

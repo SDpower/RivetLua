@@ -30,14 +30,8 @@ fn manifest_schema_is_strict_and_profile_seed_bound() {
     }
 
     let missing_key = VALID_MANIFEST.replace("\"dirty\":false,", "");
-    let unknown_key = VALID_MANIFEST.replace(
-        "\"version\":1,",
-        "\"version\":1,\"unexpected\":0,",
-    );
-    let duplicate_key = VALID_MANIFEST.replace(
-        "\"version\":1,",
-        "\"version\":1,\"version\":1,",
-    );
+    let unknown_key = VALID_MANIFEST.replace("\"version\":1,", "\"version\":1,\"unexpected\":0,");
+    let duplicate_key = VALID_MANIFEST.replace("\"version\":1,", "\"version\":1,\"version\":1,");
     let wrong_profile = manifest_for("lua56-i64f64", 23001);
     let wrong_seed = manifest_for("lua55-i64f64", 23002);
     for invalid in [

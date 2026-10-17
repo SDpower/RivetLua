@@ -210,15 +210,9 @@ fn p17_full_db_dump_obeys_cli_finite_quota() {
                 .expect_err("少一 work 單位必須拒絕");
                 assert_eq!(error.kind, OfficialExportErrorKind::WorkExhausted);
                 let mut exact = OfficialWorkBudget::new(consumed);
-                let exact_bytes = emit_official_chunk(
-                    &module,
-                    ProtoId(0),
-                    profile,
-                    false,
-                    &limits,
-                    &mut exact,
-                )
-                .unwrap();
+                let exact_bytes =
+                    emit_official_chunk(&module, ProtoId(0), profile, false, &limits, &mut exact)
+                        .unwrap();
                 assert_eq!(exact.consumed(), consumed);
                 assert_eq!(exact_bytes, bytes);
                 let decoded = decode_official_chunk(&bytes, profile, &limits).unwrap();
@@ -226,8 +220,16 @@ fn p17_full_db_dump_obeys_cli_finite_quota() {
                     .unwrap()
                     .verified()
                     .clone();
-                let lines = imported.official_artifact().unwrap().pc_map(ProtoId(0)).unwrap();
-                let count_line = if profile == LuaProfile::Lua55 { 603 } else { 597 };
+                let lines = imported
+                    .official_artifact()
+                    .unwrap()
+                    .pc_map(ProtoId(0))
+                    .unwrap();
+                let count_line = if profile == LuaProfile::Lua55 {
+                    603
+                } else {
+                    597
+                };
                 // 完整 db.lua 的後段 assert key 超過 8-bit 索引，須重用較早的同值常數。
                 assert!(decoded.main.code.iter().enumerate().any(|(pc, word)| {
                     let field = ((word >> 24) & 0xff) as usize;

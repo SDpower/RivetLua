@@ -70,10 +70,18 @@ fn main() {
         .warnings(true)
         .extra_warnings(true)
         .warnings_into_errors(true);
-    let profile = if env::var_os("CARGO_FEATURE_LUA55").is_some() { "lua55" } else { "lua54" };
+    let profile = if env::var_os("CARGO_FEATURE_LUA55").is_some() {
+        "lua55"
+    } else {
+        "lua54"
+    };
     let packaged = PathBuf::from("include/rivetlua").join(profile);
     let workspace = PathBuf::from("../../include/rivetlua").join(profile);
-    let header_dir = if packaged.is_dir() { &packaged } else { &workspace };
+    let header_dir = if packaged.is_dir() {
+        &packaged
+    } else {
+        &workspace
+    };
     build.include(header_dir);
     if profile == "lua55" {
         build.define("RV_LUA55_B2", None);
@@ -95,7 +103,10 @@ fn main() {
     };
     println!("cargo:rustc-link-arg-bin=rivetlua-native-worker={worker_export}");
     println!("cargo:rerun-if-changed=src/trampoline.c");
-    println!("cargo:rerun-if-changed={}", header_dir.join("lualib.h").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        header_dir.join("lualib.h").display()
+    );
     println!("cargo:rerun-if-changed=src/native/platform.c");
     println!("cargo:rerun-if-changed=build.rs");
 }

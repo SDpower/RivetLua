@@ -71,18 +71,14 @@ impl<'a> CallbackContext<'a> {
             Value::LightUserdata(_) => Ok("userdata"),
             Value::CFunction(id) if id.vm() == self.vm.id() => Ok("function"),
             Value::CFunction(_) => Err(VmError::WrongVm),
-            Value::Object(object) => self.vm.object_kind(object).and_then(|kind| {
-                match kind {
-                    ObjectKind::ByteString => Ok("string"),
-                    ObjectKind::Table => Ok("table"),
-                    ObjectKind::Userdata | ObjectKind::File => Ok("userdata"),
-                    ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin => {
-                        Ok("function")
-                    }
-                    ObjectKind::Coroutine => Ok("thread"),
-                    ObjectKind::Value | ObjectKind::Upvalue | ObjectKind::Module => {
-                        Err(VmError::WrongObjectType)
-                    }
+            Value::Object(object) => self.vm.object_kind(object).and_then(|kind| match kind {
+                ObjectKind::ByteString => Ok("string"),
+                ObjectKind::Table => Ok("table"),
+                ObjectKind::Userdata | ObjectKind::File => Ok("userdata"),
+                ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin => Ok("function"),
+                ObjectKind::Coroutine => Ok("thread"),
+                ObjectKind::Value | ObjectKind::Upvalue | ObjectKind::Module => {
+                    Err(VmError::WrongObjectType)
                 }
             }),
         };

@@ -1664,13 +1664,15 @@ fn official_pack_unpack_allocation_sites_rollback_and_retry() {
             .map(|site| site.0)
             .expect("PackUnpack snapshot table 配置未命中");
         assert!(
-            segment.iter().any(|site| site.0 > snapshot
-                && site.1 == Some(FailPoint::TableHashReserve)),
+            segment
+                .iter()
+                .any(|site| site.0 > snapshot && site.1 == Some(FailPoint::TableHashReserve)),
             "PackUnpack snapshot hash 配置未命中：{segment:?}"
         );
         assert!(
-            segment.iter().any(|site| site.0 > snapshot
-                && site.1 == Some(FailPoint::ObjectReserve)),
+            segment
+                .iter()
+                .any(|site| site.0 > snapshot && site.1 == Some(FailPoint::ObjectReserve)),
             "PackUnpack snapshot object 配置未命中：{segment:?}"
         );
         assert!(

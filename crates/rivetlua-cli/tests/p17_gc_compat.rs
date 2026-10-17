@@ -163,7 +163,11 @@ fn assert_output(output: &Output, expected_stdout: &[u8], profile: &str) {
         "{profile}: CLI 應成功結束；stderr={:?}",
         output.stderr
     );
-    assert_eq!(output.stdout.as_slice(), expected_stdout, "{profile}: stdout 不符");
+    assert_eq!(
+        output.stdout.as_slice(),
+        expected_stdout,
+        "{profile}: stdout 不符"
+    );
     assert!(output.stderr.is_empty(), "{profile}: stderr 不應有內容");
 }
 

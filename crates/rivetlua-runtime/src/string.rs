@@ -4,10 +4,10 @@ use crate::rust_alloc::vec::Vec;
 
 use crate::VmError;
 use crate::alloc::{AllocationLedger, FailPoint, PairedLuaCharges, Reservation, reserve_vec};
-use core::mem::size_of;
+use crate::rust_alloc::rc::Rc;
 use core::fmt;
 use core::hash::{Hash, Hasher};
-use crate::rust_alloc::rc::Rc;
+use core::mem::size_of;
 
 /// 外部不可變 byte string 的安全擁有者。bytes 在 owner 存活期間須保持不變；
 /// 最後一個 owner 消失時由實作者釋放資源。
@@ -418,7 +418,10 @@ mod tests {
         let mut vm = Vm::new().unwrap();
         let before = vm.ledger_snapshot();
         vm.set_allocation_limit(before.committed + bytes.len());
-        assert_eq!(vm.allocate_byte_string(&bytes), Err(VmError::AllocationFailed));
+        assert_eq!(
+            vm.allocate_byte_string(&bytes),
+            Err(VmError::AllocationFailed)
+        );
         assert_eq!(vm.ledger_snapshot().committed, before.committed);
         assert_eq!(vm.ledger_snapshot().reserved, 0);
         assert_eq!(vm.roots().total_count(), 0);

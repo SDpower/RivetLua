@@ -600,9 +600,7 @@ fn c_closure_a43_named_failpoints_preserve_state_and_retry() {
                 .unwrap();
             prime_protected_allocation_error(&owner);
         } else if active_gc {
-            owner
-                .with_vm(|vm| vm.incremental_step(1).unwrap())
-                .unwrap();
+            owner.with_vm(|vm| vm.incremental_step(1).unwrap()).unwrap();
             prime_protected_error(state);
             prime_protected_allocation_error(&owner);
         }
@@ -637,11 +635,7 @@ fn c_closure_a43_named_failpoints_preserve_state_and_retry() {
             owner
                 .with_vm(|vm| {
                     assert_eq!(
-                        vm.allocation_trace()
-                            .last_failure
-                            .unwrap()
-                            .attempt
-                            .point,
+                        vm.allocation_trace().last_failure.unwrap().attempt.point,
                         Some(point),
                         "point={point:?}"
                     );

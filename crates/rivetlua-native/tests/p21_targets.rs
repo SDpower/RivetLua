@@ -54,12 +54,11 @@ fn synthetic_board(float_abi: &str) -> BoardConfig {
 #[test]
 fn p21_platform_targets_expose_local_deployment_contracts() {
     let targets = platform_targets();
-    assert!(targets.iter().all(|target| {
-        !matches!(
-            &target.status,
-            DeploymentStatus::Supported { .. }
-        )
-    }));
+    assert!(
+        targets
+            .iter()
+            .all(|target| { !matches!(&target.status, DeploymentStatus::Supported { .. }) })
+    );
 
     let expected_desktop = [
         (
@@ -105,15 +104,7 @@ fn p21_platform_targets_expose_local_deployment_contracts() {
             let descriptor = target
                 .descriptor(profile, RAM_CAP, CODE_CAP, None, PROVENANCE)
                 .unwrap();
-            assert_descriptor(
-                &descriptor,
-                triple,
-                isa,
-                os,
-                abi,
-                profile,
-                policy,
-            );
+            assert_descriptor(&descriptor, triple, isa, os, abi, profile, policy);
         }
     }
 
@@ -130,10 +121,7 @@ fn p21_platform_targets_expose_local_deployment_contracts() {
     assert_eq!(rv32.abi, "unspecified");
     assert!(!rv32.aot_codegen);
     assert_eq!(rv32.exec_memory_policy, ExecMemoryPolicy::Forbidden);
-    assert!(matches!(
-        &rv32.status,
-        DeploymentStatus::Unsupported { .. }
-    ));
+    assert!(matches!(&rv32.status, DeploymentStatus::Unsupported { .. }));
 
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
         let thumb_descriptor = thumb
@@ -161,9 +149,10 @@ fn p21_platform_targets_expose_local_deployment_contracts() {
             .unwrap();
         assert!(validate_board_target(&board, &arm64_descriptor).is_err());
 
-        assert!(rv32
-            .descriptor(profile, RAM_CAP, CODE_CAP, None, PROVENANCE)
-            .is_err());
+        assert!(
+            rv32.descriptor(profile, RAM_CAP, CODE_CAP, None, PROVENANCE)
+                .is_err()
+        );
     }
 
     assert!(platform_target("unknown-target-triple").is_none());

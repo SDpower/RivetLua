@@ -22,9 +22,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
 use rivetlua::{ExternalCommand, ForeignNativeKind};
 #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
-pub use rivetlua_capi::native::{AttestedNative, VerifiedNative};
-#[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
 use rivetlua_capi::native::{self, NativeLibrary, SymbolVisibility};
+#[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
+pub use rivetlua_capi::native::{AttestedNative, VerifiedNative};
 #[cfg(any(feature = "native-lua55", feature = "native-lua54"))]
 use std::ffi::CString;
 use std::rc::Rc;
@@ -32,9 +32,9 @@ use std::rc::Rc;
 use rivetlua::{
     AbortReason, COMPATIBILITY_VERSION, CallbackContext, CallbackContinuation, CallbackFn,
     CallbackResult, CompileBudget, ContainerLimits, DebugCapability, DebugPermission,
-    DumpCapability, DumpLimits, Engine, FileOperation, FileReadFormat, FileSeekOrigin, HostCloseResult,
-    HostDeadline, HostEntropy, HostEntropyError, HostExitRequest, HostFileLease, HostIo,
-    HostLoadError, HostLoadErrorKind, HostModuleBytes, HostModuleRepository, HostOs,
+    DumpCapability, DumpLimits, Engine, FileOperation, FileReadFormat, FileSeekOrigin,
+    HostCloseResult, HostDeadline, HostEntropy, HostEntropyError, HostExitRequest, HostFileLease,
+    HostIo, HostLoadError, HostLoadErrorKind, HostModuleBytes, HostModuleRepository, HostOs,
     HostOsOperation, HostOsValue, HostOutput, HostOutputError, HostResourceError,
     HostResourceErrorKind, HostServices, HostSourceReader, HostWarning, HostWarningError,
     InputFormat, LoadBudget, LoadCapability, LoadFormat, LoadLimits, LuaProfile, Module,
@@ -165,52 +165,89 @@ struct CliErrorHandler {
     program_name: Vec<u8>,
 }
 
-fn cli_error_handler(vm: &mut Vm, program_name: &[u8], tostring: &rivetlua::Root) -> CliResult<CliErrorHandler> {
+fn cli_error_handler(
+    vm: &mut Vm,
+    program_name: &[u8],
+    tostring: &rivetlua::Root,
+) -> CliResult<CliErrorHandler> {
     let mut roots = Vec::new();
-    for kind in ["nil", "boolean", "table", "userdata", "thread", "function", "number"] {
-        roots.push(vm.new_string(format!("(error object is a {kind} value)").as_bytes()).map_err(sdk_failure)?);
+    for kind in [
+        "nil", "boolean", "table", "userdata", "thread", "function", "number",
+    ] {
+        roots.push(
+            vm.new_string(format!("(error object is a {kind} value)").as_bytes())
+                .map_err(sdk_failure)?,
+        );
     }
-    let invalid_result = vm.new_string(b"'__tostring' must return a string").map_err(sdk_failure)?;
+    let invalid_result = vm
+        .new_string(b"'__tostring' must return a string")
+        .map_err(sdk_failure)?;
     let mut captures = vec![tostring.value(vm).map_err(sdk_failure)?];
     for root in &roots {
         captures.push(root.value(vm).map_err(sdk_failure)?);
     }
     captures.push(invalid_result.value(vm).map_err(sdk_failure)?);
-    let continuation: Rc<CallbackFn> = Rc::new(|ctx: &mut CallbackContext<'_>, values: &[Value]| {
-        let value = values.first().copied().unwrap_or(Value::Nil);
-        match ctx.value_type(value) {
-            Ok("string") => CallbackResult::Return(vec![value]),
-            Ok(_) => CallbackResult::Throw(ctx.capture(1).unwrap_or(Value::Nil)),
-            Err(_) => CallbackResult::Return(Vec::new()),
-        }
-    });
-    let callback: Rc<CallbackFn> = Rc::new(move |ctx: &mut CallbackContext<'_>, values: &[Value]| {
-        let value = values.first().copied().unwrap_or(Value::Nil);
-        let kind = match ctx.value_type(value) {
-            Ok(kind) => kind,
-            Err(_) => return CallbackResult::Return(Vec::new()),
-        };
-        let method = match ctx.raw_metamethod(value, b"__tostring") {
-            Ok(method) => method,
-            Err(_) => return CallbackResult::Return(Vec::new()),
-        };
-        if method != Value::Nil {
-            return ctx.call(method, vec![value], CallbackContinuation::new(vec![value, ctx.capture(8).unwrap_or(Value::Nil)], Rc::clone(&continuation)));
-        }
-        if kind == "string" {
-            return CallbackResult::Return(vec![value]);
-        }
-        if kind == "number" {
-            return ctx.call(ctx.capture(0).unwrap_or(Value::Nil), vec![value], CallbackContinuation::new(vec![value, ctx.capture(8).unwrap_or(Value::Nil)], Rc::clone(&continuation)));
-        }
-        let index = match kind {
-            "nil" => 1, "boolean" => 2, "table" => 3, "userdata" => 4,
-            "thread" => 5, "function" => 6, _ => 7,
-        };
-        CallbackResult::Return(vec![ctx.capture(index).unwrap_or(Value::Nil)])
-    });
-    let root = vm.register_callback(&captures, callback).map_err(sdk_failure)?;
-    Ok(CliErrorHandler { root, program_name: program_name.to_vec() })
+    let continuation: Rc<CallbackFn> =
+        Rc::new(|ctx: &mut CallbackContext<'_>, values: &[Value]| {
+            let value = values.first().copied().unwrap_or(Value::Nil);
+            match ctx.value_type(value) {
+                Ok("string") => CallbackResult::Return(vec![value]),
+                Ok(_) => CallbackResult::Throw(ctx.capture(1).unwrap_or(Value::Nil)),
+                Err(_) => CallbackResult::Return(Vec::new()),
+            }
+        });
+    let callback: Rc<CallbackFn> =
+        Rc::new(move |ctx: &mut CallbackContext<'_>, values: &[Value]| {
+            let value = values.first().copied().unwrap_or(Value::Nil);
+            let kind = match ctx.value_type(value) {
+                Ok(kind) => kind,
+                Err(_) => return CallbackResult::Return(Vec::new()),
+            };
+            let method = match ctx.raw_metamethod(value, b"__tostring") {
+                Ok(method) => method,
+                Err(_) => return CallbackResult::Return(Vec::new()),
+            };
+            if method != Value::Nil {
+                return ctx.call(
+                    method,
+                    vec![value],
+                    CallbackContinuation::new(
+                        vec![value, ctx.capture(8).unwrap_or(Value::Nil)],
+                        Rc::clone(&continuation),
+                    ),
+                );
+            }
+            if kind == "string" {
+                return CallbackResult::Return(vec![value]);
+            }
+            if kind == "number" {
+                return ctx.call(
+                    ctx.capture(0).unwrap_or(Value::Nil),
+                    vec![value],
+                    CallbackContinuation::new(
+                        vec![value, ctx.capture(8).unwrap_or(Value::Nil)],
+                        Rc::clone(&continuation),
+                    ),
+                );
+            }
+            let index = match kind {
+                "nil" => 1,
+                "boolean" => 2,
+                "table" => 3,
+                "userdata" => 4,
+                "thread" => 5,
+                "function" => 6,
+                _ => 7,
+            };
+            CallbackResult::Return(vec![ctx.capture(index).unwrap_or(Value::Nil)])
+        });
+    let root = vm
+        .register_callback(&captures, callback)
+        .map_err(sdk_failure)?;
+    Ok(CliErrorHandler {
+        root,
+        program_name: program_name.to_vec(),
+    })
 }
 
 impl CliFailure {
@@ -405,20 +442,22 @@ impl<'a> NativeDriver<'a> {
             LuaProfile::Lua55 => "5.5",
         });
         let meta = fs::symlink_metadata(&lib).map_err(|_| "native-grant: tree 原生目錄缺失")?;
-        if !meta.is_dir() || meta.file_type().is_symlink()
+        if !meta.is_dir()
+            || meta.file_type().is_symlink()
             || fs::canonicalize(&lib).map_err(|_| "native-grant: tree 原生目錄不可讀")? != lib
         {
             return Err("native-grant: tree 原生目錄不安全".into());
         }
         let grant = self.bridge.grant.as_ref().ok_or("native grant 未授權")?;
-        if grant.modules.iter().any(|module| !module.path.starts_with(&lib)
-            || module.path.extension() != Some(OsStr::new("so")))
-            || grant.cpath.iter().any(|template| {
-                let path = Path::new(template);
-                !path.starts_with(&lib)
-                    || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
-            })
-        {
+        if grant.modules.iter().any(|module| {
+            !module.path.starts_with(&lib) || module.path.extension() != Some(OsStr::new("so"))
+        }) || grant.cpath.iter().any(|template| {
+            let path = Path::new(template);
+            !path.starts_with(&lib)
+                || path
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+        }) {
             return Err("native-grant: 模組或 cpath 不在指定 tree".into());
         }
         Ok(())
@@ -577,7 +616,9 @@ fn parse_options(args: &[OsString]) -> CliResult<Options> {
         } else if bytes == b"--vm-policy" {
             i += 1;
             let Some(value) = args.get(i).map(|arg| os_bytes(arg)) else {
-                return Err(CliFailure::usage("--vm-policy 需要 compatibility、sandbox 或 private-service"));
+                return Err(CliFailure::usage(
+                    "--vm-policy 需要 compatibility、sandbox 或 private-service",
+                ));
             };
             vm_policy = parse_vm_policy(&value)?;
         } else if bytes.starts_with(b"--vm-policy=") {
@@ -641,7 +682,9 @@ fn parse_vm_policy(value: &[u8]) -> CliResult<VmPolicy> {
         b"compatibility" => Ok(VmPolicy::Compatibility),
         b"sandbox" => Ok(VmPolicy::Sandbox),
         b"private-service" => Ok(VmPolicy::PrivateService),
-        _ => Err(CliFailure::usage("--vm-policy 只接受 compatibility、sandbox 或 private-service")),
+        _ => Err(CliFailure::usage(
+            "--vm-policy 只接受 compatibility、sandbox 或 private-service",
+        )),
     }
 }
 
@@ -1351,8 +1394,12 @@ impl HostWarning for CliWarning {
 
 fn version_line(profile: LuaProfile) -> &'static [u8] {
     match profile {
-        LuaProfile::Lua54 => b"RivetLua 0.0.0 (Lua 5.4.9); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n",
-        LuaProfile::Lua55 => b"RivetLua 0.0.0 (Lua 5.5.1); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n",
+        LuaProfile::Lua54 => {
+            b"RivetLua 0.0.0 (Lua 5.4.9); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n"
+        }
+        LuaProfile::Lua55 => {
+            b"RivetLua 0.0.0 (Lua 5.5.1); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n"
+        }
     }
 }
 
@@ -1618,11 +1665,7 @@ fn file_input_is_binary(bytes: &[u8], prefix_len: usize) -> bool {
     format.is_none() || format.is_some_and(|value| value != InputFormat::Source)
 }
 
-fn apply_file_input_preprocessing(
-    bytes: &mut Vec<u8>,
-    prefix_len: usize,
-    is_binary: bool,
-) -> bool {
+fn apply_file_input_preprocessing(bytes: &mut Vec<u8>, prefix_len: usize, is_binary: bool) -> bool {
     if is_binary {
         bytes.drain(..prefix_len);
         true
@@ -1697,10 +1740,9 @@ fn read_input(reader: &mut dyn Read, limit: usize) -> CliResult<Vec<u8>> {
 }
 
 fn read_file(path: &Path, limit: usize) -> CliResult<Vec<u8>> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| {
-            CliFailure::failed(format!("讀取檔案資訊失敗（{}）：{error}", path.display()))
-        })?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        CliFailure::failed(format!("讀取檔案資訊失敗（{}）：{error}", path.display()))
+    })?;
     let size = usize::try_from(metadata.len()).map_err(|_| CliFailure::failed("檔案長度溢位"))?;
     if size > limit {
         return Err(CliFailure::failed("檔案超出 CLI 限額"));
@@ -2116,7 +2158,8 @@ fn run_module(
             vm.load_module_with_args_and_error_handler(module, args, &handler.root)
         } else {
             vm.load_module_with_args(module, args)
-        }.map_err(sdk_failure)?;
+        }
+        .map_err(sdk_failure)?;
         set_cli_execution_fuel(&mut execution)?;
         execution.run()
     };
@@ -2131,7 +2174,12 @@ fn run_module(
         RunOutcome::Exited(request) => Err(CliFailure::exited(request)),
         RunOutcome::Returned(values) => Ok(values),
         RunOutcome::LuaError(error) => {
-            write_lua_error(vm, &error, errors, handler.map(|handler| handler.program_name.as_slice()))?;
+            write_lua_error(
+                vm,
+                &error,
+                errors,
+                handler.map(|handler| handler.program_name.as_slice()),
+            )?;
             Err(CliFailure::failed("Lua chunk 執行失敗"))
         }
         RunOutcome::Aborted(AbortReason::FuelExhausted) => {
@@ -2142,9 +2190,7 @@ fn run_module(
             write_bytes(errors, b"rivetlua: E_OUTPUT_LIMIT\n")?;
             Err(CliFailure::failed("E_OUTPUT_LIMIT"))
         }
-        RunOutcome::SafeDiagnostic(diagnostic) => {
-            Err(report_safe_diagnostic(diagnostic, errors)?)
-        }
+        RunOutcome::SafeDiagnostic(diagnostic) => Err(report_safe_diagnostic(diagnostic, errors)?),
         RunOutcome::PendingClose(snapshot) => {
             write_bytes(
                 errors,
@@ -2232,9 +2278,7 @@ fn print_interactive_values_with_fuel(
             write_bytes(errors, b"rivetlua: E_OUTPUT_LIMIT\n")?;
             Err(CliFailure::failed("E_OUTPUT_LIMIT"))
         }
-        RunOutcome::SafeDiagnostic(diagnostic) => {
-            Err(report_safe_diagnostic(diagnostic, errors)?)
-        }
+        RunOutcome::SafeDiagnostic(diagnostic) => Err(report_safe_diagnostic(diagnostic, errors)?),
         RunOutcome::PendingClose(snapshot) => {
             write_bytes(
                 errors,
@@ -2457,9 +2501,7 @@ fn run_require_action(
             Err(CliFailure::failed("-l 載入模組失敗"))
         }
         RunOutcome::Aborted(_) => Err(CliFailure::failed("-l 載入模組時執行額度耗盡")),
-        RunOutcome::SafeDiagnostic(diagnostic) => {
-            Err(report_safe_diagnostic(diagnostic, errors)?)
-        }
+        RunOutcome::SafeDiagnostic(diagnostic) => Err(report_safe_diagnostic(diagnostic, errors)?),
         RunOutcome::PendingClose(_) => {
             Err(CliFailure::failed("-l 載入模組等待 close continuation"))
         }
@@ -2490,7 +2532,16 @@ fn run_init(
         let path = os_from_bytes(&init[1..]);
         let bytes = read_file(Path::new(&path), MAX_INPUT_BYTES)?;
         let module = input_module(engine, bytes, &init[1..], true)?;
-        run_module(vm, &module, &[], &mut io::stdout(), errors, bridge, Some(handler)).map(|_| ())
+        run_module(
+            vm,
+            &module,
+            &[],
+            &mut io::stdout(),
+            errors,
+            bridge,
+            Some(handler),
+        )
+        .map(|_| ())
     } else {
         run_source(
             engine,
@@ -2534,9 +2585,7 @@ fn call_original_warning(
             write_lua_error(vm, &error, errors, None)?;
             Err(CliFailure::failed("CLI warning 控制發生 Lua 錯誤"))
         }
-        RunOutcome::SafeDiagnostic(diagnostic) => {
-            Err(report_safe_diagnostic(diagnostic, errors)?)
-        }
+        RunOutcome::SafeDiagnostic(diagnostic) => Err(report_safe_diagnostic(diagnostic, errors)?),
         other => Err(report_unsupported_run_outcome(
             "CLI warning 控制",
             &other,
@@ -2589,9 +2638,7 @@ fn run_repl_module(
             write_bytes(errors, b"rivetlua: E_OUTPUT_LIMIT\n")?;
             Err(CliFailure::failed("E_OUTPUT_LIMIT"))
         }
-        RunOutcome::SafeDiagnostic(diagnostic) => {
-            Err(report_safe_diagnostic(diagnostic, errors)?)
-        }
+        RunOutcome::SafeDiagnostic(diagnostic) => Err(report_safe_diagnostic(diagnostic, errors)?),
         RunOutcome::PendingClose(snapshot) => {
             write_bytes(
                 errors,
@@ -2631,10 +2678,18 @@ fn write_repl_prompt(
     bridge: &mut NativeBridge<'_>,
 ) -> CliResult<()> {
     let _signal_epoch = SignalEpochGuard::begin();
-    let name = if first_line { b"_PROMPT".as_slice() } else { b"_PROMPT2".as_slice() };
+    let name = if first_line {
+        b"_PROMPT".as_slice()
+    } else {
+        b"_PROMPT2".as_slice()
+    };
     let value = vm.get_global(name).map_err(sdk_failure)?;
     let prompt = if matches!(value, Value::Nil) {
-        if first_line { b"> ".to_vec() } else { b">> ".to_vec() }
+        if first_line {
+            b"> ".to_vec()
+        } else {
+            b">> ".to_vec()
+        }
     } else {
         let _value_root = if matches!(value, Value::Object(_)) {
             Some(vm.root(value).map_err(sdk_failure)?)
@@ -2685,13 +2740,22 @@ fn write_repl_prompt(
             | RunOutcome::NestedReturned(_)
             | RunOutcome::NestedErrored(_)
             | RunOutcome::NestedFailed(_)) => {
-                return Err(report_unsupported_run_outcome("REPL prompt", &outcome, errors)?);
+                return Err(report_unsupported_run_outcome(
+                    "REPL prompt",
+                    &outcome,
+                    errors,
+                )?);
             }
         }
     };
-    let length = prompt.iter().position(|byte| *byte == 0).unwrap_or(prompt.len());
+    let length = prompt
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(prompt.len());
     write_bytes(output, &prompt[..length])?;
-    output.flush().map_err(|error| CliFailure::failed(format!("REPL 輸出失敗：{error}")))
+    output
+        .flush()
+        .map_err(|error| CliFailure::failed(format!("REPL 輸出失敗：{error}")))
 }
 
 fn repl(
@@ -3115,7 +3179,9 @@ mod cli_unit_tests {
 
     #[test]
     fn p17_standalone_signal_epoch_preserves_second_interrupt() {
-        use super::{CURRENT_STANDALONE_SIGNAL, SignalEpochGuard, StandaloneSignal, StandaloneSignalSession};
+        use super::{
+            CURRENT_STANDALONE_SIGNAL, SignalEpochGuard, StandaloneSignal, StandaloneSignalSession,
+        };
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
@@ -3337,7 +3403,8 @@ mod cli_unit_tests {
         let warning = b"warning: locals do not survive across lines in interactive mode\n";
         let (result, stdout, stderr) = run_interactive_repl_case("lua55", b"  \t\tlocal x\n");
         assert!(matches!(result, Ok(0)), "lua55: {result:?}");
-        let version = b"RivetLua 0.0.0 (Lua 5.5.1); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n";
+        let version =
+            b"RivetLua 0.0.0 (Lua 5.5.1); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n";
         assert!(
             stdout.starts_with(version),
             "lua55 stdout: {}",
@@ -3380,7 +3447,8 @@ mod cli_unit_tests {
 
         let (result, stdout, stderr) = run_interactive_repl_case("lua54", b"  \t\tlocal x\n");
         assert!(matches!(result, Ok(0)), "lua54: {result:?}");
-        let version = b"RivetLua 0.0.0 (Lua 5.4.9); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n";
+        let version =
+            b"RivetLua 0.0.0 (Lua 5.4.9); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n";
         assert!(
             stdout.starts_with(version),
             "lua54 stdout: {}",
@@ -3492,15 +3560,18 @@ mod cli_unit_tests {
             } else {
                 b"RivetLua 0.0.0 (Lua 5.4.9); Lua language: Copyright (C) 1994-2026 Lua.org, PUC-Rio\n".as_slice()
             };
-            let (result, stdout, stderr) =
-                run_interactive_repl_case(profile, b" --\na = 2\n");
+            let (result, stdout, stderr) = run_interactive_repl_case(profile, b" --\na = 2\n");
             assert!(matches!(result, Ok(0)), "{profile}: {result:?}");
             assert_eq!(
                 stdout,
                 [version, b">  --\n> a = 2\n> \n"].concat(),
                 "{profile}"
             );
-            assert!(stderr.is_empty(), "{profile}: {}", String::from_utf8_lossy(&stderr));
+            assert!(
+                stderr.is_empty(),
+                "{profile}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
 
             let (result, stdout, stderr) = run_interactive_repl_case_with_action(
                 profile,
@@ -3513,7 +3584,11 @@ mod cli_unit_tests {
                 [version, b"aloa = {}\naloa.\ncontb = 1\nalo\n"].concat(),
                 "{profile}"
             );
-            assert!(stderr.is_empty(), "{profile}: {}", String::from_utf8_lossy(&stderr));
+            assert!(
+                stderr.is_empty(),
+                "{profile}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
 
             let (result, stdout, stderr) = run_interactive_repl_case_with_action(
                 profile,
@@ -3522,12 +3597,18 @@ mod cli_unit_tests {
             );
             assert!(matches!(result, Ok(0)), "{profile}: {result:?}");
             assert_eq!(stdout, [version, b" --\na = 2\n\n"].concat(), "{profile}");
-            assert!(stderr.is_empty(), "{profile}: {}", String::from_utf8_lossy(&stderr));
+            assert!(
+                stderr.is_empty(),
+                "{profile}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
 
             let (result, stdout, stderr) = run_interactive_repl_case_with_action(
                 profile,
                 b" --\na = 2\n",
-                Some("local n=0; _PROMPT=setmetatable({}, {__tostring=function() n=n+1; return tostring(n) end})"),
+                Some(
+                    "local n=0; _PROMPT=setmetatable({}, {__tostring=function() n=n+1; return tostring(n) end})",
+                ),
             );
             assert!(matches!(result, Ok(0)), "{profile}: {result:?}");
             assert_eq!(
@@ -3535,7 +3616,11 @@ mod cli_unit_tests {
                 [version, b"1 --\n2a = 2\n3\n"].concat(),
                 "{profile}"
             );
-            assert!(stderr.is_empty(), "{profile}: {}", String::from_utf8_lossy(&stderr));
+            assert!(
+                stderr.is_empty(),
+                "{profile}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
 
             let lua_profile = if profile == "lua55" {
                 LuaProfile::Lua55
@@ -3544,7 +3629,9 @@ mod cli_unit_tests {
             };
             let (result, stdout, stderr) = run_repl_with_captured_output_for_profile(
                 lua_profile,
-                Some("p17_print_count=0; p17_original_print=print; print=function(...) p17_print_count=p17_print_count+1; return p17_original_print(...) end"),
+                Some(
+                    "p17_print_count=0; p17_original_print=print; print=function(...) p17_print_count=p17_print_count+1; return p17_original_print(...) end",
+                ),
                 b"return(101)\ndo return 13, 22 end\nreturn nil, {}\na = 1\np17_print_count\n",
             );
             assert!(matches!(result, Ok(())), "{profile}: {result:?}");
@@ -3575,16 +3662,24 @@ mod cli_unit_tests {
                 "{profile}: {}",
                 String::from_utf8_lossy(&stdout)
             );
-            assert!(stderr.is_empty(), "{profile}: {}", String::from_utf8_lossy(&stderr));
+            assert!(
+                stderr.is_empty(),
+                "{profile}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
 
             let (result, _, stderr) = run_interactive_repl_case_with_action(
                 profile,
                 b"",
-                Some("_PROMPT=setmetatable({}, {__tostring=function() error('PROMPT_BROKEN') end})"),
+                Some(
+                    "_PROMPT=setmetatable({}, {__tostring=function() error('PROMPT_BROKEN') end})",
+                ),
             );
             assert!(result.is_err(), "{profile}: {result:?}");
             assert!(
-                stderr.windows(b"PROMPT_BROKEN".len()).any(|part| part == b"PROMPT_BROKEN"),
+                stderr
+                    .windows(b"PROMPT_BROKEN".len())
+                    .any(|part| part == b"PROMPT_BROKEN"),
                 "{profile}: {}",
                 String::from_utf8_lossy(&stderr)
             );
@@ -3605,28 +3700,34 @@ mod cli_unit_tests {
                 );
             }
 
-            let (result, stdout, stderr) = run_interactive_repl_case(
-                profile,
-                b"function p17_repl_multiline()\nend\n",
-            );
+            let (result, stdout, stderr) =
+                run_interactive_repl_case(profile, b"function p17_repl_multiline()\nend\n");
             assert!(matches!(result, Ok(0)), "{profile}: {result:?}");
             assert_eq!(
                 stdout,
                 [version, b"> function p17_repl_multiline()\n>> end\n> \n"].concat(),
                 "{profile}"
             );
-            assert!(stderr.is_empty(), "{profile}: {}", String::from_utf8_lossy(&stderr));
+            assert!(
+                stderr.is_empty(),
+                "{profile}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
 
             for source in [b"a.\n".as_slice(), b"a.".as_slice()] {
                 let (result, _, stderr) = run_interactive_repl_case(profile, source);
                 assert!(matches!(result, Ok(0)), "{profile}: {result:?}");
                 assert!(
-                    stderr.windows("預期名稱".len()).any(|part| part == "預期名稱".as_bytes()),
+                    stderr
+                        .windows("預期名稱".len())
+                        .any(|part| part == "預期名稱".as_bytes()),
                     "{profile}: {}",
                     String::from_utf8_lossy(&stderr)
                 );
                 assert!(
-                    stderr.windows(b"near <eof>\n".len()).any(|part| part == b"near <eof>\n"),
+                    stderr
+                        .windows(b"near <eof>\n".len())
+                        .any(|part| part == b"near <eof>\n"),
                     "{profile}: {}",
                     String::from_utf8_lossy(&stderr)
                 );
@@ -3644,12 +3745,16 @@ mod cli_unit_tests {
             let (result, _, stderr) = run_interactive_repl_case(profile, b"a.(\n");
             assert!(matches!(result, Ok(0)), "{profile}: {result:?}");
             assert!(
-                stderr.windows("預期名稱".len()).any(|part| part == "預期名稱".as_bytes()),
+                stderr
+                    .windows("預期名稱".len())
+                    .any(|part| part == "預期名稱".as_bytes()),
                 "{profile}: {}",
                 String::from_utf8_lossy(&stderr)
             );
             assert!(
-                !stderr.windows(b"near <eof>\n".len()).any(|part| part == b"near <eof>\n"),
+                !stderr
+                    .windows(b"near <eof>\n".len())
+                    .any(|part| part == b"near <eof>\n"),
                 "{profile}: {}",
                 String::from_utf8_lossy(&stderr)
             );
@@ -3943,7 +4048,10 @@ mod cli_unit_tests {
             let value = values.first().copied().expect("string.dump 回傳 binary");
             let root = vm.root(value).unwrap();
             let chunk = vm.read_byte_string(&root).unwrap();
-            assert_eq!(rivetlua::classify_input(&chunk), super::InputFormat::Official);
+            assert_eq!(
+                rivetlua::classify_input(&chunk),
+                super::InputFormat::Official
+            );
             chunk
         };
 
@@ -3970,31 +4078,21 @@ mod cli_unit_tests {
                 "{profile:?}: 前綴 binary 應先通過 budget admission 再掃描首行"
             );
             let run = |bytes| {
-                let module = super::input_module(
-                    &engine,
-                    bytes,
-                    b"=p17-binary-file-prefix",
-                    true,
-                )
-                .unwrap();
+                let module =
+                    super::input_module(&engine, bytes, b"=p17-binary-file-prefix", true).unwrap();
                 let captured = Rc::new(RefCell::new(Vec::new()));
                 let mut vm = engine
-                    .new_vm_with_services(HostServices::with_output(CapturedReplOutput(
-                        Rc::clone(&captured),
-                    )))
+                    .new_vm_with_services(HostServices::with_output(CapturedReplOutput(Rc::clone(
+                        &captured,
+                    ))))
                     .unwrap();
                 let outcome = vm.load_module(&module).unwrap().run().unwrap();
                 assert!(matches!(outcome, RunOutcome::Returned(_)), "{outcome:?}");
                 captured.borrow().clone()
             };
             let assert_binary_rejected = |bytes| {
-                let error = super::input_module(
-                    &engine,
-                    bytes,
-                    b"=p17-binary-file-prefix",
-                    true,
-                )
-                .expect_err("prefixed binary must be rejected by the SDK");
+                let error = super::input_module(&engine, bytes, b"=p17-binary-file-prefix", true)
+                    .expect_err("prefixed binary must be rejected by the SDK");
                 assert!(
                     error.message.starts_with("binary 載入失敗".as_bytes()),
                     "{profile:?}: {}",
@@ -4014,20 +4112,19 @@ mod cli_unit_tests {
                 "{profile:?}: BOM 與首行 # 後的官方 chunk 應執行 print(3)"
             );
 
-            assert!(super::input_module(
-                &engine,
-                b"# line one\nprint(3)".to_vec(),
-                b"=p17-prefix-source",
-                true,
-            )
-            .is_ok());
-            assert!(super::input_module(
-                &engine,
-                b"# comment".to_vec(),
-                b"=p17-no-newline",
-                true,
-            )
-            .is_ok());
+            assert!(
+                super::input_module(
+                    &engine,
+                    b"# line one\nprint(3)".to_vec(),
+                    b"=p17-prefix-source",
+                    true,
+                )
+                .is_ok()
+            );
+            assert!(
+                super::input_module(&engine, b"# comment".to_vec(), b"=p17-no-newline", true,)
+                    .is_ok()
+            );
 
             assert_binary_rejected(prepend(b"# comment\n", &other_chunk));
             let mut unsupported_version = chunk.clone();
@@ -4504,7 +4601,11 @@ fn run_compiler(args: &[OsString], stdin: &mut dyn Read, stdout: &mut dyn Write)
             let name = os_bytes(path);
             (bytes, name, true)
         }
-        Some(_) | None => (read_input(stdin, MAX_INPUT_BYTES)?, b"=stdin".to_vec(), false),
+        Some(_) | None => (
+            read_input(stdin, MAX_INPUT_BYTES)?,
+            b"=stdin".to_vec(),
+            false,
+        ),
     };
     let module = input_module(&engine, input, &chunk_name, file_mode)?;
     if options.list {
@@ -4619,7 +4720,11 @@ fn run_interpreter_inner(
         return compatibility_query(options.profile, options.gaps, stdout);
     }
     if options.vm_policy != VmPolicy::Compatibility {
-        if options.script.as_ref().is_some_and(|script| os_bytes(script) != b"-") {
+        if options
+            .script
+            .as_ref()
+            .is_some_and(|script| os_bytes(script) != b"-")
+        {
             return Err(CliFailure::failed("E_POLICY_DENIED"));
         }
         if std::env::var_os("RIVETLUA_NATIVE_MANIFEST").is_some() {
@@ -4685,7 +4790,10 @@ fn run_interpreter_inner(
         let original_warning = vm.root(warning_value).map_err(sdk_failure)?;
         let tostring_value = vm.get_global(b"tostring").map_err(sdk_failure)?;
         let original_tostring = vm.root(tostring_value).map_err(sdk_failure)?;
-        let program_name = args.first().map(|name| os_bytes(name)).unwrap_or_else(|| b"rivetlua".to_vec());
+        let program_name = args
+            .first()
+            .map(|name| os_bytes(name))
+            .unwrap_or_else(|| b"rivetlua".to_vec());
         let error_handler = cli_error_handler(&mut vm, &program_name, &original_tostring)?;
         call_original_warning(&mut vm, &original_warning, b"@off", stderr, &mut bridge)?;
         set_arg_table(&mut vm, args, options.script_index)?;
@@ -4701,13 +4809,26 @@ fn run_interpreter_inner(
             None
         };
         if !options.ignore_environment {
-            run_init(&engine, &mut vm, options.profile, stderr, &mut bridge, &error_handler)?;
+            run_init(
+                &engine,
+                &mut vm,
+                options.profile,
+                stderr,
+                &mut bridge,
+                &error_handler,
+            )?;
         }
         for action in &options.actions {
             match action {
-                Action::Execute(source) => {
-                    run_exec_action(&engine, &mut vm, source, stdout, stderr, &mut bridge, &error_handler)?
-                }
+                Action::Execute(source) => run_exec_action(
+                    &engine,
+                    &mut vm,
+                    source,
+                    stdout,
+                    stderr,
+                    &mut bridge,
+                    &error_handler,
+                )?,
                 Action::Require(name) => run_require_action(&mut vm, name, stderr, &mut bridge)?,
                 Action::WarningOn => {
                     call_original_warning(&mut vm, &original_warning, b"@on", stderr, &mut bridge)?
@@ -4743,13 +4864,40 @@ fn run_interpreter_inner(
             }
         } else if !options.interactive && options.actions.is_empty() && !options.show_version {
             if io::stdin().is_terminal() {
-                repl(&engine, &mut vm, stdin, stdout, stderr, &mut bridge, &original_tostring, false)?;
+                repl(
+                    &engine,
+                    &mut vm,
+                    stdin,
+                    stdout,
+                    stderr,
+                    &mut bridge,
+                    &original_tostring,
+                    false,
+                )?;
                 return Ok(0);
             }
-            run_stdin_script(&engine, &mut vm, stdin, None, stdout, stderr, &mut bridge, &error_handler)?;
+            run_stdin_script(
+                &engine,
+                &mut vm,
+                stdin,
+                None,
+                stdout,
+                stderr,
+                &mut bridge,
+                &error_handler,
+            )?;
         }
         if options.interactive {
-            repl(&engine, &mut vm, stdin, stdout, stderr, &mut bridge, &original_tostring, true)?;
+            repl(
+                &engine,
+                &mut vm,
+                stdin,
+                stdout,
+                stderr,
+                &mut bridge,
+                &original_tostring,
+                true,
+            )?;
             return Ok(0);
         }
         Ok(0)

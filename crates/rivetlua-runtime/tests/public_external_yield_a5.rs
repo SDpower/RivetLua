@@ -33,7 +33,10 @@ fn nested_capi_call_scopes_coroutine_yieldability_a5() {
         vm.install_coroutine_builtins(environment).unwrap();
         let RunOutcome::Returned(values) = vm
             .load_with_environment(
-                compile(b"return function() return coroutine.isyieldable() end", profile),
+                compile(
+                    b"return function() return coroutine.isyieldable() end",
+                    profile,
+                ),
                 Value::Object(environment),
             )
             .unwrap()

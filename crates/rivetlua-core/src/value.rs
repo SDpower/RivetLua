@@ -1,11 +1,11 @@
 //! P01 值分類與不透明物件身分。
 
 use core::num::NonZeroU64;
-use core::sync::atomic::Ordering;
-#[cfg(target_has_atomic = "64")]
-use core::sync::atomic::AtomicU64 as IdAtomic;
 #[cfg(all(not(target_has_atomic = "64"), target_has_atomic = "32"))]
 use core::sync::atomic::AtomicU32 as IdAtomic;
+#[cfg(target_has_atomic = "64")]
+use core::sync::atomic::AtomicU64 as IdAtomic;
+use core::sync::atomic::Ordering;
 
 #[cfg(not(any(target_has_atomic = "64", target_has_atomic = "32")))]
 compile_error!("RivetLua 唯一 ID 需要 32 或 64 位元原子操作");

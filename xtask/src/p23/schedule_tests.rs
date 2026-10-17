@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
+use super::ExperimentManifest;
 use super::manifest_tests::manifest_for;
 use super::schedule::{self, Tier};
 use super::target_registry;
-use super::ExperimentManifest;
 
 const PROFILES: [&str; 2] = ["lua55-i64f64", "lua54-i64f64"];
 

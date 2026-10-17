@@ -27,7 +27,11 @@ pub(super) fn schedule(tier: Tier, release_seeds: usize) -> Result<Vec<Job>, &'s
             }
             let count = u64::try_from(release_seeds).map_err(|_| "E_P23B04_RELEASE_SEEDS")?;
             // 每組 target/profile 預算固定 3600 秒，餘秒依序分配以維持總額。
-            (release_seeds, RELEASE_SECONDS / count, RELEASE_SECONDS % count)
+            (
+                release_seeds,
+                RELEASE_SECONDS / count,
+                RELEASE_SECONDS % count,
+            )
         }
     };
 

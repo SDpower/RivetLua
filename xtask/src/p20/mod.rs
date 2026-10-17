@@ -12,8 +12,7 @@ const HEAP_LIMIT: usize = 16 * 1024 * 1024;
 pub(super) const P23_FUEL: u64 = FUEL;
 pub(super) const P23_HEAP_LIMIT: usize = HEAP_LIMIT;
 pub(super) const P23_RUNS_PER_WORKLOAD: usize = 1 + WARMUP + ITERATIONS;
-const USAGE: &str =
-    "用法：perf baseline --target <target-triple> --toolchain <toolchain-label> [--jit] [lua54|lua55]";
+const USAGE: &str = "用法：perf baseline --target <target-triple> --toolchain <toolchain-label> [--jit] [lua54|lua55]";
 
 #[derive(Clone, Copy)]
 enum Expected {
@@ -98,7 +97,10 @@ pub(super) fn run(arguments: &[String]) -> Result<(), String> {
     ];
     let mut scenarios = Vec::with_capacity(6);
     for (profile_argument, profile_name, profile) in profiles {
-        if options.profile.is_some_and(|selected| selected != profile_argument) {
+        if options
+            .profile
+            .is_some_and(|selected| selected != profile_argument)
+        {
             continue;
         }
         for workload in &WORKLOADS {
@@ -224,15 +226,39 @@ fn run_scenario(
             .map_err(|error| format!("{} 啟用 JIT 失敗：{error:?}", workload.id))?;
     }
 
-    let first = measure_sample(&mut vm, &module, workload, SampleKind::First, 0, Some(compile_ns), jit)?;
+    let first = measure_sample(
+        &mut vm,
+        &module,
+        workload,
+        SampleKind::First,
+        0,
+        Some(compile_ns),
+        jit,
+    )?;
     let mut raw_samples = vec![sample_json(&first)];
     for iteration in 1..=WARMUP {
-        let _ = measure_sample(&mut vm, &module, workload, SampleKind::Warmup, iteration, None, jit)?;
+        let _ = measure_sample(
+            &mut vm,
+            &module,
+            workload,
+            SampleKind::Warmup,
+            iteration,
+            None,
+            jit,
+        )?;
     }
 
     let mut hot_times = Vec::with_capacity(ITERATIONS);
     for iteration in 1..=ITERATIONS {
-        let sample = measure_sample(&mut vm, &module, workload, SampleKind::Hot, iteration, None, jit)?;
+        let sample = measure_sample(
+            &mut vm,
+            &module,
+            workload,
+            SampleKind::Hot,
+            iteration,
+            None,
+            jit,
+        )?;
         hot_times.push(sample.hot_ns.ok_or("缺少 hot_ns 樣本")?);
         raw_samples.push(sample_json(&sample));
     }
@@ -259,7 +285,10 @@ fn run_scenario(
 }
 
 pub(super) fn p23_workloads() -> Vec<(&'static str, &'static str)> {
-    WORKLOADS.iter().map(|workload| (workload.id, workload.source)).collect()
+    WORKLOADS
+        .iter()
+        .map(|workload| (workload.id, workload.source))
+        .collect()
 }
 
 pub(super) fn p23_collect(
@@ -269,7 +298,8 @@ pub(super) fn p23_collect(
     toolchain: &str,
     jit: bool,
 ) -> Result<Vec<String>, String> {
-    WORKLOADS.iter()
+    WORKLOADS
+        .iter()
         .map(|workload| run_scenario(workload, profile_name, profile, target, toolchain, jit))
         .collect()
 }
@@ -363,7 +393,11 @@ fn sample_json(sample: &Sample) -> String {
         optional_number(sample.first_ns),
         optional_number(sample.hot_ns),
         sample.gc_ns,
-        if sample.jit { sample.jit_stats.jit_compile_ns.to_string() } else { "null".into() },
+        if sample.jit {
+            sample.jit_stats.jit_compile_ns.to_string()
+        } else {
+            "null".into()
+        },
         ledger_json(sample.ledger_before_load),
         ledger_json(sample.ledger_after_run),
         ledger_json(sample.ledger_after_collect),
@@ -371,19 +405,23 @@ fn sample_json(sample: &Sample) -> String {
         trace_json(sample.trace_after_run),
         trace_json(sample.trace_after_collect),
         sample.jit_stats.code_bytes,
-        sample.cache_bytes.saturating_add(sample.jit_stats.metadata_bytes),
+        sample
+            .cache_bytes
+            .saturating_add(sample.jit_stats.metadata_bytes),
         sample.cache_bytes,
         sample.jit_stats.metadata_bytes,
         sample.jit_stats.native_executed_instructions,
         sample.jit_stats.total_logical_instructions,
-        if sample.jit_stats.total_logical_instructions == 0 { 0.0 } else {
+        if sample.jit_stats.total_logical_instructions == 0 {
+            0.0
+        } else {
             sample.jit_stats.native_executed_instructions as f64
                 / sample.jit_stats.total_logical_instructions as f64
         },
-        sample.jit_stats.fallback_reason.map_or_else(
-            || "null".to_owned(),
-            |reason| format!("\"{reason:?}\""),
-        ),
+        sample
+            .jit_stats
+            .fallback_reason
+            .map_or_else(|| "null".to_owned(), |reason| format!("\"{reason:?}\""),),
     )
 }
 
@@ -464,15 +502,19 @@ mod tests {
 
     #[test]
     fn p20_rejects_unexpected_guest_results() {
-        assert!(ensure_expected_return(
-            &WORKLOADS[0],
-            &RunOutcome::Returned(vec![Value::Integer(500_500)])
-        )
-        .is_ok());
-        assert!(ensure_expected_return(
-            &WORKLOADS[0],
-            &RunOutcome::Returned(vec![Value::Integer(1)])
-        )
-        .is_err());
+        assert!(
+            ensure_expected_return(
+                &WORKLOADS[0],
+                &RunOutcome::Returned(vec![Value::Integer(500_500)])
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_expected_return(
+                &WORKLOADS[0],
+                &RunOutcome::Returned(vec![Value::Integer(1)])
+            )
+            .is_err()
+        );
     }
 }

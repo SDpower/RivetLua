@@ -57,12 +57,9 @@ pub(super) fn sha256_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
 pub(super) fn sha256(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("P17 SHA-256 讀取失敗：{}：{error}", path.display()))?;
-    let digest = sha256_bytes(&bytes)
-        .ok_or_else(|| format!("P17 SHA-256 長度溢位：{}", path.display()))?;
-    Ok(digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    let digest =
+        sha256_bytes(&bytes).ok_or_else(|| format!("P17 SHA-256 長度溢位：{}", path.display()))?;
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[cfg(test)]
@@ -76,10 +73,7 @@ mod tests {
     }
 
     fn temporary_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "rivetlua-p17-sha256-{}-{name}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("rivetlua-p17-sha256-{}-{name}", std::process::id()))
     }
 
     #[test]
@@ -93,11 +87,26 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         for (length, expected) in [
-            (55, "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"),
-            (56, "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"),
-            (63, "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34"),
-            (64, "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"),
-            (128, "6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e"),
+            (
+                55,
+                "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+            ),
+            (
+                56,
+                "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+            ),
+            (
+                63,
+                "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+            ),
+            (
+                64,
+                "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+            ),
+            (
+                128,
+                "6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e",
+            ),
         ] {
             assert_eq!(
                 hex(&sha256_bytes(&vec![b'a'; length]).unwrap()),

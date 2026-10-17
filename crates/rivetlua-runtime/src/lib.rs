@@ -37,8 +37,8 @@ mod vm;
 
 pub use alloc::{
     AllocationAdmission, AllocationAttempt, AllocationCharge, AllocationCharges, AllocationDomain,
-    AllocationFailure, AllocationFailureKind, AllocationLedger, AllocationPeaks, AllocationSite, AllocationTrace,
-    FailPoint, LedgerProbe, LedgerSnapshot,
+    AllocationFailure, AllocationFailureKind, AllocationLedger, AllocationPeaks, AllocationSite,
+    AllocationTrace, FailPoint, LedgerProbe, LedgerSnapshot,
 };
 pub use call::PendingCloseSnapshot;
 pub use callback::{CallbackContext, CallbackContinuation, CallbackFn, CallbackResult};
@@ -57,26 +57,26 @@ pub use heap::{
 pub use host::{
     DebugCapability, DebugLimits, DebugPermission, DumpCapability, DumpLimits, FileOperation,
     FileReadFormat, FileSeekOrigin, ForeignNativeKind, HostCalendar, HostCloseResult, HostDeadline,
-    HostEntropy, HostEntropyError, HostExitStatus, HostFileLease, HostIo, HostIoFailure,
-    HostLoadCompiler, HostLoadError, HostLoadErrorKind, HostModuleBytes, HostModuleRepository,
-    HostExitRequest, HostNativeLoader, HostNativeModule, HostOs, HostOsOperation, HostOsValue, HostOutput,
-    HostOutputError, HostResourceError, HostResourceErrorKind, HostServices, HostSourceReader,
-    HostWarning, HostWarningError, LoadBudget, LoadCapability, LoadFormat, LoadLimits,
-    PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
-};
-pub use policy::{
-    CapabilityGrant, OpaqueServiceHandle, PolicyCapabilities, PolicyClock, PrivateService,
-    ServiceAccessError, ServiceAudience, ServiceOperation, VmPolicy, ExportPolicy, OutputBudget,
-    OutputAudit, OutputError, SafeDiagnostic,
+    HostEntropy, HostEntropyError, HostExitRequest, HostExitStatus, HostFileLease, HostIo,
+    HostIoFailure, HostLoadCompiler, HostLoadError, HostLoadErrorKind, HostModuleBytes,
+    HostModuleRepository, HostNativeLoader, HostNativeModule, HostOs, HostOsOperation, HostOsValue,
+    HostOutput, HostOutputError, HostResourceError, HostResourceErrorKind, HostServices,
+    HostSourceReader, HostWarning, HostWarningError, LoadBudget, LoadCapability, LoadFormat,
+    LoadLimits, PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
 };
 #[cfg(any(feature = "jit", feature = "aot"))]
 pub use jit::{JitEligibility, JitFallbackReason, JitPolicy, JitStats};
-#[cfg(feature = "aot")]
-pub use rivetlua_native::{AotArtifact, AotError, AotManifest, NativeError, TrustedAotBuild};
+pub use metamethod::MetamethodEvent;
+pub use policy::{
+    CapabilityGrant, ExportPolicy, OpaqueServiceHandle, OutputAudit, OutputBudget, OutputError,
+    PolicyCapabilities, PolicyClock, PrivateService, SafeDiagnostic, ServiceAccessError,
+    ServiceAudience, ServiceOperation, VmPolicy,
+};
 #[cfg(feature = "aot")]
 pub use rivetlua_core::TargetDescriptor;
-pub use metamethod::MetamethodEvent;
 pub use rivetlua_core::{Generation, ObjectId, SlotId, VmId};
+#[cfg(feature = "aot")]
+pub use rivetlua_native::{AotArtifact, AotError, AotManifest, NativeError, TrustedAotBuild};
 pub use roots::{RootId, RootKind, RootSet};
 pub use stdlib::table::{TableSortStop, TableSortTrace};
 pub use string::{ByteString, ExternalStringStorage};

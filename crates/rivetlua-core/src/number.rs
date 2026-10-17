@@ -28,24 +28,58 @@ pub trait NoStdFloat {
 
 #[cfg(not(feature = "std"))]
 impl NoStdFloat for f64 {
-    fn powf(self, exponent: f64) -> f64 { libm::pow(self, exponent) }
-    fn floor(self) -> f64 { libm::floor(self) }
-    fn trunc(self) -> f64 { libm::trunc(self) }
-    fn fract(self) -> f64 {
-        if self.is_finite() { libm::modf(self).0 } else { f64::NAN }
+    fn powf(self, exponent: f64) -> f64 {
+        libm::pow(self, exponent)
     }
-    fn ceil(self) -> f64 { libm::ceil(self) }
-    fn acos(self) -> f64 { libm::acos(self) }
-    fn asin(self) -> f64 { libm::asin(self) }
-    fn atan2(self, other: f64) -> f64 { libm::atan2(self, other) }
-    fn cos(self) -> f64 { libm::cos(self) }
-    fn exp(self) -> f64 { libm::exp(self) }
-    fn ln(self) -> f64 { libm::log(self) }
-    fn log2(self) -> f64 { libm::log2(self) }
-    fn log10(self) -> f64 { libm::log10(self) }
-    fn sin(self) -> f64 { libm::sin(self) }
-    fn sqrt(self) -> f64 { libm::sqrt(self) }
-    fn tan(self) -> f64 { libm::tan(self) }
+    fn floor(self) -> f64 {
+        libm::floor(self)
+    }
+    fn trunc(self) -> f64 {
+        libm::trunc(self)
+    }
+    fn fract(self) -> f64 {
+        if self.is_finite() {
+            libm::modf(self).0
+        } else {
+            f64::NAN
+        }
+    }
+    fn ceil(self) -> f64 {
+        libm::ceil(self)
+    }
+    fn acos(self) -> f64 {
+        libm::acos(self)
+    }
+    fn asin(self) -> f64 {
+        libm::asin(self)
+    }
+    fn atan2(self, other: f64) -> f64 {
+        libm::atan2(self, other)
+    }
+    fn cos(self) -> f64 {
+        libm::cos(self)
+    }
+    fn exp(self) -> f64 {
+        libm::exp(self)
+    }
+    fn ln(self) -> f64 {
+        libm::log(self)
+    }
+    fn log2(self) -> f64 {
+        libm::log2(self)
+    }
+    fn log10(self) -> f64 {
+        libm::log10(self)
+    }
+    fn sin(self) -> f64 {
+        libm::sin(self)
+    }
+    fn sqrt(self) -> f64 {
+        libm::sqrt(self)
+    }
+    fn tan(self) -> f64 {
+        libm::tan(self)
+    }
 }
 
 /// 十六進位浮點解析中的 2^n，保留整數指數與次正規邊界。

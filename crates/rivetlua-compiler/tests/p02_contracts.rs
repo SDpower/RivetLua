@@ -3,8 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use rivetlua_compiler::{
-    CompileLimits, DiagnosticCode, Keyword, LanguageProfile, Literal, Span, Symbol, TokenKind,
-    lex,
+    CompileLimits, DiagnosticCode, Keyword, LanguageProfile, Literal, Span, Symbol, TokenKind, lex,
 };
 use rivetlua_core::Number;
 
@@ -64,7 +63,11 @@ fn p02_contract_cases_are_complete_for_one_profile() {
     assert_eq!(chunk.tokens[0].kind, TokenKind::Keyword(Keyword::Local));
     assert_eq!(chunk.tokens[1].literal, Some(Literal::Name(b"x".to_vec())));
     assert_eq!(
-        chunk.tokens.iter().map(|token| token.span).collect::<Vec<_>>(),
+        chunk
+            .tokens
+            .iter()
+            .map(|token| token.span)
+            .collect::<Vec<_>>(),
         vec![
             Span {
                 start_byte: 0,

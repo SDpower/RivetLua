@@ -45,9 +45,9 @@ impl Text {
 
     fn byte_len(&self, vm: &Vm) -> Result<usize, RuntimeError> {
         let prefix_len = match self.prefix {
-            Some(prefix) => vm.with_byte_string(prefix, |string| {
-                c_string_len(string.as_bytes())
-            })?,
+            Some(prefix) => {
+                vm.with_byte_string(prefix, |string| c_string_len(string.as_bytes()))?
+            }
             None => 0,
         };
         prefix_len
@@ -55,11 +55,7 @@ impl Text {
             .ok_or(VmError::ArithmeticOverflow.into())
     }
 
-    fn append_to(
-        &self,
-        vm: &Vm,
-        buffer: &mut PrintBuffer,
-    ) -> Result<(), RuntimeError> {
+    fn append_to(&self, vm: &Vm, buffer: &mut PrintBuffer) -> Result<(), RuntimeError> {
         if let Some(prefix) = self.prefix {
             vm.with_byte_string(prefix, |string| {
                 let bytes = string.as_bytes();
@@ -150,10 +146,10 @@ fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
         }
         Value::LightUserdata(address) => {
             if vm.policy() == crate::VmPolicy::Compatibility {
-                write!(text, "userdata: 0x{address:x}")
-                    .map_err(|_| VmError::ArithmeticOverflow)?;
+                write!(text, "userdata: 0x{address:x}").map_err(|_| VmError::ArithmeticOverflow)?;
             } else {
-                text.write_str("userdata").map_err(|_| VmError::ArithmeticOverflow)?;
+                text.write_str("userdata")
+                    .map_err(|_| VmError::ArithmeticOverflow)?;
             }
         }
         Value::CFunction(id) => {
@@ -176,7 +172,8 @@ fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
                     ObjectKind::File => "file",
                     _ => "userdata",
                 };
-                text.write_str(name).map_err(|_| VmError::ArithmeticOverflow)?;
+                text.write_str(name)
+                    .map_err(|_| VmError::ArithmeticOverflow)?;
                 return Ok(Some(text));
             }
             let prefix = metatable_name(vm, value)?;
@@ -562,9 +559,7 @@ pub(crate) fn print(vm: &mut Vm, args: &[Value]) -> Result<(), RuntimeError> {
         Err(HostServiceError::OutputFailed) => {
             Err(RuntimeError::new(RuntimeErrorKind::HostOutputFailed))
         }
-        Err(HostServiceError::OutputLimit) => {
-            Err(RuntimeError::new(RuntimeErrorKind::OutputLimit))
-        }
+        Err(HostServiceError::OutputLimit) => Err(RuntimeError::new(RuntimeErrorKind::OutputLimit)),
     }
 }
 
@@ -628,7 +623,9 @@ pub(crate) fn execute(
                         b"param" if vm.language_profile() == rivetlua_core::LuaProfile::Lua55 => {
                             Some(8)
                         }
-                        b"setpause" if vm.language_profile() == rivetlua_core::LuaProfile::Lua54 => {
+                        b"setpause"
+                            if vm.language_profile() == rivetlua_core::LuaProfile::Lua54 =>
+                        {
                             Some(9)
                         }
                         b"setstepmul"
@@ -929,7 +926,10 @@ mod p13_a_tests {
             let baseline_roots = vm.roots().total_count();
             let late_bad_argument = [Value::Integer(7), Value::Boolean(false)];
             for (args, expected) in [
-                (&[][..], b"bad argument #1 to 'warn' (string expected)".as_slice()),
+                (
+                    &[][..],
+                    b"bad argument #1 to 'warn' (string expected)".as_slice(),
+                ),
                 (
                     &late_bad_argument[..],
                     b"bad argument #2 to 'warn' (string expected)".as_slice(),

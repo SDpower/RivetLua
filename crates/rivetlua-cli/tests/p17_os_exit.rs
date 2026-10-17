@@ -491,17 +491,25 @@ fn exit_probe_fixture() -> ExitProbeFixture {
         env_json,
         exit_code.map_or_else(|| "null".to_owned(), |code| code.to_string()),
         compile_success.map_or_else(|| "null".to_owned(), |success| success.to_string()),
-        spawn_error.as_deref().map_or_else(|| "null".to_owned(), json_string),
+        spawn_error
+            .as_deref()
+            .map_or_else(|| "null".to_owned(), json_string),
         json_string(&stdout),
         json_string(&stderr),
         json_string(&source.display().to_string()),
         json_string(&source_sha256),
         json_string(&binary.display().to_string()),
-        binary_sha256.as_deref().map_or_else(|| "null".to_owned(), json_string),
+        binary_sha256
+            .as_deref()
+            .map_or_else(|| "null".to_owned(), json_string),
         json_string(&cpath.display().to_string()),
         json_string(&grant.display().to_string()),
-        grant_sha256.as_deref().map_or_else(|| "null".to_owned(), json_string),
-        grant_error.as_deref().map_or_else(|| "null".to_owned(), json_string),
+        grant_sha256
+            .as_deref()
+            .map_or_else(|| "null".to_owned(), json_string),
+        grant_error
+            .as_deref()
+            .map_or_else(|| "null".to_owned(), json_string),
     );
     let build_log = run.join("exit-probe-build.json");
     let mut log = OpenOptions::new()
@@ -767,7 +775,8 @@ fn run_cli_inner(
         native_build_log_sha256,
         CHILD_TIMEOUT.as_secs(),
         status.code(),
-        stdin.map(String::from_utf8_lossy)
+        stdin
+            .map(String::from_utf8_lossy)
             .map(|value| value.into_owned())
             .unwrap_or_else(|| "<null>".to_owned()),
         String::from_utf8_lossy(&stdout),
@@ -1308,6 +1317,8 @@ fn p17_exit_cli_control_flow() {
         &[],
     );
     let mut expected_stdout = VERSION_LINE.to_vec();
-    expected_stdout.extend_from_slice(b"> print('repl-before-exit')\nrepl-before-exit\n> os.exit(53, false)\n");
+    expected_stdout.extend_from_slice(
+        b"> print('repl-before-exit')\nrepl-before-exit\n> os.exit(53, false)\n",
+    );
     assert_cli_result(&result, 53, &expected_stdout, b"", "exit_stops_repl_input");
 }

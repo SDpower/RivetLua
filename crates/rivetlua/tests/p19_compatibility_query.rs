@@ -1,4 +1,4 @@
-use rivetlua::{compatibility_entries, CompatibilityEntry, LuaProfile, COMPATIBILITY_VERSION};
+use rivetlua::{COMPATIBILITY_VERSION, CompatibilityEntry, LuaProfile, compatibility_entries};
 
 #[test]
 fn sdk_exposes_profile_compatibility_queries() {
@@ -16,12 +16,16 @@ fn sdk_exposes_profile_compatibility_queries() {
         keyword.selected_rule(LuaProfile::Lua55),
         keyword.selected_rule(LuaProfile::Lua54)
     );
-    assert!(keyword
-        .source
-        .contains("https://www.lua.org/source/5.5/llex.c.html"));
-    assert!(keyword
-        .source
-        .contains("https://www.lua.org/source/5.4/llex.c.html"));
+    assert!(
+        keyword
+            .source
+            .contains("https://www.lua.org/source/5.5/llex.c.html")
+    );
+    assert!(
+        keyword
+            .source
+            .contains("https://www.lua.org/source/5.4/llex.c.html")
+    );
 
     let unimplemented = entries
         .iter()
@@ -29,7 +33,9 @@ fn sdk_exposes_profile_compatibility_queries() {
         .find(|entry| entry.case_id == "PROF-002-CAPI-OPENSELECTEDLIBS")
         .expect("open-selected-libraries entry should be present");
     assert_ne!(unimplemented.status, "implemented");
-    assert!(unimplemented
-        .source
-        .contains("https://www.lua.org/source/5.5/lualib.h.html"));
+    assert!(
+        unimplemented
+            .source
+            .contains("https://www.lua.org/source/5.5/lualib.h.html")
+    );
 }

@@ -184,9 +184,7 @@ fn p21_aot_enabled_matches_interpreter_and_preserves_recovery_paths() {
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {
         let engine = Engine::new(profile);
         let mut interpreter_vm = engine.new_vm().unwrap();
-        interpreter_vm
-            .set_jit_policy(JitPolicy::Disabled)
-            .unwrap();
+        interpreter_vm.set_jit_policy(JitPolicy::Disabled).unwrap();
         let mut aot_vm = engine.new_vm().unwrap();
         aot_vm.set_jit_policy(JitPolicy::Enabled).unwrap();
         let target = target_descriptor(profile);

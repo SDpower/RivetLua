@@ -20,10 +20,10 @@ use rivetlua_core::{
 use rivetlua_runtime::ExternalStringStorage;
 use rivetlua_runtime::{
     AllocationCharges, AllocationFailureKind, CapiDumpBytes, CoroutineState, DebugFrameHandle,
-    DebugFrameInfo, DebugFrameKind, DebugHookConfig, Execution, ExternalCommand, ExternalToken, FailPoint,
-    GcControl, GcControlResult, HostAllocationCharge, HostAllocationReservation, HostExitRequest,
-    HostHandle, HostServices, ObjectKind, RootId, RootKind, RunOutcome, RuntimeError,
-    RuntimeErrorKind, ValueOperation, Vm, VmError, VmPolicy,
+    DebugFrameInfo, DebugFrameKind, DebugHookConfig, Execution, ExternalCommand, ExternalToken,
+    FailPoint, GcControl, GcControlResult, HostAllocationCharge, HostAllocationReservation,
+    HostExitRequest, HostHandle, HostServices, ObjectKind, RootId, RootKind, RunOutcome,
+    RuntimeError, RuntimeErrorKind, ValueOperation, Vm, VmError, VmPolicy,
 };
 
 use crate::allocator::{CAllocatorState, LuaAlloc};
@@ -1136,9 +1136,10 @@ impl StateGroup {
         parent: Option<ExternalToken>,
     ) -> Result<RunOutcome, RuntimeError> {
         if let Some(fuel) = self.worker_fuel() {
-            let lowered = self.vm.parked_fuel_remaining(token).and_then(|parked| {
-                self.vm.set_parked_fuel_remaining(token, parked.min(fuel))
-            });
+            let lowered = self
+                .vm
+                .parked_fuel_remaining(token)
+                .and_then(|parked| self.vm.set_parked_fuel_remaining(token, parked.min(fuel)));
             if let Err(error) = lowered {
                 self.worker_fuel_remaining = Some(0);
                 return Err(error);
@@ -1861,10 +1862,8 @@ impl StateControl {
         } else {
             None
         };
-        let arguments = callback_values_b4(
-            &group.vm,
-            &stack.slots[base + usize::from(first_resume)..],
-        )?;
+        let arguments =
+            callback_values_b4(&group.vm, &stack.slots[base + usize::from(first_resume)..])?;
         if let Some(entry) = entry {
             group.vm.set_host_coroutine_entry_a5(child, entry)?;
         }
@@ -3528,7 +3527,11 @@ impl StateControl {
         let group_owner = self.group.upgrade().ok_or(StackError::InvalidState)?;
         let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
         let mut stack = self.stack.try_borrow_mut().map_err(|_| StackError::Busy)?;
-        let required = stack.slots.len().checked_add(1).ok_or(StackError::StackLimit)?;
+        let required = stack
+            .slots
+            .len()
+            .checked_add(1)
+            .ok_or(StackError::StackLimit)?;
         if required > MAX_STACK {
             return Err(StackError::StackLimit);
         }
@@ -3537,17 +3540,16 @@ impl StateControl {
         }
         let prepared = stack.prepare_capacity(&group.vm, required)?;
         let registry = group.registry_table()?;
-        let Value::Object(globals) = group.vm.raw_get(
-            registry,
-            Value::Integer(LUA_RIDX_GLOBALS),
-        )? else {
+        let Value::Object(globals) = group
+            .vm
+            .raw_get(registry, Value::Integer(LUA_RIDX_GLOBALS))?
+        else {
             return Err(StackError::InvalidIndex);
         };
-        let (library, library_root) = group.vm.install_c_library(
-            globals,
-            registry,
-            module as u8,
-        )?;
+        let (library, library_root) =
+            group
+                .vm
+                .install_c_library(globals, registry, module as u8)?;
         let slot = StackSlot::new(&mut group.vm, StackValue::Core(Value::Object(library)));
         group.vm.remove_root(library_root)?;
         let slot = slot?;
@@ -5201,9 +5203,11 @@ extern "C" fn requiref_private_loaded(pointer: *mut lua_State) -> c_int {
                 return Err(StackError::PolicyDenied);
             }
             let registry = group.registry_table()?;
-            let Value::Object(loaded) = group.vm.with_temporary_byte_string(b"_LOADED", |vm, key| {
-                vm.raw_get(registry, Value::Object(key))
-            })? else {
+            let Value::Object(loaded) =
+                group.vm.with_temporary_byte_string(b"_LOADED", |vm, key| {
+                    vm.raw_get(registry, Value::Object(key))
+                })?
+            else {
                 return Err(StackError::InvalidState);
             };
             if group.vm.object_kind(loaded)? != ObjectKind::Table {
@@ -5241,7 +5245,11 @@ impl StateOwner {
         {
             return Err(StackError::InvalidState);
         }
-        let group_owner = allocation.control.group.upgrade().ok_or(StackError::InvalidState)?;
+        let group_owner = allocation
+            .control
+            .group
+            .upgrade()
+            .ok_or(StackError::InvalidState)?;
         let mut group = group_owner.try_borrow_mut().map_err(|_| StackError::Busy)?;
         if group.worker_fuel_remaining.is_some()
             || group.execution_started
@@ -5991,7 +5999,11 @@ impl StateOwner {
         let allocation = self.allocation.as_ref().ok_or(StackError::InvalidState)?;
         allocation.control.validate()?;
         let restricted = {
-            let group_owner = allocation.control.group.upgrade().ok_or(StackError::InvalidState)?;
+            let group_owner = allocation
+                .control
+                .group
+                .upgrade()
+                .ok_or(StackError::InvalidState)?;
             let group = group_owner.try_borrow().map_err(|_| StackError::Busy)?;
             group.vm.policy() != VmPolicy::Compatibility
         };
@@ -7550,17 +7562,9 @@ impl StateControl {
                 self.callback_pending_value_a2(group, stack, error.value, ErrorClass::Lua)
             }
             RunOutcome::SafeDiagnostic(diagnostic) => {
-                let public = format!(
-                    "{} #{}",
-                    diagnostic.public_code, diagnostic.correlation_id
-                );
+                let public = format!("{} #{}", diagnostic.public_code, diagnostic.correlation_id);
                 let object = group.vm.allocate_byte_string(public.as_bytes())?;
-                self.callback_pending_value_a2(
-                    group,
-                    stack,
-                    Value::Object(object),
-                    ErrorClass::Lua,
-                )
+                self.callback_pending_value_a2(group, stack, Value::Object(object), ErrorClass::Lua)
             }
             RunOutcome::NestedFailed(error) => {
                 self.callback_pending_runtime_a2(group, stack, error)
@@ -7654,11 +7658,14 @@ impl StateControl {
                 .map(|frame| frame.token)
         };
         let worker_fuel = group.worker_fuel();
-        let native_parent = self.native_parent.get().filter(|_| boundary_token.is_none());
+        let native_parent = self
+            .native_parent
+            .get()
+            .filter(|_| boundary_token.is_none());
         let outcome = if let Some(token) = callback_token {
             group.continue_worker_external(
                 token,
-                    ExternalCommand::NestedCapiCall {
+                ExternalCommand::NestedCapiCall {
                     target,
                     args: std::mem::take(&mut args.values),
                     results: mode,
@@ -10076,9 +10083,8 @@ pub extern "C" fn rivetlua_capi_newstate_with_policy_b22(policy: c_int) -> *mut 
             2 => VmPolicy::PrivateService,
             _ => return Err(StackError::InvalidState),
         };
-        let owner = StateOwner::new_with_host_services(
-            HostServices::deny_all().and_policy(policy),
-        )?;
+        let owner =
+            StateOwner::new_with_host_services(HostServices::deny_all().and_policy(policy))?;
         Ok(publish_default_state(owner))
     })
 }
@@ -14216,7 +14222,10 @@ mod native_sdk_registry_tests {
         vm.remove_root(registry_root).unwrap();
         vm.collect().unwrap();
         assert_eq!(vm.main_thread_identity(), Some(main));
-        assert_eq!(vm.object_kind(main), Ok(rivetlua_runtime::ObjectKind::Coroutine));
+        assert_eq!(
+            vm.object_kind(main),
+            Ok(rivetlua_runtime::ObjectKind::Coroutine)
+        );
         vm.remove_root(globals_root).unwrap();
     }
 }
@@ -14337,8 +14346,18 @@ mod worker_fuel_and_private_requiref_tests {
     fn worker_fuel_is_single_assignment_and_never_increases() {
         let mut owner = StateOwner::new().unwrap();
         owner.set_worker_fuel_limit(7).unwrap();
-        assert!(matches!(owner.set_worker_fuel_limit(9), Err(StackError::Busy)));
-        let group_owner = owner.allocation.as_ref().unwrap().control.group.upgrade().unwrap();
+        assert!(matches!(
+            owner.set_worker_fuel_limit(9),
+            Err(StackError::Busy)
+        ));
+        let group_owner = owner
+            .allocation
+            .as_ref()
+            .unwrap()
+            .control
+            .group
+            .upgrade()
+            .unwrap();
         {
             let mut group = group_owner.borrow_mut();
             group
@@ -14349,7 +14368,10 @@ mod worker_fuel_and_private_requiref_tests {
                 .unwrap();
             assert_eq!(group.worker_fuel_remaining, Some(4));
         }
-        assert!(matches!(owner.set_worker_fuel_limit(1), Err(StackError::Busy)));
+        assert!(matches!(
+            owner.set_worker_fuel_limit(1),
+            Err(StackError::Busy)
+        ));
     }
 
     unsafe extern "C" fn open_table(state: *mut lua_State) -> c_int {
@@ -14370,9 +14392,19 @@ mod worker_fuel_and_private_requiref_tests {
         assert_eq!(status, 0);
         // SAFETY：owner 在呼叫期間保活 state，requiref 成功後留下單一結果。
         assert_eq!(unsafe { lua_gettop(owner.as_ptr()) }, 1);
-        let group_owner = owner.allocation.as_ref().unwrap().control.group.upgrade().unwrap();
+        let group_owner = owner
+            .allocation
+            .as_ref()
+            .unwrap()
+            .control
+            .group
+            .upgrade()
+            .unwrap();
         let mut group = group_owner.borrow_mut();
-        assert!(matches!(group.public_registry_allowed(), Err(StackError::PolicyDenied)));
+        assert!(matches!(
+            group.public_registry_allowed(),
+            Err(StackError::PolicyDenied)
+        ));
         let registry = group.registry_table().unwrap();
         let Value::Object(loaded) = group
             .vm

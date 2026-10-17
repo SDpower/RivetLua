@@ -2,16 +2,14 @@ use rivetlua_compiler::{
     CompileLimits, IrLimits, LanguageProfile, emit_with_native_debug, lex, lower, parse, resolve,
     translate_official_chunk,
 };
-use rivetlua_core::bytecode::official_export::emit_official_chunk;
 use rivetlua_core::bytecode::official_export::OfficialExportErrorKind;
+use rivetlua_core::bytecode::official_export::emit_official_chunk;
 use rivetlua_core::{
     LuaProfile, OfficialChunk, OfficialChunkLimits, OfficialConstant, OfficialDebug,
     OfficialPrototype, OfficialRvluPc, OfficialWorkBudget, ProtoId, Value, VerifiedModule,
     VerifyLimits, decode_official_chunk,
 };
-use rivetlua_runtime::{
-    DebugCapability, DebugPermission, HostServices, RootKind, RunOutcome, Vm,
-};
+use rivetlua_runtime::{DebugCapability, DebugPermission, HostServices, RootKind, RunOutcome, Vm};
 
 // 以下片段逐位元組取自 Lua 官方 5.4.9 與 5.5.1 測試集的 testes/db.lua。
 // 5.4.9 的版權聲明見同套測試的 all.lua；5.5.1 見 lua.h：
@@ -1259,7 +1257,8 @@ end
 return sum, last
 "#;
 
-const COUNT_LOCAL_SOURCE: &[u8] = br#"local seen, bad, last, maximum, nested, active = 0, 0, 0, 0, 0, false
+const COUNT_LOCAL_SOURCE: &[u8] =
+    br#"local seen, bad, last, maximum, nested, active = 0, 0, 0, 0, 0, false
 debug.sethook(function(event)
   if active then nested = nested + 1 end
   active = true
@@ -1385,7 +1384,11 @@ fn test_jump(offset: i32) -> u32 {
     56 | (((offset + 16_777_215) as u32) << 7)
 }
 
-fn test_official_code(profile: LuaProfile, code: Vec<u32>, constants: Vec<OfficialConstant>) -> VerifiedModule {
+fn test_official_code(
+    profile: LuaProfile,
+    code: Vec<u32>,
+    constants: Vec<OfficialConstant>,
+) -> VerifiedModule {
     let chunk = OfficialChunk {
         profile,
         root_upvalues: 0,
@@ -1431,7 +1434,8 @@ fn run_with_gc_permissions(
         .allow(DebugPermission::StackInspection)
         .allow(DebugPermission::LocalInspection);
     let debug = if upvalue_mutation {
-        debug.allow(DebugPermission::Upvalues)
+        debug
+            .allow(DebugPermission::Upvalues)
             .allow(DebugPermission::UpvalueMutation)
     } else {
         debug
@@ -1454,7 +1458,8 @@ fn run_with_gc_permissions(
     let RunOutcome::Returned(values) = outcome else {
         let message = if let RunOutcome::LuaError(error) = &outcome {
             if let Value::Object(object) = error.value {
-                vm.with_byte_string(object, |text| text.as_bytes().to_vec()).ok()
+                vm.with_byte_string(object, |text| text.as_bytes().to_vec())
+                    .ok()
             } else {
                 None
             }
@@ -1467,7 +1472,10 @@ fn run_with_gc_permissions(
         let Value::Object(mask) = values[3] else {
             panic!("gethook mask 應為字串: {:?}", values[3]);
         };
-        Some(vm.with_byte_string(mask, |text| text.as_bytes().to_vec()).unwrap())
+        Some(
+            vm.with_byte_string(mask, |text| text.as_bytes().to_vec())
+                .unwrap(),
+        )
     } else {
         None
     };
@@ -1570,8 +1578,16 @@ fn p17_original_db_count_block_assertions_survive_official_roundtrip() {
 fn p17_db_prefix_native_context_preserves_empty_for_count() {
     let mut failures = Vec::new();
     for (language, profile, fixture) in [
-        (LanguageProfile::Lua54, LuaProfile::Lua54, DB54_PREFIX_AND_CAPTURES),
-        (LanguageProfile::Lua55, LuaProfile::Lua55, DB55_PREFIX_AND_CAPTURES),
+        (
+            LanguageProfile::Lua54,
+            LuaProfile::Lua54,
+            DB54_PREFIX_AND_CAPTURES,
+        ),
+        (
+            LanguageProfile::Lua55,
+            LuaProfile::Lua55,
+            DB55_PREFIX_AND_CAPTURES,
+        ),
     ] {
         let lines: Vec<_> = fixture.split_inclusive(|byte| *byte == b'\n').collect();
         let old_captures = if profile == LuaProfile::Lua54 {
@@ -1579,7 +1595,11 @@ fn p17_db_prefix_native_context_preserves_empty_for_count() {
         } else {
             &lines[583..586]
         };
-        let prefix_end = if profile == LuaProfile::Lua54 { 577 } else { 583 };
+        let prefix_end = if profile == LuaProfile::Lua54 {
+            577
+        } else {
+            583
+        };
         // 保留 db.lua 前綴的完整編譯原型，執行時跳過無關的既有斷言與副作用。
         let mut source = b"if false then\n".to_vec();
         for line in &lines[..prefix_end] {
@@ -1589,7 +1609,8 @@ fn p17_db_prefix_native_context_preserves_empty_for_count() {
         for line in old_captures {
             source.extend_from_slice(line);
         }
-        source.extend_from_slice(br#"
+        source.extend_from_slice(
+            br#"
 local a=0
 debug.sethook(function (e) a=a+1 end, "", 1)
 a=0; for i=1,1000 do end; local one = a
@@ -1599,7 +1620,8 @@ debug.sethook(function (e) a=a+1 end, "", 4000)
 a=0; for i=1,1000 do end; local many = a
 debug.sethook()
 return one, four, many
-"#);
+"#,
+        );
         let native = compile(&source, language);
         eprintln!(
             "{profile:?} prototypes={} root_instructions={} root_registers={}",
@@ -1613,7 +1635,10 @@ return one, four, many
             assert_eq!(values.len(), 3, "{profile:?} {label}");
             let counts = (integer(values[0]), integer(values[1]), integer(values[2]));
             eprintln!("{profile:?} {label}: {counts:?}");
-            if !(1000 < counts.0 && counts.0 < 1012 && 250 < counts.1 && counts.1 < 255
+            if !(1000 < counts.0
+                && counts.0 < 1012
+                && 250 < counts.1
+                && counts.1 < 255
                 && counts.2 == 0)
             {
                 failures.push(format!("{profile:?} {label}: {counts:?}"));
@@ -1637,8 +1662,14 @@ fn p17_numeric_alias_rejects_backward_entry_to_prior_open_return() {
         assert_eq!(official_values.len(), 1, "{profile:?}");
         let native_count = integer(native_values[0]);
         let official_count = integer(official_values[0]);
-        assert!(1000 < native_count && native_count < 1020, "{profile:?} {native_count}");
-        assert!(official_count > 2 * native_count, "{profile:?} {official_count}");
+        assert!(
+            1000 < native_count && native_count < 1020,
+            "{profile:?} {native_count}"
+        );
+        assert!(
+            official_count > 2 * native_count,
+            "{profile:?} {official_count}"
+        );
     }
 }
 
@@ -1652,7 +1683,11 @@ fn p17_numeric_for_visible_counter_survives_official_roundtrip() {
         let official = official(&native, profile);
         for (label, module) in [("native", native), ("official", official)] {
             let (values, _) = run(module, profile, false);
-            assert_eq!(values, [Value::Integer(500_500), Value::Integer(1000)], "{profile:?} {label}");
+            assert_eq!(
+                values,
+                [Value::Integer(500_500), Value::Integer(1000)],
+                "{profile:?} {label}"
+            );
         }
     }
 }
@@ -1709,7 +1744,8 @@ fn p17_numeric_for_nested_close_preserves_parent_i_capture() {
         let official = official(&native, profile);
         for (label, module) in [("native", native), ("official", official)] {
             for pressure in [false, true] {
-                let (values, _) = run_with_gc_permissions(module.clone(), profile, true, pressure, true);
+                let (values, _) =
+                    run_with_gc_permissions(module.clone(), profile, true, pressure, true);
                 assert_eq!(
                     values,
                     [Value::Integer(9), Value::Integer(5), Value::Integer(9)],
@@ -1730,7 +1766,11 @@ fn p17_gettabup_env_metatable_and_error_match_native() {
         let official = official(&native, profile);
         for (label, module) in [("native", native), ("official", official)] {
             let (values, _) = run(module, profile, false);
-            assert_eq!(values, [Value::Integer(17), Value::Boolean(false)], "{profile:?} {label}");
+            assert_eq!(
+                values,
+                [Value::Integer(17), Value::Boolean(false)],
+                "{profile:?} {label}"
+            );
         }
     }
 }
@@ -1774,7 +1814,10 @@ fn p17_native_export_preflight_exact_allocation_budget_with_numeric_debug_names(
             OfficialExportErrorKind::LimitExceeded,
             "{profile:?}",
         );
-        assert!(!export(high).unwrap().is_empty(), "{profile:?} 精確足額應可匯出");
+        assert!(
+            !export(high).unwrap().is_empty(),
+            "{profile:?} 精確足額應可匯出"
+        );
     }
 }
 
@@ -1814,26 +1857,51 @@ fn p17_official_conditional_jump_and_testset_keep_branch_semantics() {
                 test_abc(70, 2, 2, false),
             ];
             let module = test_official_code(
-                profile, code,
+                profile,
+                code,
                 vec![OfficialConstant::Integer(1), OfficialConstant::Integer(2)],
             );
             let prototype = &module.module().prototypes[0];
-            let origins = module.official_artifact().unwrap().pc_map(ProtoId(0)).unwrap().rvlu_to_official();
-            assert!(origins.iter().zip(&prototype.instructions).any(|(origin, entry)| {
-                *origin == OfficialRvluPc::Expanded(2)
-                    && matches!(entry.instruction, rivetlua_core::Instruction::Jump { .. })
-            }));
-            assert!(origins.iter().zip(&prototype.instructions).any(|(origin, entry)| {
-                *origin == OfficialRvluPc::Anchor(3)
-                    && matches!(entry.instruction, rivetlua_core::Instruction::Jump { .. })
-            }));
+            let origins = module
+                .official_artifact()
+                .unwrap()
+                .pc_map(ProtoId(0))
+                .unwrap()
+                .rvlu_to_official();
+            assert!(
+                origins
+                    .iter()
+                    .zip(&prototype.instructions)
+                    .any(|(origin, entry)| {
+                        *origin == OfficialRvluPc::Expanded(2)
+                            && matches!(entry.instruction, rivetlua_core::Instruction::Jump { .. })
+                    })
+            );
+            assert!(
+                origins
+                    .iter()
+                    .zip(&prototype.instructions)
+                    .any(|(origin, entry)| {
+                        *origin == OfficialRvluPc::Anchor(3)
+                            && matches!(entry.instruction, rivetlua_core::Instruction::Jump { .. })
+                    })
+            );
             // 直接執行的 JMP 保留獨立 Anchor；count hook 依此 Anchor 計數。
-            assert!(origins.iter().zip(&prototype.instructions).any(|(origin, entry)| {
-                *origin == OfficialRvluPc::Anchor(5)
-                    && matches!(entry.instruction, rivetlua_core::Instruction::Jump { .. })
-            }));
+            assert!(
+                origins
+                    .iter()
+                    .zip(&prototype.instructions)
+                    .any(|(origin, entry)| {
+                        *origin == OfficialRvluPc::Anchor(5)
+                            && matches!(entry.instruction, rivetlua_core::Instruction::Jump { .. })
+                    })
+            );
             let (values, _) = run(module, profile, false);
-            assert_eq!(values, vec![Value::Boolean(less == k)], "{profile:?} LT {less:?}/{k:?}");
+            assert_eq!(
+                values,
+                vec![Value::Boolean(less == k)],
+                "{profile:?} LT {less:?}/{k:?}"
+            );
         }
         for (input, k) in [(true, true), (true, false), (false, true), (false, false)] {
             let initial = if input { 7 } else { 5 };
@@ -1848,7 +1916,11 @@ fn p17_official_conditional_jump_and_testset_keep_branch_semantics() {
             ];
             let module = test_official_code(profile, code, vec![]);
             let (values, _) = run(module, profile, false);
-            assert_eq!(values, vec![Value::Boolean(input == k)], "{profile:?} TEST {input:?}/{k:?}");
+            assert_eq!(
+                values,
+                vec![Value::Boolean(input == k)],
+                "{profile:?} TEST {input:?}/{k:?}"
+            );
 
             let sentinel = if input { 5 } else { 7 };
             let code = vec![
@@ -1862,7 +1934,11 @@ fn p17_official_conditional_jump_and_testset_keep_branch_semantics() {
             let module = test_official_code(profile, code, vec![]);
             let (values, _) = run(module, profile, false);
             let expected = if input == k { input } else { !input };
-            assert_eq!(values, vec![Value::Boolean(expected)], "{profile:?} TESTSET {input:?}/{k:?}");
+            assert_eq!(
+                values,
+                vec![Value::Boolean(expected)],
+                "{profile:?} TESTSET {input:?}/{k:?}"
+            );
         }
     }
 }
@@ -1875,9 +1951,21 @@ fn p17_compare_left_phi_alias_terminal_fallback_preserves_short_circuit() {
     ] {
         for (label, source, expected) in [
             ("true", COMPARE_ALIAS_TRUE_SOURCE, vec![Value::Integer(9)]),
-            ("false", COMPARE_ALIAS_FALSE_SOURCE, vec![Value::Boolean(false)]),
-            ("arith true", COMPARE_ALIAS_ARITH_TRUE_SOURCE, vec![Value::Integer(1002)]),
-            ("arith false", COMPARE_ALIAS_ARITH_FALSE_SOURCE, vec![Value::Boolean(false)]),
+            (
+                "false",
+                COMPARE_ALIAS_FALSE_SOURCE,
+                vec![Value::Boolean(false)],
+            ),
+            (
+                "arith true",
+                COMPARE_ALIAS_ARITH_TRUE_SOURCE,
+                vec![Value::Integer(1002)],
+            ),
+            (
+                "arith false",
+                COMPARE_ALIAS_ARITH_FALSE_SOURCE,
+                vec![Value::Boolean(false)],
+            ),
             (
                 "rhs error",
                 COMPARE_ALIAS_ERROR_SOURCE,
@@ -1885,7 +1973,11 @@ fn p17_compare_left_phi_alias_terminal_fallback_preserves_short_circuit() {
             ),
         ] {
             let native = compile(source, language);
-            assert_eq!(run(native.clone(), profile, false).0, expected, "{profile:?} {label} native");
+            assert_eq!(
+                run(native.clone(), profile, false).0,
+                expected,
+                "{profile:?} {label} native"
+            );
             let bytes = emit_official_chunk(
                 &native,
                 ProtoId(0),
@@ -1895,7 +1987,8 @@ fn p17_compare_left_phi_alias_terminal_fallback_preserves_short_circuit() {
                 &mut OfficialWorkBudget::new(u64::MAX),
             )
             .unwrap();
-            let chunk = decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
+            let chunk =
+                decode_official_chunk(&bytes, profile, &OfficialChunkLimits::default()).unwrap();
             let clobbers_left = chunk.main.code.windows(2).any(|pair| {
                 pair[0] & 0x7f == 5
                     && pair[1] & 0x7f == 58
@@ -1903,15 +1996,33 @@ fn p17_compare_left_phi_alias_terminal_fallback_preserves_short_circuit() {
             });
             eprintln!("{profile:?} {label}: fallback 左槽覆寫={clobbers_left}");
             if label == "arith true" {
-                eprintln!("{profile:?} native={:?}", native.module().prototypes[0].instructions);
-                eprintln!("{profile:?} official={:?}", chunk.main.code.iter().map(|word| (word & 0x7f, (word >> 7) & 0xff, (word >> 16) & 0xff)).collect::<Vec<_>>());
+                eprintln!(
+                    "{profile:?} native={:?}",
+                    native.module().prototypes[0].instructions
+                );
+                eprintln!(
+                    "{profile:?} official={:?}",
+                    chunk
+                        .main
+                        .code
+                        .iter()
+                        .map(|word| (word & 0x7f, (word >> 7) & 0xff, (word >> 16) & 0xff))
+                        .collect::<Vec<_>>()
+                );
             }
             let official = translate_official_chunk(&chunk, &VerifyLimits::default())
                 .unwrap()
                 .verified()
                 .clone();
-            assert_eq!(run(official, profile, false).0, expected, "{profile:?} {label} official");
-            assert!(!clobbers_left, "{profile:?} {label}: CMP 前不可覆寫左運算元");
+            assert_eq!(
+                run(official, profile, false).0,
+                expected,
+                "{profile:?} {label} official"
+            );
+            assert!(
+                !clobbers_left,
+                "{profile:?} {label}: CMP 前不可覆寫左運算元"
+            );
         }
     }
 }

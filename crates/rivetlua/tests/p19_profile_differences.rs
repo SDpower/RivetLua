@@ -3,12 +3,16 @@ use rivetlua::{Engine, LuaProfile, RunOutcome, Value};
 #[test]
 fn sdk_profile_rules_cover_generic_for_and_table_create() {
     let readonly_first = b"for key, value in ipairs({1}) do key = 2 end; return true";
-    assert!(Engine::new(LuaProfile::Lua55)
-        .compile(readonly_first)
-        .is_err());
-    assert!(Engine::new(LuaProfile::Lua54)
-        .compile(readonly_first)
-        .is_ok());
+    assert!(
+        Engine::new(LuaProfile::Lua55)
+            .compile(readonly_first)
+            .is_err()
+    );
+    assert!(
+        Engine::new(LuaProfile::Lua54)
+            .compile(readonly_first)
+            .is_ok()
+    );
 
     let writable_later = b"local result = 0; for _, value in ipairs({1}) do value = value + 1; result = value end; return result == 2";
     for profile in [LuaProfile::Lua54, LuaProfile::Lua55] {

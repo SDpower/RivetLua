@@ -1,6 +1,6 @@
 //! macOS worker 必須由不同簽名身分的 App Sandbox 程序承載。
 
-use std::ffi::{c_char, c_int, c_void, CString, OsStr};
+use std::ffi::{CString, OsStr, c_char, c_int, c_void};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -176,8 +176,7 @@ fn signing_info(path: &Path) -> Result<Cf, PolicyDenied> {
     }
     let code = Cf::owned(code)?;
     // SAFETY：只驗磁碟上的密封內容；禁止驗證過程的網路請求。
-    if unsafe { SecStaticCodeCheckValidity(code.as_ptr(), NO_NETWORK_VALIDATION, ptr::null()) }
-        != 0
+    if unsafe { SecStaticCodeCheckValidity(code.as_ptr(), NO_NETWORK_VALIDATION, ptr::null()) } != 0
     {
         return Err(PolicyDenied::InvalidWorker);
     }
@@ -191,7 +190,9 @@ fn signing_info(path: &Path) -> Result<Cf, PolicyDenied> {
 
 fn code_hash(info: &Cf) -> Result<Vec<u8>, PolicyDenied> {
     // SAFETY：SDK 的 CFTypeID 與常數 key 在程序生命週期有效。
-    let value = info_value(info, unsafe { kSecCodeInfoUnique }, unsafe { CFDataGetTypeID() })?;
+    let value = info_value(info, unsafe { kSecCodeInfoUnique }, unsafe {
+        CFDataGetTypeID()
+    })?;
     // SAFETY：CFData 由 info 保活，複製後不保留借用指標。
     let length = unsafe { CFDataGetLength(value) };
     if !(20..=64).contains(&length) {
@@ -235,7 +236,8 @@ fn identity(info: &Cf, key: *const c_void) -> Result<*const c_void, PolicyDenied
 
 fn private_run_dir(path: &Path) -> Result<(), PolicyDenied> {
     let metadata = fs::metadata(path).map_err(|_| PolicyDenied::InvalidWorker)?;
-    if !path.is_absolute() || !metadata.is_dir()
+    if !path.is_absolute()
+        || !metadata.is_dir()
         || metadata.mode() & 0o777 != 0o700
         || metadata.uid() != unsafe { geteuid() }
     {
@@ -300,7 +302,10 @@ pub(super) fn configure(
                 (RLIMIT_NPROC, 0),
                 (RLIMIT_NOFILE, 64),
             ] {
-                let limit = Rlimit { current: value, maximum: value };
+                let limit = Rlimit {
+                    current: value,
+                    maximum: value,
+                };
                 if setrlimit(resource, &limit) != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -363,7 +368,12 @@ fn kernel_policy(operation: &str, path: Option<&Path>, allowed: bool) -> Result<
             let path = CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| PolicyDenied::MissingEvidence)?;
             unsafe {
-                sandbox_check(getpid(), operation.as_ptr(), SANDBOX_FILTER_PATH, path.as_ptr())
+                sandbox_check(
+                    getpid(),
+                    operation.as_ptr(),
+                    SANDBOX_FILTER_PATH,
+                    path.as_ptr(),
+                )
             }
         }
         None => unsafe { sandbox_check(getpid(), operation.as_ptr(), 0) },
@@ -383,7 +393,10 @@ fn resource_limits() -> Result<(), PolicyDenied> {
         (RLIMIT_NPROC, 0),
         (RLIMIT_NOFILE, 64),
     ] {
-        let mut limit = Rlimit { current: u64::MAX, maximum: u64::MAX };
+        let mut limit = Rlimit {
+            current: u64::MAX,
+            maximum: u64::MAX,
+        };
         // SAFETY：getrlimit 寫入固定大小的 C 結構；返回值在使用前核對。
         if unsafe { getrlimit(resource, &mut limit) } != 0
             || limit.current > expected
@@ -404,24 +417,27 @@ struct FdInfo {
 
 fn only_stdio_fds() -> Result<(), PolicyDenied> {
     let mut fds = [FdInfo { fd: -1, _kind: 0 }; 64];
-    let size = c_int::try_from(std::mem::size_of_val(&fds))
-        .map_err(|_| PolicyDenied::MissingEvidence)?;
+    let size =
+        c_int::try_from(std::mem::size_of_val(&fds)).map_err(|_| PolicyDenied::MissingEvidence)?;
     // SAFETY：proc_pidinfo 僅列舉自身 kernel FD 表，buffer 長度與 C 結構一致。
     let bytes = unsafe { proc_pidinfo(getpid(), 1, 0, fds.as_mut_ptr().cast(), size) };
     let entry_size = std::mem::size_of::<FdInfo>();
-    if bytes <= 0 || bytes as usize > std::mem::size_of_val(&fds)
+    if bytes <= 0
+        || bytes as usize > std::mem::size_of_val(&fds)
         || bytes as usize % entry_size != 0
     {
         return Err(PolicyDenied::MissingEvidence);
     }
     let count = bytes as usize / entry_size;
     if count != 3
-        || fds[..count]
-            .iter()
-            .try_fold(0_u8, |seen, entry| {
-                let bit = 1_u8.checked_shl(entry.fd.try_into().ok()?)?;
-                if bit > 0b100 || seen & bit != 0 { None } else { Some(seen | bit) }
-            }) != Some(0b111)
+        || fds[..count].iter().try_fold(0_u8, |seen, entry| {
+            let bit = 1_u8.checked_shl(entry.fd.try_into().ok()?)?;
+            if bit > 0b100 || seen & bit != 0 {
+                None
+            } else {
+                Some(seen | bit)
+            }
+        }) != Some(0b111)
     {
         return Err(PolicyDenied::MissingEvidence);
     }
@@ -463,9 +479,17 @@ pub(super) fn child_probe(
         Some(Path::new("/private/var/db/dslocal/nodes/Default/users")),
         false,
     )?;
-    kernel_policy("file-write-data", Some(Path::new("/private/etc/hosts")), false)?;
+    kernel_policy(
+        "file-write-data",
+        Some(Path::new("/private/etc/hosts")),
+        false,
+    )?;
     kernel_policy("file-read-data", Some(Path::new("/dev/disk0")), false)?;
     kernel_policy("file-read-data", Some(run_dir), true)?;
-    kernel_policy("file-write-create", Some(&run_dir.join("rivetlua-native-probe")), true)?;
+    kernel_policy(
+        "file-write-create",
+        Some(&run_dir.join("rivetlua-native-probe")),
+        true,
+    )?;
     Ok(PlatformEvidence { _private: () })
 }

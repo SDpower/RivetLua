@@ -2,8 +2,8 @@
 
 use alloc::vec::Vec;
 
-use core::mem::size_of;
 use alloc::sync::Arc;
+use core::mem::size_of;
 
 use super::codec::{
     BytecodeClosePath, BytecodeConstant, BytecodeError, BytecodeErrorCode, BytecodeModule,
