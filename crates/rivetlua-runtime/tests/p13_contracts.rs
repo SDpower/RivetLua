@@ -5370,7 +5370,7 @@ fn official_load_vm(
 fn p13_p15_db_official_reload_cli_and_exact_budget_edges() {
     let path = std::env::var_os("RIVETLUA_P15_DB_CHUNK").expect("官方 chunk 路徑");
     let chunk = std::fs::read(path).unwrap();
-    assert_eq!(chunk.len(), 132_876);
+    assert_eq!(chunk.len(), 64_377);
     let profile = LuaProfile::Lua55;
     let stats = preflight_official_chunk(
         &chunk,
@@ -10314,7 +10314,23 @@ fn p13_v24_gc_db_shared_fuel_diagnostic() {
                     .any(|window| { window == b"V24 after db reload" })
             );
         }
-        None => {}
+        Some("dump_budget") => {
+            let RunOutcome::LuaError(error) = &outcome else {
+                panic!("dump 准入應拒絕：{outcome:?}")
+            };
+            assert_eq!(error.kind, RuntimeErrorKind::HostDumpBudget);
+            assert!(
+                output
+                    .windows(b"V24 after db load".len())
+                    .any(|window| window == b"V24 after db load")
+            );
+            assert!(
+                !output
+                    .windows(b"V24 after db dump".len())
+                    .any(|window| window == b"V24 after db dump")
+            );
+        }
+        None => panic!("須明示 RIVETLUA_V24_EXPECT 預期結果"),
         other => panic!("未知 V24 預期結果：{other:?}"),
     }
     drop(output);

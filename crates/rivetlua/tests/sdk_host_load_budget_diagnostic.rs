@@ -241,6 +241,15 @@ fn isolate_host_load_work_temporary_fuel_and_ledger_limits() {
         eprintln!(
             "case=21-blocks scenario={label} outcome={outcome} reserved={reserved} committed={committed} ledger_limit={ledger_limit}"
         );
+        assert_eq!(
+            outcome,
+            if fuel.is_some() {
+                "Returned(1 values)"
+            } else {
+                "Aborted(FuelExhausted)"
+            },
+            "{label}"
+        );
         assert_eq!(reserved, 0);
     }
 
@@ -258,6 +267,7 @@ fn isolate_host_load_work_temporary_fuel_and_ledger_limits() {
         normalized.len(),
         direct.as_ref().map(|_| "Compiled")
     );
+    assert!(direct.is_ok(), "官方 main.lua 應可直接編譯");
     for (label, limits, fuel) in [
         ("base", base, None),
         (
@@ -300,6 +310,13 @@ fn isolate_host_load_work_temporary_fuel_and_ledger_limits() {
         eprintln!(
             "case=official-main scenario={label} outcome={outcome} reserved={reserved} committed={committed} ledger_limit={ledger_limit}"
         );
+        let expected = match label {
+            "base" | "work-only-120b" | "temp-only-3gb" => "Aborted(FuelExhausted)",
+            "fuel-only-120b" | "work-plus-fuel" => "LuaError(HostLoadBudget, E_HOST_LOAD_BUDGET)",
+            "work-temp-fuel" => "Returned(1 values)",
+            _ => unreachable!(),
+        };
+        assert_eq!(outcome, expected, "{label}");
         assert_eq!(reserved, 0);
     }
 
@@ -315,6 +332,7 @@ fn isolate_host_load_work_temporary_fuel_and_ledger_limits() {
     eprintln!(
         "case=5-blocks scenario=ledger-only-2m outcome={outcome} reserved={reserved} committed={committed} ledger_limit={ledger_limit}"
     );
+    assert_eq!(outcome, "Returned(1 values)");
     assert_eq!(reserved, 0);
 }
 

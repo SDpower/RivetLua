@@ -2,7 +2,7 @@ use rivetlua_compiler::{
     CompileBudgetSink, CompileLimits, IrLimits, LanguageProfile, compile_with_budget,
 };
 use rivetlua_core::{LuaProfile, ObjectRef, Value, VerifiedModule, VerifyLimits};
-use rivetlua_runtime::{AbortReason, HostHandle, RunOutcome, RuntimeErrorKind, Vm};
+use rivetlua_runtime::{AbortReason, HostHandle, RunOutcome, RuntimeErrorKind, Vm, VmError};
 
 struct Unlimited;
 
@@ -206,8 +206,7 @@ fn count_obeys_execution_fuel_abort_and_same_vm_retry() {
 }
 
 #[test]
-fn count_keeps_one_empty_table_or_weak_pair_within_one_kib_in_steady_state() {
-    let mut observations = Vec::new();
+fn count_matches_ledger_for_empty_table_and_weak_pair_then_refunds() {
     for (language, runtime) in [
         (LanguageProfile::Lua54, LuaProfile::Lua54),
         (LanguageProfile::Lua55, LuaProfile::Lua55),
@@ -220,14 +219,6 @@ fn count_keeps_one_empty_table_or_weak_pair_within_one_kib_in_steady_state() {
             let environment = vm.allocate_table().unwrap();
             let _root = HostHandle::<Value>::new(&mut vm, environment).unwrap();
             vm.install_basic_builtins(environment).unwrap();
-            // 先建立並回收中性空表，讓 count 比較的是存活 payload 而非 slot arena 首次擴張。
-            let mut neutral = Vec::new();
-            for _ in 0..8 {
-                let table = vm.allocate_table().unwrap();
-                neutral.push(HostHandle::<Value>::new(&mut vm, table).unwrap());
-            }
-            drop(neutral);
-            vm.collect_major().unwrap();
             let mut source = b"collectgarbage(); collectgarbage(); local before = collectgarbage('count'); local a = ".to_vec();
             source.extend_from_slice(constructor);
             source.extend_from_slice(b"; collectgarbage(); local retained = collectgarbage('count'); return before, retained, a");
@@ -243,22 +234,34 @@ fn count_keeps_one_empty_table_or_weak_pair_within_one_kib_in_steady_state() {
                 panic!("count 案例結果格式錯誤：{language:?} {values:?}")
             };
             assert!(vm.with_table(*table, |table| table.is_empty()).unwrap());
-            observations.push((language, case, *before, *retained));
+            let table = *table;
+            let retained_bytes = *retained * 1024.0;
+            assert!(retained > before, "{language:?} {case}");
+            assert_eq!(retained_bytes, vm.ledger_snapshot().lua_heap_bytes as f64);
+            assert_eq!(vm.ledger_snapshot().reserved, 0);
+            drop(values);
+            vm.collect_major().unwrap();
+            assert_eq!(
+                vm.object_kind(table),
+                Err(VmError::StaleObject),
+                "{language:?} {case}"
+            );
+            assert!(
+                (vm.ledger_snapshot().lua_heap_bytes as f64) < retained_bytes,
+                "{language:?} {case}"
+            );
+            assert_eq!(
+                count(&mut vm, environment, language) * 1024.0,
+                vm.ledger_snapshot().lua_heap_bytes as f64,
+                "{language:?} {case}"
+            );
             assert_eq!(vm.ledger_snapshot().reserved, 0);
         }
     }
-    eprintln!("steady-state empty table count: {observations:?}");
-    assert!(
-        observations
-            .iter()
-            .all(|(_, _, before, retained)| *retained <= before + 1.0),
-        "空表與弱表的 count 應在 1 KiB 內：{observations:?}"
-    );
 }
 
 #[test]
-#[ignore = "P15 Basic 公開相容性缺口：Lua54 超出 1 KiB，保留原測試供 --ignored 重現"]
-fn count_after_clearing_three_weak_hash_keys_and_short_string_lookup_stays_within_one_kib() {
+fn count_after_collecting_weak_keys_and_values_matches_ledger() {
     for (language, runtime) in [
         (LanguageProfile::Lua54, LuaProfile::Lua54),
         (LanguageProfile::Lua55, LuaProfile::Lua55),
@@ -268,21 +271,33 @@ fn count_after_clearing_three_weak_hash_keys_and_short_string_lookup_stays_withi
         let _root = HostHandle::<Value>::new(&mut vm, environment).unwrap();
         vm.install_basic_builtins(environment).unwrap();
         vm.install_string_builtins(environment).unwrap();
+        // 沿用官方 gc.lua 弱鍵語義；縮小長字串，以 Lua heap 對帳取代 C 物件大小上限。
         let source = b"collectgarbage(); collectgarbage();
-            local m = collectgarbage('count')
+            local before = collectgarbage('count')
             local a = setmetatable({}, {__mode = 'kv'})
-            a['x'] = 1; a['y'] = 2; a['z'] = 3
-            a['x'] = nil; a['y'] = nil; a['z'] = nil
+            a[string.rep('a', 4096)] = 25
+            a[string.rep('b', 4096)] = {}
+            a[{}] = 14
+            local allocated = collectgarbage('count')
+            collectgarbage()
+            local after_weak = collectgarbage('count')
+            local k, v = next(a)
+            assert(k == string.rep('a', 4096) and v == 25)
+            assert(next(a, k) == nil)
+            assert(a[string.rep('b', 4096)] == nil)
+            a[k] = nil; k = nil
             collectgarbage()
             assert(next(a) == nil)
             assert(a[string.rep('b', 100)] == nil)
             local current = collectgarbage('count')
-            return m, current, a";
+            return before, allocated, after_weak, current, a";
         let RunOutcome::Returned(values) = run(&mut vm, environment, source, language) else {
             panic!("弱表 count 案例應正常返回：{language:?}")
         };
         let [
             Value::Float(before),
+            Value::Float(allocated),
+            Value::Float(after_weak),
             Value::Float(current),
             Value::Object(table),
         ] = values.as_slice()
@@ -290,10 +305,37 @@ fn count_after_clearing_three_weak_hash_keys_and_short_string_lookup_stays_withi
             panic!("弱表 count 回傳格式錯誤：{language:?} {values:?}")
         };
         assert!(vm.with_table(*table, |table| table.is_empty()).unwrap());
+        let table = *table;
+        let current_bytes = *current * 1024.0;
         assert!(
-            current <= &(before + 1.0),
-            "{language:?}: before={before} current={current} delta={} B",
-            (current - before) * 1024.0,
+            allocated > before,
+            "{language:?}: before={before} allocated={allocated}"
+        );
+        assert!(
+            after_weak < allocated,
+            "{language:?}: allocated={allocated} after_weak={after_weak}"
+        );
+        assert!(
+            current < allocated,
+            "{language:?}: allocated={allocated} current={current}"
+        );
+        assert_eq!(current_bytes, vm.ledger_snapshot().lua_heap_bytes as f64);
+        assert_eq!(vm.ledger_snapshot().reserved, 0);
+        drop(values);
+        vm.collect_major().unwrap();
+        assert_eq!(
+            vm.object_kind(table),
+            Err(VmError::StaleObject),
+            "{language:?}"
+        );
+        assert!(
+            (vm.ledger_snapshot().lua_heap_bytes as f64) < current_bytes,
+            "{language:?}"
+        );
+        assert_eq!(
+            count(&mut vm, environment, language) * 1024.0,
+            vm.ledger_snapshot().lua_heap_bytes as f64,
+            "{language:?}"
         );
         assert_eq!(vm.ledger_snapshot().reserved, 0);
     }

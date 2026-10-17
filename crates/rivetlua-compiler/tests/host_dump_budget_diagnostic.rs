@@ -296,6 +296,7 @@ fn record_native_host_dump_default_and_finite_calibration() {
         "diagnostic completed admission={admission} result={result:?} elapsed_ms={}",
         started.elapsed().as_millis()
     );
+    assert_eq!(result, DumpResult::Success);
 }
 
 #[test]
@@ -335,7 +336,10 @@ fn record_db_host_dump_admission() {
         "db diagnostic completed result={result:?} elapsed_ms={}",
         started.elapsed().as_millis()
     );
-    if std::env::var_os("RIVETLUA_HOST_LOAD_DIAG").is_some() {
+    assert_eq!(result, DumpResult::Success);
+    if std::env::var_os("RIVETLUA_HOST_LOAD_DIAG").is_some()
+        || std::env::var_os("RIVETLUA_HOST_DUMP_OUTPUT").is_some()
+    {
         let mut export_limits = OfficialChunkLimits::default();
         export_limits.max_bytes = 1024 * 1024;
         export_limits.max_allocated_bytes = 4 * 1024 * 1024;
@@ -352,6 +356,9 @@ fn record_db_host_dump_admission() {
         if let Some(path) = std::env::var_os("RIVETLUA_HOST_DUMP_OUTPUT") {
             std::fs::write(&path, &bytes).unwrap();
             eprintln!("db official product chunk written to {path:?}");
+        }
+        if std::env::var_os("RIVETLUA_HOST_LOAD_DIAG").is_none() {
+            return;
         }
         let verify = VerifyLimits::default();
         let mut load_limits = OfficialChunkLimits::default();

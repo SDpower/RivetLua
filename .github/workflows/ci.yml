@@ -157,6 +157,83 @@ jobs:
         if: ${{ !cancelled() && steps.native_worker.outcome == 'success' }}
         run: cargo test --locked --workspace --exclude rivetlua-xtask --no-fail-fast
 
+      - name: Prepare fixed ignored-test inputs
+        id: prepare_ignored
+        if: ${{ !cancelled() && matrix.target == 'x86_64-unknown-linux-gnu' && steps.native_worker.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          ignored_root="$RUNNER_TEMP/rivetlua-ignored-tests"
+          python3 -I -S tests/ignored/prepare_official_oracles.py --output-root "$ignored_root" --env-file "$GITHUB_ENV"
+          printf '%s\n' "RIVETLUA_HOST_DUMP_ADMISSION=ordinary:1073741824:4194304:1048576" "RIVETLUA_P13_PROFILE=lua55-i64f64" "RIVETLUA_V24_FUEL_CASE=db_reload" "RIVETLUA_V24_FUEL_LIMIT=30000000000" "RIVETLUA_V24_EXPECT=dump_budget" >> "$GITHUB_ENV"
+
+      - name: Produce fixed RivetLua db chunk
+        id: produce_db_chunk
+        if: ${{ !cancelled() && matrix.target == 'x86_64-unknown-linux-gnu' && steps.prepare_ignored.outcome == 'success' }}
+        env:
+          RIVETLUA_HOSTLOAD_DB: ${{ github.workspace }}/vendor/lua55/lua-5.5.1-tests/db.lua
+        run: |
+          set -euo pipefail
+          ignored_root="$RUNNER_TEMP/rivetlua-ignored-tests"
+          export RIVETLUA_HOST_DUMP_ADMISSION=ordinary:1073741824:4194304:1048576
+          export RIVETLUA_HOST_DUMP_OUTPUT="$ignored_root/evidence/rivetlua-lua55-db.luac"
+          cargo test --locked -p rivetlua-compiler --test host_dump_budget_diagnostic record_db_host_dump_admission -- --ignored
+          python3 -I -S tests/ignored/prepare_official_oracles.py --output-root "$ignored_root" --p15-db-chunk "$RIVETLUA_HOST_DUMP_OUTPUT" --env-file "$GITHUB_ENV"
+
+      - name: Prepare Lua 5.5 SDK staticlib
+        id: sdk_lua55
+        if: ${{ !cancelled() && matrix.target == 'x86_64-unknown-linux-gnu' && steps.produce_db_chunk.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          sdk_dir="$RIVETLUA_P16_EVIDENCE_DIR/sdk-lua55"
+          mkdir -p "$sdk_dir"
+          cargo build --locked -p rivetlua-capi --lib > "$sdk_dir/staticlib-build.log" 2>&1 || { cat "$sdk_dir/staticlib-build.log"; exit 1; }
+          python3 -I -S - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ['RIVETLUA_P16_EVIDENCE_DIR']) / 'sdk-lua55'
+          library = Path(os.environ['CARGO_TARGET_DIR']) / 'debug/librivetlua_capi.a'
+          compiler = Path('/usr/bin/gcc').resolve(strict=True)
+          symbols = Path('/usr/bin/nm').resolve(strict=True)
+          if not library.is_file() or not compiler.is_file() or not symbols.is_file():
+              raise RuntimeError('SDK staticlib 或具體 Linux 工具不存在')
+          values = {
+              'RIVETLUA_P16_SDK_ROOT': os.environ['GITHUB_WORKSPACE'],
+              'RIVETLUA_P16_SDK_EVIDENCE_DIR': str(evidence),
+              'RIVETLUA_P16_SDK_PROFILE': 'lua55',
+              'RIVETLUA_P16_SDK_TARGET': 'x86_64-unknown-linux-gnu',
+              'RIVETLUA_P16_SDK_HOST_TRUST': 'explicit-sdk-host-process-permissions-v1',
+              'RIVETLUA_P16_SDK_LIB_PATH': str(library),
+              'RIVETLUA_P16_SDK_NATIVE_LIBS': '\x1f'.join(('-ldl', '-lm', '-lpthread')),
+              'RIVETLUA_P16_SDK_STATICLIB_BUILD_LOG_PATH': str(evidence / 'staticlib-build.log'),
+              'RIVETLUA_P16_SDK_STATICLIB_BUILD_LOG_SHA256': hashlib.sha256((evidence / 'staticlib-build.log').read_bytes()).hexdigest(),
+              'RIVETLUA_P16_SDK_CC': str(compiler),
+              'RIVETLUA_P16_SDK_NM': str(symbols),
+          }
+          with Path(os.environ['GITHUB_ENV']).open('a') as output:
+              output.writelines(f'{name}={value}\n' for name, value in values.items())
+          PY
+
+      - name: Run fixed ignored tests
+        if: ${{ !cancelled() && matrix.target == 'x86_64-unknown-linux-gnu' && steps.sdk_lua55.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --workspace --exclude rivetlua-xtask --no-fail-fast -- --ignored --skip record_db_host_dump_admission
+
+      - name: Run Lua 5.4 SDK and P13 ignored tests
+        if: ${{ !cancelled() && matrix.target == 'x86_64-unknown-linux-gnu' && steps.sdk_lua55.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          sdk_dir="$RIVETLUA_P16_EVIDENCE_DIR/sdk-lua54"
+          mkdir -p "$sdk_dir"
+          cargo build --locked -p rivetlua-capi --no-default-features --features lua54 --lib > "$sdk_dir/staticlib-build.log" 2>&1 || { cat "$sdk_dir/staticlib-build.log"; exit 1; }
+          export RIVETLUA_P16_SDK_PROFILE=lua54 RIVETLUA_P16_SDK_EVIDENCE_DIR="$sdk_dir"
+          export RIVETLUA_P16_SDK_STATICLIB_BUILD_LOG_PATH="$sdk_dir/staticlib-build.log"
+          export RIVETLUA_P16_SDK_STATICLIB_BUILD_LOG_SHA256="$(sha256sum "$sdk_dir/staticlib-build.log" | cut -d ' ' -f 1)"
+          cargo test --locked -p rivetlua-capi --no-default-features --features lua54 --test sdk_modules sdk_modules_official_five_load_execute_and_p1 -- --ignored
+          RIVETLUA_P13_PROFILE=lua54-i64f64 cargo test --locked -p rivetlua-runtime --test p13_contracts p13_h_ -- --ignored
+
       - name: Test rivetlua AOT doctest
         if: ${{ !cancelled() && matrix.target == 'x86_64-unknown-linux-gnu' }}
         run: cargo test --locked -p rivetlua --features aot-builder --doc

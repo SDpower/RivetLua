@@ -4,7 +4,8 @@ use rivetlua_compiler::{
 };
 use rivetlua_core::{VerifyLimits, verified_module_allocation_bytes};
 
-const DEFAULT_WORK: usize = 100_000;
+// 對齊 runtime 的 LoadLimits::default().max_work_units。
+const DEFAULT_WORK: usize = 128 * 1024;
 const DEFAULT_TEMPORARY: usize = 1024 * 1024;
 const DEFAULT_MODULE: usize = 8 * 1024 * 1024;
 const RAISED_WORK: usize = 4 * 1024 * 1024;

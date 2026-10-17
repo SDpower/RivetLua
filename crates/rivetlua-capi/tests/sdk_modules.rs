@@ -121,6 +121,9 @@ fn checked_env(name: &str) -> String {
 #[ignore = "需由 P16 runner 注入固定 SDK 與 staticlib 證據"]
 fn sdk_modules_official_five_load_execute_and_p1() {
     let root = PathBuf::from(checked_env("RIVETLUA_P16_SDK_ROOT"));
+    let cc = checked_env("RIVETLUA_P16_SDK_CC");
+    let nm = checked_env("RIVETLUA_P16_SDK_NM");
+    assert!(Path::new(&cc).is_absolute() && Path::new(&nm).is_absolute());
     let dir = PathBuf::from(checked_env("RIVETLUA_P16_SDK_EVIDENCE_DIR"));
     let profile = checked_env("RIVETLUA_P16_SDK_PROFILE");
     let target = checked_env("RIVETLUA_P16_SDK_TARGET");
@@ -131,6 +134,15 @@ fn sdk_modules_official_five_load_execute_and_p1() {
         PathBuf::from(checked_env("RIVETLUA_P16_SDK_STATICLIB_BUILD_LOG_PATH"));
     let staticlib_build_log_sha = checked_env("RIVETLUA_P16_SDK_STATICLIB_BUILD_LOG_SHA256");
     assert!(matches!(profile.as_str(), "lua54" | "lua55"));
+    let compiled_profile = if cfg!(feature = "lua54") {
+        "lua54"
+    } else {
+        "lua55"
+    };
+    assert_eq!(
+        profile, compiled_profile,
+        "SDK profile 須與目前 C API 編譯 feature 相符"
+    );
     assert_eq!(host_trust, "explicit-sdk-host-process-permissions-v1");
     assert!(root.is_absolute() && dir.is_absolute() && lib.is_absolute());
     assert!(dir.is_dir() && lib.is_file());
@@ -169,7 +181,7 @@ fn sdk_modules_official_five_load_execute_and_p1() {
         let module = dir.join(names[index]);
         let build_log = dir.join(format!("{}-build.log", names[index]));
         let mut command = vec![
-            "cc".into(),
+            cc.clone(),
             "-std=c11".into(),
             "-Wall".into(),
             "-Wextra".into(),
@@ -200,7 +212,7 @@ fn sdk_modules_official_five_load_execute_and_p1() {
         ]);
         invoke(&root, &command, &build_log);
         let nm_log = dir.join(format!("{}-nm.log", names[index]));
-        let nm_command = vec!["nm".into(), "-g".into(), module.display().to_string()];
+        let nm_command = vec![nm.clone(), "-g".into(), module.display().to_string()];
         let nm = invoke(&root, &nm_command, &nm_log);
         for symbol in symbols[index] {
             assert!(
@@ -243,7 +255,7 @@ fn sdk_modules_official_five_load_execute_and_p1() {
     let binary = dir.join("sdk-driver");
     let build_log = dir.join("driver-build.log");
     let mut build = vec![
-        "cc".into(),
+        cc,
         "-std=c11".into(),
         "-Wall".into(),
         "-Wextra".into(),
@@ -270,7 +282,7 @@ fn sdk_modules_official_five_load_execute_and_p1() {
     build.extend(["-o".into(), binary.display().to_string()]);
     invoke(&root, &build, &build_log);
     let driver_nm_log = dir.join("driver-nm.log");
-    let driver_nm_command = vec!["nm".into(), "-g".into(), binary.display().to_string()];
+    let driver_nm_command = vec![nm, "-g".into(), binary.display().to_string()];
     let driver_nm = invoke(&root, &driver_nm_command, &driver_nm_log);
     for symbol in [
         "lua_newstate",

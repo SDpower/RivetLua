@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use rivetlua_compiler::{
-    BudgetedCompileError, CompileBudgetSink, CompileLimits, IrLimits, LanguageProfile,
-    compile_with_budget, lex, lower, parse, resolve,
+    BudgetedCompileError, CompileBudgetSink, CompileLimits, DiagnosticCode, IrLimits,
+    LanguageProfile, compile_with_budget, lex, lower, parse, resolve,
 };
 use rivetlua_core::{VerifyLimits, verified_module_allocation_bytes};
 
@@ -278,17 +278,17 @@ fn record_gc_compiler_baseline() {
     for case in cases() {
         let outcome = run(&case, RAW_V13_WORK, RAW_V13_TEMPORARY);
         let expected = match case.label {
-            "55-full-gc" | "55-prefix-395" => matches!(
+            "55-full-gc" | "54-full-gc" => matches!(
                 outcome,
                 Outcome::Denied(Denial {
                     dimension: Dimension::Work,
                     ..
                 })
             ),
-            "55-prefix-350" | "55-simple-21" | "55-simple-5" | "54-simple-21" | "54-simple-5" => {
+            "55-prefix-350" | "55-prefix-395" | "55-simple-21" | "55-simple-5" | "54-simple-21"
+            | "54-simple-5" => {
                 matches!(outcome, Outcome::Complete)
             }
-            "54-full-gc" => !matches!(outcome, Outcome::Unexpected),
             _ => unreachable!(),
         };
         if !expected {
@@ -643,6 +643,20 @@ fn record_raw_v23_db_compiler_budget() {
             cli_result.as_ref().map(|_| ())
         );
         raw_v23_trace("db", profile, &unbounded, &unbounded);
+        if profile == LanguageProfile::Lua54 {
+            for outcome in [&cli_result, &result] {
+                assert!(
+                    matches!(outcome, Err(BudgetedCompileError::Frontend(diagnostic))
+                        if diagnostic.code == DiagnosticCode::Parse && diagnostic.start.line == 353),
+                    "Lua 5.5 db.lua 在 Lua 5.4 應於第 353 行拒絕：{outcome:?}"
+                );
+            }
+            continue;
+        }
+        assert!(
+            cli_result.is_ok(),
+            "{profile:?} 固定 CLI 額度應准入 db.lua：{cli_result:?}"
+        );
         match result {
             Ok(module) => {
                 let actual = verified_module_allocation_bytes(&module).unwrap();
@@ -680,7 +694,7 @@ fn record_raw_v23_db_compiler_budget() {
                     assert_eq!(below.claims.len() - 1, denial.index);
                 }
             }
-            Err(error) => eprintln!("raw_v23_db profile={profile:?} UNBOUNDED_ERROR={error:?}"),
+            Err(error) => panic!("raw_v23_db profile={profile:?} 無限制編譯失敗：{error:?}"),
         }
     }
 }

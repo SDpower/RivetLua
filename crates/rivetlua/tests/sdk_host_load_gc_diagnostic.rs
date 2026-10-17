@@ -497,7 +497,7 @@ fn sdk_gc_loadfile_lua55() {
     {
         let baseline = run(&case, raw_v13_limits(), RAW_V13_FUEL, "raw-v13-baseline");
         match case.label {
-            "55-prefix-350" => assert_eq!(baseline, Observed::Function),
+            "55-prefix-350" | "55-prefix-395" => assert_eq!(baseline, Observed::Function),
             _ => assert_eq!(baseline, Observed::HostLoadBudget),
         }
         if let Some(control) = case.control {
