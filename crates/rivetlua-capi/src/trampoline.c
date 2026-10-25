@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <locale.h>
 
@@ -12,6 +13,632 @@
 #include "lualib.h"
 
 #include "trampoline_codes.h"
+
+/* 各語意 kind 有獨立固定 C 位址；真正執行仍進既有 Rust VM。 */
+extern int rivetlua_capi_builtin_push_target(lua_State *state, int kind);
+extern int rivetlua_capi_debug_hook_guard_c14(
+    lua_State *state, int setting, int mask, int count, size_t numeric_text_len);
+extern int rivetlua_capi_base_load_direct_b3(lua_State *state);
+static int rivetlua_capi_base_load_b3(lua_State *state);
+static void rivetlua_a2_callk_impl(lua_State *state, int nargs, int nresults,
+                                   lua_KContext context, lua_KFunction continuation,
+                                   int builtin_kind);
+static void rivetlua_b5_operation_raise_message(
+    lua_State *state, int status, int message);
+static int rivetlua_capi_builtin_resume(lua_State *state, int status,
+                                       lua_KContext context) {
+  (void)status;
+  (void)context;
+  return lua_gettop(state);
+}
+/* 與 Rust CapiBuiltinId::allows_yield 同表：其餘官方 C body 的回呼
+   經 lua_call／lua_getfield 等非續接邊界，不可由橋接 lua_callk 意外放行。 */
+static int rivetlua_capi_builtin_allows_yield(int kind) {
+  return kind == 1 || kind == 2 || kind == 4 || kind == 5 ||
+         kind == 8 || kind == 11 || kind == 20 || kind == 119;
+}
+static int rivetlua_capi_builtin_body(lua_State *state, int kind) {
+  int nargs = lua_gettop(state);
+  int status = rivetlua_capi_builtin_push_target(state, kind);
+  if (status != 0) rivetlua_b5_operation_raise_message(state, status, 0);
+  lua_rotate(state, 1, 1);
+  rivetlua_a2_callk_impl(state, nargs, LUA_MULTRET, 0,
+                         rivetlua_capi_builtin_resume, kind);
+  return lua_gettop(state);
+}
+#define RV_CAPI_BUILTIN(n) \
+  static int rivetlua_capi_builtin_##n(lua_State *state) { \
+    return rivetlua_capi_builtin_body(state, n); \
+  }
+RV_CAPI_BUILTIN(0)
+RV_CAPI_BUILTIN(1)
+RV_CAPI_BUILTIN(2)
+RV_CAPI_BUILTIN(3)
+RV_CAPI_BUILTIN(4)
+RV_CAPI_BUILTIN(5)
+RV_CAPI_BUILTIN(6)
+RV_CAPI_BUILTIN(7)
+RV_CAPI_BUILTIN(8)
+RV_CAPI_BUILTIN(9)
+RV_CAPI_BUILTIN(10)
+RV_CAPI_BUILTIN(11)
+RV_CAPI_BUILTIN(12)
+RV_CAPI_BUILTIN(13)
+RV_CAPI_BUILTIN(14)
+RV_CAPI_BUILTIN(15)
+RV_CAPI_BUILTIN(16)
+RV_CAPI_BUILTIN(17)
+RV_CAPI_BUILTIN(18)
+RV_CAPI_BUILTIN(19)
+RV_CAPI_BUILTIN(20)
+RV_CAPI_BUILTIN(21)
+RV_CAPI_BUILTIN(22)
+RV_CAPI_BUILTIN(23)
+RV_CAPI_BUILTIN(24)
+RV_CAPI_BUILTIN(25)
+RV_CAPI_BUILTIN(26)
+RV_CAPI_BUILTIN(27)
+RV_CAPI_BUILTIN(28)
+RV_CAPI_BUILTIN(29)
+RV_CAPI_BUILTIN(30)
+RV_CAPI_BUILTIN(31)
+RV_CAPI_BUILTIN(32)
+RV_CAPI_BUILTIN(33)
+RV_CAPI_BUILTIN(34)
+RV_CAPI_BUILTIN(35)
+RV_CAPI_BUILTIN(36)
+RV_CAPI_BUILTIN(37)
+static const char *const rivetlua_capi_hookkey_c14 = "_HOOKKEY";
+
+static lua_State *rivetlua_capi_db_getthread_c14(lua_State *state, int *arg) {
+  if (lua_isthread(state, 1)) {
+    *arg = 1;
+    return lua_tothread(state, 1);
+  }
+  *arg = 0;
+  return state;
+}
+
+static void rivetlua_capi_db_checkstack_c14(
+    lua_State *state, lua_State *target, int n) {
+  if (state != target && !lua_checkstack(target, n))
+    luaL_error(state, "stack overflow");
+}
+
+static void rivetlua_capi_hookf_c14(lua_State *state, lua_Debug *ar) {
+  static const char *const names[] =
+      {"call", "return", "line", "count", "tail call"};
+  lua_getfield(state, LUA_REGISTRYINDEX, rivetlua_capi_hookkey_c14);
+  lua_pushthread(state);
+  if (lua_rawget(state, -2) == LUA_TFUNCTION) {
+    lua_pushstring(state, names[(int)ar->event]);
+    if (ar->currentline >= 0) lua_pushinteger(state, ar->currentline);
+    else lua_pushnil(state);
+    (void)lua_getinfo(state, "lS", ar);
+    lua_call(state, 2, 0);
+  }
+}
+
+static int rivetlua_capi_db_makemask_c14(const char *text, int count) {
+  int mask = 0;
+  if (strchr(text, 'c')) mask |= LUA_MASKCALL;
+  if (strchr(text, 'r')) mask |= LUA_MASKRET;
+  if (strchr(text, 'l')) mask |= LUA_MASKLINE;
+  if (count > 0) mask |= LUA_MASKCOUNT;
+  return mask;
+}
+
+static char *rivetlua_capi_db_unmakemask_c14(int mask, char *text) {
+  int i = 0;
+  if (mask & LUA_MASKCALL) text[i++] = 'c';
+  if (mask & LUA_MASKRET) text[i++] = 'r';
+  if (mask & LUA_MASKLINE) text[i++] = 'l';
+  text[i] = '\0';
+  return text;
+}
+
+static int rivetlua_capi_builtin_38(lua_State *state) {
+  int arg, mask, count;
+  lua_Hook func;
+  lua_State *target = rivetlua_capi_db_getthread_c14(state, &arg);
+  if (lua_isnoneornil(state, arg + 1)) {
+    lua_settop(state, arg + 1);
+    func = NULL; mask = 0; count = 0;
+  } else {
+    const char *text = luaL_checkstring(state, arg + 2);
+    luaL_checktype(state, arg + 1, LUA_TFUNCTION);
+    count = (int)luaL_optinteger(state, arg + 3, 0);
+    func = rivetlua_capi_hookf_c14;
+    mask = rivetlua_capi_db_makemask_c14(text, count);
+  }
+  size_t work = lua_type(state, arg + 3) == LUA_TSTRING
+      ? lua_rawlen(state, arg + 3) : 0;
+  int admission = rivetlua_capi_debug_hook_guard_c14(
+      state, 1, mask, count, work);
+  if (admission != 0) rivetlua_b5_operation_raise_message(state, admission, 0);
+  if (!luaL_getsubtable(state, LUA_REGISTRYINDEX, rivetlua_capi_hookkey_c14)) {
+    lua_pushliteral(state, "k");
+    lua_setfield(state, -2, "__mode");
+    lua_pushvalue(state, -1);
+    lua_setmetatable(state, -2);
+  }
+  rivetlua_capi_db_checkstack_c14(state, target, 1);
+  lua_pushthread(target); lua_xmove(target, state, 1);
+  lua_pushvalue(state, arg + 1);
+  lua_rawset(state, -3);
+  lua_sethook(target, func, mask, count);
+  return 0;
+}
+
+static int rivetlua_capi_builtin_39(lua_State *state) {
+  int arg;
+  lua_State *target = rivetlua_capi_db_getthread_c14(state, &arg);
+  int admission = rivetlua_capi_debug_hook_guard_c14(state, 0, 0, 0, 0);
+  if (admission != 0) rivetlua_b5_operation_raise_message(state, admission, 0);
+  char text[5];
+  int mask = lua_gethookmask(target);
+  lua_Hook hook = lua_gethook(target);
+  if (hook == NULL) {
+    luaL_pushfail(state);
+    return 1;
+  } else if (hook != rivetlua_capi_hookf_c14) {
+    lua_pushliteral(state, "external hook");
+  } else {
+    lua_getfield(state, LUA_REGISTRYINDEX, rivetlua_capi_hookkey_c14);
+    rivetlua_capi_db_checkstack_c14(state, target, 1);
+    lua_pushthread(target); lua_xmove(target, state, 1);
+    lua_rawget(state, -2);
+    lua_remove(state, -2);
+  }
+  lua_pushstring(state, rivetlua_capi_db_unmakemask_c14(mask, text));
+  lua_pushinteger(state, lua_gethookcount(target));
+  return 3;
+}
+RV_CAPI_BUILTIN(40)
+RV_CAPI_BUILTIN(41)
+RV_CAPI_BUILTIN(42)
+RV_CAPI_BUILTIN(43)
+RV_CAPI_BUILTIN(44)
+RV_CAPI_BUILTIN(45)
+RV_CAPI_BUILTIN(46)
+RV_CAPI_BUILTIN(47)
+RV_CAPI_BUILTIN(48)
+RV_CAPI_BUILTIN(49)
+RV_CAPI_BUILTIN(50)
+RV_CAPI_BUILTIN(51)
+RV_CAPI_BUILTIN(52)
+RV_CAPI_BUILTIN(53)
+RV_CAPI_BUILTIN(54)
+RV_CAPI_BUILTIN(55)
+RV_CAPI_BUILTIN(56)
+RV_CAPI_BUILTIN(57)
+RV_CAPI_BUILTIN(58)
+RV_CAPI_BUILTIN(59)
+RV_CAPI_BUILTIN(60)
+RV_CAPI_BUILTIN(61)
+RV_CAPI_BUILTIN(62)
+RV_CAPI_BUILTIN(63)
+RV_CAPI_BUILTIN(64)
+RV_CAPI_BUILTIN(65)
+RV_CAPI_BUILTIN(66)
+RV_CAPI_BUILTIN(67)
+RV_CAPI_BUILTIN(68)
+RV_CAPI_BUILTIN(69)
+RV_CAPI_BUILTIN(70)
+RV_CAPI_BUILTIN(71)
+RV_CAPI_BUILTIN(72)
+RV_CAPI_BUILTIN(73)
+RV_CAPI_BUILTIN(74)
+RV_CAPI_BUILTIN(75)
+RV_CAPI_BUILTIN(76)
+RV_CAPI_BUILTIN(77)
+RV_CAPI_BUILTIN(78)
+RV_CAPI_BUILTIN(79)
+RV_CAPI_BUILTIN(80)
+RV_CAPI_BUILTIN(81)
+RV_CAPI_BUILTIN(82)
+RV_CAPI_BUILTIN(83)
+RV_CAPI_BUILTIN(84)
+RV_CAPI_BUILTIN(85)
+RV_CAPI_BUILTIN(86)
+RV_CAPI_BUILTIN(87)
+RV_CAPI_BUILTIN(88)
+RV_CAPI_BUILTIN(89)
+RV_CAPI_BUILTIN(90)
+RV_CAPI_BUILTIN(91)
+RV_CAPI_BUILTIN(92)
+RV_CAPI_BUILTIN(93)
+RV_CAPI_BUILTIN(94)
+RV_CAPI_BUILTIN(95)
+RV_CAPI_BUILTIN(96)
+RV_CAPI_BUILTIN(97)
+RV_CAPI_BUILTIN(98)
+RV_CAPI_BUILTIN(99)
+RV_CAPI_BUILTIN(100)
+RV_CAPI_BUILTIN(101)
+RV_CAPI_BUILTIN(102)
+RV_CAPI_BUILTIN(103)
+RV_CAPI_BUILTIN(104)
+RV_CAPI_BUILTIN(105)
+RV_CAPI_BUILTIN(106)
+RV_CAPI_BUILTIN(107)
+RV_CAPI_BUILTIN(108)
+RV_CAPI_BUILTIN(109)
+RV_CAPI_BUILTIN(110)
+RV_CAPI_BUILTIN(111)
+RV_CAPI_BUILTIN(112)
+RV_CAPI_BUILTIN(113)
+RV_CAPI_BUILTIN(114)
+RV_CAPI_BUILTIN(115)
+RV_CAPI_BUILTIN(116)
+static int rivetlua_capi_builtin_117(lua_State *state) {
+  if (rivetlua_capi_base_load_direct_b3(state))
+    return rivetlua_capi_base_load_b3(state);
+  return rivetlua_capi_builtin_body(state, 117);
+}
+static int rivetlua_capi_loadfile_aux_b3(
+    lua_State *state, int status, int environment) {
+  if (status == LUA_OK) {
+    if (environment != 0) {
+      lua_pushvalue(state, environment);
+      if (lua_setupvalue(state, -2, 1) == NULL) lua_pop(state, 1);
+    }
+    return 1;
+  }
+  luaL_pushfail(state);
+  lua_insert(state, -2);
+  return 2;
+}
+static int rivetlua_capi_builtin_118(lua_State *state) {
+  if (!rivetlua_capi_base_load_direct_b3(state))
+    return rivetlua_capi_builtin_body(state, 118);
+  const char *filename = luaL_optstring(state, 1, NULL);
+  const char *mode = luaL_optstring(state, 2, NULL);
+#if LUA_VERSION_NUM >= 505
+  if (mode != NULL && strchr(mode, 'B') != NULL)
+    return luaL_argerror(state, 2, "invalid mode");
+#endif
+  int environment = lua_isnone(state, 3) ? 0 : 3;
+  int status = luaL_loadfilex(state, filename, mode);
+  return rivetlua_capi_loadfile_aux_b3(state, status, environment);
+}
+static int rivetlua_capi_dofile_continue_b3(
+    lua_State *state, int status, lua_KContext context) {
+  (void)status;
+  (void)context;
+  return lua_gettop(state) - 1;
+}
+static int rivetlua_capi_builtin_119(lua_State *state) {
+  if (!rivetlua_capi_base_load_direct_b3(state))
+    return rivetlua_capi_builtin_body(state, 119);
+  const char *filename = luaL_optstring(state, 1, NULL);
+  lua_settop(state, 1);
+#if LUA_VERSION_NUM >= 505
+  int status = luaL_loadfilex(state, filename, "bt");
+#else
+  int status = luaL_loadfilex(state, filename, NULL);
+#endif
+  if (status != LUA_OK) return lua_error(state);
+  lua_callk(state, 0, LUA_MULTRET, 0, rivetlua_capi_dofile_continue_b3);
+  return rivetlua_capi_dofile_continue_b3(state, 0, 0);
+}
+RV_CAPI_BUILTIN(120)
+RV_CAPI_BUILTIN(121)
+RV_CAPI_BUILTIN(122)
+RV_CAPI_BUILTIN(123)
+RV_CAPI_BUILTIN(124)
+RV_CAPI_BUILTIN(125)
+RV_CAPI_BUILTIN(126)
+RV_CAPI_BUILTIN(127)
+RV_CAPI_BUILTIN(128)
+RV_CAPI_BUILTIN(129)
+RV_CAPI_BUILTIN(130)
+RV_CAPI_BUILTIN(131)
+RV_CAPI_BUILTIN(132)
+RV_CAPI_BUILTIN(133)
+RV_CAPI_BUILTIN(134)
+RV_CAPI_BUILTIN(135)
+RV_CAPI_BUILTIN(136)
+RV_CAPI_BUILTIN(137)
+RV_CAPI_BUILTIN(138)
+RV_CAPI_BUILTIN(139)
+RV_CAPI_BUILTIN(140)
+RV_CAPI_BUILTIN(141)
+RV_CAPI_BUILTIN(142)
+RV_CAPI_BUILTIN(143)
+RV_CAPI_BUILTIN(144)
+RV_CAPI_BUILTIN(145)
+RV_CAPI_BUILTIN(146)
+RV_CAPI_BUILTIN(147)
+RV_CAPI_BUILTIN(148)
+RV_CAPI_BUILTIN(149)
+RV_CAPI_BUILTIN(150)
+RV_CAPI_BUILTIN(151)
+RV_CAPI_BUILTIN(152)
+RV_CAPI_BUILTIN(153)
+RV_CAPI_BUILTIN(154)
+RV_CAPI_BUILTIN(155)
+RV_CAPI_BUILTIN(156)
+RV_CAPI_BUILTIN(157)
+RV_CAPI_BUILTIN(158)
+#undef RV_CAPI_BUILTIN
+
+static const lua_CFunction rivetlua_capi_builtin_functions[] = {
+  rivetlua_capi_builtin_0,
+  rivetlua_capi_builtin_1,
+  rivetlua_capi_builtin_2,
+  rivetlua_capi_builtin_3,
+  rivetlua_capi_builtin_4,
+  rivetlua_capi_builtin_5,
+  rivetlua_capi_builtin_6,
+  rivetlua_capi_builtin_7,
+  rivetlua_capi_builtin_8,
+  rivetlua_capi_builtin_9,
+  rivetlua_capi_builtin_10,
+  rivetlua_capi_builtin_11,
+  rivetlua_capi_builtin_12,
+  rivetlua_capi_builtin_13,
+  rivetlua_capi_builtin_14,
+  rivetlua_capi_builtin_15,
+  rivetlua_capi_builtin_16,
+  rivetlua_capi_builtin_17,
+  rivetlua_capi_builtin_18,
+  rivetlua_capi_builtin_19,
+  rivetlua_capi_builtin_20,
+  rivetlua_capi_builtin_21,
+  rivetlua_capi_builtin_22,
+  rivetlua_capi_builtin_23,
+  rivetlua_capi_builtin_24,
+  rivetlua_capi_builtin_25,
+  rivetlua_capi_builtin_26,
+  rivetlua_capi_builtin_27,
+  rivetlua_capi_builtin_28,
+  rivetlua_capi_builtin_29,
+  rivetlua_capi_builtin_30,
+  rivetlua_capi_builtin_31,
+  rivetlua_capi_builtin_32,
+  rivetlua_capi_builtin_33,
+  rivetlua_capi_builtin_34,
+  rivetlua_capi_builtin_35,
+  rivetlua_capi_builtin_36,
+  rivetlua_capi_builtin_37,
+  rivetlua_capi_builtin_38,
+  rivetlua_capi_builtin_39,
+  rivetlua_capi_builtin_40,
+  rivetlua_capi_builtin_41,
+  rivetlua_capi_builtin_42,
+  rivetlua_capi_builtin_43,
+  rivetlua_capi_builtin_44,
+  rivetlua_capi_builtin_45,
+  rivetlua_capi_builtin_46,
+  rivetlua_capi_builtin_47,
+  rivetlua_capi_builtin_48,
+  rivetlua_capi_builtin_49,
+  rivetlua_capi_builtin_50,
+  rivetlua_capi_builtin_51,
+  rivetlua_capi_builtin_52,
+  rivetlua_capi_builtin_53,
+  rivetlua_capi_builtin_54,
+  rivetlua_capi_builtin_55,
+  rivetlua_capi_builtin_56,
+  rivetlua_capi_builtin_57,
+  rivetlua_capi_builtin_58,
+  rivetlua_capi_builtin_59,
+  rivetlua_capi_builtin_60,
+  rivetlua_capi_builtin_61,
+  rivetlua_capi_builtin_62,
+  rivetlua_capi_builtin_63,
+  rivetlua_capi_builtin_64,
+  rivetlua_capi_builtin_65,
+  rivetlua_capi_builtin_66,
+  rivetlua_capi_builtin_67,
+  rivetlua_capi_builtin_68,
+  rivetlua_capi_builtin_69,
+  rivetlua_capi_builtin_70,
+  rivetlua_capi_builtin_71,
+  rivetlua_capi_builtin_72,
+  rivetlua_capi_builtin_73,
+  rivetlua_capi_builtin_74,
+  rivetlua_capi_builtin_75,
+  rivetlua_capi_builtin_76,
+  rivetlua_capi_builtin_77,
+  rivetlua_capi_builtin_78,
+  rivetlua_capi_builtin_79,
+  rivetlua_capi_builtin_80,
+  rivetlua_capi_builtin_81,
+  rivetlua_capi_builtin_82,
+  rivetlua_capi_builtin_83,
+  rivetlua_capi_builtin_84,
+  rivetlua_capi_builtin_85,
+  rivetlua_capi_builtin_86,
+  rivetlua_capi_builtin_87,
+  rivetlua_capi_builtin_88,
+  rivetlua_capi_builtin_89,
+  rivetlua_capi_builtin_90,
+  rivetlua_capi_builtin_91,
+  rivetlua_capi_builtin_92,
+  rivetlua_capi_builtin_93,
+  rivetlua_capi_builtin_94,
+  rivetlua_capi_builtin_95,
+  rivetlua_capi_builtin_96,
+  rivetlua_capi_builtin_97,
+  rivetlua_capi_builtin_98,
+  rivetlua_capi_builtin_99,
+  rivetlua_capi_builtin_100,
+  rivetlua_capi_builtin_101,
+  rivetlua_capi_builtin_102,
+  rivetlua_capi_builtin_103,
+  rivetlua_capi_builtin_104,
+  rivetlua_capi_builtin_105,
+  rivetlua_capi_builtin_106,
+  rivetlua_capi_builtin_107,
+  rivetlua_capi_builtin_108,
+  rivetlua_capi_builtin_109,
+  rivetlua_capi_builtin_110,
+  rivetlua_capi_builtin_111,
+  rivetlua_capi_builtin_112,
+  rivetlua_capi_builtin_113,
+  rivetlua_capi_builtin_114,
+  rivetlua_capi_builtin_115,
+  rivetlua_capi_builtin_116,
+  rivetlua_capi_builtin_117,
+  rivetlua_capi_builtin_118,
+  rivetlua_capi_builtin_119,
+  rivetlua_capi_builtin_120,
+  rivetlua_capi_builtin_121,
+  rivetlua_capi_builtin_122,
+  rivetlua_capi_builtin_123,
+  rivetlua_capi_builtin_124,
+  rivetlua_capi_builtin_125,
+  rivetlua_capi_builtin_126,
+  rivetlua_capi_builtin_127,
+  rivetlua_capi_builtin_128,
+  rivetlua_capi_builtin_129,
+  rivetlua_capi_builtin_130,
+  rivetlua_capi_builtin_131,
+  rivetlua_capi_builtin_132,
+  rivetlua_capi_builtin_133,
+  rivetlua_capi_builtin_134,
+  rivetlua_capi_builtin_135,
+  rivetlua_capi_builtin_136,
+  rivetlua_capi_builtin_137,
+  rivetlua_capi_builtin_138,
+  rivetlua_capi_builtin_139,
+  rivetlua_capi_builtin_140,
+  rivetlua_capi_builtin_141,
+  rivetlua_capi_builtin_142,
+  rivetlua_capi_builtin_143,
+  rivetlua_capi_builtin_144,
+  rivetlua_capi_builtin_145,
+  rivetlua_capi_builtin_146,
+  rivetlua_capi_builtin_147,
+  rivetlua_capi_builtin_148,
+  rivetlua_capi_builtin_149,
+  rivetlua_capi_builtin_150,
+  rivetlua_capi_builtin_151,
+  rivetlua_capi_builtin_152,
+  rivetlua_capi_builtin_153,
+  rivetlua_capi_builtin_154,
+  rivetlua_capi_builtin_155,
+  rivetlua_capi_builtin_156,
+  rivetlua_capi_builtin_157,
+  rivetlua_capi_builtin_158,
+};
+
+lua_CFunction rivetlua_capi_builtin_pointer(int kind) {
+  if (kind < 0 || (size_t)kind >=
+      sizeof(rivetlua_capi_builtin_functions) /
+          sizeof(rivetlua_capi_builtin_functions[0]))
+    return NULL;
+  return rivetlua_capi_builtin_functions[kind];
+}
+
+int rivetlua_capi_builtin_kind(lua_CFunction function) {
+  for (size_t index = 0;
+       index < sizeof(rivetlua_capi_builtin_functions) /
+                   sizeof(rivetlua_capi_builtin_functions[0]);
+       ++index) {
+    if (rivetlua_capi_builtin_functions[index] == function)
+      return (int)index;
+  }
+  return -1;
+}
+
+/* FILE* 前綴及 closef 的所有解參照／跳轉均留在純 C callback frame。 */
+FILE *rivetlua_capi_native_standard_file(int which) {
+  switch (which) {
+    case 0: return stdin;
+    case 1: return stdout;
+    case 2: return stderr;
+    default: return NULL;
+  }
+}
+
+int rivetlua_capi_native_file_fclose(lua_State *state) {
+  luaL_Stream *stream = (luaL_Stream *)luaL_checkudata(state, 1, LUA_FILEHANDLE);
+  errno = 0;
+  return luaL_fileresult(state, fclose(stream->f) == 0, NULL);
+}
+
+int rivetlua_capi_native_file_pclose(lua_State *state) {
+  luaL_Stream *stream = (luaL_Stream *)luaL_checkudata(state, 1, LUA_FILEHANDLE);
+  errno = 0;
+  return luaL_execresult(state, pclose(stream->f));
+}
+
+int rivetlua_capi_native_file_noclose(lua_State *state) {
+  luaL_Stream *stream = (luaL_Stream *)luaL_checkudata(state, 1, LUA_FILEHANDLE);
+  stream->closef = &rivetlua_capi_native_file_noclose;
+  lua_pushnil(state);
+  lua_pushliteral(state, "cannot close standard file");
+  return 2;
+}
+
+int rivetlua_capi_native_file_dispatch(lua_State *state) {
+  luaL_Stream *stream = (luaL_Stream *)luaL_checkudata(state, 1, LUA_FILEHANDLE);
+  if (lua_rawlen(state, 1) < sizeof(luaL_Stream))
+    return luaL_error(state, "invalid file handle size");
+  if (stream->closef == NULL) return 0;
+  lua_CFunction closef = stream->closef;
+  stream->closef = NULL;
+  return closef(state);
+}
+
+int rivetlua_capi_native_file_gc_dispatch(lua_State *state) {
+  (void)rivetlua_capi_native_file_dispatch(state);
+  return 0;
+}
+
+int rivetlua_capi_test_open_io(lua_State *state) {
+  return luaopen_io(state);
+}
+
+static int rivetlua_capi_file_close_calls;
+static int rivetlua_capi_file_close_second_arg;
+
+void rivetlua_capi_test_file_close_reset(void) {
+  rivetlua_capi_file_close_calls = 0;
+  rivetlua_capi_file_close_second_arg = 0;
+}
+
+int rivetlua_capi_test_file_close_count(void) {
+  return rivetlua_capi_file_close_calls;
+}
+
+int rivetlua_capi_test_file_close_second_arg(void) {
+  return rivetlua_capi_file_close_second_arg;
+}
+
+int rivetlua_capi_test_file_close_values(lua_State *state) {
+  luaL_Stream *stream = (luaL_Stream *)luaL_checkudata(state, 1, LUA_FILEHANDLE);
+  size_t length = 0;
+  const char *argument = lua_tolstring(state, 2, &length);
+  if (argument != NULL && length == 6 && memcmp(argument, "marker", 6) == 0)
+    rivetlua_capi_file_close_second_arg = 1;
+  else if (argument != NULL && strstr(argument, "close-error") != NULL)
+    rivetlua_capi_file_close_second_arg = 2;
+  rivetlua_capi_file_close_calls++;
+  errno = 0;
+  if (fclose(stream->f) != 0)
+    return luaL_fileresult(state, 0, NULL);
+  lua_pushinteger(state, 17);
+  lua_pushinteger(state, 29);
+  return 2;
+}
+
+int rivetlua_capi_test_file_close_success(lua_State *state) {
+  luaL_Stream *stream = (luaL_Stream *)luaL_checkudata(state, 1, LUA_FILEHANDLE);
+  rivetlua_capi_file_close_calls++;
+  return luaL_fileresult(state, fclose(stream->f) == 0, NULL);
+}
+
+int rivetlua_capi_test_file_close_error(lua_State *state) {
+  luaL_Stream *stream = (luaL_Stream *)luaL_checkudata(state, 1, LUA_FILEHANDLE);
+  rivetlua_capi_file_close_calls++;
+  (void)fclose(stream->f);
+  lua_pushliteral(state, "close failure");
+  return lua_error(state);
+}
 
 typedef struct {
   char *b;
@@ -70,6 +697,7 @@ typedef struct {
   int32_t event;
   int32_t currentline;
   void *token;
+  size_t warning_len;
 } rivetlua_capi_callback_step_b4;
 
 typedef struct {
@@ -149,10 +777,24 @@ typedef struct rivetlua_capi_checkpoint_a1 {
   volatile int32_t *raised_status;
   unsigned rust_action_active;
   unsigned yieldable_a5;
+  /* B4/B5/resume 的 typed handoff；setjmp 後的寫入必須是 volatile。 */
+  volatile unsigned close_triplets_b4;
+  volatile unsigned handoff_ready_b4;
+  volatile rivetlua_capi_callback_step_b4 handoff_b4;
 } rivetlua_capi_checkpoint_a1;
 
 static _Thread_local rivetlua_capi_checkpoint_a1 *rivetlua_capi_top_a1;
+static _Thread_local rivetlua_capi_checkpoint_a1 *rivetlua_capi_b4_driver_top;
+static _Thread_local rivetlua_capi_checkpoint_a1 *rivetlua_capi_b5_driver_top;
 static _Thread_local rivetlua_capi_checkpoint_a1 *rivetlua_capi_resume_top_a5;
+static _Thread_local rivetlua_capi_checkpoint_a1 *rivetlua_capi_b3_reader_child_top;
+
+/* 僅 reader 本身直接呼叫的公開 API 需要局部保護；巢狀 driver 自行處理。 */
+static int rivetlua_b3_reader_direct(lua_State *state) {
+  return rivetlua_capi_b3_reader_child_top != NULL &&
+         rivetlua_capi_top_a1 == rivetlua_capi_b3_reader_child_top &&
+         rivetlua_capi_top_a1->state == state;
+}
 
 /* 僅比對 live TLS checkpoint 的 state 指標；-1 表示此 state 沒有活動 C 邊界。 */
 int rivetlua_capi_yield_boundary_a5(const lua_State *state) {
@@ -179,11 +821,15 @@ extern int32_t rivetlua_capi_checkpoint_enter_a1(
 extern int32_t rivetlua_capi_checkpoint_exit_a1(
     void *state, uint64_t generation, uint64_t token,
     uint64_t previous_state_token);
+extern int rivetlua_capi_c_depth_get_b13(lua_State *state);
+extern int rivetlua_capi_c_depth_set_b13(lua_State *state, uint16_t depth);
+extern int rivetlua_capi_pending_throw_depth_b13(lua_State *state);
 extern int32_t rivetlua_capi_checkpoint_rewind_a5(
     void *state, uint64_t generation, uint64_t token, unsigned skipped);
 extern int rivetlua_capi_yield_prepare_a5(
     lua_State *state, int nresults, lua_KContext context,
     lua_KFunction continuation);
+extern int rivetlua_capi_hook_yield_mark_c16(lua_State *state);
 extern rivetlua_capi_resume_setup_a5 rivetlua_capi_resume_prepare_a5(
     lua_State *state, lua_State *from, int nargs, int from_yieldable);
 extern rivetlua_capi_resume_finish_result_a5 rivetlua_capi_resume_finish_a5(
@@ -248,17 +894,28 @@ extern rivetlua_capi_callback_step_b4 rivetlua_capi_reset_resume_boundary_a5(
 extern int rivetlua_capi_reset_finish_b11(
     lua_State *state, int overlay_status);
 extern lua_State *rivetlua_capi_close_main_b11(lua_State *state);
+extern int rivetlua_capi_shutdown_scratch_prepare_b11(lua_State *state);
 extern rivetlua_capi_callback_step_b4 rivetlua_capi_shutdown_prepare_b11(
     lua_State *state);
 extern int rivetlua_capi_close_drop_b11(lua_State *state);
+extern int rivetlua_capi_close_idle_b11(lua_State *state);
+extern int rivetlua_capi_process_exit_request_b11(
+    lua_State *state, int *status, int *close);
+extern int rivetlua_capi_process_exit_same_group_b11(
+    lua_State *state, lua_State *other);
 extern rivetlua_capi_callback_step_b4 rivetlua_capi_call_resume_b4(
     lua_State *state, int count, int nresults);
 extern rivetlua_capi_callback_step_b4 rivetlua_capi_call_prepare_a2(
-    lua_State *state, int nargs, int nresults);
+    lua_State *state, int nargs, int nresults, int protected_call,
+    void *handler);
+extern rivetlua_capi_callback_step_b4 rivetlua_capi_builtin_prepare_a2(
+    lua_State *state, int nargs, int nresults, int kind);
 extern rivetlua_capi_callback_step_b4 rivetlua_capi_call_resume_a2(
     lua_State *state, int count, int nresults);
 extern rivetlua_capi_callback_step_b4 rivetlua_capi_call_resume_error_a2(
     lua_State *state, int nresults);
+extern rivetlua_capi_callback_step_b4 rivetlua_capi_call_resume_overlay_a2(
+    lua_State *state, int closer_class, int nresults);
 extern rivetlua_capi_public_call_setup_a2 rivetlua_capi_public_preflight_a2(
     lua_State *state, int nargs, int nresults, int errfunc);
 extern int rivetlua_capi_public_settle_preflight_allocation_a2(
@@ -269,6 +926,11 @@ extern rivetlua_capi_strict_result_b2 rivetlua_capi_generic_dispatch_a3(
     lua_State *state, lua_State *other, uint64_t generation, uint64_t token,
     int operation, int first, int second, lua_Integer integer, lua_Number number,
     void *opaque, const char *text1, const char *text2, const char *text3);
+extern int rivetlua_capi_getinfo_dispatch_c13(
+    lua_State *state, const char *what, lua_Debug *ar);
+extern rivetlua_capi_strict_result_b2 rivetlua_capi_pushlstring_dispatch_b14(
+    lua_State *state, uint64_t generation, uint64_t token,
+    const char *source, size_t length);
 extern rivetlua_capi_strict_result_b2 rivetlua_capi_upvalue_dispatch_a4b(
     lua_State *state, uint64_t generation, uint64_t token, int operation,
     int first, int first_n, int second, int second_n);
@@ -283,26 +945,39 @@ extern rivetlua_capi_strict_result_b2 rivetlua_capi_aux_push_a4a(
     lua_State *state, uint64_t generation, uint64_t token, int operation,
     int index, lua_CFunction function, int nup);
 extern int rivetlua_capi_generic_panic_error_a3(lua_State *state);
-extern int rivetlua_capi_public_settle_error_a2(lua_State *state, size_t base);
-extern int rivetlua_capi_public_push_handler_a2(
-    lua_State *state, void *handler, size_t base);
+extern int rivetlua_capi_operation_panic_error_c18(
+    lua_State *state, int class_code, int message);
+extern int rivetlua_capi_public_settle_error_a2(
+    lua_State *state, size_t base);
 extern void rivetlua_capi_public_drop_handler_a2(void *handler);
 extern lua_CFunction rivetlua_capi_panic_snapshot_a2(lua_State *state);
+
+/* 公開 C API 的共用無保護出口；錯誤值已由 Rust 發布時不再覆寫。 */
+static void rivetlua_a3_panic(lua_State *state, int prepared) {
+  if (!prepared) (void)rivetlua_capi_generic_panic_error_a3(state);
+  lua_CFunction panicf = rivetlua_capi_panic_snapshot_a2(state);
+  if (panicf != NULL) (void)panicf(state);
+  abort();
+}
 extern int rivetlua_capi_call_abort_b4(lua_State *state);
 extern int rivetlua_capi_call_depth_b7(lua_State *state);
+extern int rivetlua_capi_call_handler_before_close_a2(lua_State *state);
 extern int rivetlua_capi_call_abort_to_b7(lua_State *state, int depth);
 extern int rivetlua_capi_toclose_prepare_b7(lua_State *state, int index);
 extern rivetlua_capi_close_step_b7 rivetlua_capi_close_next_b7(
     lua_State *state, size_t target, size_t error_position, int nil_slot);
+extern int rivetlua_capi_close_finish_slot_b7(lua_State *state, size_t position);
+extern int rivetlua_capi_close_recycle_b7(lua_State *state);
 extern int rivetlua_capi_close_capture_error_b7(
     lua_State *state, size_t trim_top);
 extern int rivetlua_capi_close_finalize_error_b7(
     lua_State *state, size_t trim_top, uint64_t token, int error_class);
 extern int rivetlua_capi_settop_direct_b7(lua_State *state, int index);
 extern rivetlua_capi_callback_step_b4 rivetlua_capi_operation_prepare_b5(
-    lua_State *state, int kind, int operation, int left, int right, int count);
+    lua_State *state, int kind, int operation, int left, int right, int count,
+    int reader_protected);
 extern rivetlua_capi_callback_step_b4 rivetlua_capi_operation_resume_b5(
-    lua_State *state, int count);
+    lua_State *state, int count, int nresults, int reader_protected);
 extern rivetlua_capi_callback_step_b4 rivetlua_capi_table_prepare_a4a(
     lua_State *state, int index, int setter);
 extern rivetlua_capi_callback_step_b4 rivetlua_capi_table_resume_a4a(
@@ -362,6 +1037,9 @@ _Static_assert(offsetof(rivetlua_capi_callback_step_b4, event) ==
 _Static_assert(offsetof(rivetlua_capi_callback_step_b4, token) ==
                    offsetof(rivetlua_capi_callback_step_b4, event) + 2 * sizeof(int32_t),
                "C/Rust hook token layout");
+_Static_assert(offsetof(rivetlua_capi_callback_step_b4, warning_len) ==
+                   offsetof(rivetlua_capi_callback_step_b4, token) + sizeof(void *),
+               "C/Rust warning length layout");
 _Static_assert(offsetof(rivetlua_capi_public_call_setup_a2, base) ==
                    sizeof(void *),
                "C/Rust public call setup layout");
@@ -492,8 +1170,40 @@ int32_t rivetlua_capi_rust_action_exit_a1(
 static int rivetlua_b7_close_drive(lua_State *state, size_t target,
                                    size_t trim_top, int initial_class,
                                    int nil_slot);
+static int rivetlua_b7_close_drive_handoff(
+    lua_State *state, size_t target, size_t trim_top, int initial_class,
+    int nil_slot, int pause_on_error,
+    rivetlua_capi_callback_step_b4 *handoff);
+static int rivetlua_b7_close_drive_overlay(lua_State *state, size_t target,
+                                            size_t trim_top, int initial_class,
+                                            rivetlua_capi_callback_step_b4 *handoff);
+static int rivetlua_b7_close_drive_forward(lua_State *state, size_t target,
+                                           size_t trim_top, int nil_slot);
+static int rivetlua_b11_close_drive(lua_State *state);
+static void rivetlua_b11_process_exit_close_stack(lua_State *state);
+static void rivetlua_b7_raise_existing(lua_State *state, int class_code);
+static void rivetlua_b13_depth_error(lua_State *state, int class_code,
+                                     const char *message) {
+  lua_pushstring(state, message);
+  rivetlua_capi_checkpoint_a1 *top = rivetlua_capi_top_a1;
+  if (top != NULL && top->state == state && top->rust_action_active == 0 &&
+      rivetlua_capi_error_prepare_a1(
+          state, top->generation, top->token, class_code) == RV_A1_OK)
+    rivetlua_b7_raise_existing(state, -class_code);
+  abort();
+}
+static int rivetlua_b13_public_status(int class_code) {
+  if (class_code == RV_A1_ERROR_HANDLING) return LUA_ERRERR;
+  if (class_code == RV_A1_ERROR_ALLOCATION) return LUA_ERRMEM;
+  return LUA_ERRRUN;
+}
 static int rivetlua_b10_invoke_step(
     lua_State *state, const rivetlua_capi_callback_step_b4 *step, int *count) {
+  int exit_status = 0, exit_close = 0;
+  if (rivetlua_capi_process_exit_request_b11(
+          state, &exit_status, &exit_close) == 1 && exit_close &&
+      rivetlua_capi_shutdown_scratch_prepare_b11(state) != 1)
+    return 0;
   if (step->kind == 1 && step->function != NULL) {
     *count = step->function(state);
     return 1;
@@ -508,7 +1218,25 @@ static int rivetlua_b10_invoke_step(
     return 1;
   }
   if (step->kind == 4 && step->token != NULL) {
-    lua_warning(state, (const char *)step->token, step->event);
+    if (step->value == 0) {
+      lua_warning(state, (const char *)step->token, step->event);
+    } else {
+      /* warning_len 已截於首個 NUL；只在純 C stack 上分段補終止符。
+         callback 重入時，ExternalPending 的真根仍保住原位元組。 */
+      const char *bytes = (const char *)step->token;
+      size_t offset = 0;
+      if (step->warning_len == 0) lua_warning(state, "", step->event);
+      while (offset < step->warning_len) {
+        char part[256];
+        size_t count = step->warning_len - offset;
+        if (count > sizeof(part) - 1) count = sizeof(part) - 1;
+        memcpy(part, bytes + offset, count);
+        part[count] = '\0';
+        offset += count;
+        lua_warning(state, part,
+                    offset < step->warning_len ? 1 : step->event);
+      }
+    }
     *count = 0;
     return 1;
   }
@@ -517,14 +1245,31 @@ static int rivetlua_b10_invoke_step(
 /* 終止只跳至同一執行緒仍存活的純 C checkpoint，不跨越 Rust frame。 */
 static void rivetlua_b4_raise_terminal_a1(lua_State *state) {
   rivetlua_capi_checkpoint_a1 *top = rivetlua_capi_top_a1;
-  if (top != NULL && top->state == state && top->rust_action_active == 0)
+  int status = 0, close = 0;
+  int process_exit = rivetlua_capi_process_exit_request_b11(
+      state, &status, &close);
+  if (process_exit == 1 && !close) exit(status);
+  if (top != NULL && top->rust_action_active == 0 &&
+      (top->state == state ||
+       (process_exit == 1 &&
+        rivetlua_capi_process_exit_same_group_b11(state, top->state) == 1)))
     longjmp(top->jump, 3);
+  if (process_exit == 1) {
+    (void)rivetlua_b11_close_drive(state);
+    /* 已接受的 C os.exit 不能返回公開 lua_pcall/lua_call。 */
+    exit(status);
+  }
 }
 static int rivetlua_b4_call_drive(lua_State *state, int nargs,
                                  int nresults, int public_call,
-                                 int yieldable_a5) {
+                                  int yieldable_a5, int builtin_kind,
+                                   int protected_call, void *handler,
+                                    rivetlua_capi_callback_step_b4 *handoff,
+                                    const rivetlua_capi_callback_step_b4 *initial_step,
+                                    int inherited_frame_depth) {
   if (state == NULL) return -1;
-  int frame_depth = rivetlua_capi_call_depth_b7(state);
+  int frame_depth = inherited_frame_depth >= 0
+      ? inherited_frame_depth : rivetlua_capi_call_depth_b7(state);
   if (frame_depth < 0) return -1;
   rivetlua_capi_checkpoint_a1 checkpoint;
   int32_t entered = rivetlua_capi_checkpoint_enter_a1(
@@ -537,43 +1282,146 @@ static int rivetlua_b4_call_drive(lua_State *state, int nargs,
   checkpoint.raised_status = &raised_status;
   checkpoint.rust_action_active = 0;
   checkpoint.yieldable_a5 = yieldable_a5 != 0;
+  checkpoint.close_triplets_b4 = 0;
+  checkpoint.handoff_ready_b4 = 0;
+  rivetlua_capi_checkpoint_a1 *previous_b4 = rivetlua_capi_b4_driver_top;
   rivetlua_capi_top_a1 = &checkpoint;
+  rivetlua_capi_b4_driver_top = &checkpoint;
+  int c_depth_before = -1;
+  int c_depth_error = 0;
+  volatile int c_depth_active = 0;
+  if (builtin_kind < 0 && initial_step == NULL) {
+    c_depth_before = rivetlua_capi_c_depth_get_b13(state);
+    if (c_depth_before < 0 || c_depth_before >= UINT16_MAX ||
+        rivetlua_capi_c_depth_set_b13(state,
+                                      (uint16_t)(c_depth_before + 1)) != 0) {
+      c_depth_error = -1;
+    } else {
+      c_depth_active = 1;
+      if (c_depth_before + 1 == 200) c_depth_error = RV_A1_ERROR_LUA;
+      else if (c_depth_before + 1 >= 220)
+        c_depth_error = RV_A1_ERROR_HANDLING;
+    }
+  }
   int result = -1;
   volatile int first = 1;
   /* A1 checkpoint 的跳轉目標仍在此純 C frame，絕不跨越 Rust frame。 */
   for (;;) {
     rivetlua_capi_callback_step_b4 step;
     int jumped = setjmp(checkpoint.jump);
+    if (jumped == 4) {
+      if (!checkpoint.handoff_ready_b4) abort();
+      while (checkpoint.close_triplets_b4 != 0) {
+        if (rivetlua_capi_close_recycle_b7(state) != 1) abort();
+        checkpoint.close_triplets_b4--;
+      }
+      step.kind = checkpoint.handoff_b4.kind;
+      step.value = checkpoint.handoff_b4.value;
+      step.function = checkpoint.handoff_b4.function;
+      step.hook = checkpoint.handoff_b4.hook;
+      step.event = checkpoint.handoff_b4.event;
+      step.currentline = checkpoint.handoff_b4.currentline;
+      step.token = checkpoint.handoff_b4.token;
+      step.warning_len = checkpoint.handoff_b4.warning_len;
+      checkpoint.handoff_ready_b4 = 0;
+      goto process_step_b4;
+    }
     if (jumped == 3) {
+      if (c_depth_active) {
+        (void)rivetlua_capi_c_depth_set_b13(state, (uint16_t)c_depth_before);
+        c_depth_active = 0;
+      }
       result = -2;
       break;
     }
     if (jumped == 0) {
       if (!first) break;
       first = 0;
-      checkpoint.rust_action_active = 1;
-      step = public_call
-          ? rivetlua_capi_call_prepare_a2(state, nargs, nresults)
-          : rivetlua_capi_call_prepare_b4(state, nargs, nresults);
-      checkpoint.rust_action_active = 0;
+      if (c_depth_error < 0) break;
+      if (c_depth_error != 0)
+        rivetlua_b13_depth_error(
+            state, c_depth_error,
+            c_depth_error == RV_A1_ERROR_HANDLING
+                ? "error in error handling" : "C stack overflow");
+      if (initial_step != NULL) {
+        step = *initial_step;
+      } else {
+        checkpoint.rust_action_active = 1;
+        step = builtin_kind >= 0
+            ? rivetlua_capi_builtin_prepare_a2(state, nargs, nresults, builtin_kind)
+            : (public_call
+                   ? rivetlua_capi_call_prepare_a2(
+                         state, nargs, nresults, protected_call, handler)
+                   : rivetlua_capi_call_prepare_b4(state, nargs, nresults));
+        checkpoint.rust_action_active = 0;
+      }
     } else {
       checkpoint.rust_action_active = 0;
+      if (c_depth_active) {
+        (void)rivetlua_capi_c_depth_set_b13(state, (uint16_t)c_depth_before);
+        c_depth_active = 0;
+      }
       if (rivetlua_capi_call_depth_b7(state) <= frame_depth) break;
-      size_t trim_top = (size_t)lua_gettop(state);
-      int error_class = rivetlua_capi_close_capture_error_b7(state, trim_top);
-      if (error_class <= 0) break;
-      (void)rivetlua_b7_close_drive(state, 0, trim_top, error_class, 0);
-      if (!public_call) break;
-      checkpoint.rust_action_active = 1;
-      step = rivetlua_capi_call_resume_error_a2(state, nresults);
-      checkpoint.rust_action_active = 0;
+      if (protected_call ||
+          rivetlua_capi_call_handler_before_close_a2(state) == 1) {
+        checkpoint.rust_action_active = 1;
+        step = rivetlua_capi_call_resume_error_a2(state, nresults);
+        checkpoint.rust_action_active = 0;
+      } else {
+        size_t trim_top = (size_t)lua_gettop(state);
+        int error_class = rivetlua_capi_close_capture_error_b7(state, trim_top);
+        if (error_class <= 0) break;
+        rivetlua_capi_callback_step_b4 nested_step;
+        int closed = rivetlua_b7_close_drive_handoff(
+            state, 0, trim_top, error_class, 0, 0, &nested_step);
+        if (closed == -3) {
+          step = nested_step;
+          goto process_step_b4;
+        }
+        if (!public_call) break;
+        checkpoint.rust_action_active = 1;
+        step = rivetlua_capi_call_resume_error_a2(state, nresults);
+        checkpoint.rust_action_active = 0;
+      }
     }
-    while (step.kind == 1 || step.kind == 2 || step.kind == 4) {
+process_step_b4:
+    while (step.kind == 1 || step.kind == 2 || step.kind == 4 || step.kind == 5) {
+      if (step.kind == 5) {
+        int current_depth = rivetlua_capi_call_depth_b7(state);
+        if (current_depth < frame_depth) abort();
+        if (current_depth == frame_depth) {
+          if (handoff == NULL) abort();
+          *handoff = step;
+          result = -3;
+          break;
+        }
+        size_t top = (size_t)lua_gettop(state);
+        if (top == 0) break;
+        rivetlua_capi_callback_step_b4 nested_step;
+        int closed = rivetlua_b7_close_drive_overlay(
+            state, 0, top - 1, step.value, &nested_step);
+        if (closed == -3) {
+          step = nested_step;
+          continue;
+        }
+        checkpoint.rust_action_active = 1;
+        step = rivetlua_capi_call_resume_overlay_a2(
+            state, closed < 0 ? -closed : 0, nresults);
+        checkpoint.rust_action_active = 0;
+        continue;
+      }
       int count = 0;
       if (!rivetlua_b10_invoke_step(state, &step, &count)) break;
-      int close_status = rivetlua_b7_close_drive(
-          state, 0, (size_t)lua_gettop(state), 0, 0);
-      if (close_status != 0 && !public_call) break;
+      rivetlua_capi_callback_step_b4 nested_step;
+      int handler_before_close = rivetlua_capi_call_handler_before_close_a2(state) == 1;
+      int close_status = rivetlua_b7_close_drive_handoff(
+          state, 0, (size_t)lua_gettop(state), 0, 0,
+          handler_before_close, &nested_step);
+      if (close_status == -3) {
+        step = nested_step;
+        continue;
+      }
+      if (close_status != 0 && !public_call && !handler_before_close) break;
       checkpoint.rust_action_active = 1;
       step = close_status == 0
           ? (public_call
@@ -586,12 +1434,22 @@ static int rivetlua_b4_call_drive(lua_State *state, int nargs,
     else if (step.kind == -2) result = -2;
     break;
   }
-  if (result != 0) {
+  if (c_depth_active &&
+      rivetlua_capi_c_depth_set_b13(state, (uint16_t)c_depth_before) != 0)
+    result = -1;
+  int exit_status = 0, exit_close = 0;
+  if (rivetlua_capi_process_exit_request_b11(
+          state, &exit_status, &exit_close) == 1) {
+    rivetlua_b11_process_exit_close_stack(state);
+    result = -2;
+  }
+  if (result != 0 && result != -3) {
     checkpoint.rust_action_active = 1;
     if (rivetlua_capi_call_abort_to_b7(state, frame_depth) != 1)
       result = -1;
   }
   checkpoint.rust_action_active = 0;
+  rivetlua_capi_b4_driver_top = previous_b4;
   rivetlua_capi_top_a1 = checkpoint.previous;
   int32_t exited = rivetlua_capi_checkpoint_exit_a1(
       state, checkpoint.generation, checkpoint.token,
@@ -601,16 +1459,52 @@ static int rivetlua_b4_call_drive(lua_State *state, int nargs,
 }
 
 int rivetlua_capi_call_b4(lua_State *state, int nargs, int nresults) {
-  return rivetlua_b4_call_drive(state, nargs, nresults, 0, 0);
+  return rivetlua_b4_call_drive(
+      state, nargs, nresults, 0, 0, -1, 0, NULL, NULL, NULL, -1);
 }
 
 static int rivetlua_a2_call_drive(lua_State *state, int nargs, int nresults,
-                                 int yieldable_a5) {
-  return rivetlua_b4_call_drive(state, nargs, nresults, 1, yieldable_a5);
+                                  int yieldable_a5, int builtin_kind,
+                                   int protected_call, void *handler,
+                                   rivetlua_capi_callback_step_b4 *handoff) {
+  return rivetlua_b4_call_drive(state, nargs, nresults, 1,
+                                yieldable_a5, builtin_kind,
+                                 protected_call, handler, handoff, NULL, -1);
+}
+
+/* public void lua_call 的外層同步 B4 仍持有 fault overlay；只傳純 C POD。 */
+static void rivetlua_b4_transfer_handoff(
+    lua_State *state, const rivetlua_capi_callback_step_b4 *step) {
+  rivetlua_capi_checkpoint_a1 *target = rivetlua_capi_top_a1;
+  if (target == NULL ||
+      (target != rivetlua_capi_b4_driver_top &&
+       target != rivetlua_capi_b5_driver_top &&
+       target != rivetlua_capi_resume_top_a5) ||
+      target->state != state || target->rust_action_active != 0 ||
+      target->handoff_ready_b4 || step->kind != 5)
+    abort();
+  if (rivetlua_capi_trampoline_probe_a1(
+          state, target->generation, target->token) != RV_A1_OK)
+    abort();
+  target->handoff_b4.kind = step->kind;
+  target->handoff_b4.value = step->value;
+  target->handoff_b4.function = step->function;
+  target->handoff_b4.hook = step->hook;
+  target->handoff_b4.event = step->event;
+  target->handoff_b4.currentline = step->currentline;
+  target->handoff_b4.token = step->token;
+  target->handoff_b4.warning_len = step->warning_len;
+  target->handoff_ready_b4 = 1;
+  longjmp(target->jump, 4);
 }
 
 static void rivetlua_a2_terminal_cleanup(lua_State *state, int registered,
                                          void *handler) {
+  int status = 0, close = 0;
+  if (rivetlua_capi_process_exit_request_b11(state, &status, &close) == 1) {
+    rivetlua_b4_raise_terminal_a1(state);
+    exit(status);
+  }
   if (registered)
     (void)rivetlua_capi_continuation_step_a5(
         state, (size_t)rivetlua_capi_call_depth_b7(state), 1);
@@ -624,6 +1518,8 @@ static int rivetlua_b5_operation_drive(
     lua_State *state, int kind, int operation, int left, int right, int count,
     int *published) {
   if (state == NULL || published == NULL) return -RV_A1_ERROR_LUA;
+  int reader_protected = rivetlua_b3_reader_direct(state);
+  int result_count = kind == 7 ? 0 : 1;
   int depth = rivetlua_capi_operation_depth_b5(state);
   if (depth < 0) return -RV_A1_ERROR_LUA;
   rivetlua_capi_checkpoint_a1 checkpoint;
@@ -637,31 +1533,93 @@ static int rivetlua_b5_operation_drive(
   checkpoint.raised_status = &raised_status;
   checkpoint.rust_action_active = 0;
   checkpoint.yieldable_a5 = 0;
+  checkpoint.close_triplets_b4 = 0;
+  checkpoint.handoff_ready_b4 = 0;
+  rivetlua_capi_checkpoint_a1 *previous_b5 = rivetlua_capi_b5_driver_top;
   rivetlua_capi_top_a1 = &checkpoint;
+  rivetlua_capi_b5_driver_top = &checkpoint;
   int status = -RV_A1_ERROR_LUA;
+  rivetlua_capi_callback_step_b4 handoff_step;
+  volatile int handoff_ready = 0;
   *published = 0;
   int terminal_exit = 0;
   /* callback 只在 Rust step 完整返回且 guard 清零後呼叫。 */
   int jumped = setjmp(checkpoint.jump);
   if (jumped == 3) {
     terminal_exit = 1;
+  } else if (jumped == 4) {
+    if (!checkpoint.handoff_ready_b4) abort();
+    while (checkpoint.close_triplets_b4 != 0) {
+      if (rivetlua_capi_close_recycle_b7(state) != 1) abort();
+      checkpoint.close_triplets_b4--;
+    }
+    rivetlua_capi_callback_step_b4 fault;
+    fault.kind = checkpoint.handoff_b4.kind;
+    fault.value = checkpoint.handoff_b4.value;
+    fault.function = checkpoint.handoff_b4.function;
+    fault.hook = checkpoint.handoff_b4.hook;
+    fault.event = checkpoint.handoff_b4.event;
+    fault.currentline = checkpoint.handoff_b4.currentline;
+    fault.token = checkpoint.handoff_b4.token;
+    fault.warning_len = checkpoint.handoff_b4.warning_len;
+    checkpoint.handoff_ready_b4 = 0;
+    status = rivetlua_b4_call_drive(
+        state, 0, result_count, 1, 0, -1, 0, NULL, &handoff_step,
+        &fault, depth);
+    handoff_ready = status == -3;
   } else if (jumped == 0) {
     checkpoint.rust_action_active = 1;
     rivetlua_capi_callback_step_b4 step =
         rivetlua_capi_operation_prepare_b5(
-            state, kind, operation, left, right, count);
+            state, kind, operation, left, right, count, reader_protected);
     checkpoint.rust_action_active = 0;
-    while (step.kind == 1 || step.kind == 2 || step.kind == 4) {
+    while (step.kind == 1 || step.kind == 2 || step.kind == 4 || step.kind == 5) {
+      if (step.kind == 5) {
+        status = rivetlua_b4_call_drive(
+            state, 0, result_count, 1, 0, -1, 0, NULL, &handoff_step,
+            &step, depth);
+        handoff_ready = status == -3;
+        break;
+      }
       int returned = 0;
       if (!rivetlua_b10_invoke_step(state, &step, &returned)) break;
-      int close_status = rivetlua_b7_close_drive(
-          state, 0, (size_t)lua_gettop(state), 0, 0);
+      rivetlua_capi_callback_step_b4 nested_step;
+      int handler_before_close =
+          rivetlua_capi_call_handler_before_close_a2(state) == 1;
+      int close_status = rivetlua_b7_close_drive_handoff(
+          state, 0, (size_t)lua_gettop(state), 0, 0,
+          reader_protected || handler_before_close, &nested_step);
+      if (close_status == -3) {
+        if (reader_protected) {
+          status = rivetlua_b4_call_drive(
+              state, 0, result_count, 1, 0, -1, 0, NULL, &handoff_step,
+              &nested_step, depth);
+          handoff_ready = status == -3;
+        } else {
+          handoff_step = nested_step;
+          handoff_ready = 1;
+          status = -3;
+        }
+        break;
+      }
       if (close_status != 0) {
-        status = close_status;
+        if (reader_protected || handler_before_close) {
+          checkpoint.rust_action_active = 1;
+          rivetlua_capi_callback_step_b4 fault =
+              rivetlua_capi_call_resume_error_a2(state, result_count);
+          checkpoint.rust_action_active = 0;
+          status = rivetlua_b4_call_drive(
+              state, 0, result_count, 1, 0, -1, 0, NULL, &handoff_step,
+              &fault, depth);
+          handoff_ready = status == -3;
+        } else {
+          status = close_status;
+        }
         break;
       }
       checkpoint.rust_action_active = 1;
-      step = rivetlua_capi_operation_resume_b5(state, returned);
+      step = rivetlua_capi_operation_resume_b5(
+          state, returned, result_count, reader_protected);
       checkpoint.rust_action_active = 0;
     }
     if (step.kind == -2) terminal_exit = 1;
@@ -674,35 +1632,70 @@ static int rivetlua_b5_operation_drive(
   } else if (raised_status != 0) {
     status = -raised_status;
     if (rivetlua_capi_operation_depth_b5(state) > depth) {
-      size_t trim_top = (size_t)lua_gettop(state);
-      int error_class = rivetlua_capi_close_capture_error_b7(state, trim_top);
-      if (error_class > 0)
-        status = rivetlua_b7_close_drive(
-            state, 0, trim_top, error_class, 0);
+      if (reader_protected ||
+          rivetlua_capi_call_handler_before_close_a2(state) == 1) {
+        checkpoint.rust_action_active = 1;
+        rivetlua_capi_callback_step_b4 fault =
+            rivetlua_capi_call_resume_error_a2(state, result_count);
+        checkpoint.rust_action_active = 0;
+        status = rivetlua_b4_call_drive(
+            state, 0, result_count, 1, 0, -1, 0, NULL, &handoff_step,
+            &fault, depth);
+        handoff_ready = status == -3;
+      } else {
+        size_t trim_top = (size_t)lua_gettop(state);
+        int error_class = rivetlua_capi_close_capture_error_b7(state, trim_top);
+        if (error_class > 0)
+          status = rivetlua_b7_close_drive(
+              state, 0, trim_top, error_class, 0);
+      }
     }
   }
-  if (status != 0) {
+  int exit_status = 0, exit_close = 0;
+  if (rivetlua_capi_process_exit_request_b11(
+          state, &exit_status, &exit_close) == 1)
+    terminal_exit = 1;
+  if (terminal_exit) rivetlua_b11_process_exit_close_stack(state);
+  int preserved_reader_error = reader_protected && status < 0 &&
+      status != -3 && !terminal_exit &&
+      rivetlua_capi_pending_matches_a1(
+          state, checkpoint.generation, checkpoint.token, -status) == RV_A1_OK;
+  if (preserved_reader_error) {
+    checkpoint.rust_action_active = 1;
+    if (rivetlua_capi_operation_abort_to_b5(state, depth) != 1) abort();
+    checkpoint.rust_action_active = 0;
+    int class_code = 0;
+    if (rivetlua_capi_error_consume_a1(state, &class_code) != RV_A1_OK ||
+        class_code != -status) abort();
+    *published = -1;
+  } else if ((status != 0 && status != -3) || terminal_exit) {
     checkpoint.rust_action_active = 1;
     (void)rivetlua_capi_pending_cancel_a1(
         state, checkpoint.generation, checkpoint.token);
     (void)rivetlua_capi_operation_abort_to_b5(state, depth);
     checkpoint.rust_action_active = 0;
   }
+  rivetlua_capi_b5_driver_top = previous_b5;
   rivetlua_capi_top_a1 = checkpoint.previous;
   int32_t exited = rivetlua_capi_checkpoint_exit_a1(
       state, checkpoint.generation, checkpoint.token,
       checkpoint.previous_state_token);
   if (exited != RV_A1_OK) return -RV_A1_ERROR_LUA;
   if (terminal_exit) rivetlua_b4_raise_terminal_a1(state);
+  if (handoff_ready) rivetlua_b4_transfer_handoff(state, &handoff_step);
   return status;
 }
 
 static void rivetlua_b5_operation_raise_message(
     lua_State *state, int status, int message) {
   rivetlua_capi_checkpoint_a1 *top = rivetlua_capi_top_a1;
-  if (top == NULL || top->state != state || top->rust_action_active != 0)
-    abort();
   int class_code = status < 0 ? -status : RV_A1_ERROR_LUA;
+  if (top == NULL) {
+    int prepared = rivetlua_capi_operation_panic_error_c18(
+        state, class_code, message);
+    rivetlua_a3_panic(state, prepared);
+  }
+  if (top->state != state || top->rust_action_active != 0) abort();
   rivetlua_capi_strict_result_b2 action = rivetlua_capi_operation_error_b5(
       state, top->generation, top->token, class_code, message);
   (void)rivetlua_b2_finish(state, top->generation, top->token, action);
@@ -711,6 +1704,29 @@ static void rivetlua_b5_operation_raise_message(
 
 static void rivetlua_b5_operation_raise(lua_State *state, int status) {
   rivetlua_b5_operation_raise_message(state, status, 0);
+}
+
+int lua_getinfo(lua_State *state, const char *what, lua_Debug *ar) {
+  /* Rust 已釋放 debug/stack 借用；L 的配置錯誤只在此 C frame 提出。 */
+  int result = rivetlua_capi_getinfo_dispatch_c13(state, what, ar);
+  if (result == -RV_A1_ERROR_ALLOCATION)
+    rivetlua_b5_operation_raise(state, result);
+  return result;
+}
+
+/* B5 checkpoint 已把原錯誤 slot 搬回 reader stack；由 child 原樣提出。 */
+static void rivetlua_b5_operation_raise_result(
+    lua_State *state, int status, int published) {
+  if (published == -1) {
+    rivetlua_capi_checkpoint_a1 *top = rivetlua_capi_top_a1;
+    int class_code = status < 0 ? -status : RV_A1_ERROR_LUA;
+    if (rivetlua_b3_reader_direct(state) && top != NULL &&
+        rivetlua_capi_error_prepare_a1(
+            state, top->generation, top->token, class_code) == RV_A1_OK)
+      rivetlua_b7_raise_existing(state, -class_code);
+    abort();
+  }
+  rivetlua_b5_operation_raise(state, status);
 }
 
 /* B7：錯誤值先暫存為 overlay root；每次 close handler 返回後才換成新的錯誤。 */
@@ -730,35 +1746,68 @@ static int rivetlua_b7_capture_or_synthesize(lua_State *state,
   return captured;
 }
 
-static int rivetlua_b7_close_drive(lua_State *state, size_t target,
-                                   size_t trim_top, int initial_class,
-                                   int nil_slot) {
+static int rivetlua_b7_close_drive_inner(lua_State *state, size_t target,
+                                         size_t trim_top, int initial_class,
+                                          int nil_slot, int pause_on_error,
+                                           rivetlua_capi_callback_step_b4 *handoff,
+                                           int *error_replaced) {
   int error_class = initial_class;
   size_t error_position = initial_class > 0 ? (size_t)lua_gettop(state) : 0;
   int closed = 0;
+  int new_error = 0;
+  if (error_replaced != NULL) *error_replaced = 0;
   for (;;) {
     rivetlua_capi_close_step_b7 step = rivetlua_capi_close_next_b7(
         state, target, error_position, nil_slot);
     if (step.kind == 0) break;
     if (step.kind < 0) {
+      /* 已有錯誤時覆寫其槽；同一 close walker 始終只保留最新一個錯誤。 */
+      size_t error_trim = error_position != 0
+          ? error_position - 1 : (size_t)lua_gettop(state);
       error_class = rivetlua_b7_capture_or_synthesize(
-          state, (size_t)lua_gettop(state), step.value, 3);
+          state, error_trim, step.value, 3);
       error_position = (size_t)lua_gettop(state);
-      if (nil_slot) break;
+      new_error = 1;
+      if (error_replaced != NULL) *error_replaced = 1;
+      if (nil_slot || pause_on_error) break;
       continue;
     }
     closed++;
     if (step.kind == 2) {
       size_t call_top = (size_t)lua_gettop(state) - (size_t)step.value - 1;
-      int call_status = rivetlua_capi_call_b4(state, step.value, 0);
+      rivetlua_capi_checkpoint_a1 *driver_owner = rivetlua_capi_top_a1;
+      if (driver_owner == NULL || driver_owner->state != state ||
+          (driver_owner != rivetlua_capi_b4_driver_top &&
+           driver_owner != rivetlua_capi_b5_driver_top &&
+           driver_owner != rivetlua_capi_resume_top_a5))
+        driver_owner = NULL;
+      if (driver_owner != NULL) {
+        if (driver_owner->close_triplets_b4 == ~0u) abort();
+        driver_owner->close_triplets_b4++;
+      }
+      rivetlua_capi_callback_step_b4 nested_step;
+      int call_status = rivetlua_b4_call_drive(
+          state, step.value, 0, 0, 0, -1, 0, NULL, &nested_step, NULL, -1);
+      if (rivetlua_capi_close_recycle_b7(state) != 1) abort();
+      if (driver_owner != NULL) driver_owner->close_triplets_b4--;
+      if (call_status == -3) {
+        if (handoff == NULL) abort();
+        *handoff = nested_step;
+        return -3;
+      }
       if (call_status == -2) {
         rivetlua_b4_raise_terminal_a1(state);
         return -RV_A1_ERROR_LUA;
       }
       if (call_status != 0) {
+        size_t error_trim = error_position != 0
+            ? error_position - 1 : call_top;
         error_class = rivetlua_b7_capture_or_synthesize(
-            state, call_top, RV_A1_ERROR_LUA, 3);
+            state, error_trim, RV_A1_ERROR_LUA, 3);
         error_position = (size_t)lua_gettop(state);
+        new_error = 1;
+        if (error_replaced != NULL) *error_replaced = 1;
+        if (pause_on_error) break;
       }
     }
     if (nil_slot) break;
@@ -768,7 +1817,7 @@ static int rivetlua_b7_close_drive(lua_State *state, size_t target,
         state, (size_t)lua_gettop(state), RV_A1_ERROR_LUA, 3);
     error_position = (size_t)lua_gettop(state);
   }
-  if (error_class > 0) {
+  if (error_class > 0 && (!pause_on_error || new_error)) {
     rivetlua_capi_checkpoint_a1 *top = rivetlua_capi_top_a1;
     if (top == NULL || top->state != state || error_position == 0 ||
         rivetlua_capi_close_finalize_error_b7(
@@ -779,9 +1828,62 @@ static int rivetlua_b7_close_drive(lua_State *state, size_t target,
   return 0;
 }
 
+static int rivetlua_b7_close_drive(lua_State *state, size_t target,
+                                   size_t trim_top, int initial_class,
+                                   int nil_slot) {
+  return rivetlua_b7_close_drive_inner(
+      state, target, trim_top, initial_class, nil_slot, 0, NULL, NULL);
+}
+
+static int rivetlua_b7_close_drive_handoff(
+    lua_State *state, size_t target, size_t trim_top, int initial_class,
+    int nil_slot, int pause_on_error,
+    rivetlua_capi_callback_step_b4 *handoff) {
+  return rivetlua_b7_close_drive_inner(
+      state, target, trim_top, initial_class, nil_slot, pause_on_error, handoff,
+      NULL);
+}
+
+/* message handler 已完成；每個新 closer 錯誤先交回同一 VM 保護邊界。 */
+static int rivetlua_b7_close_drive_overlay(lua_State *state, size_t target,
+                                            size_t trim_top, int initial_class,
+                                            rivetlua_capi_callback_step_b4 *handoff) {
+  return rivetlua_b7_close_drive_inner(
+      state, target, trim_top, initial_class, 0, 1, handoff, NULL);
+}
+
+/* 無自有 checkpoint 的公開 C API 保留最近的 VM handler 控制權。 */
+static int rivetlua_b7_close_drive_forward(lua_State *state, size_t target,
+                                           size_t trim_top, int nil_slot) {
+  rivetlua_capi_callback_step_b4 handoff;
+  int pause = rivetlua_capi_call_handler_before_close_a2(state) == 1;
+  int result = rivetlua_b7_close_drive_inner(
+      state, target, trim_top, 0, nil_slot, pause, &handoff, NULL);
+  if (result == -3) {
+    rivetlua_b4_transfer_handoff(state, &handoff);
+    abort();
+  }
+  return result;
+}
+
+/* C os.exit(true) 在撤銷 callback frame 前先關其目前 C stack 的 TBC。
+   若 closer 再次退出，原純 C checkpoint 會接住跳轉並重掃餘下 closers。 */
+static void rivetlua_b11_process_exit_close_stack(lua_State *state) {
+  int status = 0, close = 0;
+  if (rivetlua_capi_process_exit_request_b11(state, &status, &close) != 1)
+    return;
+  if (!close) exit(status);
+  (void)rivetlua_capi_shutdown_scratch_prepare_b11(state);
+  if (rivetlua_b7_close_drive(state, 0, 0, 0, 0) != 0) {
+    int32_t error_class = 0;
+    (void)rivetlua_capi_error_consume_a1(state, &error_class);
+    (void)rivetlua_capi_settop_direct_b7(state, 0);
+  }
+}
+
 static int rivetlua_b11_public_status(int internal) {
   int code = internal < 0 ? -internal : internal;
-  return code == RV_A1_ERROR_ALLOCATION ? LUA_ERRMEM : LUA_ERRRUN;
+  return rivetlua_b13_public_status(code);
 }
 
 #if LUA_VERSION_NUM >= 505
@@ -931,7 +2033,8 @@ int lua_closethread(lua_State *state, lua_State *from) {
     }
     frame_depth = rivetlua_capi_call_depth_b7(state);
     int original_class = overlay_status == LUA_OK ? 0 :
-        (overlay_status == LUA_ERRMEM ? RV_A1_ERROR_ALLOCATION : RV_A1_ERROR_LUA);
+        (overlay_status == LUA_ERRMEM ? RV_A1_ERROR_ALLOCATION :
+         overlay_status == LUA_ERRERR ? RV_A1_ERROR_HANDLING : RV_A1_ERROR_LUA);
     close_result = rivetlua_b7_close_drive(state, 0, 0, original_class, 0);
     if (close_result != 0) {
       int32_t error_class = 0;
@@ -953,7 +2056,8 @@ int lua_closethread(lua_State *state, lua_State *from) {
     if (step.kind == 3) {
       int prior_status = latest_error_status != LUA_OK ? latest_error_status : step.value;
       int original_class = prior_status == LUA_OK ? 0 :
-          (prior_status == LUA_ERRMEM ? RV_A1_ERROR_ALLOCATION : RV_A1_ERROR_LUA);
+          (prior_status == LUA_ERRMEM ? RV_A1_ERROR_ALLOCATION :
+           prior_status == LUA_ERRERR ? RV_A1_ERROR_HANDLING : RV_A1_ERROR_LUA);
       close_result = rivetlua_b7_close_drive(state, 0, 0, original_class, 0);
       int boundary_status = LUA_OK;
       if (close_result != 0) {
@@ -1018,8 +2122,13 @@ int lua_closethread(lua_State *state, lua_State *from) {
   } else {
     status = rivetlua_b11_public_status(step.value);
   }
-reset_exit_b11:
-  if (status != LUA_OK && frame_depth >= 0) {
+reset_exit_b11: ;
+  int exit_status = 0, exit_close = 0;
+  if (rivetlua_capi_process_exit_request_b11(
+          state, &exit_status, &exit_close) == 1)
+    terminal_exit_seen = 1;
+  if (terminal_exit_seen) rivetlua_b11_process_exit_close_stack(state);
+  if ((status != LUA_OK || terminal_exit_seen) && frame_depth >= 0) {
     checkpoint.rust_action_active = 1;
     (void)rivetlua_capi_pending_cancel_a1(
         state, checkpoint.generation, checkpoint.token);
@@ -1051,6 +2160,9 @@ int lua_resetthread(lua_State *state) {
 static int rivetlua_b11_close_drive(lua_State *state) {
   lua_State *main_state = rivetlua_capi_close_main_b11(state);
   if (main_state == NULL) return 0;
+  if (rivetlua_capi_close_idle_b11(main_state) == 1)
+    return rivetlua_capi_close_drop_b11(main_state) == 1;
+  if (rivetlua_capi_shutdown_scratch_prepare_b11(main_state) != 1) return 0;
   rivetlua_capi_checkpoint_a1 checkpoint;
   if (rivetlua_capi_checkpoint_enter_a1(
           main_state, &checkpoint.generation, &checkpoint.token,
@@ -1067,6 +2179,7 @@ static int rivetlua_b11_close_drive(lua_State *state) {
   int complete = 1;
   int initial_jump = setjmp(checkpoint.jump);
   if (initial_jump == 3) {
+    rivetlua_b11_process_exit_close_stack(main_state);
     checkpoint.rust_action_active = 1;
     if (rivetlua_capi_call_abort_to_b7(main_state, frame_depth) != 1)
       complete = 0;
@@ -1118,6 +2231,7 @@ static int rivetlua_b11_close_drive(lua_State *state) {
       checkpoint.rust_action_active = 0;
     }
     if (terminal_exit_seen) {
+      rivetlua_b11_process_exit_close_stack(main_state);
       checkpoint.rust_action_active = 1;
       if (rivetlua_capi_call_abort_to_b7(main_state, frame_depth) != 1)
         complete = 0;
@@ -1126,7 +2240,8 @@ static int rivetlua_b11_close_drive(lua_State *state) {
       break;
     }
     if (step.kind == -2) {
-      /* os.exit 是 VM terminal；依最新 close 旗標重查同一 queue。 */
+      rivetlua_b11_process_exit_close_stack(main_state);
+      /* 巢狀 os.exit(true) 更新狀態碼後，繼續關閉剩餘 TBC 與 finalizer。 */
       continue;
     }
     if (step.kind < 0) complete = 0;
@@ -1148,7 +2263,15 @@ static int rivetlua_b11_close_drive(lua_State *state) {
           main_state, checkpoint.generation, checkpoint.token,
           checkpoint.previous_state_token) != RV_A1_OK)
     return 0;
-  if (complete) return rivetlua_capi_close_drop_b11(main_state) == 1;
+  int exit_status = 0, exit_close = 0;
+  int process_exit = rivetlua_capi_process_exit_request_b11(
+      main_state, &exit_status, &exit_close);
+  if (complete) {
+    int dropped = rivetlua_capi_close_drop_b11(main_state) == 1;
+    if (process_exit == 1) exit(exit_status);
+    return dropped;
+  }
+  if (process_exit == 1) exit(exit_status);
   return 0;
 }
 
@@ -1190,6 +2313,14 @@ static void rivetlua_a4_raise(lua_State *state, int status) {
 }
 
 static void rivetlua_a4_table_drive(lua_State *state, int index, int setter) {
+  if (rivetlua_b3_reader_direct(state)) {
+    int published = 0;
+    int status = rivetlua_b5_operation_drive(
+        state, setter ? 7 : 6, 0, index, 0, 0, &published);
+    if (status != 0 || published != 1)
+      rivetlua_b5_operation_raise_result(state, status, published);
+    return;
+  }
   int depth = rivetlua_capi_operation_depth_b5(state);
   if (depth < 0) rivetlua_a4_raise(state, -RV_A1_ERROR_LUA);
   rivetlua_capi_callback_step_b4 step =
@@ -1197,13 +2328,17 @@ static void rivetlua_a4_table_drive(lua_State *state, int index, int setter) {
   while (step.kind == 1 || step.kind == 2 || step.kind == 4) {
     int returned = 0;
     if (!rivetlua_b10_invoke_step(state, &step, &returned)) break;
-    int close_status = rivetlua_b7_close_drive(
-        state, 0, (size_t)lua_gettop(state), 0, 0);
+    int close_status = rivetlua_b7_close_drive_forward(
+        state, 0, (size_t)lua_gettop(state), 0);
     if (close_status != 0) {
       if (rivetlua_capi_operation_abort_to_b5(state, depth) != 0) abort();
       rivetlua_a4_raise(state, close_status);
     }
     step = rivetlua_capi_table_resume_a4a(state, returned, setter);
+  }
+  if (step.kind == 5) {
+    rivetlua_b4_transfer_handoff(state, &step);
+    abort();
   }
   if (step.kind == 0 && step.value == 1) return;
   if (rivetlua_capi_operation_abort_to_b5(state, depth) != 0) abort();
@@ -1229,9 +2364,7 @@ static void rivetlua_a4_aux_push(lua_State *state, int operation, int index,
   if (result.kind == RV_A1_ACTION_RAISE)
     (void)rivetlua_b2_finish(state, generation, token, result);
   if (top == NULL) {
-    (void)rivetlua_capi_generic_panic_error_a3(state);
-    lua_CFunction panicf = rivetlua_capi_panic_snapshot_a2(state);
-    if (panicf != NULL) (void)panicf(state);
+    rivetlua_a3_panic(state, 0);
   }
   abort();
 }
@@ -1394,7 +2527,7 @@ int rivetlua_capi_requiref_protected_b2(lua_State *state, const char *name,
   if (outcome.kind != RV_A1_OUT_RAISED) return -1;
   int32_t error_class = 0;
   if (rivetlua_capi_error_consume_a1(state, &error_class) != RV_A1_OK) return -1;
-  return error_class == RV_A1_ERROR_ALLOCATION ? LUA_ERRMEM : LUA_ERRRUN;
+  return rivetlua_b13_public_status(error_class);
 }
 
 void luaL_setfuncs(lua_State *state, const luaL_Reg *entries, int nup) {
@@ -1733,11 +2866,16 @@ int rivetlua_capi_test_upvalue_cache_lifecycle_a4b(lua_State *state, int mode) {
 
 /* A2 public 同步呼叫只以 B4 coordinator 驅動；handler root 由 Rust preflight 持有。 */
 static int rivetlua_a2_status(int class_code) {
-  return class_code == RV_A1_ERROR_ALLOCATION ? LUA_ERRMEM : LUA_ERRRUN;
+  return rivetlua_b13_public_status(class_code);
 }
 
 static int rivetlua_a2_consume_settle(
-    lua_State *state, size_t base, int *class_code) {
+    lua_State *state, size_t base, int *class_code, int *throw_depth) {
+  if (throw_depth != NULL) {
+    int depth = rivetlua_capi_pending_throw_depth_b13(state);
+    if (depth < 0) return 0;
+    *throw_depth = depth;
+  }
   if (rivetlua_capi_error_consume_a1(state, class_code) != RV_A1_OK)
     return 0;
   return rivetlua_capi_public_settle_error_a2(state, base);
@@ -1791,6 +2929,8 @@ int lua_yieldk(lua_State *state, int nresults, lua_KContext context,
   rivetlua_capi_checkpoint_a1 *target = rivetlua_capi_resume_top_a5;
   if (state == NULL || target == NULL || target->state != state)
     return luaL_error(state, "attempt to yield from outside a coroutine");
+  if (!lua_isyieldable(state))
+    return luaL_error(state, "attempt to yield across a C-call boundary");
   unsigned skipped = 0;
   rivetlua_capi_checkpoint_a1 *cursor = rivetlua_capi_top_a1;
   while (cursor != NULL && cursor != target) {
@@ -1802,6 +2942,12 @@ int lua_yieldk(lua_State *state, int nresults, lua_KContext context,
   }
   if (cursor != target || target->rust_action_active != 0 || nresults < 0)
     return luaL_error(state, "attempt to yield across a C-call boundary");
+  if (nresults == 0 && continuation == NULL) {
+    int marked = rivetlua_capi_hook_yield_mark_c16(state);
+    if (marked < 0)
+      rivetlua_b5_operation_raise_message(state, marked, 0);
+    if (marked == 1) return 0;
+  }
   int prepared = rivetlua_capi_yield_prepare_a5(
       state, nresults, context, continuation);
   if (prepared == -RV_A1_ERROR_ALLOCATION)
@@ -1833,7 +2979,11 @@ int lua_resume(lua_State *state, lua_State *from, int nargs, int *nresults) {
   checkpoint.raised_status = &raised_status;
   checkpoint.rust_action_active = 0;
   checkpoint.yieldable_a5 = 1;
+  checkpoint.close_triplets_b4 = 0;
+  checkpoint.handoff_ready_b4 = 0;
   rivetlua_capi_checkpoint_a1 *previous_resume = rivetlua_capi_resume_top_a5;
+  rivetlua_capi_checkpoint_a1 *previous_b4 = rivetlua_capi_b4_driver_top;
+  rivetlua_capi_checkpoint_a1 *previous_b5 = rivetlua_capi_b5_driver_top;
   rivetlua_capi_top_a1 = &checkpoint;
   rivetlua_capi_resume_top_a5 = &checkpoint;
   volatile size_t resume_base = 0;
@@ -1852,21 +3002,50 @@ int lua_resume(lua_State *state, lua_State *from, int nargs, int *nresults) {
     result_count = lua_gettop(state);
     goto finish;
   }
+  if (jumped == 4) {
+    if (!checkpoint.handoff_ready_b4) abort();
+    while (checkpoint.close_triplets_b4 != 0) {
+      if (rivetlua_capi_close_recycle_b7(state) != 1) abort();
+      checkpoint.close_triplets_b4--;
+    }
+    step.kind = checkpoint.handoff_b4.kind;
+    step.value = checkpoint.handoff_b4.value;
+    step.function = checkpoint.handoff_b4.function;
+    step.hook = checkpoint.handoff_b4.hook;
+    step.event = checkpoint.handoff_b4.event;
+    step.currentline = checkpoint.handoff_b4.currentline;
+    step.token = checkpoint.handoff_b4.token;
+    step.warning_len = checkpoint.handoff_b4.warning_len;
+    checkpoint.handoff_ready_b4 = 0;
+    goto drive;
+  }
   if (jumped == 1) {
     checkpoint.rust_action_active = 0;
     if (raised_status != 0) error_class = raised_status;
     if (rivetlua_capi_call_depth_b7(state) > frame_depth) {
+      if (rivetlua_capi_call_handler_before_close_a2(state) == 1) {
+        checkpoint.rust_action_active = 1;
+        step = rivetlua_capi_call_resume_error_a2(state, LUA_MULTRET);
+        checkpoint.rust_action_active = 0;
+        goto drive;
+      }
       size_t trim_top = (size_t)lua_gettop(state);
       int captured = rivetlua_capi_close_capture_error_b7(state, trim_top);
       if (captured <= 0) goto finish;
-      int closed = rivetlua_b7_close_drive(state, 0, trim_top, captured, 0);
+      rivetlua_capi_callback_step_b4 nested_step;
+      int closed = rivetlua_b7_close_drive_handoff(
+          state, 0, trim_top, captured, 0, 0, &nested_step);
+      if (closed == -3) {
+        step = nested_step;
+        goto drive;
+      }
       if (closed < 0) error_class = -closed;
       checkpoint.rust_action_active = 1;
       step = rivetlua_capi_call_resume_error_a2(state, LUA_MULTRET);
       checkpoint.rust_action_active = 0;
       goto drive;
     }
-    result = error_class == RV_A1_ERROR_ALLOCATION ? LUA_ERRMEM : LUA_ERRRUN;
+    result = rivetlua_b13_public_status(error_class);
     goto finish;
   }
   checkpoint.rust_action_active = 1;
@@ -1878,7 +3057,9 @@ int lua_resume(lua_State *state, lua_State *from, int nargs, int *nresults) {
     int top = lua_gettop(state);
     if (nargs >= 0 && nargs <= top) lua_settop(state, top - nargs);
     if (lua_pushstring(state, result == LUA_ERRMEM
-            ? "not enough memory" : "cannot resume non-suspended coroutine") == NULL)
+            ? "not enough memory"
+            : (setup.kind == -2 ? "C stack overflow"
+                                : "cannot resume non-suspended coroutine")) == NULL)
       result = LUA_ERRMEM;
     goto finish;
   }
@@ -1892,8 +3073,16 @@ int lua_resume(lua_State *state, lua_State *from, int nargs, int *nresults) {
     int count = setup.resume_args;
     if (setup.continuation != NULL)
       count = setup.continuation(state, LUA_YIELD, setup.context);
-    int closed = rivetlua_b7_close_drive(
-        state, 0, (size_t)lua_gettop(state), 0, 0);
+    rivetlua_capi_callback_step_b4 nested_step;
+    int handler_before_close =
+        rivetlua_capi_call_handler_before_close_a2(state) == 1;
+    int closed = rivetlua_b7_close_drive_handoff(
+        state, 0, (size_t)lua_gettop(state), 0, 0,
+        handler_before_close, &nested_step);
+    if (closed == -3) {
+      step = nested_step;
+      goto drive;
+    }
     checkpoint.rust_action_active = 1;
     step = closed == 0
         ? rivetlua_capi_call_resume_a2(
@@ -1905,11 +3094,38 @@ int lua_resume(lua_State *state, lua_State *from, int nargs, int *nresults) {
     step = setup.step;
   }
 drive:
-  while (step.kind == 1 || step.kind == 2 || step.kind == 4) {
+  while (step.kind == 1 || step.kind == 2 || step.kind == 4 || step.kind == 5) {
+    if (step.kind == 5) {
+      int current_depth = rivetlua_capi_call_depth_b7(state);
+      if (current_depth <= frame_depth) abort();
+      size_t top = (size_t)lua_gettop(state);
+      if (top == 0) abort();
+      rivetlua_capi_callback_step_b4 nested_step;
+      int closed = rivetlua_b7_close_drive_overlay(
+          state, 0, top - 1, step.value, &nested_step);
+      if (closed == -3) {
+        step = nested_step;
+        continue;
+      }
+      checkpoint.rust_action_active = 1;
+      step = rivetlua_capi_call_resume_overlay_a2(
+          state, closed < 0 ? -closed : 0,
+          rivetlua_capi_continuation_results_a5(state));
+      checkpoint.rust_action_active = 0;
+      continue;
+    }
     int count = 0;
     if (!rivetlua_b10_invoke_step(state, &step, &count)) goto finish;
-    int closed = rivetlua_b7_close_drive(
-        state, 0, (size_t)lua_gettop(state), 0, 0);
+    rivetlua_capi_callback_step_b4 nested_step;
+    int handler_before_close =
+        rivetlua_capi_call_handler_before_close_a2(state) == 1;
+    int closed = rivetlua_b7_close_drive_handoff(
+        state, 0, (size_t)lua_gettop(state), 0, 0,
+        handler_before_close, &nested_step);
+    if (closed == -3) {
+      step = nested_step;
+      continue;
+    }
     checkpoint.rust_action_active = 1;
     step = closed == 0
         ? rivetlua_capi_call_resume_a2(
@@ -1931,8 +3147,16 @@ drive:
           state, (size_t)depth, 1);
       int count = continuation_step.continuation(
           state, LUA_YIELD, continuation_step.context);
-      int closed = rivetlua_b7_close_drive(
-          state, 0, (size_t)lua_gettop(state), 0, 0);
+      rivetlua_capi_callback_step_b4 nested_step;
+      int handler_before_close =
+          rivetlua_capi_call_handler_before_close_a2(state) == 1;
+      int closed = rivetlua_b7_close_drive_handoff(
+          state, 0, (size_t)lua_gettop(state), 0, 0,
+          handler_before_close, &nested_step);
+      if (closed == -3) {
+        step = nested_step;
+        goto drive;
+      }
       checkpoint.rust_action_active = 1;
       step = closed == 0
           ? rivetlua_capi_call_resume_a2(
@@ -1946,25 +3170,22 @@ drive:
       if (continuation_step.protected_call) {
         int class_code = RV_A1_ERROR_LUA;
         if (!rivetlua_a2_consume_settle(
-                state, continuation_step.base, &class_code)) goto finish;
+                state, continuation_step.base, &class_code, NULL)) goto finish;
         int kstatus = rivetlua_a2_status(class_code);
-        if (continuation_step.handler != NULL) {
-          if (!rivetlua_capi_public_push_handler_a2(
-                  state, continuation_step.handler, continuation_step.base))
-            goto finish;
-          if (rivetlua_a2_call_drive(state, 1, 1, 0) != 0) {
-            int handler_class = RV_A1_ERROR_LUA;
-            if (!rivetlua_a2_consume_settle(
-                    state, continuation_step.base, &handler_class)) goto finish;
-            kstatus = LUA_ERRERR;
-          }
-        }
         continuation_step = rivetlua_capi_continuation_step_a5(
             state, (size_t)depth, 1);
         int count = continuation_step.continuation(
             state, kstatus, continuation_step.context);
-        int closed = rivetlua_b7_close_drive(
-            state, 0, (size_t)lua_gettop(state), 0, 0);
+        rivetlua_capi_callback_step_b4 nested_step;
+        int handler_before_close =
+            rivetlua_capi_call_handler_before_close_a2(state) == 1;
+        int closed = rivetlua_b7_close_drive_handoff(
+            state, 0, (size_t)lua_gettop(state), 0, 0,
+            handler_before_close, &nested_step);
+        if (closed == -3) {
+          step = nested_step;
+          goto drive;
+        }
         checkpoint.rust_action_active = 1;
         step = closed == 0
             ? rivetlua_capi_call_resume_a2(
@@ -2009,12 +3230,21 @@ drive:
       result_count = finished.nresults;
     }
   }
-finish:
-  if (result != LUA_YIELD && rivetlua_capi_call_depth_b7(state) > frame_depth) {
+finish: ;
+  int exit_status = 0, exit_close = 0;
+  if (rivetlua_capi_process_exit_request_b11(
+          state, &exit_status, &exit_close) == 1)
+    terminal_exit = 1;
+  if (terminal_exit) rivetlua_b11_process_exit_close_stack(state);
+  if ((result != LUA_YIELD || terminal_exit) &&
+      rivetlua_capi_call_depth_b7(state) > frame_depth) {
     checkpoint.rust_action_active = 1;
     (void)rivetlua_capi_call_abort_to_b7(state, frame_depth);
     checkpoint.rust_action_active = 0;
   }
+  /* lua_yieldk 會跨越內層 C frames；其 driver TLS 不能留在已失效的 stack frame。 */
+  rivetlua_capi_b4_driver_top = previous_b4;
+  rivetlua_capi_b5_driver_top = previous_b5;
   rivetlua_capi_resume_top_a5 = previous_resume;
   rivetlua_capi_top_a1 = checkpoint.previous;
   if (rivetlua_capi_checkpoint_exit_a1(
@@ -2089,7 +3319,7 @@ int lua_pcallk(lua_State *state, int nargs, int nresults, int errfunc,
             state, top->generation, top->token, -pushed, 0);
         int class_code = RV_A1_ERROR_LUA;
         if (prepared.kind == RV_A1_ACTION_RAISE &&
-            rivetlua_a2_consume_settle(state, setup.base, &class_code))
+            rivetlua_a2_consume_settle(state, setup.base, &class_code, NULL))
           return rivetlua_a2_status(class_code);
       }
       return LUA_ERRRUN;
@@ -2097,14 +3327,24 @@ int lua_pcallk(lua_State *state, int nargs, int nresults, int errfunc,
     registered = 1;
   }
   int status = LUA_OK;
-  int driven = rivetlua_a2_call_drive(state, nargs, nresults, registered);
+  rivetlua_capi_callback_step_b4 handoff;
+  int driven = rivetlua_a2_call_drive(
+      state, nargs, nresults, registered, -1, 1, setup.handler, &handoff);
+  if (driven == -3) {
+    if (registered)
+      (void)rivetlua_capi_continuation_step_a5(
+          state, (size_t)rivetlua_capi_call_depth_b7(state), 1);
+    rivetlua_capi_public_drop_handler_a2(setup.handler);
+    rivetlua_b4_transfer_handoff(state, &handoff);
+    abort();
+  }
   if (driven == -2) {
     rivetlua_a2_terminal_cleanup(state, registered, setup.handler);
     return LUA_ERRRUN;
   }
   if (driven != 0) {
     int class_code = RV_A1_ERROR_LUA;
-    if (!rivetlua_a2_consume_settle(state, setup.base, &class_code)) {
+    if (!rivetlua_a2_consume_settle(state, setup.base, &class_code, NULL)) {
       if (registered)
         (void)rivetlua_capi_continuation_step_a5(
             state, (size_t)rivetlua_capi_call_depth_b7(state), 1);
@@ -2113,35 +3353,6 @@ int lua_pcallk(lua_State *state, int nargs, int nresults, int errfunc,
       return LUA_ERRRUN;
     }
     status = rivetlua_a2_status(class_code);
-    if (setup.handler != NULL) {
-      if (!rivetlua_capi_public_push_handler_a2(
-              state, setup.handler, setup.base)) {
-        if (registered)
-          (void)rivetlua_capi_continuation_step_a5(
-              state, (size_t)rivetlua_capi_call_depth_b7(state), 1);
-        else
-          rivetlua_capi_public_drop_handler_a2(setup.handler);
-        return LUA_ERRMEM;
-      }
-      int handler_driven = rivetlua_a2_call_drive(state, 1, 1, 0);
-      if (handler_driven == -2) {
-        rivetlua_a2_terminal_cleanup(state, registered, setup.handler);
-        return LUA_ERRRUN;
-      }
-      if (handler_driven != 0) {
-        int handler_class = RV_A1_ERROR_LUA;
-        if (!rivetlua_a2_consume_settle(
-                state, setup.base, &handler_class)) {
-          if (registered)
-            (void)rivetlua_capi_continuation_step_a5(
-                state, (size_t)rivetlua_capi_call_depth_b7(state), 1);
-          else
-            rivetlua_capi_public_drop_handler_a2(setup.handler);
-          return LUA_ERRRUN;
-        }
-        status = LUA_ERRERR;
-      }
-    }
   }
   if (registered)
     (void)rivetlua_capi_continuation_step_a5(
@@ -2151,8 +3362,9 @@ int lua_pcallk(lua_State *state, int nargs, int nresults, int errfunc,
   return status;
 }
 
-void lua_callk(lua_State *state, int nargs, int nresults,
-               lua_KContext context, lua_KFunction continuation) {
+static void rivetlua_a2_callk_impl(lua_State *state, int nargs, int nresults,
+                                   lua_KContext context, lua_KFunction continuation,
+                                   int builtin_kind) {
   rivetlua_capi_public_call_setup_a2 setup =
       rivetlua_capi_public_preflight_a2(state, nargs, nresults, 0);
   if (setup.kind == -RV_A1_ERROR_ALLOCATION) {
@@ -2177,7 +3389,19 @@ void lua_callk(lua_State *state, int nargs, int nresults,
     if (pushed != 0) rivetlua_b5_operation_raise_message(state, pushed, 0);
     registered = 1;
   }
-  int driven = rivetlua_a2_call_drive(state, nargs, nresults, registered);
+  rivetlua_capi_callback_step_b4 handoff;
+  int driven = rivetlua_a2_call_drive(
+      state, nargs, nresults,
+      registered && (builtin_kind < 0 ||
+                     rivetlua_capi_builtin_allows_yield(builtin_kind)),
+      builtin_kind, rivetlua_b3_reader_direct(state), NULL, &handoff);
+  if (driven == -3) {
+    if (registered)
+      (void)rivetlua_capi_continuation_step_a5(
+          state, (size_t)rivetlua_capi_call_depth_b7(state), 1);
+    rivetlua_b4_transfer_handoff(state, &handoff);
+    abort();
+  }
   if (driven == -2) {
     rivetlua_a2_terminal_cleanup(state, registered, NULL);
     return;
@@ -2189,10 +3413,14 @@ void lua_callk(lua_State *state, int nargs, int nresults,
     return;
   }
   int class_code = RV_A1_ERROR_LUA;
-  if (!rivetlua_a2_consume_settle(state, setup.base, &class_code)) abort();
+  int throw_depth = 0;
+  if (!rivetlua_a2_consume_settle(
+          state, setup.base, &class_code, &throw_depth)) abort();
   if (registered)
     (void)rivetlua_capi_continuation_step_a5(
         state, (size_t)rivetlua_capi_call_depth_b7(state), 1);
+  if (rivetlua_capi_c_depth_set_b13(state, (uint16_t)throw_depth) != 0)
+    abort();
   rivetlua_capi_checkpoint_a1 *top = rivetlua_capi_top_a1;
   if (top != NULL && top->state == state && top->rust_action_active == 0 &&
       rivetlua_capi_error_prepare_a1(
@@ -2201,6 +3429,11 @@ void lua_callk(lua_State *state, int nargs, int nresults,
   lua_CFunction panicf = rivetlua_capi_panic_snapshot_a2(state);
   if (panicf != NULL) (void)panicf(state);
   abort();
+}
+
+void lua_callk(lua_State *state, int nargs, int nresults,
+               lua_KContext context, lua_KFunction continuation) {
+  rivetlua_a2_callk_impl(state, nargs, nresults, context, continuation, -1);
 }
 
 /* B8：每一個 C callback 與 Rust step 間都沒有存活的 Rust 借用。 */
@@ -2266,7 +3499,12 @@ static int rivetlua_b8_gc_drive(lua_State *state, int what, size_t bytes,
   if (!terminal_exit &&
       (step.kind < 0 || step.kind == 1 || step.kind == 2 || step.kind == 4))
     status = -(step.value > 0 ? step.value : RV_A1_ERROR_LUA);
-  if (status != 0) {
+  int exit_status = 0, exit_close = 0;
+  if (rivetlua_capi_process_exit_request_b11(
+          state, &exit_status, &exit_close) == 1)
+    terminal_exit = 1;
+  if (terminal_exit) rivetlua_b11_process_exit_close_stack(state);
+  if (status != 0 || terminal_exit) {
     checkpoint.rust_action_active = 1;
     (void)rivetlua_capi_pending_cancel_a1(
         state, checkpoint.generation, checkpoint.token);
@@ -2345,9 +3583,11 @@ void lua_closeslot(lua_State *state, int index) {
   int position = lua_absindex(state, index);
   if (position <= 0)
     rivetlua_b5_operation_raise_message(state, -RV_A1_ERROR_LUA, 3);
-  int result = rivetlua_b7_close_drive(
-      state, (size_t)position - 1, (size_t)lua_gettop(state), 0, 1);
+  int result = rivetlua_b7_close_drive_forward(
+      state, (size_t)position - 1, (size_t)lua_gettop(state), 1);
   if (result != 0) rivetlua_b7_raise_existing(state, result);
+  if (rivetlua_capi_close_finish_slot_b7(state, (size_t)position - 1) != 1)
+    rivetlua_b5_operation_raise_message(state, -RV_A1_ERROR_LUA, 3);
 }
 
 void lua_settop(lua_State *state, int index) {
@@ -2358,8 +3598,8 @@ void lua_settop(lua_State *state, int index) {
     rivetlua_b5_operation_raise_message(state, -RV_A1_ERROR_LUA, 3);
   }
   if (target < top) {
-    int result = rivetlua_b7_close_drive(state, (size_t)target,
-                                         (size_t)target, 0, 0);
+    int result = rivetlua_b7_close_drive_forward(state, (size_t)target,
+                                                  (size_t)target, 0);
     if (result != 0) rivetlua_b7_raise_existing(state, result);
   }
   int result = rivetlua_capi_settop_direct_b7(state, index);
@@ -2374,15 +3614,16 @@ void lua_arith(lua_State *state, int operation) {
   int status = rivetlua_b5_operation_drive(
       state, 0, operation, 0, 0, 0, &published);
   if (status != 0 || published != 1)
-    rivetlua_b5_operation_raise(state, status);
+    rivetlua_b5_operation_raise_result(state, status, published);
 }
 
 void lua_concat(lua_State *state, int count) {
+  if (count == 1) return;
   int published = 0;
   int status = rivetlua_b5_operation_drive(
       state, 1, 0, 0, 0, count, &published);
   if (status != 0 || published != 1)
-    rivetlua_b5_operation_raise(state, status);
+    rivetlua_b5_operation_raise_result(state, status, published);
 }
 
 void lua_len(lua_State *state, int index) {
@@ -2390,14 +3631,15 @@ void lua_len(lua_State *state, int index) {
   int status = rivetlua_b5_operation_drive(
       state, 2, 0, index, 0, 0, &published);
   if (status != 0 || published != 1)
-    rivetlua_b5_operation_raise(state, status);
+    rivetlua_b5_operation_raise_result(state, status, published);
 }
 
 int lua_compare(lua_State *state, int left, int right, int operation) {
   int published = 0;
   int status = rivetlua_b5_operation_drive(
       state, 3, operation, left, right, 0, &published);
-  if (status != 0) rivetlua_b5_operation_raise(state, status);
+  if (status != 0)
+    rivetlua_b5_operation_raise_result(state, status, published);
   if (published == 0) return 0;
   int answer = lua_toboolean(state, -1);
   lua_settop(state, -2);
@@ -2409,7 +3651,7 @@ lua_Integer luaL_len(lua_State *state, int index) {
   int status = rivetlua_b5_operation_drive(
       state, 4, 0, index, 0, 0, &published);
   if (status != 0 || published != 1)
-    rivetlua_b5_operation_raise(state, status);
+    rivetlua_b5_operation_raise_result(state, status, published);
   int isnum = 0;
   lua_Integer answer = lua_tointegerx(state, -1, &isnum);
   lua_settop(state, -2);
@@ -2450,9 +3692,7 @@ static int rivetlua_a3_findfield(lua_State *state, int object, int depth) {
   return 0;
 }
 
-static int rivetlua_a3_global_name(lua_State *state, lua_Debug *ar) {
-  int top = lua_gettop(state);
-  if (!lua_getinfo(state, "f", ar)) return 0;
+static int rivetlua_a3_global_name_from_top(lua_State *state, int top) {
   lua_getfield(state, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
   luaL_checkstack(state, 6, "not enough stack");
   if (rivetlua_a3_findfield(state, top + 1, 2)) {
@@ -2469,9 +3709,33 @@ static int rivetlua_a3_global_name(lua_State *state, lua_Debug *ar) {
   return 0;
 }
 
-static void rivetlua_a3_func_name(lua_State *state, lua_Debug *ar) {
+static int rivetlua_a3_global_name(lua_State *state, lua_Debug *ar) {
+  int top = lua_gettop(state);
+  if (!lua_getinfo(state, "f", ar)) return 0;
+  return rivetlua_a3_global_name_from_top(state, top);
+}
+
+static int rivetlua_a3_trace_global_name(
+    lua_State *state, lua_State *source, lua_Debug *ar) {
+  if (state == source) return rivetlua_a3_global_name(state, ar);
+  int source_top = lua_gettop(source);
+  if (!lua_getinfo(source, "fu", ar)) {
+    lua_settop(source, source_top);
+    return 0;
+  }
+  /* 官方零 upvalue C 函式是 light C value；其他 closure 不跨 VM 搬移。 */
+  lua_CFunction function = ar->nups == 0 ? lua_tocfunction(source, -1) : NULL;
+  lua_settop(source, source_top);
+  if (function == NULL) return 0;
+  int top = lua_gettop(state);
+  lua_pushcfunction(state, function);
+  return rivetlua_a3_global_name_from_top(state, top);
+}
+
+static void rivetlua_a3_func_name(
+    lua_State *state, lua_State *source, lua_Debug *ar) {
 #if LUA_VERSION_NUM < 505
-  if (rivetlua_a3_global_name(state, ar)) {
+  if (rivetlua_a3_trace_global_name(state, source, ar)) {
     lua_pushfstring(state, "function '%s'", lua_tostring(state, -1));
     lua_remove(state, -2);
     return;
@@ -2483,7 +3747,7 @@ static void rivetlua_a3_func_name(lua_State *state, lua_Debug *ar) {
     lua_pushliteral(state, "main chunk");
   }
 #if LUA_VERSION_NUM >= 505
-  else if (rivetlua_a3_global_name(state, ar)) {
+  else if (rivetlua_a3_trace_global_name(state, source, ar)) {
     lua_pushfstring(state, "function '%s'", lua_tostring(state, -1));
     lua_remove(state, -2);
   }
@@ -2533,7 +3797,7 @@ void luaL_traceback(lua_State *state, lua_State *source,
       else
         lua_pushfstring(state, "\n\t%s:%d: in ", ar.short_src, ar.currentline);
       luaL_addvalue(&buffer);
-      rivetlua_a3_func_name(state, &ar);
+      rivetlua_a3_func_name(state, source, &ar);
       luaL_addvalue(&buffer);
       if (ar.istailcall)
         luaL_addstring(&buffer, "\n\t(...tail calls...)");
@@ -2623,7 +3887,9 @@ enum {
   RV_A3_SETMETATABLE, RV_A3_NEXT, RV_A4B_PUSHVALUE, RV_A4B_COPY,
   RV_A4B_REF, RV_A4B_UNREF, RV_A4B_GETMETATABLE, RV_A4B_SETMETATABLE,
   RV_A4B_GETUSERVALUE, RV_A4B_SETUSERVALUE,
-  RV_A4B_GETMETAFIELD, RV_A4B_TESTUDATA, RV_A5_OPEN_STANDARD_LIBRARY
+  RV_A4B_GETMETAFIELD, RV_A4B_TESTUDATA, RV_A5_OPEN_STANDARD_LIBRARY,
+  RV_A3_PUSHSTRING, RV_A3_CREATETABLE, RV_A3_FILERESULT,
+  RV_A3_EXECRESULT, RV_A3_RAWSET, RV_A3_RAWSETI, RV_A3_RAWSETP
 };
 
 /* Rust dispatch 已返回 POD；所有非局部跳轉只在目前 C checkpoint。 */
@@ -2640,11 +3906,7 @@ static rivetlua_capi_strict_result_b2 rivetlua_a3_generic(
   if (result.kind == RV_A1_ACTION_RETURN) return result;
   if (result.kind == RV_A1_ACTION_RAISE)
     return rivetlua_b2_finish(state, generation, token, result);
-  if (top == NULL) {
-    (void)rivetlua_capi_generic_panic_error_a3(state);
-    lua_CFunction panicf = rivetlua_capi_panic_snapshot_a2(state);
-    if (panicf != NULL) (void)panicf(state);
-  }
+  if (top == NULL) rivetlua_a3_panic(state, 0);
   abort();
 }
 
@@ -2653,9 +3915,48 @@ int luaopen_base(lua_State *state) {
                              0, 0, NULL, NULL, NULL, NULL).value;
 }
 
+extern int rivetlua_capi_allow_file_load_b22(lua_State *state);
+
+static void rivetlua_compat_setpath_b22(lua_State *state, const char *field,
+                                        const char *variable, const char *fallback) {
+  lua_getfield(state, LUA_REGISTRYINDEX, "LUA_NOENV");
+  int noenv = lua_toboolean(state, -1);
+  lua_pop(state, 1);
+  const char *path = NULL;
+  if (!noenv) {
+    const char *versioned = lua_pushfstring(state, "%s%s", variable, LUA_VERSUFFIX);
+    path = getenv(versioned);
+    if (path == NULL) path = getenv(variable);
+    lua_pop(state, 1);
+  }
+  const char *mark = path == NULL ? NULL : strstr(path, ";;");
+  if (path == NULL) lua_pushstring(state, fallback);
+  else if (mark == NULL) lua_pushstring(state, path);
+  else {
+    luaL_Buffer buffer;
+    luaL_buffinit(state, &buffer);
+    if (mark != path) {
+      luaL_addlstring(&buffer, path, (size_t)(mark - path));
+      luaL_addchar(&buffer, ';');
+    }
+    luaL_addstring(&buffer, fallback);
+    if (mark[2] != '\0') {
+      luaL_addchar(&buffer, ';');
+      luaL_addstring(&buffer, mark + 2);
+    }
+    luaL_pushresult(&buffer);
+  }
+  lua_setfield(state, -2, field);
+}
+
 int luaopen_package(lua_State *state) {
-  return rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 1, 0,
-                             0, 0, NULL, NULL, NULL, NULL).value;
+  int result = rivetlua_a3_generic(state, NULL, RV_A5_OPEN_STANDARD_LIBRARY, 1, 0,
+                                  0, 0, NULL, NULL, NULL, NULL).value;
+  if (result == 1 && rivetlua_capi_allow_file_load_b22(state)) {
+    rivetlua_compat_setpath_b22(state, "path", "LUA_PATH", LUA_PATH_DEFAULT);
+    rivetlua_compat_setpath_b22(state, "cpath", "LUA_CPATH", LUA_CPATH_DEFAULT);
+  }
+  return result;
 }
 
 int luaopen_coroutine(lua_State *state) {
@@ -2919,8 +4220,10 @@ void *luaL_testudata(lua_State *state, int index, const char *name) {
 }
 
 void luaL_checkstack(lua_State *state, int space, const char *message) {
-  (void)rivetlua_a3_generic(state, NULL, RV_A3_CHECKSTACK, space, 0,
-                            0, 0, NULL, message, NULL, NULL);
+  if (!lua_checkstack(state, space)) {
+    if (message != NULL) luaL_error(state, "stack overflow (%s)", message);
+    else luaL_error(state, "stack overflow");
+  }
 }
 
 void lua_rotate(lua_State *state, int index, int count) {
@@ -2958,6 +4261,41 @@ void lua_pushlightuserdata(lua_State *state, void *value) {
                             0, 0, value, NULL, NULL, NULL);
 }
 
+const char *lua_pushlstring(lua_State *state, const char *source, size_t length) {
+  rivetlua_capi_checkpoint_a1 *top = rivetlua_capi_top_a1;
+  uint64_t generation = top == NULL ? 0 : top->generation;
+  uint64_t token = top == NULL ? 0 : top->token;
+  rivetlua_capi_strict_result_b2 result = rivetlua_capi_pushlstring_dispatch_b14(
+      state, generation, token, source, length);
+  if (result.kind == RV_A1_ACTION_RETURN) return (const char *)result.pointer;
+  if (result.kind == RV_A1_ACTION_RAISE)
+    (void)rivetlua_b2_finish(state, generation, token, result);
+  if (top == NULL) {
+    (void)rivetlua_capi_generic_panic_error_a3(state);
+    lua_CFunction panicf = rivetlua_capi_panic_snapshot_a2(state);
+    if (panicf != NULL) (void)panicf(state);
+  }
+  abort();
+}
+
+const char *lua_pushstring(lua_State *state, const char *source) {
+  return (const char *)rivetlua_a3_generic(
+      state, NULL, RV_A3_PUSHSTRING, 0, 0,
+      0, 0, NULL, source, NULL, NULL).pointer;
+}
+
+const char *lua_tolstring(lua_State *state, int index, size_t *length) {
+  rivetlua_capi_aux_value_a4b result =
+      rivetlua_a4b_aux_value(state, 7, index, 0, 0, NULL);
+  if (length != NULL) *length = result.length;
+  return result.pointer;
+}
+
+void lua_createtable(lua_State *state, int array, int hash) {
+  (void)rivetlua_a3_generic(state, NULL, RV_A3_CREATETABLE, array, hash,
+                            0, 0, NULL, NULL, NULL, NULL);
+}
+
 const char *luaL_gsub(lua_State *state, const char *source,
                       const char *pattern, const char *replacement) {
   return (const char *)rivetlua_a3_generic(state, NULL, RV_A3_GSUB, 0, 0,
@@ -2979,12 +4317,182 @@ int lua_next(lua_State *state, int index) {
       0, 0, NULL, NULL, NULL, NULL).value;
 }
 
+int luaL_fileresult(lua_State *state, int stat, const char *fname) {
+  int saved_errno = errno;
+  return rivetlua_a3_generic(state, NULL, RV_A3_FILERESULT, stat, 0,
+      (lua_Integer)saved_errno, 0, NULL, fname, NULL, NULL).value;
+}
+
+int luaL_execresult(lua_State *state, int stat) {
+  int saved_errno = errno;
+  return rivetlua_a3_generic(state, NULL, RV_A3_EXECRESULT, stat, 0,
+      (lua_Integer)saved_errno, 0, NULL, NULL, NULL, NULL).value;
+}
+
+void lua_rawset(lua_State *state, int index) {
+  (void)rivetlua_a3_generic(state, NULL, RV_A3_RAWSET, index, 0,
+                            0, 0, NULL, NULL, NULL, NULL);
+}
+
+void lua_rawseti(lua_State *state, int index, lua_Integer key) {
+  (void)rivetlua_a3_generic(state, NULL, RV_A3_RAWSETI, index, 0,
+                            key, 0, NULL, NULL, NULL, NULL);
+}
+
+void lua_rawsetp(lua_State *state, int index, const void *key) {
+  (void)rivetlua_a3_generic(state, NULL, RV_A3_RAWSETP, index, 0,
+                            0, 0, (void *)key, NULL, NULL, NULL);
+}
+
+/* 測試入口須為純 C frame；failpoint 於 frame 建立後、目標 API 前才啟用。 */
+extern uint64_t rivetlua_capi_test_inject_offset_a4a(lua_State *state, uint64_t offset);
+extern int rivetlua_capi_test_limit_current_b14(lua_State *state);
+static _Thread_local int rivetlua_capi_b14_after_api;
+
+static _Thread_local int rivetlua_capi_b15_close_oom_calls;
+static _Thread_local int rivetlua_capi_b15_close_oom_after;
+
+void rivetlua_capi_test_close_oom_reset_b15(void) {
+  rivetlua_capi_b15_close_oom_calls = 0;
+  rivetlua_capi_b15_close_oom_after = 0;
+}
+
+int rivetlua_capi_test_close_oom_calls_b15(void) {
+  return rivetlua_capi_b15_close_oom_calls;
+}
+
+int rivetlua_capi_test_close_oom_after_b15(void) {
+  return rivetlua_capi_b15_close_oom_after;
+}
+
+int rivetlua_capi_test_close_oom_finalizer_b15(lua_State *state) {
+  rivetlua_capi_b15_close_oom_calls++;
+  lua_createtable(state, 32, 32);
+  rivetlua_capi_b15_close_oom_after++;
+  return 0;
+}
+
+void rivetlua_capi_test_reset_after_api_b14(void) {
+  rivetlua_capi_b14_after_api = 0;
+}
+
+int rivetlua_capi_test_after_api_b14(void) {
+  return rivetlua_capi_b14_after_api;
+}
+
+static void rivetlua_capi_test_arm_result_b14(lua_State *state) {
+  if (lua_type(state, 1) != LUA_TNUMBER) return;
+  int code = (int)lua_tointeger(state, 1);
+  int armed = code == -1
+      ? rivetlua_capi_test_limit_current_b14(state)
+      : rivetlua_capi_test_inject_point_a4a(state, code);
+  if (armed != 1) (void)luaL_error(state, "B14 failure injection setup");
+}
+
+int rivetlua_capi_test_fileresult_oom_b14(lua_State *state) {
+  errno = lua_type(state, 1) == LUA_TNUMBER && lua_tointeger(state, 1) == -1 ? 0 : 2;
+  rivetlua_capi_test_arm_result_b14(state);
+  int result = luaL_fileresult(state, 0, NULL);
+  rivetlua_capi_b14_after_api = 1;
+  return result;
+}
+
+int rivetlua_capi_test_execresult_oom_b14(lua_State *state) {
+  errno = 0;
+  rivetlua_capi_test_arm_result_b14(state);
+  int result = luaL_execresult(state, 7 << 8);
+  rivetlua_capi_b14_after_api = 1;
+  return result;
+}
+
+int rivetlua_capi_test_rawset_b14(lua_State *state) {
+  lua_rawset(state, 1);
+  rivetlua_capi_b14_after_api = 1;
+  return 0;
+}
+
+int rivetlua_capi_test_rawset_injected_b14(lua_State *state) {
+  uint64_t offset = (uint64_t)lua_tointeger(state, 1);
+  if (rivetlua_capi_test_inject_offset_a4a(state, offset) == 0)
+    return luaL_error(state, "B14 failure injection setup");
+  lua_rawset(state, 2);
+  rivetlua_capi_b14_after_api = 1;
+  return 0;
+}
+
+int rivetlua_capi_test_rawset_bad_table_b14(lua_State *state) {
+  lua_rawset(state, -1);
+  return 0;
+}
+
+int rivetlua_capi_test_rawsetp_b14(lua_State *state) {
+  lua_rawsetp(state, 1, NULL);
+  rivetlua_capi_b14_after_api = 1;
+  return 0;
+}
+
+int rivetlua_capi_test_rawsetp_injected_b14(lua_State *state) {
+  if (rivetlua_capi_test_inject_point_a4a(state, 7) != 1)
+    return luaL_error(state, "B14 failure injection setup");
+  lua_rawsetp(state, 1, NULL);
+  rivetlua_capi_b14_after_api = 1;
+  return 0;
+}
+
+int rivetlua_capi_test_rawseti_b14(lua_State *state) {
+  if (lua_toboolean(state, 1) &&
+      rivetlua_capi_test_inject_point_a4a(state, 7) != 1)
+    return luaL_error(state, "B14 failure injection setup");
+  lua_rawseti(state, 2, 97);
+  rivetlua_capi_b14_after_api = 1;
+  return 0;
+}
+
+int rivetlua_capi_test_pushlstring_oom_b14(lua_State *state) {
+  static const char value[] = "b14 long binary string allocation probe\0tail";
+  if (lua_toboolean(state, 1) &&
+      rivetlua_capi_test_inject_point_a4a(state, 6) != 1)
+    return luaL_error(state, "B14 failure injection setup");
+  lua_pushlstring(state, value, sizeof(value) - 1);
+  rivetlua_capi_b14_after_api = 1;
+  return 1;
+}
+
+int rivetlua_capi_test_pushstring_oom_b14(lua_State *state) {
+  if (lua_toboolean(state, 1) &&
+      rivetlua_capi_test_inject_point_a4a(state, 6) != 1)
+    return luaL_error(state, "B14 failure injection setup");
+  lua_pushstring(state, "b14 long string allocation probe");
+  rivetlua_capi_b14_after_api = 1;
+  return 1;
+}
+
+int rivetlua_capi_test_tolstring_oom_b14(lua_State *state) {
+  lua_pushnumber(state, 12345.75);
+  if (lua_toboolean(state, 1) &&
+      rivetlua_capi_test_inject_point_a4a(state, 6) != 1)
+    return luaL_error(state, "B14 failure injection setup");
+  (void)lua_tolstring(state, -1, NULL);
+  rivetlua_capi_b14_after_api = 1;
+  return 1;
+}
+
+int rivetlua_capi_test_createtable_oom_b14(lua_State *state) {
+  if (lua_toboolean(state, 1) &&
+      rivetlua_capi_test_inject_point_a4a(state, 1) != 1)
+    return luaL_error(state, "B14 failure injection setup");
+  lua_createtable(state, 32, 32);
+  rivetlua_capi_b14_after_api = 1;
+  return 1;
+}
+
 const char *luaL_tolstring(lua_State *state, int index, size_t *length) {
   index = lua_absindex(state, index);
   int published = 0;
   int status = rivetlua_b5_operation_drive(
       state, 5, 0, index, 0, 0, &published);
-  if (status != 0) rivetlua_b5_operation_raise(state, status);
+  if (status != 0)
+    rivetlua_b5_operation_raise_result(state, status, published);
   if (published == 1) {
     if (!lua_isstring(state, -1)) {
       lua_settop(state, -2);
@@ -3031,6 +4539,8 @@ void luaL_checkversion_(lua_State *state, double version, size_t sizes) {
     *top->raised_status = action.value;
     longjmp(top->jump, 1);
   }
+  if (top == NULL)
+    rivetlua_a3_panic(state, action.kind == RV_A1_ACTION_RAISE);
   /* 無 checkpoint、Rust action frame 或無法準備錯誤時絕不假裝相容成功。 */
   abort();
 }
@@ -3152,6 +4662,8 @@ static char *rivetlua_buffer_call_a49(
     *top->raised_status = result.value;
     longjmp(top->jump, 1);
   }
+  if (top == NULL)
+    rivetlua_a3_panic(state, result.kind == RV_A1_ACTION_RAISE);
   abort();
 }
 
@@ -3502,10 +5014,12 @@ const char *lua_pushfstring(lua_State *state, const char *format, ...) {
 
 typedef void (*rivetlua_capi_raised_hook_a1)(
     lua_State *state, void *context, rivetlua_capi_outcome_a1 *outcome);
+typedef void (*rivetlua_capi_terminal_cleanup_a1)(void *context);
 
 static rivetlua_capi_outcome_a1 rivetlua_capi_trampoline_protect_impl_a1(
     void *state, rivetlua_capi_action_fn_a1 action_fn, void *context,
-    rivetlua_capi_raised_hook_a1 raised_hook) {
+    rivetlua_capi_raised_hook_a1 raised_hook,
+    rivetlua_capi_terminal_cleanup_a1 terminal_cleanup) {
   rivetlua_capi_outcome_a1 outcome = {RV_A1_OUT_REJECTED, RV_A1_REJECT_NULL};
   if (state == NULL) return outcome;
   if (action_fn == NULL) {
@@ -3569,6 +5083,9 @@ static rivetlua_capi_outcome_a1 rivetlua_capi_trampoline_protect_impl_a1(
     }
   } else if (jumped == 3) {
     terminal_exit = 1;
+    /* 本 C frame 不再返回 caller；先釋放 B3 reader／writer 擁有的資源。 */
+    if (terminal_cleanup != NULL) terminal_cleanup(context);
+    rivetlua_b11_process_exit_close_stack((lua_State *)state);
     outcome.kind = RV_A1_OUT_REJECTED;
     outcome.value = RV_A1_REJECT_INVALID_ACTION;
     (void)rivetlua_capi_pending_cancel_a1(
@@ -3595,37 +5112,71 @@ static rivetlua_capi_outcome_a1 rivetlua_capi_trampoline_protect_impl_a1(
 rivetlua_capi_outcome_a1 rivetlua_capi_trampoline_protect_a1(
     void *state, rivetlua_capi_action_fn_a1 action_fn, void *context) {
   return rivetlua_capi_trampoline_protect_impl_a1(
-      state, action_fn, context, NULL);
+      state, action_fn, context, NULL, NULL);
 }
 
 /* B3：C reader／writer frame 是唯一 callback 與 longjmp 邊界。Rust session
    只在 callback 已返回時短借 VM，並由本 frame 在所有退出路徑釋放。 */
 typedef struct { void *pointer; int32_t fault; } rivetlua_b3_load_start;
 typedef struct {
+  int32_t fault;
+  int32_t stopped_class;
+  int32_t terminal;
+  int32_t yield_attempt;
+} rivetlua_b3_load_drive;
+#if LUA_VERSION_NUM >= 505
+typedef struct {
   void *pointer;
   const void *data;
   size_t len;
   int32_t fault;
 } rivetlua_b3_dump_start;
+#else
+typedef union {
+  uint64_t alignment;
+  unsigned char bytes[256];
+} rivetlua_b3_dump54_storage;
+typedef struct {
+  const void *data;
+  size_t len;
+  unsigned char inline_bytes[16];
+  int32_t fault;
+  int32_t done;
+} rivetlua_b3_dump54_next;
+#endif
 
 extern rivetlua_b3_load_start rivetlua_capi_load_begin_b3(
     lua_State *state, const char *name, int file_style);
-extern int rivetlua_capi_load_append_b3(
-    lua_State *state, void *session, const char *bytes, size_t len);
+extern rivetlua_b3_load_drive rivetlua_capi_load_drive_b3(
+    lua_State *state, void *session, void *context, const char *mode);
 extern int rivetlua_capi_load_finish_b3(
     lua_State *state, void *session, const char *mode);
 extern void rivetlua_capi_load_drop_b3(void *session);
 extern int rivetlua_capi_load_error_b3(
-    lua_State *state, uint64_t generation, uint64_t token, int fault);
+    lua_State *state, uint64_t generation, uint64_t token, int fault,
+    const char *filename, const char *reason, int operation, void *session);
 extern int rivetlua_capi_restore_reader_stack_b3(
     lua_State *state, int original_top);
+#if LUA_VERSION_NUM >= 505
 extern rivetlua_b3_dump_start rivetlua_capi_dump_begin_b3(
     lua_State *state, int strip);
 extern void rivetlua_capi_dump_drop_b3(void *session);
-extern int rivetlua_capi_allow_file_load_b22(lua_State *state);
-
+#else
+extern int rivetlua_capi_dump54_prepare_b3(
+    lua_State *state, int strip, void *storage);
+extern rivetlua_b3_dump54_next rivetlua_capi_dump54_next_b3(void *storage);
+extern void rivetlua_capi_dump54_drop_b3(void *storage);
+#endif
 enum { RV_B3_SYNTAX = 1, RV_B3_MEMORY = 2, RV_B3_BUDGET = 3,
        RV_B3_FILE = 4, RV_B3_POLICY = 5, RV_B3_OUTPUT_LIMIT = 6 };
+enum { RV_B3_FILE_OPEN = 0, RV_B3_FILE_REOPEN = 1, RV_B3_FILE_READ = 2 };
+
+typedef struct {
+  FILE *file;
+  unsigned n;
+  char bytes[BUFSIZ];
+  int error_number;
+} rivetlua_b3_file_reader;
 
 typedef struct {
   lua_Reader reader;
@@ -3635,11 +5186,100 @@ typedef struct {
   int file_style;
   FILE *file;
   int own_file;
+  const char *filename;
+  int file_errno;
+  int file_operation;
   int initial_fault;
   int result_status;
   int original_top;
   void *session;
+  const char *piece;
+  size_t piece_len;
+  size_t piece_at;
+  int piece_fresh;
+  int reader_eof;
 } rivetlua_b3_load_context;
+
+typedef struct {
+  const char *data;
+  size_t len;
+  int32_t status; /* 0=片段，-1=結束，-2=待提出錯誤，-3=終止，-4=yield */
+  int32_t new_piece;
+  int32_t class_code;
+} rivetlua_b3_reader_piece;
+
+/* Rust parser 可在 stack 上；reader 的任何跳轉都只落在此純 C child frame。 */
+rivetlua_b3_reader_piece rivetlua_b3_reader_peek_c(
+    lua_State *state, void *context) {
+  rivetlua_b3_load_context *load = (rivetlua_b3_load_context *)context;
+  rivetlua_b3_reader_piece result = {NULL, 0, RV_B3_BUDGET, 0, 0};
+  if (load == NULL || load->reader == NULL || load->session == NULL) return result;
+  if (load->piece_at == load->piece_len && !load->reader_eof) {
+    load->piece = NULL;
+    load->piece_len = 0;
+    load->piece_at = 0;
+    load->piece_fresh = 0;
+    rivetlua_capi_checkpoint_a1 *outer = rivetlua_capi_top_a1;
+    if (outer == NULL || outer->state != state || outer->rust_action_active != 0)
+      abort();
+    rivetlua_capi_checkpoint_a1 child = {0};
+    volatile int32_t raised_status = 0;
+    child.previous = outer;
+    child.state = state;
+    child.generation = outer->generation;
+    child.token = outer->token;
+    child.raised_status = &raised_status;
+    child.yieldable_a5 = 0;
+    rivetlua_capi_checkpoint_a1 *previous_reader_child =
+        rivetlua_capi_b3_reader_child_top;
+    rivetlua_capi_top_a1 = &child;
+    rivetlua_capi_b3_reader_child_top = &child;
+    int jumped = setjmp(child.jump);
+    if (jumped == 0) {
+      size_t size = 0;
+      const char *piece = load->reader(state, load->data, &size);
+      rivetlua_capi_top_a1 = outer;
+      rivetlua_capi_b3_reader_child_top = previous_reader_child;
+      if (load->file != NULL && ferror(load->file)) {
+        int saved = ((rivetlua_b3_file_reader *)load->data)->error_number;
+        load->file_errno = saved;
+        load->file_operation = RV_B3_FILE_READ;
+        result.status = RV_B3_FILE;
+        return result;
+      }
+      if (piece == NULL || size == 0) {
+        load->reader_eof = 1;
+      } else {
+        load->piece = piece;
+        load->piece_len = size;
+        load->piece_fresh = 1;
+      }
+    } else {
+      rivetlua_capi_top_a1 = outer;
+      rivetlua_capi_b3_reader_child_top = previous_reader_child;
+      result.status = jumped == 1 ? -2 : jumped == 2 ? -4 : jumped == 3 ? -3 : RV_B3_BUDGET;
+      result.class_code = raised_status;
+      return result;
+    }
+  }
+  if (load->reader_eof) { result.status = -1; return result; }
+  if (load->piece == NULL || load->piece_at >= load->piece_len) return result;
+  result.data = load->piece + load->piece_at;
+  result.len = load->piece_len - load->piece_at;
+  result.status = 0;
+  result.new_piece = load->piece_fresh;
+  load->piece_fresh = 0;
+  return result;
+}
+
+int rivetlua_b3_reader_consume_c(void *context, size_t bytes) {
+  rivetlua_b3_load_context *load = (rivetlua_b3_load_context *)context;
+  if (load == NULL || bytes == 0 || load->piece_at > load->piece_len ||
+      bytes > load->piece_len - load->piece_at)
+    return 0;
+  load->piece_at += bytes;
+  return 1;
+}
 
 static int rivetlua_b3_load_status(int fault) {
   if (fault == RV_B3_SYNTAX) return LUA_ERRSYNTAX;
@@ -3659,22 +5299,60 @@ static rivetlua_capi_action_a1 rivetlua_b3_load_action(
     load->session = start.pointer;
     fault = start.fault;
   }
-  while (fault == 0) {
-    size_t size = 0;
-    const char *part = load->reader(state, load->data, &size);
-    if (part == NULL || size == 0) break;
-    fault = rivetlua_capi_load_append_b3(state, load->session, part, size);
+  if (fault == 0) {
+#if LUA_VERSION_NUM < 505
+    if (load->file != NULL) errno = 0;  /* 5.4 在 lua_load 前重設 errno。 */
+#endif
+    rivetlua_b3_load_drive driven = rivetlua_capi_load_drive_b3(
+        state, load->session, load, load->mode);
+    if (driven.terminal) {
+      /* Rust parser 已正常展開；外層 B3 checkpoint 才處理終止與唯一 cleanup。 */
+      rivetlua_b4_raise_terminal_a1(state);
+      abort();
+    }
+    if (driven.yield_attempt) {
+      (void)luaL_error(state, "attempt to yield across a C-call boundary");
+      abort();
+    }
+    if (driven.stopped_class != 0) {
+      if (load->own_file && load->file != NULL) {
+        (void)fclose(load->file);
+        load->file = NULL;
+      }
+      rivetlua_capi_action_a1 raised = {RV_A1_ACTION_RAISE,
+                                        driven.stopped_class};
+      return raised;
+    }
+    fault = driven.fault;
   }
-  if (load->file != NULL && ferror(load->file)) fault = RV_B3_FILE;
+  if (load->file != NULL && ferror(load->file)) {
+    int saved = ((rivetlua_b3_file_reader *)load->data)->error_number;
+    load->file_errno = saved;
+    load->file_operation = RV_B3_FILE_READ;
+    fault = RV_B3_FILE;
+  }
+  if (fault == RV_B3_FILE && load->file_operation == RV_B3_FILE_READ) {
+#if LUA_VERSION_NUM >= 505
+    errno = 0;  /* 5.5 先取得 readstatus，再清除無用的讀取 errno。 */
+#else
+    errno = load->file_errno;
+#endif
+  }
   if (load->own_file && load->file != NULL) {
-    if (fclose(load->file) != 0) fault = RV_B3_FILE;
+    (void)fclose(load->file);
     load->file = NULL;
   }
+  if (fault == RV_B3_FILE && load->file_operation == RV_B3_FILE_READ)
+    load->file_errno = errno;
 #if LUA_VERSION_NUM >= 505
-  /* 5.5 reader 可變動 stack；片段已複製後才恢復原 top。 */
-  int restore_fault = rivetlua_capi_restore_reader_stack_b3(
-      state, load->original_top);
-  if (restore_fault != 0) fault = restore_fault;
+  /* 不再取用任何 piece 指標；成功時才還原 5.5 reader stack。 */
+  load->piece = NULL;
+  load->piece_len = load->piece_at = 0;
+  if (fault == 0) {
+    int restore_fault = rivetlua_capi_restore_reader_stack_b3(
+        state, load->original_top);
+    if (restore_fault != 0) fault = restore_fault;
+  }
 #endif
   if (fault == 0)
     fault = rivetlua_capi_load_finish_b3(state, load->session, load->mode);
@@ -3683,7 +5361,11 @@ static rivetlua_capi_action_a1 rivetlua_b3_load_action(
     return done;
   }
   load->result_status = rivetlua_b3_load_status(fault);
-  int class_code = rivetlua_capi_load_error_b3(state, generation, token, fault);
+  const char *reason = fault == RV_B3_FILE && load->file_errno != 0
+      ? strerror(load->file_errno) : NULL;
+  int class_code = rivetlua_capi_load_error_b3(
+      state, generation, token, fault, load->filename, reason,
+      load->file_operation, load->session);
   if (class_code == RV_A1_ERROR_ALLOCATION)
     load->result_status = LUA_ERRMEM;
   if (class_code <= 0) {
@@ -3708,14 +5390,28 @@ static void rivetlua_b3_load_raised(
   size_t error_top = (size_t)lua_gettop(state);
   int captured = rivetlua_capi_close_capture_error_b7(state, error_top);
   if (captured <= 0) abort();
-  int closed = rivetlua_b7_close_drive(
+  int error_replaced = 0;
+  int closed = rivetlua_b7_close_drive_inner(
       state, (size_t)load->original_top, (size_t)load->original_top,
-      captured, 0);
+      captured, 0, 0, NULL, &error_replaced);
   if (closed >= 0) abort();
+  if (error_replaced) load->result_status = 0;
   outcome->value = -closed;
   if (rivetlua_capi_pending_matches_a1(
           state, top->generation, top->token, outcome->value) != RV_A1_OK)
     abort();
+}
+
+static void rivetlua_b3_load_cleanup(void *context) {
+  rivetlua_b3_load_context *load = (rivetlua_b3_load_context *)context;
+  if (load->session != NULL) {
+    rivetlua_capi_load_drop_b3(load->session);
+    load->session = NULL;
+  }
+  if (load->own_file && load->file != NULL) {
+    (void)fclose(load->file);
+    load->file = NULL;
+  }
 }
 
 static int rivetlua_b3_load_common(rivetlua_b3_load_context *load,
@@ -3723,23 +5419,24 @@ static int rivetlua_b3_load_common(rivetlua_b3_load_context *load,
   load->session = NULL;
   load->result_status = 0;
   load->original_top = lua_gettop(state);
+  load->piece = NULL;
+  load->piece_len = load->piece_at = 0;
+  load->piece_fresh = load->reader_eof = 0;
   rivetlua_capi_outcome_a1 outcome = rivetlua_capi_trampoline_protect_impl_a1(
-      state, rivetlua_b3_load_action, load, rivetlua_b3_load_raised);
-  rivetlua_capi_load_drop_b3(load->session);
-  if (load->own_file && load->file != NULL) {
-    (void)fclose(load->file);
-    load->file = NULL;
-  }
+      state, rivetlua_b3_load_action, load, rivetlua_b3_load_raised,
+      rivetlua_b3_load_cleanup);
+  rivetlua_b3_load_cleanup(load);
   if (outcome.kind == RV_A1_OUT_NORMAL) return outcome.value;
   if (outcome.kind == RV_A1_OUT_RAISED) {
     int class_code = 0;
     if (rivetlua_capi_error_consume_a1(state, &class_code) != RV_A1_OK)
       abort();
     if (load->result_status != 0)
-      return class_code == RV_A1_ERROR_ALLOCATION
-          ? LUA_ERRMEM : load->result_status;
+      return class_code == RV_A1_ERROR_ALLOCATION ||
+                     class_code == RV_A1_ERROR_HANDLING
+          ? rivetlua_b13_public_status(class_code) : load->result_status;
     /* reader 的原錯誤或 __close 替代錯誤已在同一 checkpoint 歸位。 */
-    return class_code == RV_A1_ERROR_ALLOCATION ? LUA_ERRMEM : LUA_ERRRUN;
+    return rivetlua_b13_public_status(class_code);
   }
   return LUA_ERRMEM;
 }
@@ -3754,6 +5451,288 @@ int lua_load(lua_State *state, lua_Reader reader, void *data,
   if (reader == NULL) load.initial_fault = RV_B3_SYNTAX;
   return rivetlua_b3_load_common(&load, state);
 }
+
+/* lua_load 已保護 reader；內層 pcall 的錯誤須保留原物件與狀態類別。 */
+static void rivetlua_b3_raise_reader_result(lua_State *state, int status) {
+  int class_code = status == LUA_ERRMEM ? RV_A1_ERROR_ALLOCATION
+      : status == LUA_ERRERR ? RV_A1_ERROR_HANDLING : RV_A1_ERROR_LUA;
+  rivetlua_capi_checkpoint_a1 *top = rivetlua_capi_top_a1;
+  if (top != NULL && top->state == state && top->rust_action_active == 0 &&
+      rivetlua_capi_error_prepare_a1(
+          state, top->generation, top->token, class_code) == RV_A1_OK)
+    rivetlua_b7_raise_existing(state, -class_code);
+  abort();
+}
+
+static const char *rivetlua_b3_base_load_reader(
+    lua_State *state, void *data, size_t *size) {
+  luaL_checkstack(state, 2, "too many nested functions");
+#if LUA_VERSION_NUM >= 505
+  int *first = (int *)data;
+  if (*first) *first = 0;
+  else lua_pop(state, 1);
+#else
+  (void)data;
+#endif
+  lua_pushvalue(state, 1);
+  int status = lua_pcallk(state, 0, 1, 0, 0, NULL);
+  if (status != LUA_OK) rivetlua_b3_raise_reader_result(state, status);
+  if (lua_isnil(state, -1)) {
+#if LUA_VERSION_NUM < 505
+    lua_pop(state, 1);
+#endif
+    *size = 0;
+    return NULL;
+  }
+  if (!lua_isstring(state, -1))
+    luaL_error(state, "reader function must return a string");
+#if LUA_VERSION_NUM >= 505
+  return lua_tolstring(state, -1, size);
+#else
+  lua_replace(state, 5);
+  return lua_tolstring(state, 5, size);
+#endif
+}
+
+static int rivetlua_capi_base_load_b3(lua_State *state) {
+  size_t length = 0;
+  const char *source = lua_tolstring(state, 1, &length);
+#if LUA_VERSION_NUM >= 505
+  const char *mode = luaL_optstring(state, 3, NULL);
+  if (mode != NULL && strchr(mode, 'B') != NULL)
+    return luaL_argerror(state, 3, "invalid mode");
+#else
+  const char *mode = luaL_optstring(state, 3, "bt");
+#endif
+  int env = !lua_isnone(state, 4) ? 4 : 0;
+  int status;
+  if (source != NULL) {
+    const char *chunkname = luaL_optstring(state, 2, source);
+    status = luaL_loadbufferx(state, source, length, chunkname, mode);
+  } else {
+    const char *chunkname = luaL_optstring(state, 2, "=(load)");
+    luaL_checktype(state, 1, LUA_TFUNCTION);
+#if LUA_VERSION_NUM >= 505
+    int first = 1;
+    status = lua_load(state, rivetlua_b3_base_load_reader, &first, chunkname, mode);
+#else
+    lua_settop(state, 5);
+    status = lua_load(state, rivetlua_b3_base_load_reader, NULL, chunkname, mode);
+#endif
+  }
+  if (status == LUA_OK) {
+    if (env != 0) {
+      lua_pushvalue(state, env);
+      if (lua_setupvalue(state, -2, 1) == NULL) lua_pop(state, 1);
+    }
+    return 1;
+  }
+  luaL_pushfail(state);
+  lua_insert(state, -2);
+  return 2;
+}
+
+typedef struct {
+  int kind;
+  int calls;
+} rivetlua_b3_reader_jump_probe;
+
+/* 第二次回呼時從純 C frame 提出錯誤，驗證 child checkpoint 接住跳轉。 */
+static const char *rivetlua_b3_reader_jump(lua_State *state, void *data,
+                                           size_t *size) {
+  rivetlua_b3_reader_jump_probe *probe =
+      (rivetlua_b3_reader_jump_probe *)data;
+  probe->calls++;
+  if (probe->calls == 1) {
+    *size = 7;
+    return "return ";
+  }
+  *size = 0;
+  if (probe->kind == 1)
+    (void)lua_yieldk(state, 0, 0, NULL);
+  else
+    (void)luaL_error(state, "reader failed");
+  return NULL;
+}
+
+int rivetlua_capi_test_load_reader_jump_b3(lua_State *state, int kind,
+                                           int *calls) {
+  rivetlua_b3_reader_jump_probe probe = {kind, 0};
+  int status = lua_load(state, rivetlua_b3_reader_jump, &probe,
+                        "=reader-jump", "t");
+  if (calls != NULL) *calls = probe.calls;
+  return status;
+}
+
+typedef struct {
+  int operation;
+  int calls;
+  int close_calls;
+  int saw_error;
+} rivetlua_b3_reader_nested_probe;
+
+static int rivetlua_b3_reader_nested_close(lua_State *state) {
+  rivetlua_b3_reader_nested_probe *probe =
+      (rivetlua_b3_reader_nested_probe *)lua_touserdata(state, lua_upvalueindex(1));
+  if (probe == NULL) abort();
+  probe->close_calls++;
+  size_t length = 0;
+  const char *error = lua_tolstring(state, 2, &length);
+  static const char expected[] = "reader nested fault";
+  probe->saw_error = error != NULL && length == sizeof(expected) - 1 &&
+      memcmp(error, expected, length) == 0;
+  return 0;
+}
+
+static int rivetlua_b3_reader_nested_fault(lua_State *state) {
+  lua_pushliteral(state, "reader nested fault");
+  return lua_error(state);
+}
+
+/* 一般 C reader 直接使用未保護 lua_call 或帶 metamethod 的 B5 operation。 */
+static const char *rivetlua_b3_reader_nested(lua_State *state, void *data,
+                                            size_t *size) {
+  rivetlua_b3_reader_nested_probe *probe =
+      (rivetlua_b3_reader_nested_probe *)data;
+  probe->calls++;
+  if (probe->calls == 1) {
+    *size = 7;
+    return "return ";
+  }
+  lua_newtable(state);
+  lua_newtable(state);
+  lua_pushlightuserdata(state, probe);
+  lua_pushcclosure(state, rivetlua_b3_reader_nested_close, 1);
+  lua_setfield(state, -2, "__close");
+  lua_setmetatable(state, -2);
+  lua_toclose(state, -1);
+  if (probe->operation == 0) {
+    lua_pushcfunction(state, rivetlua_b3_reader_nested_fault);
+    lua_call(state, 0, 0);
+  } else if (probe->operation == 1) {
+    lua_newtable(state);
+    lua_newtable(state);
+    lua_pushcfunction(state, rivetlua_b3_reader_nested_fault);
+    lua_setfield(state, -2, "__add");
+    lua_setmetatable(state, -2);
+    lua_pushvalue(state, -1);
+    lua_arith(state, LUA_OPADD);
+  } else if (probe->operation == 2) {
+    lua_newtable(state);
+    lua_newtable(state);
+    lua_pushcfunction(state, rivetlua_b3_reader_nested_fault);
+    lua_setfield(state, -2, "__index");
+    lua_setmetatable(state, -2);
+    lua_pushliteral(state, "missing");
+    (void)lua_gettable(state, -2);
+  } else {
+    lua_newtable(state);
+    lua_newtable(state);
+    lua_pushcfunction(state, rivetlua_b3_reader_nested_fault);
+    lua_setfield(state, -2, "__newindex");
+    lua_setmetatable(state, -2);
+    lua_pushliteral(state, "missing");
+    lua_pushinteger(state, 1);
+    lua_settable(state, -3);
+  }
+  *size = 0;
+  return NULL;
+}
+
+int rivetlua_capi_test_load_reader_nested_b3(
+    lua_State *state, int operation, int *calls,
+    int *close_calls, int *saw_error) {
+  rivetlua_b3_reader_nested_probe probe = {operation, 0, 0, 0};
+  int status = lua_load(state, rivetlua_b3_reader_nested, &probe,
+                        "=reader-nested", "t");
+  if (calls != NULL) *calls = probe.calls;
+  if (close_calls != NULL) *close_calls = probe.close_calls;
+  if (saw_error != NULL) *saw_error = probe.saw_error;
+  return status;
+}
+
+/* 第二次回呼從 os.exit 終止，測試純 C child 接住 parser 仍存活時的終止。 */
+static const char *rivetlua_b3_reader_terminal(lua_State *state, void *data,
+                                               size_t *size) {
+  int *calls = (int *)data;
+  (*calls)++;
+  if (*calls == 1) {
+    *size = 7;
+    return "return ";
+  }
+  lua_getglobal(state, "os");
+  lua_getfield(state, -1, "exit");
+  lua_pushinteger(state, 29);
+  lua_pushboolean(state, 0);
+  lua_call(state, 2, 0);
+  *size = 0;
+  return NULL;
+}
+
+int rivetlua_capi_test_load_reader_terminal_b3(lua_State *state, int *calls) {
+  return lua_load(state, rivetlua_b3_reader_terminal, calls,
+                  "=reader-terminal", "t");
+}
+
+#if LUA_VERSION_NUM >= 505
+typedef struct {
+  int rethrow;
+  int calls;
+  int close_calls;
+  int saw_error;
+} rivetlua_b3_reader_close_probe;
+
+static int rivetlua_b3_reader_close(lua_State *state) {
+  rivetlua_b3_reader_close_probe *probe =
+      (rivetlua_b3_reader_close_probe *)lua_touserdata(state, lua_upvalueindex(1));
+  if (probe == NULL) abort();
+  probe->close_calls++;
+  const char expected[] = "invalid or incompatible Lua chunk";
+  size_t error_len = 0;
+  const char *error = lua_type(state, 2) == LUA_TSTRING
+      ? lua_tolstring(state, 2, &error_len) : NULL;
+  probe->saw_error = error != NULL && error_len == sizeof(expected) - 1 &&
+      memcmp(error, expected, error_len) == 0;
+  if (probe->rethrow) {
+    /* 使用完全相同的錯誤物件，狀態碼仍須變成新 closer 的 LUA_ERRRUN。 */
+    lua_pushvalue(state, 2);
+    return lua_error(state);
+  }
+  return 0;
+}
+
+static const char *rivetlua_b3_reader_with_close(lua_State *state, void *data,
+                                                 size_t *size) {
+  rivetlua_b3_reader_close_probe *probe =
+      (rivetlua_b3_reader_close_probe *)data;
+  probe->calls++;
+  if (probe->calls != 1) {
+    *size = 0;
+    return NULL;
+  }
+  lua_newtable(state);
+  lua_newtable(state);
+  lua_pushlightuserdata(state, probe);
+  lua_pushcclosure(state, rivetlua_b3_reader_close, 1);
+  lua_setfield(state, -2, "__close");
+  lua_setmetatable(state, -2);
+  lua_toclose(state, -1);
+  *size = sizeof("local then ") - 1;
+  return "local then ";
+}
+
+int rivetlua_capi_test_load_reader_close_b3(
+    lua_State *state, int rethrow, int *calls, int *close_calls,
+    int *saw_error) {
+  rivetlua_b3_reader_close_probe probe = {rethrow, 0, 0, 0};
+  int status = lua_load(state, rivetlua_b3_reader_with_close, &probe,
+                        "=reader-close", "t");
+  if (calls != NULL) *calls = probe.calls;
+  if (close_calls != NULL) *close_calls = probe.close_calls;
+  if (saw_error != NULL) *saw_error = probe.saw_error;
+  return status;
+}
+#endif
 
 typedef struct {
   const char *bytes;
@@ -3801,27 +5780,90 @@ int luaL_loadstring(lua_State *state, const char *source) {
                           );
 }
 
-typedef struct { FILE *file; char bytes[4096]; } rivetlua_b3_file_reader;
-
 static const char *rivetlua_b3_read_file(
     lua_State *state, void *opaque, size_t *size) {
   rivetlua_b3_file_reader *reader = (rivetlua_b3_file_reader *)opaque;
   (void)state;
+  if (reader->n != 0) {
+    *size = reader->n;
+    reader->n = 0;
+    return reader->bytes;
+  }
+  if (feof(reader->file)) { *size = 0; return NULL; }
   *size = fread(reader->bytes, 1, sizeof(reader->bytes), reader->file);
+  if (ferror(reader->file))
+    reader->error_number = errno;
   return *size == 0 ? NULL : reader->bytes;
+}
+
+static int rivetlua_b3_skip_bom(FILE *file) {
+  int c = getc(file);
+  if (c == 0xEF && getc(file) == 0xBB && getc(file) == 0xBF)
+    return getc(file);
+  return c;
+}
+
+static int rivetlua_b3_skip_comment(FILE *file, int *first) {
+  int c = *first = rivetlua_b3_skip_bom(file);
+  if (c != '#') return 0;
+  do { c = getc(file); } while (c != EOF && c != '\n');
+  *first = getc(file);
+  return 1;
 }
 
 int luaL_loadfilex(lua_State *state, const char *filename, const char *mode) {
   int permitted = rivetlua_capi_allow_file_load_b22(state);
-  FILE *file = !permitted ? NULL : filename == NULL ? stdin : fopen(filename, "rb");
-  rivetlua_b3_file_reader reader = {file, {0}};
+  FILE *file = NULL;
+  int open_errno = 0;
+  if (permitted) {
+    if (filename == NULL) file = stdin;
+    else {
+      errno = 0;
+      file = fopen(filename, "r");
+      if (file == NULL) open_errno = errno;
+    }
+  }
+  rivetlua_b3_file_reader reader = {.file = file, .n = 0, .error_number = 0};
   rivetlua_b3_load_context load = {
     .reader = rivetlua_b3_read_file, .data = &reader,
     .chunkname = filename == NULL ? "=stdin" : filename,
     .mode = mode, .file_style = filename == NULL ? 2 : 1,
     .file = file, .own_file = filename != NULL && file != NULL,
+    .filename = filename, .file_errno = open_errno,
+    .file_operation = RV_B3_FILE_OPEN,
     .initial_fault = !permitted ? RV_B3_POLICY : file == NULL ? RV_B3_FILE : 0,
   };
+  if (load.initial_fault == 0) {
+    int first;
+    if (rivetlua_b3_skip_comment(file, &first))
+      reader.bytes[reader.n++] = '\n';
+    if (first == 0x1B) {
+      reader.n = 0;
+      if (filename != NULL) {
+        errno = 0;
+        FILE *reopened = freopen(filename, "rb", file);
+        if (reopened == NULL) {
+          load.file_errno = errno;
+          load.file_operation = RV_B3_FILE_REOPEN;
+          load.initial_fault = RV_B3_FILE;
+          load.file = reader.file = NULL;
+          load.own_file = 0;
+        } else {
+          load.file = reader.file = file = reopened;
+          (void)rivetlua_b3_skip_comment(file, &first);
+        }
+      }
+    }
+    if (load.initial_fault == 0) {
+      if (first != EOF) reader.bytes[reader.n++] = (char)first;
+      if (ferror(file)) {
+        reader.error_number = errno;
+        load.file_errno = reader.error_number;
+        load.file_operation = RV_B3_FILE_READ;
+        load.initial_fault = RV_B3_FILE;
+      }
+    }
+  }
   return rivetlua_b3_load_common(&load, state);
 }
 
@@ -3830,54 +5872,97 @@ typedef struct {
   void *data;
   int strip;
   int original_top;
+#if LUA_VERSION_NUM >= 505
   void *session;
   int output_status;
   rivetlua_b3_dump_start dump;
+#else
+  rivetlua_b3_dump54_storage storage;
+  int prepared;
+  int output_status;
+#endif
 } rivetlua_b3_dump_context;
+
+static rivetlua_capi_action_a1 rivetlua_b3_dump_fault_action(
+    lua_State *state, uint64_t generation, uint64_t token, int fault) {
+  if (fault != RV_B3_MEMORY) {
+    rivetlua_capi_action_a1 failed = {RV_A1_ACTION_RETURN, 1};
+    return failed;
+  }
+  int class_code = rivetlua_capi_load_error_b3(
+      state, generation, token, RV_B3_MEMORY, NULL, NULL, 0, NULL);
+  if (class_code <= 0) {
+    rivetlua_capi_action_a1 rejected = {RV_A1_ACTION_REJECT,
+                                          RV_A1_REJECT_INVALID_ACTION};
+    return rejected;
+  }
+  rivetlua_capi_action_a1 raised = {RV_A1_ACTION_RAISE, class_code};
+  return raised;
+}
 
 static rivetlua_capi_action_a1 rivetlua_b3_dump_action(
     void *opaque, uint64_t generation, uint64_t token, void *context) {
   lua_State *state = (lua_State *)opaque;
   rivetlua_b3_dump_context *dump = (rivetlua_b3_dump_context *)context;
+#if LUA_VERSION_NUM >= 505
   dump->dump = rivetlua_capi_dump_begin_b3(state, dump->strip);
   dump->session = dump->dump.pointer;
-  if (dump->dump.fault != 0) {
-    if (dump->dump.fault != RV_B3_MEMORY) {
-      rivetlua_capi_action_a1 failed = {RV_A1_ACTION_RETURN, 1};
-      return failed;
-    }
-    int class_code = rivetlua_capi_load_error_b3(
-        state, generation, token, RV_B3_MEMORY);
-    if (class_code <= 0) {
-      rivetlua_capi_action_a1 rejected = {RV_A1_ACTION_REJECT,
-                                            RV_A1_REJECT_INVALID_ACTION};
-      return rejected;
-    }
-    rivetlua_capi_action_a1 raised = {RV_A1_ACTION_RAISE, class_code};
-    return raised;
-  }
+  if (dump->dump.fault != 0)
+    return rivetlua_b3_dump_fault_action(state, generation, token,
+                                        dump->dump.fault);
   dump->output_status = dump->writer(
       state, dump->dump.data, dump->dump.len, dump->data);
-#if LUA_VERSION_NUM >= 505
   if (dump->output_status == 0)
     dump->output_status = dump->writer(state, NULL, 0, dump->data);
   lua_settop(state, dump->original_top);
+#else
+  int fault = rivetlua_capi_dump54_prepare_b3(
+      state, dump->strip, &dump->storage);
+  if (fault != 0)
+    return rivetlua_b3_dump_fault_action(state, generation, token, fault);
+  dump->prepared = 1;
+  for (;;) {
+    rivetlua_b3_dump54_next piece = rivetlua_capi_dump54_next_b3(&dump->storage);
+    if (piece.fault != 0)
+      return rivetlua_b3_dump_fault_action(state, generation, token, piece.fault);
+    if (piece.done) break;
+    if (piece.len == 0) continue;
+    const void *bytes = piece.data != NULL ? piece.data : piece.inline_bytes;
+    dump->output_status = dump->writer(state, bytes, piece.len, dump->data);
+    if (dump->output_status != 0) break;
+  }
 #endif
   rivetlua_capi_action_a1 done = {RV_A1_ACTION_RETURN,
                                   dump->output_status};
   return done;
 }
 
+static void rivetlua_b3_dump_cleanup(void *context) {
+  rivetlua_b3_dump_context *dump = (rivetlua_b3_dump_context *)context;
+#if LUA_VERSION_NUM >= 505
+  if (dump->session != NULL) {
+    rivetlua_capi_dump_drop_b3(dump->session);
+    dump->session = NULL;
+  }
+#else
+  if (dump->prepared) {
+    rivetlua_capi_dump54_drop_b3(&dump->storage);
+    dump->prepared = 0;
+  }
+#endif
+}
+
 int lua_dump(lua_State *state, lua_Writer writer, void *data, int strip) {
   if (writer == NULL) return 1;
-  rivetlua_b3_dump_context dump = {
-    .writer = writer, .data = data, .strip = strip,
-    .original_top = lua_gettop(state), .session = NULL,
-    .output_status = 0,
-  };
-  rivetlua_capi_outcome_a1 outcome = rivetlua_capi_trampoline_protect_a1(
-      state, rivetlua_b3_dump_action, &dump);
-  rivetlua_capi_dump_drop_b3(dump.session);
+  rivetlua_b3_dump_context dump = {0};
+  dump.writer = writer;
+  dump.data = data;
+  dump.strip = strip;
+  dump.original_top = lua_gettop(state);
+  rivetlua_capi_outcome_a1 outcome = rivetlua_capi_trampoline_protect_impl_a1(
+      state, rivetlua_b3_dump_action, &dump, NULL,
+      rivetlua_b3_dump_cleanup);
+  rivetlua_b3_dump_cleanup(&dump);
   if (outcome.kind == RV_A1_OUT_NORMAL) return outcome.value;
   if (outcome.kind == RV_A1_OUT_RAISED) {
     int class_code = 0;
@@ -3886,4 +5971,211 @@ int lua_dump(lua_State *state, lua_Writer writer, void *data, int strip) {
     return lua_error(state);
   }
   return 1;
+}
+
+/* 測試專用：dump 的記憶體錯誤只穿過純 C protected frame。 */
+static int rivetlua_capi_test_discard_dump_b3(
+    lua_State *state, const void *bytes, size_t len, void *data) {
+  (void)state;
+  (void)bytes;
+  (void)len;
+  (void)data;
+  return 0;
+}
+
+static int rivetlua_capi_test_dump_call_b3(lua_State *state) {
+  int status = lua_dump(state, rivetlua_capi_test_discard_dump_b3, NULL, 0);
+  if (status != 0) {
+    lua_pushinteger(state, status);
+    return 1;
+  }
+  return 0;
+}
+
+void rivetlua_capi_test_prepare_dump_b3(lua_State *state) {
+  /* 拒絕注入前先備好 C callback；原函式留在 stack，複本為唯一參數。 */
+  lua_pushcclosure(state, rivetlua_capi_test_dump_call_b3, 0);
+  lua_pushvalue(state, -2);
+}
+
+#if LUA_VERSION_NUM < 505
+typedef struct {
+  int outer_calls;
+  int nested_calls;
+  int nested_status;
+  int gc_status;
+  size_t outer_bytes;
+  size_t nested_bytes;
+} rivetlua_b3_dump54_observation;
+
+static int rivetlua_b3_dump54_nested_writer(
+    lua_State *state, const void *bytes, size_t len, void *data) {
+  (void)state;
+  (void)bytes;
+  rivetlua_b3_dump54_observation *seen = data;
+  seen->nested_calls++;
+  seen->nested_bytes += len;
+  return 0;
+}
+
+static int rivetlua_b3_dump54_outer_writer(
+    lua_State *state, const void *bytes, size_t len, void *data) {
+  (void)bytes;
+  rivetlua_b3_dump54_observation *seen = data;
+  seen->outer_calls++;
+  seen->outer_bytes += len;
+  if (seen->outer_calls == 1) {
+    seen->nested_status = lua_dump(
+        state, rivetlua_b3_dump54_nested_writer, seen, 1);
+    lua_settop(state, 0);
+    seen->gc_status = lua_gc(state, LUA_GCCOLLECT, 0);
+  }
+  return 0;
+}
+
+static int rivetlua_b3_dump54_reentry_call(lua_State *state) {
+  rivetlua_b3_dump54_observation *seen =
+      lua_touserdata(state, lua_upvalueindex(1));
+  lua_pushvalue(state, 1);
+  int status = lua_dump(state, rivetlua_b3_dump54_outer_writer, seen, 0);
+  lua_pushinteger(state, status);
+  return 1;
+}
+
+void rivetlua_capi_test_prepare_dump54_reentry_b3(
+    lua_State *state, rivetlua_b3_dump54_observation *seen) {
+  lua_pushlightuserdata(state, seen);
+  lua_pushcclosure(state, rivetlua_b3_dump54_reentry_call, 1);
+  lua_pushvalue(state, -2);
+  lua_remove(state, -3);
+}
+#endif
+
+/* Compatibility 原生模組：Rust 只持有 dlopen lease，Lua 錯誤在純 C frame 提出。 */
+extern int rivetlua_capi_compat_load_symbol_b22(
+    lua_State *state, const char *path, const char *symbol,
+    lua_CFunction *out, const char **diagnostic);
+
+int rivetlua_capi_compat_loadlib_b22(lua_State *state) {
+  const char *path = luaL_checkstring(state, 1);
+  const char *symbol = luaL_checkstring(state, 2);
+  lua_CFunction function = NULL;
+  const char *diagnostic = NULL;
+  int only_global = symbol[0] == '*';
+  int stage = rivetlua_capi_compat_load_symbol_b22(
+      state, path, symbol, &function, &diagnostic);
+  /* Rust 保留票據已釋放；記憶體錯誤只在純 C checkpoint 提出。 */
+  if (stage == 4)
+    rivetlua_b5_operation_raise(state, -RV_A1_ERROR_ALLOCATION);
+  if (stage == 0) {
+    if (only_global) lua_pushboolean(state, 1);
+    else lua_pushcclosure(state, function, 0);
+    return 1;
+  }
+  lua_pushstring(state, diagnostic != NULL ? diagnostic : "native loader failed");
+  luaL_pushfail(state);
+  lua_insert(state, -2);
+  lua_pushstring(state, stage == 1 ? "open" : "init");
+  return 3;
+}
+
+static const char *rivetlua_compat_next_file_b22(char **path, char *end) {
+  char *name = *path;
+  if (name == end) return NULL;
+  if (*name == '\0') { *name = ';'; name++; }
+  char *separator = strchr(name, ';');
+  if (separator == NULL) separator = end;
+  *separator = '\0';
+  *path = separator;
+  return name;
+}
+
+static void rivetlua_compat_missing_b22(lua_State *state, const char *path) {
+  luaL_Buffer message;
+  luaL_buffinit(state, &message);
+  luaL_addstring(&message, "no file '");
+  luaL_addgsub(&message, path, ";", "'\n\tno file '");
+  luaL_addstring(&message, "'");
+  luaL_pushresult(&message);
+}
+
+static const char *rivetlua_compat_find_b22(
+    lua_State *state, const char *name) {
+  lua_getfield(state, lua_upvalueindex(1), "cpath");
+  const char *cpath = lua_tostring(state, -1);
+  if (cpath == NULL) luaL_error(state, "'package.cpath' must be a string");
+  if (strchr(name, '.') != NULL) name = luaL_gsub(state, name, ".", "/");
+  luaL_Buffer paths;
+  luaL_buffinit(state, &paths);
+  luaL_addgsub(&paths, cpath, "?", name);
+  luaL_addchar(&paths, '\0');
+  char *cursor = luaL_buffaddr(&paths);
+  char *end = cursor + luaL_bufflen(&paths) - 1;
+  const char *candidate;
+  while ((candidate = rivetlua_compat_next_file_b22(&cursor, end)) != NULL) {
+    FILE *file = fopen(candidate, "r");
+    if (file != NULL) {
+      fclose(file);
+      return lua_pushstring(state, candidate);
+    }
+  }
+  luaL_pushresult(&paths);
+  rivetlua_compat_missing_b22(state, lua_tostring(state, -1));
+  return NULL;
+}
+
+static int rivetlua_compat_open_function_b22(
+    lua_State *state, const char *path, const char *name,
+    lua_CFunction *function, const char **diagnostic) {
+  const char *translated = luaL_gsub(state, name, ".", "_");
+  const char *mark = strchr(translated, '-');
+  if (mark != NULL) {
+    const char *prefix = lua_pushlstring(state, translated, (size_t)(mark - translated));
+    const char *symbol = lua_pushfstring(state, "luaopen_%s", prefix);
+    int stage = rivetlua_capi_compat_load_symbol_b22(
+        state, path, symbol, function, diagnostic);
+    if (stage != 2) return stage;
+    translated = mark + 1;
+  }
+  const char *symbol = lua_pushfstring(state, "luaopen_%s", translated);
+  return rivetlua_capi_compat_load_symbol_b22(
+      state, path, symbol, function, diagnostic);
+}
+
+static int rivetlua_capi_compat_search_b22(lua_State *state, int root) {
+  const char *name = luaL_checkstring(state, 1);
+  const char *dot = strchr(name, '.');
+  if (root && dot == NULL) return 0;
+  /* 所有暫存字串均由 Lua stack／luaL_Buffer 保活，錯誤跳轉不遺失 malloc。 */
+  const char *lookup = root
+      ? lua_pushlstring(state, name, (size_t)(dot - name)) : name;
+  const char *candidate = rivetlua_compat_find_b22(state, lookup);
+  if (candidate == NULL) return 1;
+  lua_CFunction function = NULL;
+  const char *diagnostic = NULL;
+  int stage = rivetlua_compat_open_function_b22(
+      state, candidate, name, &function, &diagnostic);
+  if (stage == 4)
+    rivetlua_b5_operation_raise(state, -RV_A1_ERROR_ALLOCATION);
+  if (stage == 2 && root) {
+    lua_pushfstring(state, "no module '%s' in file '%s'", name, candidate);
+    return 1;
+  }
+  if (stage != 0) {
+    const char *message = lua_pushstring(
+        state, diagnostic != NULL ? diagnostic : "native loader failed");
+    return luaL_error(state, "error loading module '%s' from file '%s':\n\t%s",
+                      name, candidate, message);
+  }
+  lua_pushcclosure(state, function, 0);
+  lua_pushstring(state, candidate);
+  return 2;
+}
+
+int rivetlua_capi_compat_searcher_b22(lua_State *state) {
+  return rivetlua_capi_compat_search_b22(state, 0);
+}
+
+int rivetlua_capi_compat_root_searcher_b22(lua_State *state) {
+  return rivetlua_capi_compat_search_b22(state, 1);
 }

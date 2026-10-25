@@ -15,6 +15,7 @@ compile_error!("P16 C SDK 僅支援既定 little-endian target");
 
 pub mod abi;
 mod allocator;
+mod compat_host;
 #[doc(hidden)]
 pub mod error;
 mod load;
@@ -24,6 +25,16 @@ pub mod stack;
 #[doc(hidden)]
 pub mod trampoline;
 pub mod worker;
+
+#[cfg(feature = "lua54")]
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static lua_ident: [u8; 129] = *b"$LuaVersion: Lua 5.4.9  Copyright (C) 1994-2026 Lua.org, PUC-Rio $$LuaAuthors: R. Ierusalimschy, L. H. de Figueiredo, W. Celes $\0";
+
+#[cfg(feature = "lua55")]
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static lua_ident: [u8; 129] = *b"$LuaVersion: Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio $$LuaAuthors: R. Ierusalimschy, L. H. de Figueiredo, W. Celes $\0";
 
 #[cfg(feature = "lua55")]
 fn seed_time_seconds() -> i64 {

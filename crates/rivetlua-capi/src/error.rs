@@ -130,6 +130,8 @@ pub enum ErrorClass {
     Policy = codes::ERROR_POLICY,
     Allocation = codes::ERROR_ALLOCATION,
     Aborted = codes::ERROR_ABORTED,
+    /// Lua C 呼叫錯誤處理保留空間耗盡，對應 LUA_ERRERR。
+    Handling = codes::ERROR_HANDLING,
 }
 
 impl ErrorClass {
@@ -140,6 +142,7 @@ impl ErrorClass {
             codes::ERROR_POLICY => Self::Policy,
             codes::ERROR_ALLOCATION => Self::Allocation,
             codes::ERROR_ABORTED => Self::Aborted,
+            codes::ERROR_HANDLING => Self::Handling,
             _ => return None,
         })
     }
@@ -186,6 +189,7 @@ impl Reject {
 const _: () = {
     assert!(ErrorClass::Lua as i32 == codes::ERROR_LUA);
     assert!(ErrorClass::Aborted as i32 == codes::ERROR_ABORTED);
+    assert!(ErrorClass::Handling as i32 == codes::ERROR_HANDLING);
     assert!(Reject::Null as i32 == codes::REJECT_NULL);
     assert!(Reject::StackChanged as i32 == codes::REJECT_STACK_CHANGED);
 };
@@ -220,9 +224,6 @@ pub unsafe fn prepare_checkversion(checkpoint: Checkpoint, version: f64, sizes: 
     if sizes == LUAL_NUMSIZES && version == core {
         return Action::Return(0);
     }
-    if let Err(reject) = trampoline::probe(checkpoint) {
-        return Action::Reject(reject);
-    }
     let mut formatted = [0_u8; 128];
     let message = if sizes != LUAL_NUMSIZES {
         INCOMPATIBLE_NUMBERS
@@ -234,6 +235,18 @@ pub unsafe fn prepare_checkversion(checkpoint: Checkpoint, version: f64, sizes: 
         formatted[..len].copy_from_slice(&bytes[..len]);
         &formatted[..len]
     };
+    if checkpoint.generation == 0 && checkpoint.token == 0 {
+        // SAFETY：C facade 保活 state；錯誤值在 Rust 返回前發布，panic 由純 C 呼叫。
+        return match unsafe {
+            stack::publish_unprotected_message_c18(checkpoint.state, message, ErrorClass::Lua)
+        } {
+            Ok(class) => Action::Raise(class),
+            Err(_) => Action::Reject(Reject::Stale),
+        };
+    }
+    if let Err(reject) = trampoline::probe(checkpoint) {
+        return Action::Reject(reject);
+    }
     // SAFETY：checkpoint 在 probe 後仍屬同一同步 C action，helper 再驗 Rust state 身分。
     match unsafe { stack::prepare_version_pending(checkpoint, message) } {
         Ok(class) => Action::Raise(class),

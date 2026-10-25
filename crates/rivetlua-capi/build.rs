@@ -25,6 +25,7 @@ fn main() {
         ("ERROR_POLICY", 4),
         ("ERROR_ALLOCATION", 5),
         ("ERROR_ABORTED", 6),
+        ("ERROR_HANDLING", 7),
         ("REJECT_NULL", -1),
         ("REJECT_WRONG_THREAD", -2),
         ("REJECT_BUSY", -3),
@@ -65,6 +66,20 @@ fn main() {
     build
         .file("src/trampoline.c")
         .file("src/native/platform.c")
+        .file("tests/p16/lua_ident_link.c")
+        .file("tests/p16/builtin_upvalue_debug.c")
+        .file("tests/p16/process_exit_close.c")
+        .file("tests/p16/c_builtin_identity.c")
+        .file("tests/p16/c_call_depth.c")
+        .file("tests/p16/c_auxiliary_contracts.c")
+        .file("tests/p16/c_core_contracts.c")
+        .file("tests/p16/c_header_contracts.c")
+        .file("tests/p16/c_nonthrow_contracts.c")
+        .file("tests/p16/c_dump_streaming.c")
+        .file("tests/p16/c_compile_allocator_contracts.c")
+        .file("tests/p16/c_loading_contracts.c")
+        .file("tests/p16/c_reader_resume_contract.c")
+        .file("tests/p16/c_host_contracts.c")
         .include(&out)
         .std("c11")
         .warnings(true)
@@ -75,6 +90,14 @@ fn main() {
     } else {
         "lua54"
     };
+    build.define(
+        if profile == "lua55" {
+            "RV_PROFILE_LUA55"
+        } else {
+            "RV_PROFILE_LUA54"
+        },
+        None,
+    );
     let packaged = PathBuf::from("include/rivetlua").join(profile);
     let workspace = PathBuf::from("../../include/rivetlua").join(profile);
     let header_dir = if packaged.is_dir() {
@@ -83,6 +106,7 @@ fn main() {
         &workspace
     };
     build.include(header_dir);
+    build.include(header_dir.parent().expect("Lua 標頭必須位於 rivetlua 目錄"));
     if profile == "lua55" {
         build.define("RV_LUA55_B2", None);
     }
@@ -93,6 +117,34 @@ fn main() {
         build.define("_GNU_SOURCE", None);
     }
     build.compile("rivetlua_capi_trampoline_a1");
+    let mut cpp = cc::Build::new();
+    cpp.file("tests/p16/c_header_contracts.cpp")
+        .cpp(true)
+        .cpp_link_stdlib(None)
+        .std("c++11")
+        .include(&out)
+        .include(header_dir)
+        .include(header_dir.parent().expect("Lua 標頭必須位於 rivetlua 目錄"))
+        .warnings(true)
+        .extra_warnings(true)
+        .warnings_into_errors(true);
+    cpp.define(
+        if profile == "lua55" {
+            "RV_PROFILE_LUA55"
+        } else {
+            "RV_PROFILE_LUA54"
+        },
+        None,
+    );
+    if profile == "lua55" {
+        cpp.define("RV_LUA55_B2", None);
+    }
+    if target == "aarch64-apple-darwin" {
+        cpp.flag("-mmacosx-version-min=11.0");
+    } else {
+        cpp.define("_GNU_SOURCE", None);
+    }
+    cpp.compile("rivetlua_capi_header_contracts_cpp");
     if target != "aarch64-apple-darwin" {
         println!("cargo:rustc-link-lib=dl");
     }
@@ -107,6 +159,28 @@ fn main() {
         "cargo:rerun-if-changed={}",
         header_dir.join("lualib.h").display()
     );
+    println!("cargo:rerun-if-changed={}", header_dir.join("lua.h").display());
+    println!("cargo:rerun-if-changed={}", header_dir.join("lauxlib.h").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        header_dir.parent().expect("Lua 標頭必須位於 rivetlua 目錄")
+            .join("rivetlua_abi.h").display()
+    );
     println!("cargo:rerun-if-changed=src/native/platform.c");
+    println!("cargo:rerun-if-changed=tests/p16/lua_ident_link.c");
+    println!("cargo:rerun-if-changed=tests/p16/builtin_upvalue_debug.c");
+    println!("cargo:rerun-if-changed=tests/p16/process_exit_close.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_builtin_identity.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_call_depth.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_auxiliary_contracts.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_core_contracts.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_header_contracts.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_nonthrow_contracts.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_dump_streaming.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_compile_allocator_contracts.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_loading_contracts.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_reader_resume_contract.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_host_contracts.c");
+    println!("cargo:rerun-if-changed=tests/p16/c_header_contracts.cpp");
     println!("cargo:rerun-if-changed=build.rs");
 }

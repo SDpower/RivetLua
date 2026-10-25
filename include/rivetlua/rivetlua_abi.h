@@ -43,6 +43,11 @@
 #define RIVETLUA_NUMERIC_CONFIG_I64F64 1
 #define RIVETLUA_ENDIAN_LITTLE 1
 #define RIVETLUA_LAYOUT_COUNT 37
+#ifdef __cplusplus
+#define RIVETLUA_ABI_ALIGNOF(type) alignof(type)
+#else
+#define RIVETLUA_ABI_ALIGNOF(type) _Alignof(type)
+#endif
 typedef struct rivetlua_abi_identity {
   uint32_t revision;
   uint16_t profile;
@@ -57,7 +62,13 @@ typedef struct rivetlua_abi_identity {
   uint8_t luaconf_h_sha256[32];
   uint16_t layout[RIVETLUA_LAYOUT_COUNT];
 } rivetlua_abi_identity;
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern rivetlua_abi_identity rivetlua_abi_identity_v1(void);
+#ifdef __cplusplus
+}
+#endif
 static inline rivetlua_abi_identity rivetlua_expected_abi_identity(void) {
   rivetlua_abi_identity identity = {
     RIVETLUA_ABI_REVISION, RIVETLUA_PROFILE_ID, RIVETLUA_NUMERIC_CONFIG_I64F64,
@@ -66,14 +77,14 @@ static inline rivetlua_abi_identity rivetlua_expected_abi_identity(void) {
     RIVETLUA_LUA_H_SHA256_BYTES, RIVETLUA_LAUXLIB_H_SHA256_BYTES,
     RIVETLUA_LUACONF_H_SHA256_BYTES,
     {
-      sizeof(void *), _Alignof(void *), sizeof(int), _Alignof(int),
-      sizeof(long), _Alignof(long), sizeof(long long), _Alignof(long long),
-      sizeof(double), _Alignof(double), sizeof(long double), _Alignof(long double),
-      sizeof(size_t), _Alignof(size_t), sizeof(lua_Integer), _Alignof(lua_Integer),
-      sizeof(lua_Number), _Alignof(lua_Number), sizeof(lua_Unsigned), _Alignof(lua_Unsigned),
-      sizeof(lua_KContext), _Alignof(lua_KContext),
-      sizeof(lua_Debug), _Alignof(lua_Debug), sizeof(luaL_Buffer), _Alignof(luaL_Buffer),
-      sizeof(luaL_Reg), _Alignof(luaL_Reg), sizeof(luaL_Stream), _Alignof(luaL_Stream),
+      sizeof(void *), RIVETLUA_ABI_ALIGNOF(void *), sizeof(int), RIVETLUA_ABI_ALIGNOF(int),
+      sizeof(long), RIVETLUA_ABI_ALIGNOF(long), sizeof(long long), RIVETLUA_ABI_ALIGNOF(long long),
+      sizeof(double), RIVETLUA_ABI_ALIGNOF(double), sizeof(long double), RIVETLUA_ABI_ALIGNOF(long double),
+      sizeof(size_t), RIVETLUA_ABI_ALIGNOF(size_t), sizeof(lua_Integer), RIVETLUA_ABI_ALIGNOF(lua_Integer),
+      sizeof(lua_Number), RIVETLUA_ABI_ALIGNOF(lua_Number), sizeof(lua_Unsigned), RIVETLUA_ABI_ALIGNOF(lua_Unsigned),
+      sizeof(lua_KContext), RIVETLUA_ABI_ALIGNOF(lua_KContext),
+      sizeof(lua_Debug), RIVETLUA_ABI_ALIGNOF(lua_Debug), sizeof(luaL_Buffer), RIVETLUA_ABI_ALIGNOF(luaL_Buffer),
+      sizeof(luaL_Reg), RIVETLUA_ABI_ALIGNOF(luaL_Reg), sizeof(luaL_Stream), RIVETLUA_ABI_ALIGNOF(luaL_Stream),
       offsetof(lua_Debug, short_src), offsetof(lua_Debug, i_ci),
       offsetof(luaL_Buffer, init), offsetof(luaL_Reg, func),
       offsetof(luaL_Stream, closef), LUA_IDSIZE, LUAL_BUFFERSIZE
@@ -81,6 +92,7 @@ static inline rivetlua_abi_identity rivetlua_expected_abi_identity(void) {
   };
   return identity;
 }
+#undef RIVETLUA_ABI_ALIGNOF
 
 /* VM 建立前固定政策；非法值回傳 NULL。 */
 #define RIVETLUA_VM_POLICY_COMPATIBILITY 0

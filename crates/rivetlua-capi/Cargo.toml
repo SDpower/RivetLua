@@ -20,7 +20,9 @@ lua55 = []
 lua54 = []
 
 [dependencies]
+allocator-api2 = { version = "=0.2.21", default-features = false, features = ["alloc"] }
 libc = "=0.2.190"
+rivetlua-alloc = { path = "../rivetlua-alloc" }
 rivetlua-core = { path = "../rivetlua-core" }
 rivetlua-compiler = { path = "../rivetlua-compiler" }
 rivetlua-runtime = { path = "../rivetlua-runtime" }

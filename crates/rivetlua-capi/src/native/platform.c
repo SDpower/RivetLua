@@ -21,12 +21,18 @@ void *rivetlua_native_open(const char *path, int global) {
 }
 
 int rivetlua_native_symbol(void *handle, const char *name,
-                           rivetlua_native_opener *out) {
+                           rivetlua_native_opener *out,
+                           const char **diagnostic) {
+  if (diagnostic != NULL) *diagnostic = NULL;
   if (handle == NULL || name == NULL || out == NULL) return 0;
   *out = NULL;
   (void)dlerror();
   void *symbol = dlsym(handle, name);
-  if (dlerror() != NULL || symbol == NULL) return 0;
+  const char *error = dlerror();
+  if (error != NULL || symbol == NULL) {
+    if (diagnostic != NULL) *diagnostic = error;
+    return 0;
+  }
   _Static_assert(sizeof(symbol) == sizeof(*out),
                  "P16 target 的資料與函式指標大小須相同");
   memcpy(out, &symbol, sizeof(symbol));

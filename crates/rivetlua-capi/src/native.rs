@@ -3,12 +3,17 @@
 mod sha256;
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::cell::Cell;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{SharedBlock, StateAllocator};
+use rivetlua_runtime::{HostAllocationCharge, Vm};
 
 use crate::abi::{self, AbiIdentity, AbiMismatch};
 use crate::stack::{StackError, StateOwner, lua_State};
@@ -275,8 +280,218 @@ unsafe extern "C" {
         handle: *mut c_void,
         name: *const c_char,
         out: *mut Option<NativeOpener>,
+        diagnostic: *mut *const c_char,
     ) -> c_int;
     fn rivetlua_native_close(handle: *mut c_void);
+}
+
+/// 官方 Compatibility 路徑保留 dlopen handle 至 state 結束；不要求宿主提供 P16 票據。
+pub(crate) struct CompatNativeLibrary {
+    pub(crate) path: AllocVec<u8, StateAllocator>,
+    _path_charge: Option<CompatPathCharge>,
+    handle: Cell<*mut c_void>,
+}
+
+struct CompatPathCharge {
+    _base: HostAllocationCharge,
+    _extra: Option<HostAllocationCharge>,
+}
+
+struct PreparedCompatPath {
+    bytes: AllocVec<u8, StateAllocator>,
+    charge: Option<CompatPathCharge>,
+}
+
+/// C Compatibility lease 的實體 callback owner 與唯一 control backing 帳款。
+pub(crate) struct CompatLease {
+    pub(crate) owner: SharedBlock<CompatNativeLibrary>,
+    _control_charge: HostAllocationCharge,
+}
+
+impl CompatNativeLibrary {
+    pub(crate) fn prepare(vm: &mut Vm, path: &[u8]) -> Result<CompatLease, StackError> {
+        let mut bytes = AllocVec::new_in(vm.capi_backing_allocator());
+        let path_charge = if path.is_empty() {
+            None
+        } else {
+            let base_ticket = vm.capi_reserve_host_vec(&mut bytes, path.len(), path.len())?;
+            let extra_bytes = bytes.capacity().checked_sub(path.len()).ok_or(StackError::Layout)?;
+            let extra_ticket = if extra_bytes == 0 {
+                None
+            } else {
+                Some(vm.capi_reserve_host_backing(extra_bytes)?)
+            };
+            bytes.extend_from_slice(path);
+            let base = match base_ticket.commit() {
+                Ok(charge) => charge,
+                Err(error) => {
+                    drop(bytes);
+                    return Err(error.into());
+                }
+            };
+            let extra = match extra_ticket.map(|ticket| ticket.commit()).transpose() {
+                Ok(charge) => charge,
+                Err(error) => {
+                    drop(bytes);
+                    drop(base);
+                    return Err(error.into());
+                }
+            };
+            Some(CompatPathCharge { _base: base, _extra: extra })
+        };
+        let prepared_path = PreparedCompatPath { bytes, charge: path_charge };
+        let (pending, ticket) = vm.capi_reserve_host_shared::<Self>()?;
+        let control_charge = ticket.commit()?;
+        let PreparedCompatPath { bytes, charge: path_charge } = prepared_path;
+        Ok(CompatLease {
+            owner: pending.write(Self {
+                path: bytes,
+                _path_charge: path_charge,
+                handle: Cell::new(std::ptr::null_mut()),
+            }),
+            _control_charge: control_charge,
+        })
+    }
+
+    pub(crate) fn set_handle(&self, handle: *mut c_void) {
+        self.handle.set(handle);
+    }
+
+    pub(crate) fn handle(&self) -> *mut c_void {
+        self.handle.get()
+    }
+}
+
+impl Drop for CompatNativeLibrary {
+    fn drop(&mut self) {
+        if !self.handle.get().is_null() {
+            // SAFETY：此 handle 由成功的 dlopen 唯一取得，lease 在 VM 結束後釋放。
+            unsafe { rivetlua_native_close(self.handle.get()) };
+        }
+    }
+}
+
+fn compat_diagnostic(
+    target: *mut *const c_char,
+    diagnostic: *const c_char,
+    fallback: &'static CStr,
+) {
+    if !target.is_null() {
+        // SAFETY：C 呼叫端提供唯一可寫 pointer slot；libc 診斷僅供同步 C caller 立即複製。
+        unsafe { *target = if diagnostic.is_null() { fallback.as_ptr() } else { diagnostic } };
+    }
+}
+
+fn compat_native_failure_stage(error: StackError) -> c_int {
+    if crate::stack::version_error_allocation_failed(error) { 4 } else { 3 }
+}
+
+/// C trampoline 先取出 Lua 參數；此入口只載入及保留符號，不呼叫 Lua API。
+/// 回傳 0 成功、1 開啟失敗、2 符號失敗、3 state 失敗、4 記憶體配置失敗。
+///
+/// # Safety
+/// 指標須由仍存活的同執行緒 C checkpoint 傳入；`path`/`symbol` 為 NUL 結尾，
+/// `out` 可寫；非空 `diagnostic` 可寫且其中 libc 訊息須由 C caller 立即複製。
+/// 動態函式庫及相依物不得跨 FFI unwind。
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn rivetlua_capi_compat_load_symbol_b22(
+    state: *mut lua_State,
+    path: *const c_char,
+    symbol: *const c_char,
+    out: *mut Option<NativeOpener>,
+    diagnostic: *mut *const c_char,
+) -> c_int {
+    if path.is_null() || symbol.is_null() || out.is_null() {
+        compat_diagnostic(diagnostic, std::ptr::null(), c"invalid native load arguments");
+        return 3;
+    }
+    if !diagnostic.is_null() {
+        // SAFETY：C 呼叫端提供唯一可寫 pointer slot。
+        unsafe { *diagnostic = std::ptr::null() };
+    }
+    let attempt = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY：C trampoline 保留兩個 NUL 結尾參數至本呼叫返回。
+        let path = unsafe { CStr::from_ptr(path) };
+        let symbol = unsafe { CStr::from_ptr(symbol) };
+        let only_global = symbol.to_bytes().first() == Some(&b'*');
+        // SAFETY：checked_state 以 StateGroup 辨識主執行緒及 coroutine；查詢期間不保留借用。
+        let lease = match unsafe { crate::stack::compat_native_find(state, path.to_bytes()) } {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                let (reservation, lease) = match unsafe {
+                    crate::stack::compat_native_reserve(state, path.to_bytes())
+                } {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        compat_diagnostic(
+                            diagnostic,
+                            std::ptr::null(),
+                            c"native library lease unavailable",
+                        );
+                        return compat_native_failure_stage(error);
+                    }
+                };
+                // SAFETY：path 在同步 dlopen 呼叫期間有效；constructor 不經 Rust frame unwind。
+                let handle = unsafe {
+                    rivetlua_native_open(path.as_ptr(), c_int::from(only_global))
+                };
+                if handle.is_null() {
+                    // SAFETY：dlopen 失敗後立即取得此執行緒的診斷，C caller 立即複製。
+                    let loader_error = unsafe { libc::dlerror() };
+                    compat_diagnostic(diagnostic, loader_error, c"cannot open native library");
+                    return 1;
+                }
+                lease.owner.set_handle(handle);
+                match reservation.publish_compat(lease) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        compat_diagnostic(
+                            diagnostic,
+                            std::ptr::null(),
+                            c"native library lease publication failed",
+                        );
+                        return compat_native_failure_stage(error);
+                    }
+                }
+            }
+            Err(error) => {
+                compat_diagnostic(
+                    diagnostic,
+                    std::ptr::null(),
+                    c"native library lease unavailable",
+                );
+                return compat_native_failure_stage(error);
+            }
+        };
+        if only_global {
+            // SAFETY：C 呼叫端提供有效 out；首字元 '*' 表示只載入全域 symbols。
+            unsafe { *out = None };
+            return 0;
+        }
+        let mut function: Option<NativeOpener> = None;
+        let mut symbol_error = std::ptr::null();
+        // SAFETY：lease 已保留 handle；符號名稱在呼叫期間有效。
+        if unsafe {
+            rivetlua_native_symbol(
+                lease.handle(), symbol.as_ptr(), &mut function, &mut symbol_error,
+            )
+        } == 0
+            || function.is_none()
+        {
+            compat_diagnostic(diagnostic, symbol_error, c"native open function not found");
+            return 2;
+        }
+        // SAFETY：C 呼叫端提供有效 out；lease 在 state 結束前持續持有 library。
+        unsafe { *out = function };
+        0
+    }));
+    match attempt {
+        Ok(code) => code,
+        Err(_) => {
+            compat_diagnostic(diagnostic, std::ptr::null(), c"native loader panicked");
+            3
+        }
+    }
 }
 
 /// 載入時已查核且不可在 preflight 後改寫的宿主授權紀錄。
@@ -323,8 +538,11 @@ impl NativeLibrary {
         let mut opener: Option<NativeOpener> = None;
         // SAFETY：此 handle 由 attested load 建立且 Rc 維持其存活；CNoUnwind 聲明
         // 已涵蓋此映像，dlsym 不呼叫 Lua 或 opener。
-        let found =
-            unsafe { rivetlua_native_symbol(self.handle, symbol.as_ptr(), &mut opener) } != 0;
+        let found = unsafe {
+            rivetlua_native_symbol(
+                self.handle, symbol.as_ptr(), &mut opener, std::ptr::null_mut(),
+            )
+        } != 0;
         if !found {
             return Err(NativeError::Symbol);
         }
@@ -438,7 +656,9 @@ pub fn load_and_bind(
     let opener = if let Some(symbol) = symbol {
         let mut opener: Option<NativeOpener> = None;
         // SAFETY：handle 為本次 dlopen 有效值；symbol NUL 結尾，out 唯一可寫。
-        let found = unsafe { rivetlua_native_symbol(handle, symbol.as_ptr(), &mut opener) } != 0;
+        let found = unsafe {
+            rivetlua_native_symbol(handle, symbol.as_ptr(), &mut opener, std::ptr::null_mut())
+        } != 0;
         if !found {
             return Err(NativeError::Symbol);
         }
