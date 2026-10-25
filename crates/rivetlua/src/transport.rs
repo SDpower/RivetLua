@@ -70,7 +70,7 @@ impl TransportBudget {
         self.ledger.snapshot()
     }
 
-    /// 讀取單次操作的公開配置嘗試序號，供呼叫端與測試觀察。
+    /// 讀取配置序號並啟用後續詳細診斷；首次讀取前不保留 last_attempt/site 歷史。
     pub fn allocation_trace(&self) -> AllocationTrace {
         self.ledger.trace()
     }

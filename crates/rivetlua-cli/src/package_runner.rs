@@ -110,6 +110,19 @@ impl HostSourceReader for RestrictedReader {
 struct RestrictedRepository(Allowed);
 
 impl HostModuleRepository for RestrictedRepository {
+    fn readable(
+        &mut self,
+        _modname: &[u8],
+        raw: &[u8],
+        budget: &mut LoadBudget<'_>,
+    ) -> Result<bool, HostLoadError> {
+        budget.spend_work(raw.len().saturating_add(1))?;
+        let Some(path) = self.0.checked(raw, true)? else {
+            return Ok(false);
+        };
+        Ok(File::open(path).is_ok())
+    }
+
     fn search(
         &mut self,
         _modname: &[u8],
@@ -768,3 +781,5 @@ fn run_inner(
     }
     Ok(())
 }
+
+

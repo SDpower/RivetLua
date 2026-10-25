@@ -44,7 +44,8 @@ use rivetlua::{
 
 const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_READER_BYTES: usize = 4 * 1024 * 1024;
-const MAX_HOST_LOAD_TEMPORARY_BYTES: usize = 256 * 1024 * 1024;
+// 官方 Moses 模組編譯所需暫存額度超過 256 MiB。
+const MAX_HOST_LOAD_TEMPORARY_BYTES: usize = 512 * 1024 * 1024;
 const MAX_HOST_LOAD_WORK_UNITS: usize = 2 * 1024 * 1024 * 1024;
 const CLI_EXECUTION_FUEL: u64 = 8_000_000_000;
 const MAX_SCRIPT_ARGUMENTS: i64 = 1_000_000;
@@ -1218,6 +1219,19 @@ fn read_budgeted(
 struct FsRepository;
 
 impl HostModuleRepository for FsRepository {
+    fn readable(
+        &mut self,
+        _modname: &[u8],
+        candidate_path: &[u8],
+        budget: &mut LoadBudget<'_>,
+    ) -> Result<bool, HostLoadError> {
+        if candidate_path.is_empty() || candidate_path.len() > MAX_CANDIDATE_BYTES {
+            return Err(HostLoadError::new(HostLoadErrorKind::Budget, Vec::new()));
+        }
+        admit_path_access(candidate_path.len(), budget)?;
+        with_path_bytes(candidate_path, |path| Ok(File::open(path).is_ok()))
+    }
+
     fn search(
         &mut self,
         _modname: &[u8],
