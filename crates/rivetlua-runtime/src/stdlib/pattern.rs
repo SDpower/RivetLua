@@ -3,8 +3,38 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PatternError {
     Malformed,
+    EndsWithEscape,
+    MissingBracket,
+    MissingBalanceArguments,
+    MissingFrontierBracket,
+    TooManyCaptures,
+    InvalidPatternCapture,
+    InvalidCaptureIndex(u8),
+    UnfinishedCapture,
+    InvalidReplacementUse,
     TooComplex,
     Exhausted,
+}
+
+impl PatternError {
+    pub(crate) const fn message(self) -> Option<&'static str> {
+        match self {
+            Self::Malformed => Some("malformed pattern"),
+            Self::EndsWithEscape => Some("malformed pattern (ends with '%')"),
+            Self::MissingBracket => Some("malformed pattern (missing ']')"),
+            Self::MissingBalanceArguments => {
+                Some("malformed pattern (missing arguments to '%b')")
+            }
+            Self::MissingFrontierBracket => Some("missing '[' after '%f' in pattern"),
+            Self::TooManyCaptures => Some("too many captures"),
+            Self::InvalidPatternCapture => Some("invalid pattern capture"),
+            Self::InvalidCaptureIndex(_) => Some("invalid capture index"),
+            Self::UnfinishedCapture => Some("unfinished capture"),
+            Self::InvalidReplacementUse => Some("invalid use of '%' in replacement string"),
+            Self::TooComplex => Some("pattern too complex"),
+            Self::Exhausted => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -146,7 +176,7 @@ impl<'a> Matcher<'a> {
         self.step()?;
         match self.pattern.get(p) {
             Some(b'%') if p + 1 < self.pattern.len() => Ok(p + 2),
-            Some(b'%') => Err(PatternError::Malformed),
+            Some(b'%') => Err(PatternError::EndsWithEscape),
             Some(b'[') => {
                 let mut cursor = p + 1;
                 if self.pattern.get(cursor) == Some(&b'^') {
@@ -154,7 +184,7 @@ impl<'a> Matcher<'a> {
                 }
                 loop {
                     self.step()?;
-                    let byte = *self.pattern.get(cursor).ok_or(PatternError::Malformed)?;
+                    let byte = *self.pattern.get(cursor).ok_or(PatternError::MissingBracket)?;
                     cursor += 1;
                     if byte == b'%' && cursor < self.pattern.len() {
                         cursor += 1;
@@ -170,19 +200,13 @@ impl<'a> Matcher<'a> {
     }
 
     fn class(byte: u8, symbol: u8) -> bool {
-        let hit = match symbol.to_ascii_lowercase() {
-            b'a' => byte.is_ascii_alphabetic(),
-            b'c' => byte.is_ascii_control(),
-            b'd' => byte.is_ascii_digit(),
-            b'g' => byte.is_ascii_graphic(),
-            b'l' => byte.is_ascii_lowercase(),
-            b'p' => byte.is_ascii_punctuation(),
-            b's' => matches!(byte, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' '),
-            b'u' => byte.is_ascii_uppercase(),
-            b'w' => byte.is_ascii_alphanumeric(),
-            b'x' => byte.is_ascii_hexdigit(),
-            b'z' => byte == 0,
-            _ => return byte == symbol,
+        let class = symbol.to_ascii_lowercase();
+        let hit = if class == b'z' {
+            byte == 0
+        } else if let Some(hit) = rivetlua_alloc::c_ctype::classify(byte, class) {
+            hit
+        } else {
+            return byte == symbol;
         };
         if symbol.is_ascii_lowercase() {
             hit
@@ -253,7 +277,7 @@ impl<'a> Matcher<'a> {
             match self.pattern[p] {
                 b'(' => {
                     if state.count == 32 {
-                        return Err(PatternError::Malformed);
+                        return Err(PatternError::TooManyCaptures);
                     }
                     let position = self.pattern.get(p + 1) == Some(&b')');
                     state.captures[state.count] = Capture {
@@ -270,7 +294,7 @@ impl<'a> Matcher<'a> {
                         .rev()
                         .find(|&i| state.captures[i].end.is_none())
                     else {
-                        return Err(PatternError::Malformed);
+                        return Err(PatternError::InvalidPatternCapture);
                     };
                     state.captures[index].end = Some(s);
                     p += 1;
@@ -280,11 +304,17 @@ impl<'a> Matcher<'a> {
                     return Ok((s == self.source.len()).then_some(s));
                 }
                 b'%' => {
-                    let code = *self.pattern.get(p + 1).ok_or(PatternError::Malformed)?;
+                    let code = *self.pattern.get(p + 1).ok_or(PatternError::EndsWithEscape)?;
                     match code {
                         b'b' => {
-                            let open = *self.pattern.get(p + 2).ok_or(PatternError::Malformed)?;
-                            let close = *self.pattern.get(p + 3).ok_or(PatternError::Malformed)?;
+                            let open = *self
+                                .pattern
+                                .get(p + 2)
+                                .ok_or(PatternError::MissingBalanceArguments)?;
+                            let close = *self
+                                .pattern
+                                .get(p + 3)
+                                .ok_or(PatternError::MissingBalanceArguments)?;
                             if self.source.get(s) != Some(&open) {
                                 return Ok(None);
                             }
@@ -312,7 +342,7 @@ impl<'a> Matcher<'a> {
                         b'f' => {
                             let class = p + 2;
                             if self.pattern.get(class) != Some(&b'[') {
-                                return Err(PatternError::Malformed);
+                                return Err(PatternError::MissingFrontierBracket);
                             }
                             let end = self.class_end(class)?;
                             let previous = if s == 0 { 0 } else { self.source[s - 1] };
@@ -326,19 +356,26 @@ impl<'a> Matcher<'a> {
                             continue;
                         }
                         b'0'..=b'9' => {
-                            let index =
-                                usize::from(code.checked_sub(b'1').ok_or(PatternError::Malformed)?);
+                            let capture_index = code - b'0';
+                            let Some(index) = code
+                                .checked_sub(b'1')
+                                .map(usize::from)
+                            else {
+                                return Err(PatternError::InvalidCaptureIndex(capture_index));
+                            };
                             let capture = state
                                 .captures
                                 .get(index)
                                 .filter(|_| index < state.count)
-                                .ok_or(PatternError::Malformed)?;
-                            let end = capture.end.ok_or(PatternError::Malformed)?;
+                                .ok_or(PatternError::InvalidCaptureIndex(capture_index))?;
+                            let end = capture
+                                .end
+                                .ok_or(PatternError::InvalidCaptureIndex(capture_index))?;
                             if capture.position {
                                 return Ok(None);
                             }
                             if end < capture.start {
-                                return Err(PatternError::Malformed);
+                                return Err(PatternError::InvalidPatternCapture);
                             }
                             let length = end - capture.start;
                             if s.saturating_add(length) > self.source.len() {
@@ -424,3 +461,5 @@ impl<'a> Matcher<'a> {
 pub(crate) fn special(pattern: &[u8]) -> bool {
     pattern.iter().any(|byte| b"^$*+?.([%-".contains(byte))
 }
+
+

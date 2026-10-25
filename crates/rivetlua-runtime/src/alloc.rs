@@ -6,7 +6,10 @@ use crate::rust_alloc::rc::Rc;
 use core::cell::Cell;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
+use core::ops::Deref;
 use core::panic::Location;
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{AdmissionToken, LuaBindingRef, SharedBlock, StateAllocator};
 
 use crate::VmError;
 
@@ -14,10 +17,13 @@ use crate::VmError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FailPoint {
     SlotReserve,
+    SlotChargeReserve,
+    SlotSpareReserve,
     ObjectReserve,
     ObjectInitialize,
     ModuleConstantsReserve,
     StringBytesReserve,
+    ShortStringIndexReserve,
     UserdataBytesReserve,
     UserdataUservaluesReserve,
     TableArrayReserve,
@@ -53,7 +59,7 @@ impl FailPoint {
             Self::SlotReserve
             | Self::ObjectReserve
             | Self::ModuleConstantsReserve
-            | Self::StringBytesReserve
+            | Self::ShortStringIndexReserve
             | Self::UserdataBytesReserve
             | Self::UserdataUservaluesReserve
             | Self::TableArrayReserve
@@ -61,21 +67,8 @@ impl FailPoint {
             | Self::TableKeyReserve
             | Self::TableArrayGrow
             | Self::TableHashGrow
-            | Self::ChildReserve
-            | Self::ClosureCapturesReserve => AllocationDomain::LuaHeap,
+            | Self::ChildReserve => AllocationDomain::LuaHeap,
             _ => AllocationDomain::Host,
-        }
-    }
-
-    fn domain_at(self, site: AllocationSite) -> AllocationDomain {
-        // 執行器中的 captures 與 string_bytes 是短暫 staging Vec；同名
-        // failpoint 在 closure/string payload 建構處則屬 Lua heap。
-        if (matches!(self, Self::ClosureCapturesReserve) && !site.file.ends_with("closure.rs"))
-            || (matches!(self, Self::StringBytesReserve) && !site.file.ends_with("string.rs"))
-        {
-            AllocationDomain::Host
-        } else {
-            self.domain()
         }
     }
 }
@@ -118,23 +111,23 @@ pub enum AllocationFailureKind {
     RustReserve,
 }
 
-/// 宿主對邏輯配置的安全 admission 介面。實際 FFI 指標只由 CAPI 層解讀。
+/// 宿主對邏輯配置的安全 admission 介面。callback 指標僅由 rivetlua-alloc 管理。
 pub trait AllocationAdmission {
-    /// 非零要求成功時回傳唯一、非零且須以相同大小釋放的 token。
-    fn admit(&self, bytes: usize) -> Option<NonZeroUsize>;
+    /// 非零要求成功時回傳唯一擁有的 token。
+    fn admit(&self, bytes: usize) -> Option<AdmissionToken>;
 
     /// 釋放先前成功 admission 的 token；呼叫者已先丟棄對應 backing。
-    fn release(&self, token: NonZeroUsize, bytes: usize);
+    fn release(&self, token: AdmissionToken, bytes: usize);
 }
 
 struct InternalAdmission;
 
 impl AllocationAdmission for InternalAdmission {
-    fn admit(&self, _bytes: usize) -> Option<NonZeroUsize> {
-        NonZeroUsize::new(1)
+    fn admit(&self, _bytes: usize) -> Option<AdmissionToken> {
+        Some(AdmissionToken::logical(NonZeroUsize::MIN))
     }
 
-    fn release(&self, _token: NonZeroUsize, _bytes: usize) {}
+    fn release(&self, _token: AdmissionToken, _bytes: usize) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,12 +167,73 @@ pub struct AllocationPeaks {
 struct LedgerState {
     snapshot: LedgerSnapshot,
     peaks: AllocationPeaks,
-    fail_once: Option<FailPoint>,
     poisoned: bool,
     lua_reserved: usize,
     host_reserved: usize,
-    trace: AllocationTrace,
+    next_ordinal: u64,
+    failure_stamp: Option<(u64, AllocationFailureKind)>,
+    diagnostics_enabled: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DiagnosticState {
+    last_attempt: Option<AllocationAttempt>,
+    last_failure: Option<AllocationFailure>,
+    fail_once: Option<FailPoint>,
     fail_at_ordinal: Option<u64>,
+}
+
+struct LedgerInner {
+    state: Cell<LedgerState>,
+    diagnostics: Cell<DiagnosticState>,
+    backing_allocator: StateAllocator,
+}
+
+#[derive(Clone)]
+enum LedgerControl {
+    Host(Rc<LedgerInner>),
+    Lua(SharedBlock<LedgerInner>),
+}
+
+impl LedgerControl {
+    fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Host(left), Self::Host(right)) => Rc::ptr_eq(left, right),
+            (Self::Lua(left), Self::Lua(right)) => SharedBlock::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Deref for LedgerControl {
+    type Target = LedgerInner;
+    fn deref(&self) -> &Self::Target {
+        match self { Self::Host(inner) => inner, Self::Lua(inner) => inner }
+    }
+}
+
+#[derive(Clone)]
+enum AdmissionOwner {
+    Host(Rc<dyn AllocationAdmission>),
+    Lua(LuaBindingRef),
+}
+
+impl AdmissionOwner {
+    fn admit(&self, bytes: usize) -> Option<AdmissionToken> {
+        match self { Self::Host(owner) => owner.admit(bytes), Self::Lua(binding) => binding.admit(bytes) }
+    }
+
+    fn release(&self, token: AdmissionToken, bytes: usize) {
+        match self { Self::Host(owner) => owner.release(token, bytes), Self::Lua(_) => drop(token) }
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Host(left), Self::Host(right)) => Rc::ptr_eq(left, right),
+            (Self::Lua(left), Self::Lua(right)) => left.same_binding(right),
+            _ => false,
+        }
+    }
 }
 
 impl LedgerState {
@@ -203,14 +257,14 @@ impl LedgerState {
 /// VM 的邏輯配置帳本；保留票據可跨短暫 heap 借用邊界。
 #[derive(Clone)]
 pub struct AllocationLedger {
-    inner: Rc<Cell<LedgerState>>,
-    admission: Rc<dyn AllocationAdmission>,
+    inner: LedgerControl,
+    admission: AdmissionOwner,
     external_admission: bool,
 }
 
 struct PendingAdmission {
-    admission: Rc<dyn AllocationAdmission>,
-    token: Option<NonZeroUsize>,
+    admission: AdmissionOwner,
+    token: Option<AdmissionToken>,
     bytes: usize,
 }
 
@@ -235,6 +289,7 @@ impl LedgerProbe {
         self.0.peaks()
     }
 
+    /// 首次請求才啟用詳細追蹤；此前的 last_attempt／last_failure 無歷史資料。
     pub fn trace(&self) -> AllocationTrace {
         self.0.trace()
     }
@@ -242,129 +297,253 @@ impl LedgerProbe {
 
 impl AllocationLedger {
     pub fn new(limit: usize) -> Self {
-        Self::with_admission_kind(limit, Rc::new(InternalAdmission), false)
+        Self::with_admission_kind(limit, Rc::new(InternalAdmission), false, StateAllocator::Global)
     }
 
     pub fn with_admission(limit: usize, admission: Rc<dyn AllocationAdmission>) -> Self {
-        Self::with_admission_kind(limit, admission, true)
+        Self::with_admission_kind(limit, admission, true, StateAllocator::Global)
+    }
+
+    pub fn with_admission_and_allocator(
+        limit: usize,
+        admission: Rc<dyn AllocationAdmission>,
+        allocator: StateAllocator,
+    ) -> Self {
+        Self::with_admission_kind(limit, admission, true, allocator)
     }
 
     fn with_admission_kind(
         limit: usize,
         admission: Rc<dyn AllocationAdmission>,
         external_admission: bool,
+        backing_allocator: StateAllocator,
     ) -> Self {
         Self {
-            inner: Rc::new(Cell::new(LedgerState {
-                snapshot: LedgerSnapshot {
-                    limit,
-                    committed: 0,
-                    reserved: 0,
-                    lua_heap_bytes: 0,
-                    host_allocation_bytes: 0,
-                    shared_rss_observation: None,
-                },
-                peaks: AllocationPeaks {
-                    committed: 0,
-                    outstanding: 0,
-                    lua_heap_bytes: 0,
-                    host_allocation_bytes: 0,
-                },
-                fail_once: None,
-                poisoned: false,
-                lua_reserved: 0,
-                host_reserved: 0,
-                trace: AllocationTrace {
+            inner: LedgerControl::Host(Rc::new(LedgerInner {
+                state: Cell::new(LedgerState {
+                    snapshot: LedgerSnapshot {
+                        limit,
+                        committed: 0,
+                        reserved: 0,
+                        lua_heap_bytes: 0,
+                        host_allocation_bytes: 0,
+                        shared_rss_observation: None,
+                    },
+                    peaks: AllocationPeaks {
+                        committed: 0,
+                        outstanding: 0,
+                        lua_heap_bytes: 0,
+                        host_allocation_bytes: 0,
+                    },
+                    poisoned: false,
+                    lua_reserved: 0,
+                    host_reserved: 0,
                     next_ordinal: 1,
-                    last_attempt: None,
-                    last_failure: None,
-                },
-                fail_at_ordinal: None,
+                    failure_stamp: None,
+                    diagnostics_enabled: false,
+                }),
+                diagnostics: Cell::new(DiagnosticState::default()),
+                backing_allocator,
             })),
-            admission,
+            admission: AdmissionOwner::Host(admission),
             external_admission,
         }
     }
 
+    /// C-owned state 的唯一 ledger control backing；尚無 VM 可用時不重試配置。
+    pub(crate) fn with_lua_binding(limit: usize, binding: LuaBindingRef)
+        -> Result<Self, VmError>
+    {
+        let allocator = StateAllocator::Lua(binding.clone());
+        let pending = allocator.clone().shared_uninit::<LedgerInner>(0)
+            .map_err(|_| VmError::AllocationFailed)?;
+        let inner = LedgerInner {
+            state: Cell::new(LedgerState {
+                snapshot: LedgerSnapshot {
+                    limit, committed: 0, reserved: 0, lua_heap_bytes: 0,
+                    host_allocation_bytes: 0, shared_rss_observation: None,
+                },
+                peaks: AllocationPeaks {
+                    committed: 0, outstanding: 0, lua_heap_bytes: 0,
+                    host_allocation_bytes: 0,
+                },
+                poisoned: false, lua_reserved: 0, host_reserved: 0,
+                next_ordinal: 1, failure_stamp: None, diagnostics_enabled: false,
+            }),
+            diagnostics: Cell::new(DiagnosticState::default()),
+            backing_allocator: allocator,
+        };
+        Ok(Self {
+            inner: LedgerControl::Lua(pending.write(inner)),
+            admission: AdmissionOwner::Lua(binding),
+            external_admission: true,
+        })
+    }
+
+    pub(crate) fn backing_allocator(&self) -> StateAllocator {
+        self.inner.backing_allocator.clone()
+    }
+
     pub fn snapshot(&self) -> LedgerSnapshot {
-        self.inner.get().snapshot
+        self.inner.state.get().snapshot
     }
 
     pub fn peaks(&self) -> AllocationPeaks {
-        self.inner.get().peaks
+        self.inner.state.get().peaks
     }
 
     pub(crate) fn probe(&self) -> LedgerProbe {
         LedgerProbe(self.clone())
     }
 
+    /// 從首次請求開始記錄詳細配置；此前的 last_attempt 與 last_failure 無歷史資料。
     pub fn trace(&self) -> AllocationTrace {
-        self.inner.get().trace
+        let mut state = self.inner.state.get();
+        if !state.diagnostics_enabled {
+            state.diagnostics_enabled = true;
+            self.inner.state.set(state);
+        }
+        let diagnostics = self.inner.diagnostics.get();
+        AllocationTrace {
+            next_ordinal: state.next_ordinal,
+            last_attempt: diagnostics.last_attempt,
+            last_failure: diagnostics.last_failure,
+        }
+    }
+
+    /// 只在失敗時變更，供 C API 區分本次 close 是否遇到配置失敗。
+    pub fn failure_stamp(&self) -> Option<(u64, AllocationFailureKind)> {
+        self.inner.state.get().failure_stamp
     }
 
     /// 僅接受外部已量測 RSS；不把它用作 Lua 配置額度或 leak 判定。
     pub fn observe_shared_rss(&self, bytes: usize) {
-        let mut state = self.inner.get();
+        let mut state = self.inner.state.get();
         state.snapshot.shared_rss_observation = Some(bytes);
-        self.inner.set(state);
+        self.inner.state.set(state);
     }
 
     pub fn fail_once_at_ordinal(&self, ordinal: u64) {
-        let mut state = self.inner.get();
-        state.fail_at_ordinal = Some(ordinal);
-        self.inner.set(state);
+        self.enable_diagnostics();
+        let mut diagnostics = self.inner.diagnostics.get();
+        diagnostics.fail_at_ordinal = Some(ordinal);
+        self.inner.diagnostics.set(diagnostics);
+    }
+
+    fn enable_diagnostics(&self) {
+        let mut state = self.inner.state.get();
+        if !state.diagnostics_enabled {
+            state.diagnostics_enabled = true;
+            self.inner.state.set(state);
+        }
+    }
+
+    fn record_failure_in_state(
+        &self,
+        state: &mut LedgerState,
+        ordinal: u64,
+        attempt: Option<AllocationAttempt>,
+        kind: AllocationFailureKind,
+    ) {
+        state.failure_stamp = Some((ordinal, kind));
+        if let Some(attempt) = attempt {
+            let mut diagnostics = self.inner.diagnostics.get();
+            diagnostics.last_failure = Some(AllocationFailure { attempt, kind });
+            self.inner.diagnostics.set(diagnostics);
+        }
     }
 
     #[track_caller]
     fn record_preflight_overflow(&self, domain: AllocationDomain, point: FailPoint) {
-        let mut state = self.inner.get();
-        let ordinal = state.trace.next_ordinal;
+        let mut state = self.inner.state.get();
+        let ordinal = state.next_ordinal;
         if let Some(next) = ordinal.checked_add(1) {
-            state.trace.next_ordinal = next;
+            state.next_ordinal = next;
         } else {
             state.poisoned = true;
         }
+        let attempt = if state.diagnostics_enabled {
+            Some(AllocationAttempt {
+                site: AllocationSite::caller(),
+                ordinal,
+                domain,
+                bytes: usize::MAX,
+                point: Some(point),
+            })
+        } else {
+            None
+        };
+        if let Some(attempt) = attempt {
+            let mut diagnostics = self.inner.diagnostics.get();
+            diagnostics.last_attempt = Some(attempt);
+            self.inner.diagnostics.set(diagnostics);
+        }
+        self.record_failure_in_state(
+            &mut state,
+            ordinal,
+            attempt,
+            AllocationFailureKind::Arithmetic,
+        );
+        self.inner.state.set(state);
+    }
+
+    fn record_failure(
+        &self,
+        ordinal: u64,
+        attempt: Option<AllocationAttempt>,
+        kind: AllocationFailureKind,
+    ) {
+        let mut state = self.inner.state.get();
+        self.record_failure_in_state(&mut state, ordinal, attempt, kind);
+        self.inner.state.set(state);
+    }
+
+    #[track_caller]
+    fn attempt_enabled_during_admission(
+        &self,
+        ordinal: u64,
+        domain: AllocationDomain,
+        bytes: usize,
+        point: Option<FailPoint>,
+    ) -> AllocationAttempt {
         let attempt = AllocationAttempt {
             site: AllocationSite::caller(),
             ordinal,
             domain,
-            bytes: usize::MAX,
-            point: Some(point),
+            bytes,
+            point,
         };
-        state.trace.last_attempt = Some(attempt);
-        state.trace.last_failure = Some(AllocationFailure {
-            attempt,
-            kind: AllocationFailureKind::Arithmetic,
-        });
-        self.inner.set(state);
-    }
-
-    fn record_failure(&self, attempt: AllocationAttempt, kind: AllocationFailureKind) {
-        let mut state = self.inner.get();
-        state.trace.last_failure = Some(AllocationFailure { attempt, kind });
-        self.inner.set(state);
+        let mut diagnostics = self.inner.diagnostics.get();
+        diagnostics.last_attempt = Some(attempt);
+        self.inner.diagnostics.set(diagnostics);
+        attempt
     }
 
     pub fn set_limit(&self, limit: usize) {
-        let mut state = self.inner.get();
+        let mut state = self.inner.state.get();
         state.snapshot.limit = limit;
-        self.inner.set(state);
+        self.inner.state.set(state);
     }
 
     pub fn fail_once_at(&self, point: FailPoint) {
-        let mut state = self.inner.get();
-        state.fail_once = Some(point);
-        self.inner.set(state);
+        self.enable_diagnostics();
+        let mut diagnostics = self.inner.diagnostics.get();
+        diagnostics.fail_once = Some(point);
+        self.inner.diagnostics.set(diagnostics);
     }
 
     pub(crate) fn checkpoint(&self, point: FailPoint) -> Result<(), VmError> {
-        let mut state = self.inner.get();
+        let state = self.inner.state.get();
         if state.poisoned {
             return Err(VmError::LedgerInvariant);
         }
-        if state.fail_once == Some(point) {
-            state.fail_once = None;
-            self.inner.set(state);
+        if !state.diagnostics_enabled {
+            return Ok(());
+        }
+        let mut diagnostics = self.inner.diagnostics.get();
+        if diagnostics.fail_once == Some(point) {
+            diagnostics.fail_once = None;
+            self.inner.diagnostics.set(diagnostics);
             return Err(VmError::InjectedFailure(point));
         }
         Ok(())
@@ -382,9 +561,15 @@ impl AllocationLedger {
         bytes: usize,
         point: FailPoint,
     ) -> Result<Reservation, VmError> {
-        let ticket = self.reserve_at(bytes, AllocationDomain::LuaHeap, Some(point))?;
+        // Lua allocator 已持有較大的實體 Vec block；超額容量只補帳本，不再請求影子 block。
+        let ticket = self.reserve_at_inner(
+            bytes,
+            AllocationDomain::LuaHeap,
+            Some(point),
+            !self.inner.backing_allocator.is_lua(),
+        )?;
         if let Err(error) = self.checkpoint(point) {
-            self.record_failure(ticket.attempt, AllocationFailureKind::Injection);
+            self.record_failure(ticket.ordinal, ticket.attempt, AllocationFailureKind::Injection);
             return Err(error);
         }
         Ok(ticket)
@@ -397,80 +582,156 @@ impl AllocationLedger {
         domain: AllocationDomain,
         point: Option<FailPoint>,
     ) -> Result<Reservation, VmError> {
-        let mut state = self.inner.get();
+        self.reserve_at_inner(bytes, domain, point, true)
+    }
+
+    #[track_caller]
+    pub(crate) fn reserve_userdata_vec(
+        &self,
+        bytes: usize,
+        point: FailPoint,
+        physical: bool,
+    ) -> Result<Reservation, VmError> {
+        let ticket = self.reserve_at_inner(bytes, AllocationDomain::LuaHeap, Some(point), !physical)?;
+        if let Err(error) = self.checkpoint(point) {
+            self.record_failure(ticket.ordinal, ticket.attempt, AllocationFailureKind::Injection);
+            return Err(error);
+        }
+        Ok(ticket)
+    }
+
+    #[track_caller]
+    pub(crate) fn reserve_host_vec(
+        &self,
+        bytes: usize,
+        point: FailPoint,
+        physical: bool,
+    ) -> Result<Reservation, VmError> {
+        let ticket = self.reserve_at_inner(bytes, AllocationDomain::Host, Some(point), !physical)?;
+        if let Err(error) = self.checkpoint(point) {
+            self.record_failure(ticket.ordinal, ticket.attempt, AllocationFailureKind::Injection);
+            return Err(error);
+        }
+        Ok(ticket)
+    }
+
+    #[track_caller]
+    pub(crate) fn reserve_physical_host(&self, bytes: usize) -> Result<Reservation, VmError> {
+        self.reserve_at_inner(bytes, AllocationDomain::Host, None, false)
+    }
+
+    #[track_caller]
+    fn reserve_at_inner(
+        &self,
+        bytes: usize,
+        domain: AllocationDomain,
+        point: Option<FailPoint>,
+        admit: bool,
+    ) -> Result<Reservation, VmError> {
+        let mut state = self.inner.state.get();
         if state.poisoned {
             return Err(VmError::LedgerInvariant);
         }
-        let ordinal = state.trace.next_ordinal;
-        state.trace.next_ordinal = ordinal.checked_add(1).ok_or(VmError::ArithmeticOverflow)?;
-        let attempt = AllocationAttempt {
-            site: AllocationSite::caller(),
-            ordinal,
-            domain,
-            bytes,
-            point,
+        let ordinal = state.next_ordinal;
+        state.next_ordinal = ordinal.checked_add(1).ok_or(VmError::ArithmeticOverflow)?;
+        let mut attempt = if state.diagnostics_enabled {
+            Some(AllocationAttempt {
+                site: AllocationSite::caller(),
+                ordinal,
+                domain,
+                bytes,
+                point,
+            })
+        } else {
+            None
         };
-        state.trace.last_attempt = Some(attempt);
+        if let Some(attempt) = attempt {
+            let mut diagnostics = self.inner.diagnostics.get();
+            diagnostics.last_attempt = Some(attempt);
+            self.inner.diagnostics.set(diagnostics);
+        }
         let outstanding = state
             .snapshot
             .committed
             .checked_add(state.snapshot.reserved);
         let Some(outstanding) = outstanding else {
-            state.trace.last_failure = Some(AllocationFailure {
+            self.record_failure_in_state(
+                &mut state,
+                ordinal,
                 attempt,
-                kind: AllocationFailureKind::Arithmetic,
-            });
-            self.inner.set(state);
+                AllocationFailureKind::Arithmetic,
+            );
+            self.inner.state.set(state);
             return Err(VmError::ArithmeticOverflow);
         };
         let total = outstanding.checked_add(bytes);
         let Some(total) = total else {
-            state.trace.last_failure = Some(AllocationFailure {
+            self.record_failure_in_state(
+                &mut state,
+                ordinal,
                 attempt,
-                kind: AllocationFailureKind::Arithmetic,
-            });
-            self.inner.set(state);
+                AllocationFailureKind::Arithmetic,
+            );
+            self.inner.state.set(state);
             return Err(VmError::ArithmeticOverflow);
         };
         if total > state.snapshot.limit {
-            state.trace.last_failure = Some(AllocationFailure {
+            self.record_failure_in_state(
+                &mut state,
+                ordinal,
                 attempt,
-                kind: AllocationFailureKind::Budget,
-            });
-            self.inner.set(state);
+                AllocationFailureKind::Budget,
+            );
+            self.inner.state.set(state);
             return Err(VmError::AllocationFailed);
         }
-        if state.fail_at_ordinal == Some(ordinal) {
-            state.fail_at_ordinal = None;
-            state.trace.last_failure = Some(AllocationFailure {
-                attempt,
-                kind: AllocationFailureKind::Injection,
-            });
-            self.inner.set(state);
-            return Err(VmError::InjectedAllocation(attempt));
+        if state.diagnostics_enabled {
+            let mut diagnostics = self.inner.diagnostics.get();
+            if diagnostics.fail_at_ordinal == Some(ordinal) {
+                diagnostics.fail_at_ordinal = None;
+                self.inner.diagnostics.set(diagnostics);
+                self.record_failure_in_state(
+                    &mut state,
+                    ordinal,
+                    attempt,
+                    AllocationFailureKind::Injection,
+                );
+                self.inner.state.set(state);
+                return Err(VmError::InjectedAllocation(
+                    attempt.ok_or(VmError::LedgerInvariant)?,
+                ));
+            }
         }
-        // callback 可在 CAPI 層 fail-closed；先發布 trace，再呼叫它，絕不在
+        // callback 可在 CAPI 層 fail-closed；先發布狀態，再呼叫它，絕不在
         // admission 拒絕後預留 Rust backing 或修改 committed/reserved。
-        self.inner.set(state);
-        let token = if bytes == 0 {
+        self.inner.state.set(state);
+        let token = if bytes == 0 || !admit {
             None
         } else {
             match self.admission.admit(bytes) {
                 Some(token) => Some(token),
                 None => {
-                    self.record_failure(attempt, AllocationFailureKind::Admission);
+                    if attempt.is_none() && self.inner.state.get().diagnostics_enabled {
+                        attempt = Some(self.attempt_enabled_during_admission(
+                            ordinal, domain, bytes, point,
+                        ));
+                    }
+                    self.record_failure(ordinal, attempt, AllocationFailureKind::Admission);
                     return Err(VmError::AllocationFailed);
                 }
             }
         };
         let mut admission = PendingAdmission {
-            admission: Rc::clone(&self.admission),
+            admission: self.admission.clone(),
             token,
             bytes,
         };
-        let mut state = self.inner.get();
+        let mut state = self.inner.state.get();
         if state.poisoned {
             return Err(VmError::LedgerInvariant);
+        }
+        if attempt.is_none() && state.diagnostics_enabled {
+            attempt = Some(self.attempt_enabled_during_admission(ordinal, domain, bytes, point));
         }
         state.snapshot.reserved = state
             .snapshot
@@ -492,11 +753,12 @@ impl AllocationLedger {
             }
         }
         state.record_peaks()?;
-        self.inner.set(state);
+        self.inner.state.set(state);
         Ok(Reservation {
             ledger: self.clone(),
             bytes,
             domain,
+            ordinal,
             attempt,
             token: admission.token.take(),
             active: true,
@@ -513,7 +775,7 @@ impl AllocationLedger {
     }
 
     fn refund_domain(&self, bytes: usize, domain: AllocationDomain) -> Result<(), VmError> {
-        let mut state = self.inner.get();
+        let mut state = self.inner.state.get();
         if state.poisoned {
             return Err(VmError::LedgerInvariant);
         }
@@ -533,13 +795,13 @@ impl AllocationLedger {
             AllocationDomain::LuaHeap => state.snapshot.lua_heap_bytes = domain_balance,
             AllocationDomain::Host => state.snapshot.host_allocation_bytes = domain_balance,
         }
-        self.inner.set(state);
+        self.inner.state.set(state);
         Ok(())
     }
 
     /// Drop 不可回傳錯誤；若內部帳本已損壞，標記後續操作為可檢查失敗。
     fn refund_on_drop_domain(&self, bytes: usize, domain: AllocationDomain) {
-        let mut state = self.inner.get();
+        let mut state = self.inner.state.get();
         let domain_balance = match domain {
             AllocationDomain::LuaHeap => state.snapshot.lua_heap_bytes,
             AllocationDomain::Host => state.snapshot.host_allocation_bytes,
@@ -557,7 +819,7 @@ impl AllocationLedger {
             }
             _ => state.poisoned = true,
         }
-        self.inner.set(state);
+        self.inner.state.set(state);
     }
 }
 
@@ -566,8 +828,9 @@ pub struct Reservation {
     ledger: AllocationLedger,
     bytes: usize,
     domain: AllocationDomain,
-    attempt: AllocationAttempt,
-    token: Option<NonZeroUsize>,
+    ordinal: u64,
+    attempt: Option<AllocationAttempt>,
+    token: Option<AdmissionToken>,
     active: bool,
 }
 
@@ -576,14 +839,14 @@ pub struct AllocationCharge {
     ledger: AllocationLedger,
     bytes: usize,
     domain: AllocationDomain,
-    token: Option<NonZeroUsize>,
+    token: Option<AdmissionToken>,
 }
 
 /// 同一 Lua 物件的兩塊 backing 共用帳本，各自保存 admission token 與費用。
 #[derive(Default)]
 struct LuaChargePart {
     bytes: usize,
-    token: Option<NonZeroUsize>,
+    token: Option<AdmissionToken>,
 }
 
 pub(crate) struct PairedLuaCharges {
@@ -602,8 +865,8 @@ impl PairedLuaCharges {
     }
 
     fn take_part(&self, mut charge: AllocationCharge) -> LuaChargePart {
-        debug_assert!(Rc::ptr_eq(&self.ledger.inner, &charge.ledger.inner));
-        debug_assert!(Rc::ptr_eq(&self.ledger.admission, &charge.ledger.admission));
+        debug_assert!(self.ledger.inner.ptr_eq(&charge.ledger.inner));
+        debug_assert!(self.ledger.admission.ptr_eq(&charge.ledger.admission));
         debug_assert_eq!(charge.domain, AllocationDomain::LuaHeap);
         let part = LuaChargePart {
             bytes: core::mem::replace(&mut charge.bytes, 0),
@@ -636,6 +899,22 @@ impl PairedLuaCharges {
         let old = core::mem::take(&mut self.second);
         self.release_part(old);
     }
+
+    /// 將原字串 bytes 的 admission 與實體帳款原封移交給共享 owner。
+    pub(crate) fn move_first_to(&mut self, owner: &mut Self) -> Result<usize, VmError> {
+        if !self.ledger.inner.ptr_eq(&owner.ledger.inner)
+            || !self.ledger.admission.ptr_eq(&owner.ledger.admission)
+            || owner.first.bytes != 0
+        {
+            return Err(VmError::LedgerInvariant);
+        }
+        owner.first = core::mem::take(&mut self.first);
+        Ok(owner.first.bytes)
+    }
+
+    pub(crate) fn first_bytes(&self) -> usize {
+        self.first.bytes
+    }
 }
 
 impl Drop for PairedLuaCharges {
@@ -648,9 +927,15 @@ impl Drop for PairedLuaCharges {
 }
 
 /// 同一 owner 的多筆原始 admission；每筆 token 在合計或移交前保持獨立。
-#[derive(Default)]
+/// entries 的實體 backing 使用指定配置器；其容量不另計為 ledger charge，避免自指計費。
 pub struct AllocationCharges {
-    entries: Vec<AllocationCharge>,
+    entries: AllocVec<AllocationCharge, StateAllocator>,
+}
+
+impl Default for AllocationCharges {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// replacement backing 已備妥之後才使用的兩階段 charge 正規化。
@@ -672,7 +957,25 @@ pub(crate) struct PreparedPartialNormalization {
 
 impl AllocationCharges {
     pub fn new() -> Self {
-        Self::default()
+        Self::new_in(StateAllocator::Global)
+    }
+
+    #[doc(hidden)]
+    pub fn new_in(allocator: StateAllocator) -> Self {
+        Self { entries: AllocVec::new_in(allocator) }
+    }
+
+    pub(crate) fn allocator(&self) -> &StateAllocator {
+        self.entries.allocator()
+    }
+
+    pub(crate) fn take_preserving_allocator(&mut self) -> Self {
+        Self::replace_empty(self)
+    }
+
+    fn replace_empty(&mut self) -> Self {
+        let empty = Self::new_in(self.entries.allocator().clone());
+        core::mem::replace(self, empty)
     }
 
     pub fn total_bytes(&self) -> Result<usize, VmError> {
@@ -685,7 +988,7 @@ impl AllocationCharges {
 
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), VmError> {
         self.entries
-            .try_reserve_exact(additional)
+            .try_reserve(additional)
             .map_err(|_| VmError::AllocationFailed)
     }
 
@@ -695,18 +998,35 @@ impl AllocationCharges {
         self.entries.push(charge);
     }
 
+    pub(crate) fn first_bytes(&self) -> Option<usize> {
+        self.entries.first().map(AllocationCharge::bytes)
+    }
+
+    pub(crate) fn swap_first(&mut self, charge: AllocationCharge) -> Result<AllocationCharge, VmError> {
+        let first = self.entries.first_mut().ok_or(VmError::LedgerInvariant)?;
+        if !first.ledger.inner.ptr_eq(&charge.ledger.inner)
+            || first.domain != charge.domain
+        {
+            return Err(VmError::LedgerInvariant);
+        }
+        Ok(core::mem::replace(first, charge))
+    }
+
     pub fn try_push(
         &mut self,
         charge: AllocationCharge,
     ) -> Result<(), (VmError, AllocationCharge)> {
+        if !self.entries.allocator().same_binding(&charge.ledger.backing_allocator()) {
+            return Err((VmError::LedgerInvariant, charge));
+        }
         if let Some(first) = self.entries.first() {
-            if !Rc::ptr_eq(&first.ledger.inner, &charge.ledger.inner)
+            if !first.ledger.inner.ptr_eq(&charge.ledger.inner)
                 || first.domain != charge.domain
             {
                 return Err((VmError::LedgerInvariant, charge));
             }
         }
-        if self.entries.try_reserve_exact(1).is_err() {
+        if self.entries.try_reserve(1).is_err() {
             return Err((VmError::AllocationFailed, charge));
         }
         self.entries.push(charge);
@@ -714,13 +1034,16 @@ impl AllocationCharges {
     }
 
     pub fn try_absorb(&mut self, other: &mut Self) -> Result<(), VmError> {
+        if !self.entries.allocator().same_binding(other.entries.allocator()) {
+            return Err(VmError::LedgerInvariant);
+        }
         if let (Some(first), Some(next)) = (self.entries.first(), other.entries.first()) {
-            if !Rc::ptr_eq(&first.ledger.inner, &next.ledger.inner) || first.domain != next.domain {
+            if !first.ledger.inner.ptr_eq(&next.ledger.inner) || first.domain != next.domain {
                 return Err(VmError::LedgerInvariant);
             }
         }
         self.entries
-            .try_reserve_exact(other.entries.len())
+            .try_reserve(other.entries.len())
             .map_err(|_| VmError::AllocationFailed)?;
         self.entries.append(&mut other.entries);
         Ok(())
@@ -745,7 +1068,7 @@ impl AllocationCharges {
         let first = self.entries.first().ok_or(VmError::LedgerInvariant)?;
         let ledger = first.ledger.clone();
         let domain = first.domain;
-        let before = ledger.inner.get();
+        let before = ledger.inner.state.get();
         let domain_committed = match domain {
             AllocationDomain::LuaHeap => before.snapshot.lua_heap_bytes,
             AllocationDomain::Host => before.snapshot.host_allocation_bytes,
@@ -754,20 +1077,22 @@ impl AllocationCharges {
         if before.poisoned || before.snapshot.committed < excess || domain_committed < excess {
             return Err(VmError::LedgerInvariant);
         }
-        let token = ledger
-            .admission
-            .admit(actual)
-            .ok_or(VmError::AllocationFailed)?;
+        // 全部來源皆為已配置的實體 backing 時，縮減帳本不應重新呼叫宿主 allocator。
+        let token = if self.entries.iter().all(|entry| entry.token.is_none()) {
+            None
+        } else {
+            Some(ledger.admission.admit(actual).ok_or(VmError::AllocationFailed)?)
+        };
         let pending = PendingAdmission {
-            admission: Rc::clone(&ledger.admission),
-            token: Some(token),
+            admission: ledger.admission.clone(),
+            token,
             bytes: actual,
         };
-        let mut next = Self::new();
+        let mut next = Self::new_in(self.entries.allocator().clone());
         next.entries
             .try_reserve_exact(1)
             .map_err(|_| VmError::AllocationFailed)?;
-        let state = ledger.inner.get();
+        let state = ledger.inner.state.get();
         if state.poisoned
             || state.snapshot.committed != before.snapshot.committed
             || state.snapshot.reserved != before.snapshot.reserved
@@ -794,10 +1119,10 @@ impl AllocationCharges {
     /// 呼叫者先 drop 舊 backing，兩者之間不得執行其他 ledger 動作。
     pub(crate) fn commit_normalize(&mut self, prepared: PreparedNormalization) -> Self {
         let mut partial = match prepared {
-            PreparedNormalization::Equal => return core::mem::take(self),
+            PreparedNormalization::Equal => return self.take_preserving_allocator(),
             PreparedNormalization::Zero => {
                 self.entries.clear();
-                return Self::new();
+                return Self::new_in(self.entries.allocator().clone());
             }
             PreparedNormalization::Partial(partial) => partial,
         };
@@ -810,13 +1135,17 @@ impl AllocationCharges {
             charge.bytes = 0;
         }
         self.entries.clear();
-        state.peaks = partial.ledger.inner.get().peaks;
+        let current = partial.ledger.inner.state.get();
+        state.peaks = current.peaks;
+        state.next_ordinal = current.next_ordinal;
+        state.failure_stamp = current.failure_stamp;
+        state.diagnostics_enabled = current.diagnostics_enabled;
         state.snapshot.committed -= partial.excess;
         match partial.domain {
             AllocationDomain::LuaHeap => state.snapshot.lua_heap_bytes -= partial.excess,
             AllocationDomain::Host => state.snapshot.host_allocation_bytes -= partial.excess,
         }
-        partial.ledger.inner.set(state);
+        partial.ledger.inner.state.set(state);
         partial.next.entries.push(AllocationCharge {
             ledger: partial.ledger,
             bytes: partial.actual,
@@ -855,9 +1184,15 @@ impl Drop for AllocationCharge {
 }
 
 impl Reservation {
+    pub(crate) fn physical_reserve_failure(&self) -> VmError {
+        self.ledger
+            .record_failure(self.ordinal, self.attempt, AllocationFailureKind::Admission);
+        VmError::AllocationFailed
+    }
+
     pub(crate) fn rust_reserve_failure(&self) -> VmError {
         self.ledger
-            .record_failure(self.attempt, AllocationFailureKind::RustReserve);
+            .record_failure(self.ordinal, self.attempt, AllocationFailureKind::RustReserve);
         VmError::AllocationFailed
     }
 
@@ -870,7 +1205,12 @@ impl Reservation {
     }
 
     pub fn commit_charge(mut self) -> Result<AllocationCharge, VmError> {
-        let mut state = self.ledger.inner.get();
+        self.commit_charge_in_place()
+    }
+
+    /// 配對 backing 尚未發布時，失敗者可先釋放實體 storage，再丟棄 reservation。
+    pub(crate) fn commit_charge_in_place(&mut self) -> Result<AllocationCharge, VmError> {
+        let mut state = self.ledger.inner.state.get();
         if state.poisoned {
             return Err(VmError::LedgerInvariant);
         }
@@ -901,7 +1241,7 @@ impl Reservation {
         state.snapshot.reserved = reserved;
         state.snapshot.committed = committed;
         state.record_peaks()?;
-        self.ledger.inner.set(state);
+        self.ledger.inner.state.set(state);
         self.active = false;
         Ok(AllocationCharge {
             ledger: self.ledger.clone(),
@@ -918,7 +1258,7 @@ impl Drop for Reservation {
             if let Some(token) = self.token.take() {
                 self.ledger.admission.release(token, self.bytes);
             }
-            let mut state = self.ledger.inner.get();
+            let mut state = self.ledger.inner.state.get();
             if let Some(reserved) = state.snapshot.reserved.checked_sub(self.bytes) {
                 state.snapshot.reserved = reserved;
                 let domain_reserved = match self.domain {
@@ -933,7 +1273,7 @@ impl Drop for Reservation {
             } else {
                 state.poisoned = true;
             }
-            self.ledger.inner.set(state);
+            self.ledger.inner.state.set(state);
         }
     }
 }
@@ -950,7 +1290,82 @@ pub(crate) fn reserve_vec<T>(
     additional: usize,
     point: FailPoint,
 ) -> Result<Reservation, VmError> {
-    let domain = point.domain_at(AllocationSite::caller());
+    reserve_vec_in_domain(ledger, values, additional, point, point.domain())
+}
+
+/// 同名 failpoint 用於暫存與持久 backing 時，明確指定 Lua heap 計帳。
+#[track_caller]
+pub(crate) fn reserve_vec_lua<T>(
+    ledger: &AllocationLedger,
+    values: &mut Vec<T>,
+    additional: usize,
+    point: FailPoint,
+) -> Result<Reservation, VmError> {
+    reserve_vec_in_domain(ledger, values, additional, point, AllocationDomain::LuaHeap)
+}
+
+#[track_caller]
+pub(crate) fn reserve_state_vec_lua<T>(
+    ledger: &AllocationLedger,
+    values: &mut AllocVec<T, StateAllocator>,
+    additional: usize,
+    point: FailPoint,
+) -> Result<Reservation, VmError> {
+    let bytes = match checked_bytes(additional, size_of::<T>()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            ledger.record_preflight_overflow(AllocationDomain::LuaHeap, point);
+            return Err(error);
+        }
+    };
+    let physical = ledger.inner.backing_allocator.is_lua();
+    let ticket = ledger.reserve_userdata_vec(bytes, point, physical)?;
+    let before = ledger.inner.backing_allocator.refusal_count();
+    values.try_reserve_exact(additional).map_err(|_| {
+        if physical && ledger.inner.backing_allocator.refusal_count() != before {
+            ticket.physical_reserve_failure()
+        } else {
+            ticket.rust_reserve_failure()
+        }
+    })?;
+    Ok(ticket)
+}
+
+#[track_caller]
+pub(crate) fn reserve_state_vec_host<T>(
+    ledger: &AllocationLedger,
+    values: &mut AllocVec<T, StateAllocator>,
+    additional: usize,
+    point: FailPoint,
+) -> Result<Reservation, VmError> {
+    let bytes = match checked_bytes(additional, size_of::<T>()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            ledger.record_preflight_overflow(AllocationDomain::Host, point);
+            return Err(error);
+        }
+    };
+    let physical = ledger.inner.backing_allocator.is_lua();
+    let ticket = ledger.reserve_host_vec(bytes, point, physical)?;
+    let before = ledger.inner.backing_allocator.refusal_count();
+    values.try_reserve_exact(additional).map_err(|_| {
+        if physical && ledger.inner.backing_allocator.refusal_count() != before {
+            ticket.physical_reserve_failure()
+        } else {
+            ticket.rust_reserve_failure()
+        }
+    })?;
+    Ok(ticket)
+}
+
+#[track_caller]
+fn reserve_vec_in_domain<T>(
+    ledger: &AllocationLedger,
+    values: &mut Vec<T>,
+    additional: usize,
+    point: FailPoint,
+    domain: AllocationDomain,
+) -> Result<Reservation, VmError> {
     let bytes = match checked_bytes(additional, size_of::<T>()) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -960,7 +1375,7 @@ pub(crate) fn reserve_vec<T>(
     };
     let ticket = ledger.reserve_at(bytes, domain, Some(point))?;
     if let Err(error) = ledger.checkpoint(point) {
-        ledger.record_failure(ticket.attempt, AllocationFailureKind::Injection);
+        ledger.record_failure(ticket.ordinal, ticket.attempt, AllocationFailureKind::Injection);
         return Err(error);
     }
     values

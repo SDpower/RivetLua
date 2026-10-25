@@ -44,7 +44,7 @@ pub(crate) enum SortStep {
 
 #[derive(Debug)]
 pub(crate) struct SortState {
-    pub table: ObjectRef,
+    pub table: Value,
     pub comparator: Option<Value>,
     pub len: i64,
     pub i: i64,
@@ -60,7 +60,7 @@ pub(crate) struct SortState {
 impl SortState {
     pub(crate) fn new(
         vm: &mut Vm,
-        table: ObjectRef,
+        table: Value,
         comparator: Option<Value>,
         trace: TableSortTrace,
     ) -> Result<Self, VmError> {
@@ -118,7 +118,7 @@ impl SortState {
 
     pub(crate) fn restore_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
         let values = [
-            Value::Object(self.table),
+            self.table,
             self.comparator.unwrap_or(Value::Nil),
             self.left,
             self.right,
@@ -138,7 +138,7 @@ impl SortState {
         mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
     ) -> Result<(), VmError> {
         for value in [
-            Value::Object(self.table),
+            self.table,
             self.comparator.unwrap_or(Value::Nil),
             self.left,
             self.right,
@@ -182,8 +182,8 @@ pub(crate) struct TableOpState {
     pub kind: TableBuiltin,
     pub args: [Value; 5],
     pub arg_count: usize,
-    pub table: ObjectRef,
-    pub destination: ObjectRef,
+    pub table: Value,
+    pub destination: Value,
     pub stage: TableOpStage,
     pub len: i64,
     pub first: i64,
@@ -194,13 +194,9 @@ pub(crate) struct TableOpState {
     pub explicit_destination: bool,
     pub hold: Value,
     pub removed: Value,
-    pub output: Vec<Value>,
+    pub output: crate::OwnedValues,
     pub buffer: Buffer,
     roots: [Option<RootId>; 7],
-    output_roots: Vec<Option<RootId>>,
-    ledger: AllocationLedger,
-    output_owner: Option<crate::alloc::AllocationCharge>,
-    roots_owner: Option<crate::alloc::AllocationCharge>,
 }
 
 impl TableOpState {
@@ -209,16 +205,7 @@ impl TableOpState {
         kind: TableBuiltin,
         args: &[Value],
     ) -> Result<Self, RuntimeError> {
-        let table = match table_arg(vm, args, 0) {
-            Err(error)
-                if kind == TableBuiltin::Concat
-                    && error.kind == RuntimeErrorKind::BasicArgument =>
-            {
-                return Err(concat_table_error(vm)?);
-            }
-            Err(error) => return Err(error),
-            Ok(table) => table,
-        };
+        let table = args.first().copied().unwrap_or(Value::Nil);
         let mut copied = [Value::Nil; 5];
         let count = args.len().min(copied.len());
         copied[..count].copy_from_slice(&args[..count]);
@@ -238,23 +225,15 @@ impl TableOpState {
             explicit_destination: false,
             hold: Value::Nil,
             removed: Value::Nil,
-            output: Vec::new(),
+            output: crate::OwnedValues::empty(vm.capi_backing_allocator()),
             buffer: Buffer::new(vm),
             roots: [None; 7],
-            output_roots: Vec::new(),
-            ledger: vm.allocation_ledger().clone(),
-            output_owner: None,
-            roots_owner: None,
         };
         if let Err(error) = state.restore_roots(vm) {
             state.clear_roots(vm)?;
             return Err(error.into());
         }
         Ok(state)
-    }
-
-    pub(crate) fn args(&self) -> &[Value] {
-        &self.args[..self.arg_count.min(self.args.len())]
     }
 
     pub(crate) fn set_hold(&mut self, vm: &mut Vm, value: Value) -> Result<(), VmError> {
@@ -281,59 +260,12 @@ impl TableOpState {
     }
 
     pub(crate) fn push_output(&mut self, vm: &mut Vm, value: Value) -> Result<(), VmError> {
-        let next = self
-            .output
-            .len()
-            .checked_add(1)
-            .ok_or(VmError::ArithmeticOverflow)?;
-        let mut output = Vec::new();
-        let output_ticket = reserve_vec(&self.ledger, &mut output, next, FailPoint::ReturnReserve)?;
-        output.extend_from_slice(&self.output);
-        output.push(value);
-        let mut roots = Vec::new();
-        let roots_ticket = match reserve_vec(&self.ledger, &mut roots, next, FailPoint::WorkReserve)
-        {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                drop(roots);
-                drop(output);
-                drop(output_ticket);
-                return Err(error);
-            }
-        };
-        roots.extend_from_slice(&self.output_roots);
-        let output_owner = output_ticket.commit_charge()?;
-        let roots_owner = roots_ticket.commit_charge()?;
-        let root = match value {
-            Value::Object(object) => match vm.add_root(RootKind::Temporary, object) {
-                Ok(root) => Some(root),
-                Err(error) => {
-                    drop(roots);
-                    drop(output);
-                    drop(roots_owner);
-                    drop(output_owner);
-                    return Err(error);
-                }
-            },
-            _ => None,
-        };
-        roots.push(root);
-        let old_output = core::mem::replace(&mut self.output, output);
-        let old_roots = core::mem::replace(&mut self.output_roots, roots);
-        drop(old_output);
-        drop(old_roots);
-        self.output_owner = Some(output_owner);
-        self.roots_owner = Some(roots_owner);
-        Ok(())
+        self.output.try_push(vm, value)
     }
 
     pub(crate) fn clear_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
-        for root in self
-            .output_roots
-            .iter_mut()
-            .rev()
-            .chain(self.roots.iter_mut().rev())
-        {
+        self.output.clear_roots(vm)?;
+        for root in self.roots.iter_mut().rev() {
             if let Some(root) = root.take() {
                 vm.remove_root(root)?;
             }
@@ -354,13 +286,7 @@ impl TableOpState {
                 }
             }
         }
-        for (value, root) in self.output.iter().zip(&mut self.output_roots) {
-            if root.is_none() {
-                if let Value::Object(object) = value {
-                    *root = Some(vm.add_root(RootKind::Temporary, *object)?);
-                }
-            }
-        }
+        self.output.restore_roots(vm)?;
         Ok(())
     }
 
@@ -373,11 +299,7 @@ impl TableOpState {
                 visit(object)?;
             }
         }
-        for value in &self.output {
-            if let Value::Object(object) = value {
-                visit(*object)?;
-            }
-        }
+        self.output.trace_children(visit)?;
         Ok(())
     }
 }
@@ -414,16 +336,20 @@ pub(crate) fn argument() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::BasicArgument)
 }
 
-fn concat_table_error(vm: &mut Vm) -> Result<RuntimeError, RuntimeError> {
+pub(crate) fn concat_table_error(vm: &mut Vm) -> Result<RuntimeError, RuntimeError> {
     let mut error = argument();
     error.value =
         Value::Object(vm.allocate_byte_string(b"bad argument #1 to 'concat' (table expected)")?);
     Ok(error)
 }
 
-pub(crate) fn concat_index_error(vm: &mut Vm, index: i64) -> Result<RuntimeError, RuntimeError> {
+pub(crate) fn concat_index_error(
+    vm: &mut Vm,
+    index: i64,
+    value: Value,
+) -> Result<RuntimeError, RuntimeError> {
     struct Message {
-        bytes: [u8; 64],
+        bytes: [u8; 96],
         len: usize,
     }
 
@@ -437,11 +363,27 @@ pub(crate) fn concat_index_error(vm: &mut Vm, index: i64) -> Result<RuntimeError
         }
     }
 
+    let kind = match value {
+        Value::Nil => "nil",
+        Value::Boolean(_) => "boolean",
+        Value::Integer(_) | Value::Float(_) => "number",
+        Value::LightUserdata(_) => "userdata",
+        Value::CFunction(_) => "function",
+        Value::Object(object) => match vm.object_kind(object)? {
+            ObjectKind::ByteString => "string",
+            ObjectKind::Table => "table",
+            ObjectKind::Closure | ObjectKind::CClosure | ObjectKind::Builtin => "function",
+            ObjectKind::Coroutine => "thread",
+            ObjectKind::Value | ObjectKind::Upvalue | ObjectKind::Module
+            | ObjectKind::Userdata | ObjectKind::File => "userdata",
+        },
+    };
     let mut message = Message {
-        bytes: [0; 64],
+        bytes: [0; 96],
         len: 0,
     };
-    write!(message, "invalid value (at index {index})").map_err(|_| VmError::ArithmeticOverflow)?;
+    write!(message, "invalid value ({kind}) at index {index} in table for 'concat'")
+        .map_err(|_| VmError::ArithmeticOverflow)?;
     let mut error = argument();
     error.value = Value::Object(vm.allocate_byte_string(&message.bytes[..message.len])?);
     Ok(error)
@@ -455,6 +397,36 @@ pub(crate) fn table_arg(vm: &Vm, args: &[Value], index: usize) -> Result<ObjectR
         return Err(argument());
     }
     Ok(table)
+}
+
+pub(crate) fn check_table_like(
+    vm: &mut Vm,
+    value: Value,
+    read: bool,
+    write: bool,
+    length: bool,
+) -> Result<(), RuntimeError> {
+    use crate::metamethod::MetamethodEvent;
+    if matches!(
+        value,
+        Value::Object(object) if vm.object_kind(object)? == ObjectKind::Table
+    ) {
+        return Ok(());
+    }
+    let valid = (!read || vm.lookup_metamethod_value(value, MetamethodEvent::Index)? != Value::Nil)
+        && (!write || vm.lookup_metamethod_value(value, MetamethodEvent::NewIndex)? != Value::Nil)
+        && (!length
+            || (vm.language_profile() == rivetlua_core::LuaProfile::Lua55
+                && matches!(
+                    value,
+                    Value::Object(object) if vm.object_kind(object)? == ObjectKind::ByteString
+                ))
+            || vm.lookup_metamethod_value(value, MetamethodEvent::Len)? != Value::Nil);
+    if valid {
+        Ok(())
+    } else {
+        Err(argument())
+    }
 }
 
 pub(crate) fn integer_arg(args: &[Value], index: usize) -> Result<i64, RuntimeError> {
@@ -490,18 +462,10 @@ pub(crate) fn optional_integer(
 }
 
 pub(crate) fn result(
-    vm: &Vm,
+    vm: &mut Vm,
     values: &[Value],
-) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
-    let mut output = Vec::new();
-    let ticket = reserve_vec(
-        vm.allocation_ledger(),
-        &mut output,
-        values.len(),
-        FailPoint::ReturnReserve,
-    )?;
-    output.extend_from_slice(values);
-    Ok((output, Some(ticket)))
+) -> Result<crate::OwnedValues, RuntimeError> {
+    Ok(crate::OwnedValues::try_copy_from(vm, values)?)
 }
 
 pub(crate) struct Buffer {
@@ -678,21 +642,13 @@ pub(crate) fn execute(
     vm: &mut Vm,
     kind: TableBuiltin,
     args: &[Value],
-) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
+) -> Result<crate::OwnedValues, RuntimeError> {
     match kind {
         TableBuiltin::Create => {
             let array = create_capacity(vm, args, 0)?;
             let hash = create_capacity(vm, args, 1)?;
-            let mut output = Vec::new();
-            let ticket = reserve_vec(
-                vm.allocation_ledger(),
-                &mut output,
-                1,
-                FailPoint::ReturnReserve,
-            )?;
             let table = vm.allocate_table_with_capacity(array, hash)?;
-            output.push(Value::Object(table));
-            Ok((output, Some(ticket)))
+            result(vm, &[Value::Object(table)])
         }
         TableBuiltin::Pack => {
             let count = i64::try_from(args.len()).map_err(|_| VmError::ArithmeticOverflow)?;
@@ -725,22 +681,17 @@ pub(crate) fn execute(
                 .checked_sub(first)
                 .and_then(|n| n.checked_add(1))
                 .and_then(|n| usize::try_from(n).ok())
-                .filter(|n| *n <= usize::from(u16::MAX))
                 .ok_or_else(argument)?;
-            let mut values = Vec::new();
-            let ticket = reserve_vec(
-                vm.allocation_ledger(),
-                &mut values,
-                count,
-                FailPoint::ReturnReserve,
-            )?;
+            vm.check_builtin_result_count(count)?;
+            let mut values = crate::OwnedValues::try_with_capacity_borrowed(vm, count, args)?;
             for offset in 0..count {
                 let index = first
                     .checked_add(i64::try_from(offset).map_err(|_| VmError::ArithmeticOverflow)?)
                     .ok_or(VmError::ArithmeticOverflow)?;
-                values.push(vm.raw_get(table, Value::Integer(index))?);
+                let value = vm.raw_get(table, Value::Integer(index))?;
+                values.try_push(vm, value)?;
             }
-            Ok((values, Some(ticket)))
+            Ok(values)
         }
         TableBuiltin::Concat => {
             let table = table_arg(vm, args, 0)?;

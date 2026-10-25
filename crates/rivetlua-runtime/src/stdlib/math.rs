@@ -1,12 +1,11 @@
 //! Lua 5.4／5.5 的數值函式；random 狀態與比較續行由 VM 管理。
 
-use crate::rust_alloc::vec::Vec;
+
 
 #[cfg(not(feature = "std"))]
 use rivetlua_core::number::NoStdFloat;
-use rivetlua_core::{LuaProfile, Value};
+use rivetlua_core::{ObjectRef, Value};
 
-use crate::alloc::{FailPoint, Reservation, reserve_vec};
 use crate::pending_op::PrintArguments;
 use crate::stdlib::basic;
 use crate::vm::{RuntimeError, RuntimeErrorKind};
@@ -20,6 +19,7 @@ pub(crate) enum MathBuiltin {
     Atan,
     Ceil,
     Cos,
+    Cosh,
     Deg,
     Exp,
     Floor,
@@ -27,37 +27,30 @@ pub(crate) enum MathBuiltin {
     Frexp,
     Ldexp,
     Log,
+    Log10,
     Max,
     Min,
     Modf,
+    Pow,
     Rad,
     Sin,
+    Sinh,
     Sqrt,
     Tan,
+    Tanh,
     ToInteger,
     Type,
     Ult,
-    Random,
-    RandomSeed,
+    Random { cell: ObjectRef },
+    RandomSeed { cell: ObjectRef },
 }
 
 pub(crate) fn argument() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::MathArgument)
 }
 
-pub(crate) fn values(
-    vm: &Vm,
-    values: &[Value],
-) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
-    let mut output = Vec::new();
-    let ticket = reserve_vec(
-        vm.allocation_ledger(),
-        &mut output,
-        values.len(),
-        FailPoint::ReturnReserve,
-    )?;
-    output.extend_from_slice(values);
-    Ok((output, Some(ticket)))
+pub(crate) fn values(vm: &mut Vm, values: &[Value]) -> Result<crate::OwnedValues, RuntimeError> {
+    Ok(crate::OwnedValues::try_copy_from(vm, values)?)
 }
 
 fn arg(args: &[Value], index: usize) -> Result<Value, RuntimeError> {
@@ -96,9 +89,9 @@ pub(crate) fn numeric_parse_units(
 ) -> Result<usize, RuntimeError> {
     let count = match kind {
         MathBuiltin::Max | MathBuiltin::Min | MathBuiltin::Type => 0,
-        MathBuiltin::Fmod | MathBuiltin::Ult | MathBuiltin::Ldexp => 2,
+        MathBuiltin::Fmod | MathBuiltin::Ldexp | MathBuiltin::Pow | MathBuiltin::Ult => 2,
         MathBuiltin::Atan | MathBuiltin::Log => 2,
-        MathBuiltin::Random | MathBuiltin::RandomSeed => args.len().min(2),
+        MathBuiltin::Random { .. } | MathBuiltin::RandomSeed { .. } => args.len().min(2),
         _ => 1,
     };
     let mut units = 0_usize;
@@ -119,7 +112,7 @@ pub(crate) fn execute(
     vm: &mut Vm,
     kind: MathBuiltin,
     args: &[Value],
-) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
+) -> Result<crate::OwnedValues, RuntimeError> {
     use MathBuiltin as M;
     let result = match kind {
         M::Abs => match arg(args, 0)? {
@@ -142,6 +135,7 @@ pub(crate) fn execute(
             _ => number_or_integer(float(vm, args, 0)?.ceil()),
         },
         M::Cos => Value::Float(float(vm, args, 0)?.cos()),
+        M::Cosh => Value::Float(float(vm, args, 0)?.cosh()),
         M::Deg => Value::Float(float(vm, args, 0)? * (180.0 / core::f64::consts::PI)),
         M::Exp => Value::Float(float(vm, args, 0)?.exp()),
         M::Floor => match arg(args, 0)? {
@@ -159,16 +153,10 @@ pub(crate) fn execute(
             }
         }
         M::Frexp => {
-            if vm.language_profile() != LuaProfile::Lua55 {
-                return Err(argument());
-            }
             let (fraction, exponent) = frexp(float(vm, args, 0)?);
             return values(vm, &[Value::Float(fraction), Value::Integer(exponent)]);
         }
         M::Ldexp => {
-            if vm.language_profile() != LuaProfile::Lua55 {
-                return Err(argument());
-            }
             let x = float(vm, args, 0)?;
             let exponent = integer(vm, arg(args, 1)?)? as i32;
             Value::Float(ldexp(x, exponent))
@@ -189,6 +177,7 @@ pub(crate) fn execute(
             };
             Value::Float(result)
         }
+        M::Log10 => Value::Float(float(vm, args, 0)?.log10()),
         M::Modf => match arg(args, 0)? {
             value @ Value::Integer(_) => {
                 return values(vm, &[value, Value::Float(0.0)]);
@@ -205,9 +194,12 @@ pub(crate) fn execute(
             }
         },
         M::Rad => Value::Float(float(vm, args, 0)? * (core::f64::consts::PI / 180.0)),
+        M::Pow => Value::Float(float(vm, args, 0)?.powf(float(vm, args, 1)?)),
         M::Sin => Value::Float(float(vm, args, 0)?.sin()),
+        M::Sinh => Value::Float(float(vm, args, 0)?.sinh()),
         M::Sqrt => Value::Float(float(vm, args, 0)?.sqrt()),
         M::Tan => Value::Float(float(vm, args, 0)?.tan()),
+        M::Tanh => Value::Float(float(vm, args, 0)?.tanh()),
         M::ToInteger => {
             let value = arg(args, 0)?;
             let converted = basic::number(vm, value, None)?;
@@ -229,7 +221,7 @@ pub(crate) fn execute(
             let right = integer(vm, arg(args, 1)?)?;
             Value::Boolean((left as u64) < (right as u64))
         }
-        M::Max | M::Min | M::Random | M::RandomSeed => return Err(argument()),
+        M::Max | M::Min | M::Random { .. } | M::RandomSeed { .. } => return Err(argument()),
     };
     values(vm, &[result])
 }

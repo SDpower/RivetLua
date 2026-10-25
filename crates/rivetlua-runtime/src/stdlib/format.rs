@@ -319,7 +319,7 @@ fn valid_spec(spec: Spec, flags: &[u8]) -> bool {
         b'd' | b'i' => b"-+0 ",
         b'u' => b"-0",
         b'o' | b'x' | b'X' => b"-#0",
-        b'a' | b'A' | b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => b"-+#0 ",
+        b'a' | b'A' | b'e' | b'E' | b'f' | b'g' | b'G' => b"-+#0 ",
         b'q' => return !spec.modified,
         _ => return false,
     };

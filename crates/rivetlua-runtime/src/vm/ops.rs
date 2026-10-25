@@ -3,10 +3,11 @@
 use crate::rust_alloc::vec::Vec;
 
 use core::cmp::Ordering;
+use core::ffi::CStr;
 use core::fmt::Write;
 
 use rivetlua_core::{
-    self as lua_core, BinaryOperation, LuaProfile, Number, UnaryOperation, Value, number_from_value,
+    self as lua_core, BinaryOperation, LuaProfile, Number, UnaryOperation, Value, number_from_value as number,
 };
 
 use super::{RuntimeError, RuntimeErrorKind};
@@ -64,7 +65,21 @@ fn format_lua_float(
         number.append(b"-inf")?;
         return Ok(());
     }
+    format_finite_lua_float(
+        number,
+        value,
+        profile,
+        rivetlua_alloc::c_ctype::decimal_point(),
+    )
+}
 
+fn format_finite_lua_float(
+    number: &mut NumberBytes,
+    value: f64,
+    profile: LuaProfile,
+    decimal_point: u8,
+) -> Result<(), RuntimeError> {
+    let decimal_point = [decimal_point];
     // Lua 5.4 使用 %.14g；Lua 5.5 先試 %.15g，回讀不等時改用 %.17g。
     let mut precision = match profile {
         LuaProfile::Lua54 => 14,
@@ -117,14 +132,15 @@ fn format_lua_float(
     {
         number.append(&digits[..1])?;
         if digit_count > 1 {
-            number.append(b".")?;
+            number.append(&decimal_point)?;
             number.append(&digits[1..digit_count])?;
         }
         write!(number, "e{exponent:+03}").map_err(|_| VmError::ArithmeticOverflow)?;
     } else {
         let decimal = exponent + 1;
         if decimal <= 0 {
-            number.append(b"0.")?;
+            number.append(b"0")?;
+            number.append(&decimal_point)?;
             for _ in 0..-decimal {
                 number.append(b"0")?;
             }
@@ -136,10 +152,11 @@ fn format_lua_float(
                 for _ in digit_count..decimal {
                     number.append(b"0")?;
                 }
-                number.append(b".0")?;
+                number.append(&decimal_point)?;
+                number.append(b"0")?;
             } else {
                 number.append(&digits[..decimal])?;
-                number.append(b".")?;
+                number.append(&decimal_point)?;
                 number.append(&digits[decimal..digit_count])?;
             }
         }
@@ -234,10 +251,6 @@ pub(super) fn raw_concat(
     Ok(true)
 }
 
-fn number(value: Value) -> Result<Number, RuntimeError> {
-    number_from_value(value).map_err(RuntimeError::from)
-}
-
 fn value(number: Number) -> Value {
     match number {
         Number::Integer(number) => Value::Integer(number),
@@ -253,6 +266,7 @@ fn number_if(value: Value) -> Option<Number> {
     }
 }
 
+#[inline(always)]
 pub(super) fn unary(op: UnaryOperation, operand: Value) -> Result<Value, RuntimeError> {
     match op {
         UnaryOperation::Negate => Ok(value(lua_core::negate(number(operand)?))),
@@ -304,6 +318,41 @@ fn equal(left: Value, right: Value) -> bool {
     }
 }
 
+fn string_order(
+    mut left: &[u8],
+    mut right: &[u8],
+    mut compare: impl FnMut(&CStr, &CStr) -> Ordering,
+) -> Option<Ordering> {
+    let mut left_len = left.len().checked_sub(1)?;
+    let mut right_len = right.len().checked_sub(1)?;
+    loop {
+        let left_segment = CStr::from_bytes_until_nul(left).ok()?;
+        let right_segment = CStr::from_bytes_until_nul(right).ok()?;
+        let order = compare(left_segment, right_segment);
+        if order != Ordering::Equal {
+            return Some(order);
+        }
+        let left_zero = left_segment.to_bytes().len();
+        let right_zero = right_segment.to_bytes().len();
+        if right_zero == right_len {
+            return Some(if left_zero == left_len {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
+            });
+        }
+        if left_zero == left_len {
+            return Some(Ordering::Less);
+        }
+        let left_step = left_zero + 1;
+        let right_step = right_zero + 1;
+        left = left.get(left_step..)?;
+        right = right.get(right_step..)?;
+        left_len -= left_step;
+        right_len -= right_step;
+    }
+}
+
 pub(super) fn raw_equal(vm: &Vm, left: Value, right: Value) -> Result<bool, RuntimeError> {
     if let (Value::Object(a), Value::Object(b)) = (left, right) {
         if vm.object_kind(a)? == ObjectKind::ByteString
@@ -330,8 +379,12 @@ pub(super) fn raw_order(
             && vm.object_kind(b)? == ObjectKind::ByteString
         {
             Some(vm.with_byte_string(a, |a| {
-                vm.with_byte_string(b, |b| a.as_bytes().cmp(b.as_bytes()))
-            })??)
+                vm.with_byte_string(b, |b| {
+                    a.nul_terminated_bytes()
+                        .zip(b.nul_terminated_bytes())
+                        .and_then(|(a, b)| string_order(a, b, rivetlua_alloc::c_ctype::strcoll))
+                })
+            })??.ok_or(VmError::LedgerInvariant)?)
         } else {
             return Ok(None);
         }
@@ -377,6 +430,11 @@ pub(super) fn raw_arithmetic(
     }
 }
 
+
+
+
+
+#[inline(always)]
 pub(super) fn binary(
     op: BinaryOperation,
     left: Value,

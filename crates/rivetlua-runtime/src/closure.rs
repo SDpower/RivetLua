@@ -1,16 +1,18 @@
 //! Closure 保存已驗證模組身分及共享 upvalue 物件參照。
 
-use crate::rust_alloc::vec::Vec;
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::StateAllocator;
 
 use rivetlua_core::{HostFunctionId, ObjectRef, ProtoId, Value};
 
 use crate::VmError;
-use crate::alloc::{AllocationCharge, AllocationLedger, FailPoint, reserve_vec};
+use crate::alloc::{AllocationCharge, AllocationLedger, FailPoint, reserve_state_vec_lua};
+use crate::errors::Builtin;
 
 pub struct Closure {
     module: ObjectRef,
     prototype: ProtoId,
-    upvalues: Vec<ObjectRef>,
+    upvalues: AllocVec<ObjectRef, StateAllocator>,
     environment: Option<Value>,
     environment_cell: Option<ObjectRef>,
     _charge: Option<AllocationCharge>,
@@ -24,9 +26,9 @@ impl Closure {
         environment: Option<Value>,
         ledger: &AllocationLedger,
     ) -> Result<Self, VmError> {
-        let mut upvalues = Vec::new();
+        let mut upvalues = AllocVec::new_in(ledger.backing_allocator());
         let charge = if !captures.is_empty() {
-            let ticket = reserve_vec(
+            let ticket = reserve_state_vec_lua(
                 ledger,
                 &mut upvalues,
                 captures.len(),
@@ -103,7 +105,8 @@ impl Closure {
 /// C closure 僅保存宿主函式 capability；真正的 C 指標由 C API group 持有。
 pub(crate) struct CClosure {
     function: HostFunctionId,
-    upvalues: Vec<ObjectRef>,
+    upvalues: AllocVec<ObjectRef, StateAllocator>,
+    builtin: Option<Builtin>,
     _charge: Option<AllocationCharge>,
 }
 
@@ -113,12 +116,12 @@ impl CClosure {
         captures: &[Option<ObjectRef>],
         ledger: &AllocationLedger,
     ) -> Result<Self, VmError> {
-        let mut upvalues = Vec::new();
+        let mut upvalues = AllocVec::new_in(ledger.backing_allocator());
         if captures.iter().any(Option::is_none) {
             return Err(VmError::LedgerInvariant);
         }
         let charge = if !captures.is_empty() {
-            let ticket = reserve_vec(
+            let ticket = reserve_state_vec_lua(
                 ledger,
                 &mut upvalues,
                 captures.len(),
@@ -134,8 +137,18 @@ impl CClosure {
         Ok(Self {
             function,
             upvalues,
+            builtin: None,
             _charge: charge,
         })
+    }
+
+    pub(crate) fn with_builtin(mut self, builtin: Builtin) -> Self {
+        self.builtin = Some(builtin);
+        self
+    }
+
+    pub(crate) const fn builtin(&self) -> Option<Builtin> {
+        self.builtin
     }
 
     pub(crate) const fn function(&self) -> HostFunctionId {
@@ -152,6 +165,9 @@ impl CClosure {
     ) -> Result<(), VmError> {
         for &cell in &self.upvalues {
             visit(cell)?;
+        }
+        if let Some(builtin) = self.builtin {
+            builtin.trace_children(&mut visit)?;
         }
         Ok(())
     }

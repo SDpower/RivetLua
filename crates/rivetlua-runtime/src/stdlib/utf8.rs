@@ -1,13 +1,12 @@
 //! UTF-8 函式庫以原始 bytes 和 Lua byte position 運作。
 
-use crate::rust_alloc::vec::Vec;
+use core::fmt::{self, Write};
 
 use rivetlua_core::{LuaProfile, ObjectRef, Value};
 
-use crate::alloc::{FailPoint, Reservation, reserve_vec};
 use crate::stdlib::{basic, string};
 use crate::vm::{RuntimeError, RuntimeErrorKind};
-use crate::{ObjectKind, Vm, VmError};
+use crate::{ObjectKind, OwnedValues, Vm, VmError};
 
 pub(crate) const CHAR_PATTERN: &[u8] = b"[\0-\x7f\xc2-\xfd][\x80-\xbf]*";
 const MAX_UTF: u32 = 0x7fff_ffff;
@@ -25,14 +24,59 @@ pub(crate) enum Utf8Builtin {
 }
 
 pub(crate) enum Prepared {
-    Values(Vec<Value>, Option<Reservation>),
+    Scalars([Value; 2], usize),
+    Values(OwnedValues),
     Bytes(string::Buffer),
     Codes { iterator: ObjectRef, source: Value },
+}
+
+enum ErrorMessage {
+    Text(&'static str),
+    Argument {
+        function: &'static str,
+        index: usize,
+        reason: &'static str,
+    },
+    TypeArgument {
+        function: &'static str,
+        index: usize,
+        expected: &'static str,
+        actual: Option<Value>,
+    },
 }
 
 enum Stop {
     Aborted,
     Error(RuntimeError),
+    Message(RuntimeError, ErrorMessage),
+}
+
+struct ErrorText {
+    bytes: [u8; 128],
+    len: usize,
+}
+
+impl ErrorText {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 128],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl Write for ErrorText {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.len.checked_add(text.len()).ok_or(fmt::Error)?;
+        let target = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        target.copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 impl From<RuntimeError> for Stop {
@@ -55,10 +99,56 @@ fn sequence() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::Utf8Sequence)
 }
 
-fn arg(args: &[Value], index: usize) -> Result<Value, Stop> {
+fn argument_message(function: &'static str, index: usize, reason: &'static str) -> Stop {
+    argument_message_for(argument(), function, index, reason)
+}
+
+fn argument_message_for(
+    error: RuntimeError,
+    function: &'static str,
+    index: usize,
+    reason: &'static str,
+) -> Stop {
+    Stop::Message(
+        error,
+        ErrorMessage::Argument {
+            function,
+            index,
+            reason,
+        },
+    )
+}
+
+fn type_argument_message(
+    function: &'static str,
+    index: usize,
+    expected: &'static str,
+    actual: Option<Value>,
+) -> Stop {
+    Stop::Message(
+        argument(),
+        ErrorMessage::TypeArgument {
+            function,
+            index,
+            expected,
+            actual,
+        },
+    )
+}
+
+fn sequence_message(message: &'static str) -> Stop {
+    Stop::Message(sequence(), ErrorMessage::Text(message))
+}
+
+fn required_argument(
+    args: &[Value],
+    index: usize,
+    function: &'static str,
+    expected: &'static str,
+) -> Result<Value, Stop> {
     args.get(index)
         .copied()
-        .ok_or_else(|| Stop::Error(argument()))
+        .ok_or_else(|| type_argument_message(function, index + 1, expected, None))
 }
 
 fn charge(
@@ -75,6 +165,8 @@ fn charge(
 fn integer(
     vm: &Vm,
     value: Value,
+    function: &'static str,
+    index: usize,
     work: &mut impl FnMut(usize) -> Result<bool, RuntimeError>,
 ) -> Result<i64, Stop> {
     if let Value::Object(object) = value {
@@ -83,31 +175,39 @@ fn integer(
             charge(work, length)?;
         }
     }
-    let number = basic::number(vm, value, None).map_err(|error| {
-        if error.kind == RuntimeErrorKind::BasicArgument {
-            argument()
-        } else {
-            error
+    let number = match basic::number(vm, value, None) {
+        Ok(number) => number,
+        Err(error) if error.kind == RuntimeErrorKind::BasicArgument => {
+            return Err(type_argument_message(function, index, "number", Some(value)));
         }
-    })?;
-    basic::lua_integer(number).ok_or_else(|| Stop::Error(argument()))
+        Err(error) => return Err(error.into()),
+    };
+    if number == Value::Nil {
+        return Err(type_argument_message(function, index, "number", Some(value)));
+    }
+    basic::lua_integer(number).ok_or_else(|| {
+        argument_message(function, index, "number has no integer representation")
+    })
 }
 
 fn optional_integer(
     vm: &Vm,
     value: Option<Value>,
     default: i64,
+    function: &'static str,
+    index: usize,
     work: &mut impl FnMut(usize) -> Result<bool, RuntimeError>,
 ) -> Result<i64, Stop> {
     match value {
         None | Some(Value::Nil) => Ok(default),
-        Some(value) => integer(vm, value, work),
+        Some(value) => integer(vm, value, function, index, work),
     }
 }
 
 fn with_bytes<R>(
     vm: &Vm,
     value: Value,
+    function: &'static str,
     f: impl FnOnce(&[u8]) -> Result<R, Stop>,
 ) -> Result<R, Stop> {
     match value {
@@ -118,7 +218,7 @@ fn with_bytes<R>(
             let (bytes, length) = crate::vm::basic_number_bytes(number, vm.language_profile())?;
             f(&bytes[..length])
         }
-        _ => Err(Stop::Error(argument())),
+        _ => Err(type_argument_message(function, 1, "string", Some(value))),
     }
 }
 
@@ -196,8 +296,12 @@ fn output(
     work: &mut impl FnMut(usize) -> Result<bool, RuntimeError>,
 ) -> Result<Prepared, Stop> {
     charge(work, values.len())?;
-    let (values, ticket) = string::values(vm, values)?;
-    Ok(Prepared::Values(values, ticket))
+    let mut scalars = [Value::Nil; 2];
+    if values.len() > scalars.len() {
+        return Err(VmError::LedgerInvariant.into());
+    }
+    scalars[..values.len()].copy_from_slice(values);
+    Ok(Prepared::Scalars(scalars, values.len()))
 }
 
 fn len(
@@ -205,19 +309,26 @@ fn len(
     args: &[Value],
     work: &mut impl FnMut(usize) -> Result<bool, RuntimeError>,
 ) -> Result<Prepared, Stop> {
-    let source = arg(args, 0)?;
-    with_bytes(vm, source, |bytes| {
+    let source = required_argument(args, 0, "len", "string")?;
+    with_bytes(vm, source, "len", |bytes| {
         let first = relative(
-            optional_integer(vm, args.get(1).copied(), 1, work)?,
+            optional_integer(vm, args.get(1).copied(), 1, "len", 2, work)?,
             bytes.len(),
         );
         let last = relative(
-            optional_integer(vm, args.get(2).copied(), -1, work)?,
+            optional_integer(vm, args.get(2).copied(), -1, "len", 3, work)?,
             bytes.len(),
         );
         let lax = args.get(3).is_some_and(|value| value.is_truthy());
-        if first < 1 || first > bytes.len() as i128 + 1 || last > bytes.len() as i128 {
-            return Err(argument().into());
+        if first < 1 || first > bytes.len() as i128 + 1 {
+            return Err(argument_message(
+                "len",
+                2,
+                "initial position out of bounds",
+            ));
+        }
+        if last > bytes.len() as i128 {
+            return Err(argument_message("len", 3, "final position out of bounds"));
         }
         let mut position = (first - 1) as usize;
         let mut count = 0_i64;
@@ -237,50 +348,57 @@ fn len(
 }
 
 fn codepoint(
-    vm: &Vm,
+    vm: &mut Vm,
     args: &[Value],
     work: &mut impl FnMut(usize) -> Result<bool, RuntimeError>,
 ) -> Result<Prepared, Stop> {
-    let source = arg(args, 0)?;
-    with_bytes(vm, source, |bytes| {
+    let source = required_argument(args, 0, "codepoint", "string")?;
+    let (first, last, lax, upper) = with_bytes(vm, source, "codepoint", |bytes| {
         let first = relative(
-            optional_integer(vm, args.get(1).copied(), 1, work)?,
+            optional_integer(vm, args.get(1).copied(), 1, "codepoint", 2, work)?,
             bytes.len(),
         );
         let last = match args.get(2).copied() {
             None | Some(Value::Nil) => first,
-            Some(value) => relative(integer(vm, value, work)?, bytes.len()),
+            Some(value) => relative(integer(vm, value, "codepoint", 3, work)?, bytes.len()),
         };
         let lax = args.get(3).is_some_and(|value| value.is_truthy());
-        if first < 1 || last > bytes.len() as i128 {
-            return Err(argument().into());
+        if first < 1 {
+            return Err(argument_message("codepoint", 2, "out of bounds"));
+        }
+        if last > bytes.len() as i128 {
+            return Err(argument_message("codepoint", 3, "out of bounds"));
         }
         if first > last {
-            return Ok(Prepared::Values(Vec::new(), None));
+            return Ok((first, last, lax, 0));
         }
         let upper = last - first + 1;
         if upper > i32::MAX as i128 {
-            return Err(argument().into());
+            return Err(Stop::Message(
+                argument(),
+                ErrorMessage::Text("string slice too long"),
+            ));
         }
         let upper = usize::try_from(upper).map_err(|_| VmError::ArithmeticOverflow)?;
         charge(work, upper)?;
-        let mut values = Vec::new();
-        let ticket = reserve_vec(
-            vm.allocation_ledger(),
-            &mut values,
-            upper,
-            FailPoint::ReturnReserve,
-        )?;
+        Ok((first, last, lax, upper))
+    })?;
+    if upper == 0 {
+        return Ok(Prepared::Values(OwnedValues::try_copy_from(vm, &[])?));
+    }
+    let mut values = OwnedValues::try_with_capacity_borrowed(vm, upper, args)?;
+    with_bytes(vm, source, "codepoint", |bytes| {
         let mut position = (first - 1) as usize;
         while position < last as usize {
             let Some((next, code)) = decode(bytes, position, !lax, work)? else {
-                return Err(sequence().into());
+                return Err(sequence_message("invalid UTF-8 code"));
             };
-            values.push(Value::Integer(code as i64));
+            values.push_scalar(Value::Integer(code as i64))?;
             position = next;
         }
-        Ok(Prepared::Values(values, Some(ticket)))
-    })
+        Ok(())
+    })?;
+    Ok(Prepared::Values(values))
 }
 
 fn encode(code: u32, bytes: &mut [u8; 6]) -> usize {
@@ -318,10 +436,10 @@ fn char_bytes(
         return Err(argument().into());
     }
     let mut buffer = string::Buffer::empty(vm);
-    for value in args {
-        let code = integer(vm, *value, work)?;
+    for (index, value) in args.iter().enumerate() {
+        let code = integer(vm, *value, "char", index + 1, work)?;
         if !(0..=MAX_UTF as i64).contains(&code) {
-            return Err(argument().into());
+            return Err(argument_message("char", index + 1, "value out of range"));
         }
         let mut bytes = [0_u8; 6];
         let length = encode(code as u32, &mut bytes);
@@ -337,9 +455,15 @@ fn offset(
     args: &[Value],
     work: &mut impl FnMut(usize) -> Result<bool, RuntimeError>,
 ) -> Result<Prepared, Stop> {
-    let source = arg(args, 0)?;
-    with_bytes(vm, source, |bytes| {
-        let mut n = integer(vm, arg(args, 1)?, work)?;
+    let source = required_argument(args, 0, "offset", "string")?;
+    with_bytes(vm, source, "offset", |bytes| {
+        let mut n = integer(
+            vm,
+            required_argument(args, 1, "offset", "number")?,
+            "offset",
+            2,
+            work,
+        )?;
         let first = match args.get(2).copied() {
             None | Some(Value::Nil) => {
                 if n >= 0 {
@@ -348,10 +472,10 @@ fn offset(
                     bytes.len() as i128 + 1
                 }
             }
-            Some(value) => relative(integer(vm, value, work)?, bytes.len()),
+            Some(value) => relative(integer(vm, value, "offset", 3, work)?, bytes.len()),
         };
         if first < 1 || first > bytes.len() as i128 + 1 {
-            return Err(argument().into());
+            return Err(argument_message("offset", 3, "position out of bounds"));
         }
         let mut position = (first - 1) as usize;
         if n == 0 {
@@ -360,7 +484,9 @@ fn offset(
             }
         } else {
             if is_cont(byte_at(bytes, position, work)?) {
-                return Err(sequence().into());
+                return Err(sequence_message(
+                    "initial position is a continuation byte",
+                ));
             }
             if n < 0 {
                 while n < 0 && position > 0 {
@@ -392,7 +518,9 @@ fn offset(
         let current = byte_at(bytes, position, work)?;
         if current & 0x80 != 0 {
             if is_cont(current) {
-                return Err(sequence().into());
+                return Err(sequence_message(
+                    "initial position is a continuation byte",
+                ));
             }
             while is_cont(byte_at(bytes, end + 1, work)?) {
                 end += 1;
@@ -409,10 +537,15 @@ fn codes(
     lax: ObjectRef,
     work: &mut impl FnMut(usize) -> Result<bool, RuntimeError>,
 ) -> Result<Prepared, Stop> {
-    let source = arg(args, 0)?;
-    with_bytes(vm, source, |bytes| {
+    let source = required_argument(args, 0, "codes", "string")?;
+    with_bytes(vm, source, "codes", |bytes| {
         if !bytes.is_empty() && is_cont(byte_at(bytes, 0, work)?) {
-            return Err(sequence().into());
+            return Err(argument_message_for(
+                sequence(),
+                "codes",
+                1,
+                "invalid UTF-8 code",
+            ));
         }
         if matches!(source, Value::Integer(_) | Value::Float(_)) {
             charge(work, bytes.len())?;
@@ -435,8 +568,8 @@ fn iterator(
     strict: bool,
     work: &mut impl FnMut(usize) -> Result<bool, RuntimeError>,
 ) -> Result<Prepared, Stop> {
-    let source = arg(args, 0)?;
-    with_bytes(vm, source, |bytes| {
+    let source = required_argument(args, 0, "for iterator", "string")?;
+    with_bytes(vm, source, "for iterator", |bytes| {
         let control = match args.get(1).copied() {
             None => 0,
             Some(value) => {
@@ -459,13 +592,13 @@ fn iterator(
             }
         }
         if position >= bytes.len() as u64 {
-            return Ok(Prepared::Values(Vec::new(), None));
+            return output(vm, &[], work);
         }
         let Some((next, code)) = decode(bytes, position as usize, strict, work)? else {
-            return Err(sequence().into());
+            return Err(sequence_message("invalid UTF-8 code"));
         };
         if next < bytes.len() && is_cont(byte_at(bytes, next, work)?) {
-            return Err(sequence().into());
+            return Err(sequence_message("invalid UTF-8 code"));
         }
         output(
             vm,
@@ -479,7 +612,7 @@ fn iterator(
 }
 
 pub(crate) fn execute(
-    vm: &Vm,
+    vm: &mut Vm,
     kind: Utf8Builtin,
     args: &[Value],
     work: &mut impl FnMut(usize) -> Result<bool, RuntimeError>,
@@ -496,5 +629,29 @@ pub(crate) fn execute(
         Ok(prepared) => Ok(Some(prepared)),
         Err(Stop::Aborted) => Ok(None),
         Err(Stop::Error(error)) => Err(error),
+        Err(Stop::Message(mut error, message)) => {
+            error.value = match message {
+                ErrorMessage::Text(message) => {
+                    let mut text = ErrorText::new();
+                    text.write_str(message)
+                        .map_err(|_| VmError::ArithmeticOverflow)?;
+                    Value::Object(vm.allocate_byte_string(text.as_bytes())?)
+                }
+                ErrorMessage::Argument {
+                    function,
+                    index,
+                    reason,
+                } => basic::argument_error(vm, function, index, reason)?.value,
+                ErrorMessage::TypeArgument {
+                    function,
+                    index,
+                    expected,
+                    actual,
+                } => basic::type_argument_error(vm, function, index, expected, actual)?.value,
+            };
+            Err(error)
+        }
     }
 }
+
+

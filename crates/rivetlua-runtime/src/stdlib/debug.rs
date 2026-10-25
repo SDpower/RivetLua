@@ -3,7 +3,7 @@
 use crate::rust_alloc::vec::Vec;
 
 use crate::host::DebugPermission;
-use rivetlua_core::ObjectRef;
+use rivetlua_core::{ObjectRef, Value};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DebugHookEvent {
@@ -20,8 +20,10 @@ pub(crate) struct DebugHookEvents {
 /// 單一 Lua thread 的 hook；coroutine 以自身 payload 持有強邊。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DebugHook {
-    pub function: ObjectRef,
+    pub function: Value,
     pub count: usize,
+    /// Lua `debug.sethook` 的有號基準計數；C API hook 沿用 `count`。
+    pub base_count: Option<i64>,
     pub remaining: usize,
     pub line: bool,
     pub call: bool,
@@ -39,9 +41,14 @@ impl DebugHook {
     }
 
     pub(crate) fn with_line(function: ObjectRef, count: usize, line: bool) -> Self {
+        Self::with_value(Value::Object(function), count, line)
+    }
+
+    pub(crate) fn with_value(function: Value, count: usize, line: bool) -> Self {
         Self {
             function,
             count,
+            base_count: None,
             remaining: count,
             line,
             call: false,
@@ -51,6 +58,17 @@ impl DebugHook {
             last_prototype: None,
             last_line_event: false,
         }
+    }
+
+    pub(crate) fn with_lua_count(
+        function: Value,
+        count: usize,
+        base_count: i64,
+        line: bool,
+    ) -> Self {
+        let mut hook = Self::with_value(function, count, line);
+        hook.base_count = Some(base_count);
+        hook
     }
 
     pub(crate) fn tick(&mut self) -> bool {

@@ -4,18 +4,21 @@ use crate::rust_alloc::vec::Vec;
 
 use core::fmt::{self, Write};
 
-use rivetlua_core::{LuaProfile, Value};
+use rivetlua_core::{BinaryOperation, LuaProfile, Value};
 
 use crate::alloc::{AllocationLedger, FailPoint, Reservation, reserve_vec};
 use crate::pending_op::PrintArguments;
 use crate::stdlib::pack;
-use crate::stdlib::pattern::Found;
+use crate::stdlib::gsub::GSubError;
+use crate::stdlib::pattern::{Found, PatternError};
 use crate::stdlib::{basic, table};
 use crate::vm::{RuntimeError, RuntimeErrorKind};
 use crate::{ObjectKind, RootKind, Vm, VmError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StringBuiltin {
+    Arithmetic(BinaryOperation),
+    Negate,
     Byte,
     Char,
     Find,
@@ -161,7 +164,11 @@ fn end_position(position: i64, len: usize) -> usize {
 }
 
 fn range(vm: &Vm, args: &[Value], len: usize, byte: bool) -> Result<(usize, usize), RuntimeError> {
-    let first = optional_integer(vm, args.get(1).copied(), 1)?;
+    let first = if byte {
+        optional_integer(vm, args.get(1).copied(), 1)?
+    } else {
+        integer(vm, arg(args, 1)?)?
+    };
     let last = optional_integer(vm, args.get(2).copied(), if byte { first } else { -1 })?;
     Ok((start_position(first, len), end_position(last, len)))
 }
@@ -207,6 +214,7 @@ pub(crate) fn numeric_parse_units(
     let mut total = 0_usize;
     for (index, value) in args.iter().copied().enumerate() {
         let numeric = match kind {
+            StringBuiltin::Arithmetic(_) | StringBuiltin::Negate => index < 2,
             StringBuiltin::Char => true,
             StringBuiltin::Byte | StringBuiltin::Sub => index == 1 || index == 2,
             StringBuiltin::Rep => index == 1,
@@ -231,7 +239,7 @@ pub(crate) fn numeric_parse_units(
 }
 
 pub(crate) fn work_units(
-    vm: &Vm,
+    vm: &mut Vm,
     kind: StringBuiltin,
     args: &[Value],
     available: u64,
@@ -271,11 +279,15 @@ pub(crate) fn work_units(
                 .saturating_add(table::string_len(vm, arg(args, 1)?)?)
                 .max(1)
         }
+        StringBuiltin::Sub => {
+            let len = table::string_len(vm, arg(args, 0)?)?;
+            let _ = range(vm, args, len, false)?;
+            len.max(1)
+        }
         StringBuiltin::Len
         | StringBuiltin::Lower
         | StringBuiltin::Upper
         | StringBuiltin::Reverse
-        | StringBuiltin::Sub
         | StringBuiltin::Format => table::string_len(vm, arg(args, 0)?)?.max(1),
         _ => 1,
     };
@@ -347,24 +359,16 @@ impl Buffer {
 }
 
 pub(crate) fn values(
-    vm: &Vm,
+    vm: &mut Vm,
     input: &[Value],
-) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
-    let mut output = Vec::new();
-    let ticket = reserve_vec(
-        vm.allocation_ledger(),
-        &mut output,
-        input.len(),
-        FailPoint::ReturnReserve,
-    )?;
-    output.extend_from_slice(input);
-    Ok((output, Some(ticket)))
+) -> Result<crate::OwnedValues, RuntimeError> {
+    Ok(crate::OwnedValues::try_copy_from(vm, input)?)
 }
 
 pub(crate) fn string_result(
     vm: &mut Vm,
     buffer: &Buffer,
-) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
+) -> Result<crate::OwnedValues, RuntimeError> {
     let object = vm.allocate_byte_string(&buffer.bytes)?;
     values(vm, &[Value::Object(object)])
 }
@@ -382,25 +386,19 @@ pub(crate) fn pattern_results(
     source: &[u8],
     found: Option<Found>,
     find: bool,
-) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
+) -> Result<crate::OwnedValues, GSubError> {
     let Some(found) = found else {
-        return values(vm, &[Value::Nil]);
+        return Ok(values(vm, &[Value::Nil])?);
     };
-    with_pattern_values(vm, source, found, find, |_, result, ticket| {
-        Ok((result, Some(ticket)))
-    })
+    with_pattern_values(vm, source, found, find, |_, result| Ok(result))
 }
 
 pub(crate) fn pattern_callback_arguments(
     vm: &mut Vm,
     source: &[u8],
     found: Found,
-) -> Result<PrintArguments, RuntimeError> {
-    with_pattern_values(vm, source, found, false, |vm, values, ticket| {
-        let arguments = PrintArguments::new(vm, &values)?;
-        drop(ticket);
-        Ok(arguments)
-    })
+) -> Result<PrintArguments, GSubError> {
+    with_pattern_values(vm, source, found, false, |_, values| Ok(values))
 }
 
 fn with_pattern_values<R>(
@@ -408,8 +406,14 @@ fn with_pattern_values<R>(
     source: &[u8],
     found: Found,
     find: bool,
-    consume: impl FnOnce(&mut Vm, Vec<Value>, Reservation) -> Result<R, RuntimeError>,
-) -> Result<R, RuntimeError> {
+    consume: impl FnOnce(&mut Vm, crate::OwnedValues) -> Result<R, RuntimeError>,
+) -> Result<R, GSubError> {
+    if found.captures[..found.count]
+        .iter()
+        .any(|capture| capture.end.is_none())
+    {
+        return Err(GSubError::Pattern(PatternError::UnfinishedCapture));
+    }
     let count = found.count
         + if find {
             2
@@ -418,22 +422,15 @@ fn with_pattern_values<R>(
         } else {
             0
         };
-    let mut result = Vec::new();
-    let ticket = reserve_vec(
-        vm.allocation_ledger(),
-        &mut result,
-        count,
-        FailPoint::ReturnReserve,
-    )?;
-    let mut roots = [None; 33];
+    let mut result = crate::OwnedValues::try_with_capacity(vm, count)?;
     let built = (|| {
         if find {
-            result.push(Value::Integer(
+            result.push_scalar(Value::Integer(
                 i64::try_from(found.start + 1).map_err(|_| VmError::ArithmeticOverflow)?,
-            ));
-            result.push(Value::Integer(
+            ))?;
+            result.push_scalar(Value::Integer(
                 i64::try_from(found.end).map_err(|_| VmError::ArithmeticOverflow)?,
-            ));
+            ))?;
         }
         let items = if found.count == 0 && !find {
             1
@@ -447,29 +444,23 @@ fn with_pattern_values<R>(
                 let capture = found.captures[index];
                 (
                     capture.start,
-                    capture
-                        .end
-                        .ok_or_else(|| RuntimeError::new(RuntimeErrorKind::StringPattern))?,
+                    capture.end.ok_or(PatternError::UnfinishedCapture)?,
                     capture.position,
                 )
             };
             if position {
-                result.push(Value::Integer(
+                result.push_scalar(Value::Integer(
                     i64::try_from(first + 1).map_err(|_| VmError::ArithmeticOverflow)?,
-                ));
+                ))?;
             } else {
                 let object = vm.allocate_byte_string(&source[first..last])?;
-                roots[index] = Some(vm.add_root(RootKind::Temporary, object)?);
-                result.push(Value::Object(object));
+                result.try_push(vm, Value::Object(object))?;
             }
         }
-        Ok::<(), RuntimeError>(())
+        Ok::<(), GSubError>(())
     })();
-    let consumed = built.and_then(|()| consume(vm, result, ticket));
-    for root in roots.into_iter().flatten() {
-        vm.remove_root(root)?;
-    }
-    consumed
+    built?;
+    consume(vm, result).map_err(GSubError::from)
 }
 
 pub(crate) fn pattern_output_units(found: Option<Found>, find: bool) -> usize {
@@ -502,10 +493,12 @@ pub(crate) fn execute(
     vm: &mut Vm,
     kind: StringBuiltin,
     args: &[Value],
-) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
+    prepared_unpack: Option<pack::PreparedUnpack>,
+) -> Result<crate::OwnedValues, RuntimeError> {
     match kind {
-        StringBuiltin::Byte => with_bytes(vm, arg(args, 0)?, |source| {
-            let (first, last) = range(vm, args, source.len(), true)?;
+        StringBuiltin::Byte => {
+            let source = arg(args, 0)?;
+            let (first, last) = with_bytes(vm, source, |bytes| range(vm, args, bytes.len(), true))?;
             if first > last {
                 return values(vm, &[]);
             }
@@ -513,20 +506,15 @@ pub(crate) fn execute(
             if count >= i32::MAX as usize {
                 return Err(argument());
             }
-            let mut result = Vec::new();
-            let ticket = reserve_vec(
-                vm.allocation_ledger(),
-                &mut result,
-                count,
-                FailPoint::ReturnReserve,
-            )?;
-            result.extend(
-                source[first - 1..last]
-                    .iter()
-                    .map(|byte| Value::Integer(i64::from(*byte))),
-            );
-            Ok((result, Some(ticket)))
-        }),
+            let mut result = crate::OwnedValues::try_with_capacity_borrowed(vm, count, &[source])?;
+            with_bytes(vm, source, |bytes| {
+                for &byte in &bytes[first - 1..last] {
+                    result.push_scalar(Value::Integer(i64::from(byte)))?;
+                }
+                Ok(())
+            })?;
+            Ok(result)
+        }
         StringBuiltin::Char => {
             for (index, value) in args.iter().enumerate() {
                 if !(0..=255).contains(&integer(vm, *value)?) {
@@ -550,10 +538,10 @@ pub(crate) fn execute(
                 match kind {
                     StringBuiltin::Lower => buffer
                         .bytes
-                        .extend(source.iter().map(u8::to_ascii_lowercase)),
+                        .extend(source.iter().copied().map(rivetlua_alloc::c_ctype::lower)),
                     StringBuiltin::Upper => buffer
                         .bytes
-                        .extend(source.iter().map(u8::to_ascii_uppercase)),
+                        .extend(source.iter().copied().map(rivetlua_alloc::c_ctype::upper)),
                     StringBuiltin::Reverse => buffer.bytes.extend(source.iter().rev().copied()),
                     _ => return Err(argument()),
                 }
@@ -606,13 +594,15 @@ pub(crate) fn execute(
         }
         StringBuiltin::Dump => Err(RuntimeError::new(RuntimeErrorKind::HostPolicyStringDump)),
         StringBuiltin::Pack | StringBuiltin::Unpack | StringBuiltin::PackSize => {
-            pack::execute(vm, kind, args)
+            pack::execute(vm, kind, args, prepared_unpack)
         }
         StringBuiltin::Find
         | StringBuiltin::Match
         | StringBuiltin::GMatch
         | StringBuiltin::GSub
-        | StringBuiltin::Format => Err(argument()),
+        | StringBuiltin::Format
+        | StringBuiltin::Arithmetic(_)
+        | StringBuiltin::Negate => Err(argument()),
     }
 }
 

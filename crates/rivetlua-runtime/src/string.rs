@@ -1,20 +1,21 @@
 //! P08-1 的不可變 byte string。
 
-use crate::rust_alloc::vec::Vec;
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{CExternalBytesOwner, SharedBlock, SharedUninitBlock, StateAllocator};
 
-use crate::VmError;
-use crate::alloc::{AllocationLedger, FailPoint, PairedLuaCharges, Reservation, reserve_vec};
+use crate::{HostAllocationCharge, Vm, VmError};
+use crate::alloc::{AllocationCharge, AllocationLedger, FailPoint, PairedLuaCharges,
+    Reservation, reserve_state_vec_lua};
 use crate::rust_alloc::rc::Rc;
 use core::fmt;
 use core::hash::{Hash, Hasher};
-use core::mem::size_of;
 
 /// 外部不可變 byte string 的安全擁有者。bytes 在 owner 存活期間須保持不變；
 /// 最後一個 owner 消失時由實作者釋放資源。
 pub trait ExternalStringStorage {
     fn bytes(&self) -> &[u8];
 
-    /// 可選的原位 NUL 結尾視圖；未提供時 C API 會建立自有 NUL 結尾 view。
+    /// 可選的原位 NUL 結尾視圖；未提供時在接收 owner 時預備 C 視圖。
     #[doc(hidden)]
     fn nul_terminated_bytes(&self) -> Option<&[u8]> {
         None
@@ -22,15 +23,31 @@ pub trait ExternalStringStorage {
 }
 
 enum StringBacking {
-    Owned(Vec<u8>),
-    ManagedShared(Rc<ManagedStringBacking>),
-    External(Rc<dyn ExternalStringStorage>),
+    Owned(AllocVec<u8, StateAllocator>),
+    ManagedShared(SharedBlock<ManagedStringBacking>),
+    External(Rc<dyn ExternalStringStorage>, Option<SharedBlock<ManagedStringBacking>>),
+    ExternalC(SharedBlock<CExternalBacking>),
 }
 
-struct ManagedStringBacking {
-    bytes: Vec<u8>,
+pub(crate) struct ManagedStringBacking {
+    bytes: AllocVec<u8, StateAllocator>,
     _charges: PairedLuaCharges,
     debt_bytes: usize,
+}
+
+struct CExternalBacking {
+    owner: CExternalBytesOwner,
+    _charge: HostAllocationCharge,
+}
+
+impl ExternalStringStorage for CExternalBacking {
+    fn bytes(&self) -> &[u8] {
+        self.owner.bytes()
+    }
+
+    fn nul_terminated_bytes(&self) -> Option<&[u8]> {
+        Some(self.owner.nul_terminated_bytes())
+    }
 }
 
 /// Heap 內的不可變任意 bytes；相等與 hash 均涵蓋完整內容。
@@ -62,9 +79,9 @@ impl Hash for ByteString {
 }
 
 impl ByteString {
-    /// 共用長字串須比保留第二份 bytes 便宜；Rc owner 的實際配置含控制區。
+    /// 共用長字串須比保留第二份 bytes 便宜；共享 owner 的實體配置含控制區。
     pub(crate) const fn managed_sharing_metadata_bytes() -> usize {
-        size_of::<ManagedStringBacking>() + 2 * size_of::<usize>()
+        StateAllocator::shared_block_size::<ManagedStringBacking>()
     }
 
     pub(crate) const fn managed_sharing_is_cheaper(byte_len: usize) -> bool {
@@ -75,14 +92,15 @@ impl ByteString {
         ledger: &AllocationLedger,
         bytes: &[u8],
     ) -> Result<(Self, Reservation), VmError> {
-        let mut stored = Vec::new();
-        let ticket = reserve_vec(
+        let mut stored = AllocVec::new_in(ledger.backing_allocator());
+        let ticket = reserve_state_vec_lua(
             ledger,
             &mut stored,
-            bytes.len(),
+            bytes.len().checked_add(1).ok_or(VmError::ArithmeticOverflow)?,
             FailPoint::StringBytesReserve,
         )?;
         stored.extend_from_slice(bytes);
+        stored.push(0);
         Ok((
             Self {
                 backing: StringBacking::Owned(stored),
@@ -91,35 +109,66 @@ impl ByteString {
         ))
     }
 
-    pub(crate) fn from_external(owner: Rc<dyn ExternalStringStorage>) -> Self {
-        Self {
-            backing: StringBacking::External(owner),
-        }
+    pub(crate) fn try_from_external(vm: &mut Vm, owner: Rc<dyn ExternalStringStorage>)
+        -> Result<Self, VmError> {
+        let bytes = owner.bytes();
+        let terminated = owner.nul_terminated_bytes().is_some_and(|view| {
+            bytes.len().checked_add(1) == Some(view.len())
+                && view.as_ptr() == bytes.as_ptr() && view.last() == Some(&0)
+        });
+        let view = if terminated { None } else {
+            let copy = Self::try_managed_shared_from_bytes(vm, bytes)?;
+            let StringBacking::ManagedShared(view) = copy.backing else { unreachable!() };
+            Some(view)
+        };
+        Ok(Self { backing: StringBacking::External(owner, view) })
+    }
+
+    pub(crate) fn try_from_c_external(
+        vm: &mut Vm,
+        owner: CExternalBytesOwner,
+    ) -> Result<Self, VmError> {
+        let (storage, ticket) = vm.capi_reserve_host_shared::<CExternalBacking>()?;
+        let charge = ticket.commit()?;
+        Ok(Self {
+            backing: StringBacking::ExternalC(storage.write(CExternalBacking {
+                owner,
+                _charge: charge,
+            })),
+        })
     }
 
     /// 長字串的來源物件與 table key 共用不可變 backing；帳款隨最後一個 owner 退還。
     pub(crate) fn try_managed_shared_from_bytes(
-        ledger: &AllocationLedger,
+        vm: &mut Vm,
         bytes: &[u8],
     ) -> Result<Self, VmError> {
-        let (owned, bytes_ticket) = Self::try_from_bytes(ledger, bytes)?;
-        let metadata_bytes = Self::managed_sharing_metadata_bytes();
-        let metadata_ticket =
-            ledger.reserve_lua_backing_excess(metadata_bytes, FailPoint::StringBytesReserve)?;
+        let (mut stored, bytes_ticket) =
+            vm.reserve_userdata_vec::<u8>(bytes.len().checked_add(1)
+                .ok_or(VmError::ArithmeticOverflow)?, FailPoint::StringBytesReserve)?;
+        stored.extend_from_slice(bytes);
+        stored.push(0);
+        Self::try_managed_shared_from_staged(vm, stored, bytes_ticket)
+    }
+
+    pub(crate) fn try_managed_shared_from_staged(
+        vm: &mut Vm,
+        stored: AllocVec<u8, StateAllocator>,
+        bytes_ticket: Reservation,
+    ) -> Result<Self, VmError> {
+        let (owner, metadata_ticket) =
+            vm.reserve_state_shared::<ManagedStringBacking>(FailPoint::StringBytesReserve)?;
         let bytes_charge = bytes_ticket.commit_charge()?;
         let metadata_charge = metadata_ticket.commit_charge()?;
         let debt_bytes = bytes_charge
             .bytes()
             .checked_add(metadata_charge.bytes())
             .ok_or(VmError::ArithmeticOverflow)?;
-        let StringBacking::Owned(stored) = owned.backing else {
-            unreachable!("新建的 byte string 必須持有自有 backing")
-        };
-        let mut charges = PairedLuaCharges::new(ledger.clone());
+        let mut charges = PairedLuaCharges::new(vm.allocation_ledger().clone());
         charges.replace_first(bytes_charge);
         charges.replace_second(metadata_charge);
         Ok(Self {
-            backing: StringBacking::ManagedShared(Rc::new(ManagedStringBacking {
+            backing: StringBacking::ManagedShared(owner.write(ManagedStringBacking {
                 bytes: stored,
                 _charges: charges,
                 debt_bytes,
@@ -129,7 +178,12 @@ impl ByteString {
 
     pub(crate) fn shared_external(&self) -> Option<Self> {
         match &self.backing {
-            StringBacking::External(owner) => Some(Self::from_external(Rc::clone(owner))),
+            StringBacking::External(owner, view) => Some(Self {
+                backing: StringBacking::External(Rc::clone(owner), view.clone()),
+            }),
+            StringBacking::ExternalC(owner) => Some(Self {
+                backing: StringBacking::ExternalC(owner.clone()),
+            }),
             StringBacking::Owned(_) | StringBacking::ManagedShared(_) => None,
         }
     }
@@ -137,46 +191,97 @@ impl ByteString {
     pub(crate) fn shared_table_key(&self) -> Option<Self> {
         match &self.backing {
             StringBacking::ManagedShared(owner) => Some(Self {
-                backing: StringBacking::ManagedShared(Rc::clone(owner)),
+                backing: StringBacking::ManagedShared(owner.clone()),
             }),
-            StringBacking::External(owner) => Some(Self::from_external(Rc::clone(owner))),
+            StringBacking::External(owner, view) => Some(Self {
+                backing: StringBacking::External(Rc::clone(owner), view.clone()),
+            }),
+            StringBacking::ExternalC(owner) => Some(Self {
+                backing: StringBacking::ExternalC(owner.clone()),
+            }),
             StringBacking::Owned(_) => None,
         }
     }
 
-    /// 宿主借讀 external 原指標；呼叫端必須以此字串物件的 root 保活它。
+    /// Owned bytes 原位移入 native 可共用 owner；原 heap 物件仍能讀同一批 bytes。
+    pub(crate) fn promote_owned_for_reader(
+        &mut self,
+        owner: SharedUninitBlock<ManagedStringBacking>,
+        metadata_charge: AllocationCharge,
+        heap_charges: &mut PairedLuaCharges,
+        ledger: &AllocationLedger,
+    ) -> Result<(Self, usize), VmError> {
+        let StringBacking::Owned(bytes) = &self.backing else {
+            return Err(VmError::WrongObjectType);
+        };
+        let old_debt = bytes.len();
+        let debt = heap_charges.first_bytes()
+            .checked_add(metadata_charge.bytes())
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let extra_debt = debt.saturating_sub(old_debt);
+        let placeholder = StringBacking::Owned(AllocVec::new_in(bytes.allocator().clone()));
+        let StringBacking::Owned(bytes) = core::mem::replace(&mut self.backing, placeholder) else {
+            return Err(VmError::LedgerInvariant);
+        };
+        let mut charges = PairedLuaCharges::new(ledger.clone());
+        if let Err(error) = heap_charges.move_first_to(&mut charges) {
+            self.backing = StringBacking::Owned(bytes);
+            return Err(error);
+        }
+        charges.replace_second(metadata_charge);
+        self.backing = StringBacking::ManagedShared(owner.write(ManagedStringBacking {
+            bytes,
+            _charges: charges,
+            debt_bytes: debt,
+        }));
+        let shared = self.shared_table_key().ok_or(VmError::LedgerInvariant)?;
+        Ok((shared, extra_debt))
+    }
+
+    /// 字串建立時已預備 NUL；呼叫端必須以此字串物件的 root 保活它。
     #[doc(hidden)]
     pub fn external_pointer(&self) -> Option<(*const u8, usize)> {
-        match &self.backing {
-            StringBacking::External(owner) => {
-                let bytes = owner.bytes();
-                let terminated = owner.nul_terminated_bytes()?;
-                let required = bytes.len().checked_add(1)?;
-                if terminated.len() != required
-                    || terminated.as_ptr() != bytes.as_ptr()
-                    || terminated[bytes.len()] != 0
-                {
-                    return None;
-                }
-                Some((bytes.as_ptr(), bytes.len()))
-            }
-            StringBacking::Owned(_) | StringBacking::ManagedShared(_) => None,
+        let bytes = self.nul_terminated_bytes()?;
+        Some((bytes.as_ptr(), self.len()))
+    }
+
+    pub(crate) fn nul_terminated_bytes(&self) -> Option<&[u8]> {
+        let owner: &dyn ExternalStringStorage = match &self.backing {
+            StringBacking::Owned(bytes) => return Some(bytes.as_slice()),
+            StringBacking::ManagedShared(owner) =>
+                return Some(owner.bytes.as_slice()),
+            StringBacking::External(_, Some(view)) =>
+                return Some(view.bytes.as_slice()),
+            StringBacking::External(owner, None) => owner.as_ref(),
+            StringBacking::ExternalC(owner) => &**owner,
+        };
+        let bytes = owner.bytes();
+        let terminated = owner.nul_terminated_bytes()?;
+        let required = bytes.len().checked_add(1)?;
+        if terminated.len() != required
+            || terminated.as_ptr() != bytes.as_ptr()
+            || terminated[bytes.len()] != 0
+        {
+            return None;
         }
+        Some(terminated)
     }
 
     pub(crate) fn managed_payload_len(&self) -> usize {
         match &self.backing {
             StringBacking::Owned(bytes) => bytes.len(),
             StringBacking::ManagedShared(owner) => owner.debt_bytes,
-            StringBacking::External(_) => 0,
+            StringBacking::External(_, Some(view)) => view.debt_bytes,
+            StringBacking::External(_, None) | StringBacking::ExternalC(_) => 0,
         }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
         match &self.backing {
-            StringBacking::Owned(bytes) => bytes,
-            StringBacking::ManagedShared(owner) => &owner.bytes,
-            StringBacking::External(owner) => owner.bytes(),
+            StringBacking::Owned(bytes) => &bytes[..bytes.len() - 1],
+            StringBacking::ManagedShared(owner) => &owner.bytes[..owner.bytes.len() - 1],
+            StringBacking::External(owner, _) => owner.bytes(),
+            StringBacking::ExternalC(owner) => owner.bytes(),
         }
     }
 

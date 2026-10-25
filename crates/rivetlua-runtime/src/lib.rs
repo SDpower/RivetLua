@@ -25,6 +25,7 @@ mod host;
 #[cfg(any(feature = "jit", feature = "aot"))]
 mod jit;
 mod metamethod;
+mod owned_values;
 mod pending_op;
 mod policy;
 mod roots;
@@ -34,6 +35,10 @@ mod table;
 mod unwind;
 mod upvalue;
 mod vm;
+
+pub use rivetlua_alloc::AdmissionToken;
+#[doc(hidden)]
+pub use rivetlua_alloc::StateAllocator;
 
 pub use alloc::{
     AllocationAdmission, AllocationAttempt, AllocationCharge, AllocationCharges, AllocationDomain,
@@ -45,25 +50,34 @@ pub use callback::{CallbackContext, CallbackContinuation, CallbackFn, CallbackRe
 pub use closure::Closure;
 pub use coroutine::CoroutineState;
 pub use errors::LuaError;
+#[doc(hidden)]
+pub use errors::CapiBuiltinId;
 pub use gc::trace::ActiveRootKind;
 pub use gc::{
     FinalizerState, GcAge, GcColor, GcControl, GcControlResult, GcCycleKind, GcMode, GcPhase,
     GcTrace, WeakMode,
 };
 pub use handle::HostHandle;
+#[doc(hidden)]
+pub use owned_values::OwnedValues;
 pub use heap::{
-    HostAllocationCharge, HostAllocationReservation, ObjectKind, SlotState, Vm, VmError,
+    CapiShutdownRoot, CapiStackCapacity, DebugCString, DebugLineSource, HostAllocationCharge, HostAllocationReservation, NativeFileScope, ObjectKind,
+    SlotState, Vm, VmError,
 };
 pub use host::{
     DebugCapability, DebugLimits, DebugPermission, DumpCapability, DumpLimits, FileOperation,
     FileReadFormat, FileSeekOrigin, ForeignNativeKind, HostCalendar, HostCloseResult, HostDeadline,
     HostEntropy, HostEntropyError, HostExitRequest, HostExitStatus, HostFileLease, HostIo,
-    HostIoFailure, HostLoadCompiler, HostLoadError, HostLoadErrorKind, HostModuleBytes,
+    HostIoFailure, HostLoadAdvance, HostLoadCompiler, HostLoadError, HostLoadErrorKind,
+    HostLoadJob, HostLoadJobContext, HostLoadJobDriver, HostLoadProgress, HostModuleBytes,
     HostModuleRepository, HostNativeLoader, HostNativeModule, HostOs, HostOsOperation, HostOsValue,
     HostOutput, HostOutputError, HostResourceError, HostResourceErrorKind, HostServices,
+    NativeFileView,
     HostSourceReader, HostWarning, HostWarningError, LoadBudget, LoadCapability, LoadFormat,
     LoadLimits, PathEncoding, ResourceBudget, ResourceCapability, ResourceLimits,
 };
+#[doc(hidden)]
+pub use host::HostLoadSource;
 #[cfg(any(feature = "jit", feature = "aot"))]
 pub use jit::{JitEligibility, JitFallbackReason, JitPolicy, JitStats};
 pub use metamethod::MetamethodEvent;
@@ -83,9 +97,11 @@ pub use string::{ByteString, ExternalStringStorage};
 pub use table::{CanonicalKey, CanonicalKeyClass, Table};
 pub use upvalue::{Upvalue, UpvalueState};
 pub use vm::{
-    AbortReason, CapiDumpBytes, DebugFrameHandle, DebugFrameInfo, DebugFrameKind, DebugHookConfig,
+    capi_official_short_source,
+    AbortReason, CapiDump54Lease, CapiDumpBytes, DebugFrameHandle, DebugFrameInfo, DebugFrameKind, DebugHookConfig,
     DebugLocal, DebugLocalKind, DebugParameterName, Execution, ExternalCommand, ExternalEventView,
-    ExternalResumeA5, ExternalToken, RunOutcome, RuntimeError, RuntimeErrorKind, ValueOperation,
+    ExternalResumeA5, ExternalToken, OwnedExternalCommand, OwnedRunOutcome, ResultRequest, RunOutcome,
+    RuntimeError, RuntimeErrorKind, ValueOperation,
 };
 
 #[cfg(test)]

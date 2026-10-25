@@ -9,13 +9,16 @@ description = "RivetLua 的純 Rust VM 與 heap。"
 
 [features]
 default = ["std"]
-std = ["rivetlua-core/std"]
+std = ["rivetlua-core/std", "rivetlua-alloc/std"]
 jit = ["std", "dep:rivetlua-native", "rivetlua-native/compiler"]
 aot = ["std", "dep:rivetlua-native"]
 
 [dependencies]
 rivetlua-core = { path = "../rivetlua-core", default-features = false }
+rivetlua-alloc = { path = "../rivetlua-alloc", default-features = false }
+allocator-api2 = { version = "=0.2.21", default-features = false, features = ["alloc"] }
 rivetlua-native = { path = "../rivetlua-native", optional = true, default-features = false }
 
 [dev-dependencies]
 rivetlua-compiler = { path = "../rivetlua-compiler" }
+rivetlua-alloc = { path = "../rivetlua-alloc", default-features = false, features = ["test-support"] }

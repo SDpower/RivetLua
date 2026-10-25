@@ -1,6 +1,7 @@
 //! P10-3 execution 所屬的 table 事件續接堆疊與暫時 root。
 
 use crate::rust_alloc::vec::Vec;
+use core::cell::Cell;
 
 use rivetlua_core::{ObjectRef, Register, ResultMode, Value};
 
@@ -13,7 +14,8 @@ use crate::stdlib::math::MinMaxState;
 use crate::stdlib::os::CalendarTimeState;
 use crate::stdlib::package::{LoadReaderState, PathSearcherState, PreloadState, RequireState};
 use crate::stdlib::table::{SortState, TableOpState, TableSortTrace};
-use crate::{RootId, RootKind, Vm, VmError};
+use crate::vm::{DebugFrameId, DebugPublishedToken};
+use crate::{OwnedValues, RootId, RootKind, Vm, VmError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PendingTableKind {
@@ -38,11 +40,15 @@ pub(crate) enum BasicPending {
         tail_return: bool,
     },
     DebugHook {
-        hook_function: ObjectRef,
+        debug_id: DebugFrameId,
+        debug_publication: Cell<Option<DebugPublishedToken>>,
+        hook_function: Value,
         original: Value,
         dynamic_top: usize,
         resume_instruction: bool,
         followup_line: Option<Option<u32>>,
+        count_event: bool,
+        hook_yield_requested: bool,
         local_current_pc: bool,
         target: Option<ObjectRef>,
         target_root: Option<RootId>,
@@ -91,6 +97,11 @@ pub(crate) enum BasicPending {
     ToString {
         outer_mode: ResultMode,
         tail_return: bool,
+    },
+    StringArithmetic {
+        outer_mode: ResultMode,
+        tail_return: bool,
+        protected_depth: usize,
     },
     Pairs {
         count: u16,
@@ -219,8 +230,8 @@ pub(crate) struct DebugBuiltinReturn {
 
 pub(crate) struct HostCallbackPending {
     callback: crate::rust_alloc::rc::Rc<CallbackFn>,
-    captures: PrintArguments,
-    arguments: PrintArguments,
+    values: PrintArguments,
+    capture_len: usize,
 }
 
 impl HostCallbackPending {
@@ -229,136 +240,60 @@ impl HostCallbackPending {
         continuation: CallbackContinuation,
         args: &[Value],
     ) -> Result<Self, VmError> {
-        let mut captures = PrintArguments::new(vm, &continuation.captures)?;
-        let arguments = match PrintArguments::new(vm, args) {
-            Ok(arguments) => arguments,
-            Err(error) => {
-                captures.clear_roots(vm)?;
-                return Err(error);
-            }
+        Self::new_with_leading(vm, continuation, None, args)
+    }
+
+    pub(crate) fn new_with_leading(
+        vm: &mut Vm,
+        continuation: CallbackContinuation,
+        leading: Option<Value>,
+        args: &[Value],
+    ) -> Result<Self, VmError> {
+        let capture_len = continuation.captures.len();
+        let values = if let Some(leading) = leading {
+            PrintArguments::try_copy_with_middle(vm, &continuation.captures, leading, args)?
+        } else {
+            PrintArguments::try_copy_pair(vm, &continuation.captures, args)?
         };
         Ok(Self {
             callback: continuation.callback,
-            captures,
-            arguments,
+            values,
+            capture_len,
         })
     }
 
     pub(crate) fn invoke(&self, vm: &mut Vm, values: &[Value]) -> Result<CallbackResult, VmError> {
-        let mut context = CallbackContext::new(self.captures.values(), vm);
+        let mut context = CallbackContext::new(&self.values[..self.capture_len], vm);
         let result = (self.callback)(&mut context, values);
         context.finish()?;
         Ok(result)
     }
 
     pub(crate) fn arguments(&self) -> &[Value] {
-        self.arguments.values()
+        &self.values[self.capture_len..]
     }
 
     pub(crate) fn capture_len(&self) -> usize {
-        self.captures.values().len()
+        self.capture_len
     }
 
     pub(crate) fn clear_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
-        self.arguments.clear_roots(vm)?;
-        self.captures.clear_roots(vm)
+        self.values.clear_roots(vm)
     }
 
     pub(crate) fn restore_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
-        self.captures.restore_roots(vm)?;
-        if let Err(error) = self.arguments.restore_roots(vm) {
-            self.captures.clear_roots(vm)?;
-            return Err(error);
-        }
-        Ok(())
+        self.values.restore_roots(vm)
     }
 
     pub(crate) fn trace_children(
         &self,
         mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
     ) -> Result<(), VmError> {
-        self.captures.trace_children(&mut visit)?;
-        self.arguments.trace_children(&mut visit)
+        self.values.trace_children(&mut visit)
     }
 }
 
-pub(crate) struct PrintArguments {
-    values: Vec<Value>,
-    roots: Vec<RootId>,
-    _values_charge: Option<crate::alloc::AllocationCharge>,
-    _roots_charge: Option<crate::alloc::AllocationCharge>,
-}
-
-impl PrintArguments {
-    pub(crate) fn empty() -> Self {
-        Self {
-            values: Vec::new(),
-            roots: Vec::new(),
-            _values_charge: None,
-            _roots_charge: None,
-        }
-    }
-
-    pub(crate) fn new(vm: &mut Vm, values: &[Value]) -> Result<Self, VmError> {
-        let ledger = vm.allocation_ledger().clone();
-        let mut owned = Vec::new();
-        let values_ticket = reserve_vec(&ledger, &mut owned, values.len(), FailPoint::WorkReserve)?;
-        owned.extend_from_slice(values);
-        let mut roots = Vec::new();
-        let roots_ticket = reserve_vec(&ledger, &mut roots, values.len(), FailPoint::WorkReserve)?;
-        let values_charge = values_ticket.commit_charge()?;
-        let roots_charge = roots_ticket.commit_charge()?;
-        let mut arguments = Self {
-            values: owned,
-            roots,
-            _values_charge: Some(values_charge),
-            _roots_charge: Some(roots_charge),
-        };
-        if let Err(error) = arguments.restore_roots(vm) {
-            arguments.clear_roots(vm)?;
-            return Err(error);
-        }
-        Ok(arguments)
-    }
-
-    pub(crate) fn values(&self) -> &[Value] {
-        &self.values
-    }
-
-    pub(crate) fn clear_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
-        while let Some(root) = self.roots.pop() {
-            vm.remove_root(root)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn restore_roots(&mut self, vm: &mut Vm) -> Result<(), VmError> {
-        for value in &self.values {
-            if let Value::Object(object) = value {
-                match vm.add_root(RootKind::Temporary, *object) {
-                    Ok(root) => self.roots.push(root),
-                    Err(error) => {
-                        self.clear_roots(vm)?;
-                        return Err(error);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn trace_children(
-        &self,
-        mut visit: impl FnMut(ObjectRef) -> Result<(), VmError>,
-    ) -> Result<(), VmError> {
-        for value in &self.values {
-            if let Value::Object(object) = value {
-                visit(*object)?;
-            }
-        }
-        Ok(())
-    }
-}
+pub(crate) type PrintArguments = OwnedValues;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResumeStage {
@@ -382,6 +317,8 @@ pub(crate) struct PendingOp {
     pub(crate) chain_steps: usize,
     pub(crate) stage: ResumeStage,
     pub(crate) basic: Option<BasicPending>,
+    /// C→Lua 語意呼叫的進入前基線；停放 root 不等於結束呼叫。
+    pub(crate) c_call_restore: Option<(ObjectRef, u16)>,
     roots: [Option<RootId>; 5],
 }
 
@@ -434,6 +371,7 @@ impl PendingOp {
             dynamic_top,
             chain_steps,
             stage: ResumeStage::AwaitingReturn,
+            c_call_restore: None,
             basic: None,
             roots: [None; 5],
         };
@@ -452,6 +390,13 @@ impl PendingOp {
     }
 
     pub(crate) fn clear(&mut self, vm: &mut Vm) -> Result<(), VmError> {
+        if let Some((thread, previous)) = self.c_call_restore.take() {
+            // 純 C checkpoint 可能已先還原進入前基線；舊 pending 只能降低深度。
+            let current = vm.capi_c_call_depth(Some(thread))?;
+            if current > previous {
+                vm.capi_set_c_call_depth(Some(thread), previous)?;
+            }
+        }
         self.park_roots(vm)?;
         self.basic = None;
         Ok(())
@@ -494,7 +439,10 @@ impl PendingOp {
         {
             result.values.restore_roots(vm)?;
         }
-        if let Some(BasicPending::Print { arguments, .. }) = self.basic.as_mut() {
+        if let Some(
+            BasicPending::Print { arguments, .. }
+            | BasicPending::Warning { arguments, .. },
+        ) = self.basic.as_mut() {
             arguments.restore_roots(vm)?;
         }
         if let Some(BasicPending::StringFormat { state, .. }) = self.basic.as_mut() {
@@ -551,12 +499,17 @@ impl PendingOp {
             ..
         }) = self.basic.as_ref()
         {
-            visit(*hook_function)?;
+            if let Value::Object(object) = hook_function {
+                visit(*object)?;
+            }
             if let Some(result) = builtin_return {
                 result.values.trace_children(&mut visit)?;
             }
         }
-        if let Some(BasicPending::Print { arguments, .. }) = self.basic.as_ref() {
+        if let Some(
+            BasicPending::Print { arguments, .. }
+            | BasicPending::Warning { arguments, .. },
+        ) = self.basic.as_ref() {
             arguments.trace_children(&mut visit)?;
         }
         if let Some(BasicPending::StringFormat { state, .. }) = self.basic.as_ref() {
@@ -621,7 +574,30 @@ impl PendingStack {
     pub(crate) fn basic_depth(&self) -> usize {
         self.entries
             .iter()
-            .filter(|pending| pending.kind == PendingKind::Basic)
+            .filter(|pending| {
+                pending.kind == PendingKind::Basic
+                    && !matches!(pending.basic.as_ref(), Some(BasicPending::StringArithmetic { .. }))
+            })
+            .count()
+    }
+
+    pub(crate) fn string_arithmetic_depth_in_frame(
+        &self,
+        caller_depth: usize,
+        caller_stack_base: usize,
+        caller_prototype: usize,
+        caller_module: Option<ObjectRef>,
+    ) -> usize {
+        self.entries
+            .iter()
+            .filter(|pending| {
+                pending.kind == PendingKind::Basic
+                    && matches!(pending.basic, Some(BasicPending::StringArithmetic { .. }))
+                    && pending.caller_depth == caller_depth
+                    && pending.caller_stack_base == caller_stack_base
+                    && pending.caller_prototype == caller_prototype
+                    && pending.caller_module == caller_module
+            })
             .count()
     }
 
@@ -888,3 +864,5 @@ mod p13_a_tests {
         assert_eq!(vm.ledger_snapshot().reserved, baseline.reserved);
     }
 }
+
+

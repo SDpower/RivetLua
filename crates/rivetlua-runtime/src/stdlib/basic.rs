@@ -80,6 +80,86 @@ fn argument() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::BasicArgument)
 }
 
+fn basic_error(vm: &mut Vm, message: &[u8]) -> Result<RuntimeError, RuntimeError> {
+    let mut error = argument();
+    error.value = Value::Object(vm.allocate_byte_string(message)?);
+    Ok(error)
+}
+
+pub(crate) fn argument_error(
+    vm: &mut Vm,
+    function: &str,
+    index: usize,
+    reason: &str,
+) -> Result<RuntimeError, RuntimeError> {
+    let mut text = Text::new();
+    write!(text, "bad argument #{index} to '{function}' (")
+        .map_err(|_| VmError::ArithmeticOverflow)?;
+    let reason_start = text.as_bytes().len();
+    write!(text, "{reason}").map_err(|_| VmError::ArithmeticOverflow)?;
+    let reason_end = text.as_bytes().len();
+    text.write_str(")").map_err(|_| VmError::ArithmeticOverflow)?;
+    let error = basic_error(vm, text.as_bytes())?;
+    if let Value::Object(payload) = error.value {
+        vm.record_argument_error(crate::heap::ArgumentErrorMeta {
+            payload, index, reason_start, reason_end,
+        });
+    }
+    Ok(error)
+}
+
+pub(crate) fn type_argument_error(
+    vm: &mut Vm,
+    function: &str,
+    index: usize,
+    expected: &str,
+    actual: Option<Value>,
+) -> Result<RuntimeError, RuntimeError> {
+    let mut prefix = Text::new();
+    write!(prefix, "bad argument #{index} to '{function}' (")
+        .map_err(|_| VmError::ArithmeticOverflow)?;
+    let reason_start = prefix.as_bytes().len();
+    write!(prefix, "{expected} expected, got ").map_err(|_| VmError::ArithmeticOverflow)?;
+    let mut message = PrintBuffer::new(vm);
+    message.append(prefix.as_bytes())?;
+    match actual {
+        None => message.append(b"no value")?,
+        Some(value) => {
+            if let Some(name) = metatable_name(vm, value)? {
+                vm.with_byte_string(name, |string| {
+                    let bytes = string.as_bytes();
+                    message.append(&bytes[..c_string_len(bytes)])
+                })??;
+            } else if matches!(value, Value::LightUserdata(_)) {
+                message.append(b"light userdata")?;
+            } else {
+                message.append(type_name(vm, value)?)?;
+            }
+        }
+    }
+    let reason_end = message.as_bytes().len();
+    message.append(b")")?;
+    let error = basic_error(vm, message.as_bytes())?;
+    if let Value::Object(payload) = error.value {
+        vm.record_argument_error(crate::heap::ArgumentErrorMeta {
+            payload, index, reason_start, reason_end,
+        });
+    }
+    Ok(error)
+}
+
+fn checked_arg(
+    vm: &mut Vm,
+    args: &[Value],
+    index: usize,
+    function: &str,
+) -> Result<Value, RuntimeError> {
+    match args.get(index).copied() {
+        Some(value) => Ok(value),
+        None => Err(argument_error(vm, function, index + 1, "value expected")?),
+    }
+}
+
 pub(crate) fn warn_argument(vm: &mut Vm, index: usize) -> Result<RuntimeError, RuntimeError> {
     let mut text = Text::new();
     write!(text, "bad argument #{index} to 'warn' (string expected)")
@@ -108,26 +188,46 @@ pub(crate) fn lua_integer(value: Value) -> Option<i64> {
     }
 }
 
-fn table_arg(vm: &Vm, args: &[Value], index: usize) -> Result<ObjectRef, RuntimeError> {
-    let Value::Object(table) = arg(args, index)? else {
-        return Err(argument());
+fn optional_gc_integer(vm: &mut Vm, args: &[Value], index: usize) -> Result<i32, RuntimeError> {
+    let Some(value) = args.get(index).copied().filter(|value| *value != Value::Nil) else {
+        return Ok(0);
     };
-    if vm.object_kind(table)? != ObjectKind::Table {
-        return Err(argument());
+    let numeric = number(vm, value, None)?;
+    match lua_integer(numeric) {
+        Some(integer) => Ok(integer as i32),
+        None if numeric != Value::Nil => Err(argument_error(
+            vm,
+            "collectgarbage",
+            index + 1,
+            "number has no integer representation",
+        )?),
+        None => Err(type_argument_error(
+            vm,
+            "collectgarbage",
+            index + 1,
+            "number",
+            Some(value),
+        )?),
     }
-    Ok(table)
 }
 
-fn result(vm: &Vm, values: &[Value]) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
-    let mut output = Vec::new();
-    let ticket = reserve_vec(
-        vm.allocation_ledger(),
-        &mut output,
-        values.len(),
-        FailPoint::ReturnReserve,
-    )?;
-    output.extend_from_slice(values);
-    Ok((output, Some(ticket)))
+fn table_arg(
+    vm: &mut Vm,
+    args: &[Value],
+    index: usize,
+    function: &str,
+) -> Result<ObjectRef, RuntimeError> {
+    let value = args.get(index).copied();
+    if let Some(Value::Object(table)) = value {
+        if vm.object_kind(table)? == ObjectKind::Table {
+            return Ok(table);
+        }
+    }
+    Err(type_argument_error(vm, function, index + 1, "table", value)?)
+}
+
+fn result(vm: &mut Vm, values: &[Value]) -> Result<crate::OwnedValues, RuntimeError> {
+    Ok(crate::OwnedValues::try_copy_from(vm, values)?)
 }
 
 fn text_for(vm: &Vm, value: Value) -> Result<Option<Text>, RuntimeError> {
@@ -336,7 +436,7 @@ fn value_to_string(vm: &mut Vm, value: Value) -> Result<Value, RuntimeError> {
     Ok(Value::Object(vm.allocate_byte_string(buffer.as_bytes())?))
 }
 
-fn type_name(vm: &Vm, value: Value) -> Result<&'static [u8], RuntimeError> {
+pub(crate) fn type_name(vm: &Vm, value: Value) -> Result<&'static [u8], RuntimeError> {
     Ok(match value {
         Value::Nil => b"nil",
         Value::Boolean(_) => b"boolean",
@@ -365,8 +465,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-fn lua_hex_number(text: &str) -> Option<Value> {
-    let mut bytes = text.as_bytes();
+fn lua_hex_number(mut bytes: &[u8], decimal_point: u8, float_only: bool) -> Option<Value> {
     let negative = bytes.first() == Some(&b'-');
     if matches!(bytes.first(), Some(b'-' | b'+')) {
         bytes = &bytes[1..];
@@ -376,12 +475,14 @@ fn lua_hex_number(text: &str) -> Option<Value> {
     }
     bytes = &bytes[2..];
     let mut integer = 0_u64;
-    let mut number = 0_f64;
-    let mut digits = 0_usize;
-    let mut fraction = 1_f64;
+    let mut significand = 0_u128;
+    let mut significant_digits = 0_usize;
+    let mut discarded_nonzero = false;
+    let mut exponent_correction = 0_i128;
+    let mut any_digit = false;
     let mut dot = false;
     while let Some((&byte, rest)) = bytes.split_first() {
-        if byte == b'.' && !dot {
+        if byte == decimal_point && !dot {
             dot = true;
             bytes = rest;
             continue;
@@ -389,69 +490,346 @@ fn lua_hex_number(text: &str) -> Option<Value> {
         let Some(digit) = hex_digit(byte) else {
             break;
         };
-        digits += 1;
+        any_digit = true;
         integer = integer.wrapping_mul(16).wrapping_add(u64::from(digit));
-        if dot {
-            fraction /= 16.0;
-            number += f64::from(digit) * fraction;
+        if significant_digits == 0 && digit == 0 {
+            if dot {
+                exponent_correction -= 4;
+            }
+        } else if significant_digits < 30 {
+            significand = (significand << 4) | u128::from(digit);
+            significant_digits += 1;
+            if dot {
+                exponent_correction -= 4;
+            }
         } else {
-            number = number * 16.0 + f64::from(digit);
+            discarded_nonzero |= digit != 0;
+            if !dot {
+                exponent_correction += 4;
+            }
         }
         bytes = rest;
     }
-    if digits == 0 {
+    if !any_digit {
         return None;
     }
-    if !dot && bytes.is_empty() && digits <= 16 {
+    if !float_only && !dot && bytes.is_empty() {
         return Some(Value::Integer(if negative {
             (0_u64.wrapping_sub(integer)) as i64
         } else {
             integer as i64
         }));
     }
-    if matches!(bytes.first(), Some(b'p' | b'P')) {
-        let exponent = core::str::from_utf8(&bytes[1..])
-            .ok()?
-            .parse::<i32>()
-            .ok()?;
-        #[cfg(feature = "std")]
-        let scale = 2_f64.powi(exponent);
-        #[cfg(not(feature = "std"))]
-        let scale = rivetlua_core::number::no_std_pow2i(exponent);
-        number *= scale;
+    let exponent = if matches!(bytes.first(), Some(b'p' | b'P')) {
+        bytes = &bytes[1..];
+        let negative_exponent = bytes.first() == Some(&b'-');
+        if matches!(bytes.first(), Some(b'-' | b'+')) {
+            bytes = &bytes[1..];
+        }
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut magnitude = 0_i128;
+        for &byte in bytes {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            magnitude = magnitude
+                .saturating_mul(10)
+                .saturating_add(i128::from(byte - b'0'));
+        }
+        if negative_exponent { -magnitude } else { magnitude }
     } else if !bytes.is_empty() {
         return None;
-    }
+    } else {
+        0
+    };
+    let number = scale_hex_number(
+        significand,
+        exponent.saturating_add(exponent_correction),
+        discarded_nonzero,
+    );
     Some(Value::Float(if negative { -number } else { number }))
+}
+
+// 官方 l_str2d 僅在 '.' 轉成 locale 小數點重試時限制原始字串長度。
+const LUA_DOT_FALLBACK_LIMIT: usize = 200;
+
+fn hex_number_with_locale(
+    bytes: &[u8],
+    original_len: usize,
+    locale_point: impl FnOnce() -> u8,
+    float_only: bool,
+) -> Option<Value> {
+    let dot = lua_hex_number(bytes, b'.', float_only);
+    if dot.is_some() && !bytes.contains(&b'.') {
+        return dot;
+    }
+    let point = locale_point();
+    if dot.is_some() && (point == b'.' || original_len <= LUA_DOT_FALLBACK_LIMIT) {
+        return dot;
+    }
+    if point != b'.' {
+        lua_hex_number(bytes, point, float_only)
+    } else {
+        None
+    }
+}
+
+fn scale_hex_number(value: u128, exponent: i128, discarded_nonzero: bool) -> f64 {
+    if value == 0 {
+        return 0.0;
+    }
+    let mut binary_exponent = exponent.saturating_add(i128::from(127 - value.leading_zeros()));
+    if binary_exponent > 1023 {
+        return f64::INFINITY;
+    }
+    if binary_exponent < -1075 {
+        return 0.0;
+    }
+    let unit_exponent = if binary_exponent < -1022 {
+        -1074
+    } else {
+        binary_exponent - 52
+    };
+    // 30 個有效十六進位位數與指數界限，保證右移量不超過 120 位。
+    let shift = unit_exponent - exponent;
+    let mut rounded = if shift > 0 {
+        let shift = shift as u32;
+        let truncated = value >> shift;
+        let remainder = value & ((1u128 << shift) - 1);
+        let halfway = 1u128 << (shift - 1);
+        let round_up = remainder > halfway
+            || (remainder == halfway && (discarded_nonzero || truncated & 1 != 0));
+        truncated + u128::from(round_up)
+    } else {
+        value << ((-shift) as u32)
+    };
+    if binary_exponent < -1022 {
+        return f64::from_bits(rounded as u64);
+    }
+    if rounded == 1u128 << 53 {
+        rounded >>= 1;
+        binary_exponent += 1;
+        if binary_exponent > 1023 {
+            return f64::INFINITY;
+        }
+    }
+    let bits = ((binary_exponent + 1023) as u64) << 52
+        | ((rounded as u64) & ((1u64 << 52) - 1));
+    f64::from_bits(bits)
+}
+
+fn parse_locale_decimal(mut bytes: &[u8], decimal_point: u8) -> Option<f64> {
+    let negative = bytes.first() == Some(&b'-');
+    if matches!(bytes.first(), Some(b'-' | b'+')) {
+        bytes = &bytes[1..];
+    }
+    let mut digits = [0u8; 1100];
+    let mut kept = 0usize;
+    let mut discarded_nonzero = false;
+    let mut all_digits = 0usize;
+    let mut digits_before_point = 0usize;
+    let mut first_significant = None;
+    let mut has_point = false;
+    let mut cursor = 0usize;
+    while let Some(&byte) = bytes.get(cursor) {
+        if byte == decimal_point && !has_point {
+            has_point = true;
+            cursor += 1;
+            continue;
+        }
+        if matches!(byte, b'e' | b'E') {
+            break;
+        }
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        if !has_point {
+            digits_before_point += 1;
+        }
+        if first_significant.is_none() && byte != b'0' {
+            first_significant = Some(all_digits);
+        }
+        if first_significant.is_some() {
+            if kept < digits.len() {
+                digits[kept] = byte;
+                kept += 1;
+            } else {
+                discarded_nonzero |= byte != b'0';
+            }
+        }
+        all_digits += 1;
+        cursor += 1;
+    }
+    if !has_point || all_digits == 0 {
+        return None;
+    }
+    let mut exponent = 0i128;
+    if cursor < bytes.len() {
+        cursor += 1;
+        let negative_exponent = bytes.get(cursor) == Some(&b'-');
+        if matches!(bytes.get(cursor), Some(b'-' | b'+')) {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            return None;
+        }
+        while let Some(&byte) = bytes.get(cursor) {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            exponent = exponent
+                .saturating_mul(10)
+                .saturating_add(i128::from(byte - b'0'));
+            cursor += 1;
+        }
+        if negative_exponent {
+            exponent = -exponent;
+        }
+    }
+    let Some(first_significant) = first_significant else {
+        return Some(if negative { -0.0 } else { 0.0 });
+    };
+    // 略去前導零後，依原小數點位置補回首個有效位的十進位指數。
+    let exponent = exponent.saturating_add(
+        digits_before_point as i128 - first_significant as i128 - 1,
+    );
+    if exponent > 308 {
+        return Some(if negative { f64::NEG_INFINITY } else { f64::INFINITY });
+    }
+    if exponent < -324 {
+        return Some(if negative { -0.0 } else { 0.0 });
+    }
+    // binary64 中點為 k×2^q（k < 2^54、q >= -1075），十進位有效位少於 770。
+    // 保留 1100 位；其後只要非零，補一位即可區分恰好半 ULP 與略高於中點。
+    let mut normalized = [0u8; 1200];
+    let mut len = 0usize;
+    if negative {
+        normalized[len] = b'-';
+        len += 1;
+    }
+    normalized[len] = digits[0];
+    len += 1;
+    normalized[len] = b'.';
+    len += 1;
+    normalized[len..len + kept - 1].copy_from_slice(&digits[1..kept]);
+    len += kept - 1;
+    if kept == 1 {
+        normalized[len] = b'0';
+        len += 1;
+    }
+    if discarded_nonzero {
+        normalized[len] = b'1';
+        len += 1;
+    }
+    normalized[len] = b'e';
+    len += 1;
+    if exponent < 0 {
+        normalized[len] = b'-';
+        len += 1;
+    }
+    let mut magnitude = exponent.unsigned_abs();
+    let exponent_start = len;
+    loop {
+        normalized[len] = b'0' + (magnitude % 10) as u8;
+        len += 1;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    normalized[exponent_start..len].reverse();
+    core::str::from_utf8(&normalized[..len]).ok()?.parse::<f64>().ok()
 }
 
 /// `tonumber` 與 C API 共用的無 base 數值字串解析；不配置或改動 VM。
 pub(crate) fn parse_number_bytes(bytes: &[u8]) -> Option<Value> {
-    let text = core::str::from_utf8(bytes).ok()?;
-    let text = text.trim_matches(|ch: char| ch.is_ascii_whitespace());
-    if text
-        .as_bytes()
-        .get(..2)
-        .is_some_and(|prefix| prefix == b"0x" || prefix == b"0X")
-        || text
-            .as_bytes()
-            .get(1..3)
-            .is_some_and(|prefix| prefix == b"0x" || prefix == b"0X")
-    {
-        return lua_hex_number(text);
+    parse_number_bytes_with_point(bytes, rivetlua_alloc::c_ctype::decimal_point)
+}
+
+fn parse_number_bytes_with_point(bytes: &[u8], locale_point: impl FnOnce() -> u8) -> Option<Value> {
+    parse_number_bytes_with_space(bytes, locale_point, |byte| {
+        rivetlua_alloc::c_ctype::classify(byte, b's') == Some(true)
+    })
+}
+
+fn lua_number_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+fn parse_number_bytes_with_space(
+    bytes: &[u8],
+    locale_point: impl FnOnce() -> u8,
+    c_space: impl Fn(u8) -> bool,
+) -> Option<Value> {
+    let original_len = bytes.len();
+    let mut integer_bytes = bytes;
+    while integer_bytes.first().is_some_and(|byte| lua_number_space(*byte)) {
+        integer_bytes = &integer_bytes[1..];
     }
-    if let Ok(value) = text.parse::<i64>() {
-        return Some(Value::Integer(value));
+    while integer_bytes.last().is_some_and(|byte| lua_number_space(*byte)) {
+        integer_bytes = &integer_bytes[..integer_bytes.len() - 1];
     }
-    let word = text.trim_start_matches(['-', '+']);
-    if word.eq_ignore_ascii_case("nan")
-        || word.eq_ignore_ascii_case("inf")
-        || word.eq_ignore_ascii_case("infinity")
-    {
+    if integer_bytes.contains(&0) {
         return None;
     }
-    text.parse::<f64>().ok().map(Value::Float)
+    let unsigned = if matches!(integer_bytes.first(), Some(b'-' | b'+')) {
+        &integer_bytes[1..]
+    } else {
+        integer_bytes
+    };
+    if unsigned.starts_with(b"0x") || unsigned.starts_with(b"0X") {
+        return hex_number_with_locale(integer_bytes, original_len, locale_point, false);
+    }
+    if let Ok(text) = core::str::from_utf8(integer_bytes) {
+        if let Ok(value) = text.parse::<i64>() {
+            return Some(Value::Integer(value));
+        }
+    }
+    // 整數用固定的 Lua 空白；浮點 strtod 前導空白走 C locale，尾端仍用 Lua 空白。
+    let mut bytes = bytes;
+    while bytes.first().is_some_and(|byte| c_space(*byte)) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(|byte| lua_number_space(*byte)) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    let unsigned = if matches!(bytes.first(), Some(b'-' | b'+')) {
+        &bytes[1..]
+    } else {
+        bytes
+    };
+    if unsigned.starts_with(b"0x") || unsigned.starts_with(b"0X") {
+        return hex_number_with_locale(bytes, original_len, locale_point, true);
+    }
+    if let Ok(text) = core::str::from_utf8(bytes) {
+        let word = text.trim_start_matches(['-', '+']);
+        if word.eq_ignore_ascii_case("nan")
+            || word.eq_ignore_ascii_case("inf")
+            || word.eq_ignore_ascii_case("infinity")
+        {
+            return None;
+        }
+        if let Ok(value) = text.parse::<f64>() {
+            if !bytes.contains(&b'.') {
+                return Some(Value::Float(value));
+            }
+            let point = locale_point();
+            if point == b'.' || original_len <= LUA_DOT_FALLBACK_LIMIT {
+                return Some(Value::Float(value));
+            }
+            return None;
+        }
+    }
+    let point = locale_point();
+    if point == b'.' || !bytes.contains(&point) {
+        return None;
+    }
+    parse_locale_decimal(bytes, point).map(Value::Float)
 }
+
+
 
 pub(crate) fn number(vm: &Vm, value: Value, base: Option<Value>) -> Result<Value, RuntimeError> {
     if base.is_none() || base == Some(Value::Nil) {
@@ -476,7 +854,7 @@ pub(crate) fn number(vm: &Vm, value: Value, base: Option<Value>) -> Result<Value
     vm.with_byte_string(object, |string| {
         let bytes = string.as_bytes();
         if let Some(base) = base.filter(|base| *base != Value::Nil) {
-            let Some(base) = lua_integer(base) else {
+            let Some(base) = lua_integer(number(vm, base, None)?) else {
                 return Err(argument());
             };
             if !(2..=36).contains(&base) {
@@ -520,13 +898,6 @@ pub(crate) fn number(vm: &Vm, value: Value, base: Option<Value>) -> Result<Value
     })?
 }
 
-fn protected_metatable(vm: &mut Vm, table: ObjectRef) -> Result<Option<Value>, RuntimeError> {
-    let Some(metatable) = vm.get_metatable(table)? else {
-        return Ok(None);
-    };
-    protected_metatable_value(vm, metatable).map(Some)
-}
-
 fn protected_metatable_value(vm: &mut Vm, metatable: ObjectRef) -> Result<Value, RuntimeError> {
     let value = metatable_field(vm, metatable)?;
     Ok(if value == Value::Nil {
@@ -551,7 +922,10 @@ pub(crate) fn print(vm: &mut Vm, args: &[Value]) -> Result<(), RuntimeError> {
         append_print_value(vm, &mut buffer, *value, index != 0)?;
     }
     buffer.append(b"\n")?;
-    match vm.write_host_output(buffer.as_bytes()) {
+    match vm
+        .write_host_output(buffer.as_bytes())
+        .and_then(|()| vm.flush_host_output())
+    {
         Ok(()) => Ok(()),
         Err(HostServiceError::PolicyDenied) => {
             Err(RuntimeError::new(RuntimeErrorKind::HostPolicyOutput))
@@ -568,13 +942,13 @@ pub(crate) fn execute(
     builtin: BasicBuiltin,
     args: &[Value],
     pc: usize,
-) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
+) -> Result<crate::OwnedValues, RuntimeError> {
     match builtin {
         BasicBuiltin::Assert => {
             let condition = arg(args, 0)?;
             if !condition.is_truthy() {
                 let message = match args.get(1).copied() {
-                    Some(value) if value != Value::Nil => value,
+                    Some(value) => value,
                     _ => Value::Object(vm.allocate_byte_string(b"assertion failed!")?),
                 };
                 return Err(explicit_error(message, pc));
@@ -639,10 +1013,13 @@ pub(crate) fn execute(
             };
             match operation {
                 Some(0) => {
-                    let bytes = vm.ledger_snapshot().lua_heap_bytes;
+                    let bytes = vm.callback_gc_count_bytes()
+                        .unwrap_or_else(|| vm.ledger_snapshot().lua_heap_bytes);
                     result(vm, &[Value::Float(bytes as f64 / 1024.0)])
                 }
-                Some(1..=10) if vm.finalizer_running() => result(vm, &[Value::Nil]),
+                Some(1..=10) if vm.finalizer_running() && !matches!(operation, Some(5 | 6)) => {
+                    result(vm, &[Value::Nil])
+                }
                 Some(1) => result(vm, &[Value::Boolean(vm.automatic_gc_running())]),
                 Some(2) => {
                     let output = result(vm, &[Value::Integer(0)])?;
@@ -660,42 +1037,59 @@ pub(crate) fn execute(
                     Ok(output)
                 }
                 Some(5 | 6) => {
-                    let requested = if operation == Some(5) {
-                        GcMode::Incremental
+                    let control = if operation == Some(5) {
+                        let (pause, step_mul, step_size) =
+                            if vm.language_profile() == rivetlua_core::LuaProfile::Lua54 {
+                                (
+                                    optional_gc_integer(vm, args, 1)?,
+                                    optional_gc_integer(vm, args, 2)?,
+                                    optional_gc_integer(vm, args, 3)?,
+                                )
+                            } else {
+                                (0, 0, 0)
+                            };
+                        GcControl::Incremental {
+                            pause,
+                            step_mul,
+                            step_size,
+                        }
                     } else {
-                        GcMode::Generational
+                        let (minor_mul, minor_major) =
+                            if vm.language_profile() == rivetlua_core::LuaProfile::Lua54 {
+                                (
+                                    optional_gc_integer(vm, args, 1)?,
+                                    optional_gc_integer(vm, args, 2)?,
+                                )
+                            } else {
+                                (0, 0)
+                            };
+                        GcControl::Generational {
+                            minor_mul,
+                            minor_major,
+                        }
                     };
+                    if vm.finalizer_running() {
+                        return result(vm, &[Value::Nil]);
+                    }
                     let previous = vm.gc_mode();
-                    let (mut values, ticket) = result(vm, &[Value::Nil])?;
                     let name = match previous {
                         GcMode::Incremental => b"incremental".as_slice(),
                         GcMode::Generational => b"generational".as_slice(),
                     };
                     let string = vm.allocate_byte_string(name)?;
-                    let root = vm.add_root(RootKind::Temporary, string)?;
-                    let switched = (|| {
-                        if requested != previous {
-                            while vm.gc_trace().phase != GcPhase::Pause {
-                                vm.incremental_step(1024)?;
-                            }
-                            vm.set_gc_mode(requested)?;
-                        }
-                        Ok::<(), VmError>(())
-                    })();
-                    let removed = vm.remove_root(root);
-                    switched?;
-                    removed?;
-                    values[0] = Value::Object(string);
-                    Ok((values, ticket))
+                    let values = result(vm, &[Value::Object(string)])?;
+                    vm.gc_control(control)?;
+                    Ok(values)
                 }
                 Some(7) => {
                     let size = match args.get(1).copied().unwrap_or(Value::Nil) {
                         Value::Nil => 0,
                         value => lua_integer(number(vm, value, None)?).ok_or_else(argument)?,
                     };
-                    let (mut values, ticket) = result(vm, &[Value::Boolean(false)])?;
-                    values[0] = Value::Boolean(vm.explicit_gc_step(size)?);
-                    Ok((values, ticket))
+                    let mut values = result(vm, &[Value::Boolean(false)])?;
+                    let stepped = vm.explicit_gc_step(size)?;
+                    values.try_set(vm, 0, Value::Boolean(stepped))?;
+                    Ok(values)
                 }
                 Some(8) => {
                     let Value::Object(name_object) = arg(args, 1)? else {
@@ -744,7 +1138,9 @@ pub(crate) fn execute(
             }
         }
         BasicBuiltin::Select => {
-            let index = arg(args, 0)?;
+            let Some(index) = args.first().copied() else {
+                return Err(type_argument_error(vm, "select", 1, "number", None)?);
+            };
             if let Value::Object(object) = index {
                 if vm.object_kind(object)? == ObjectKind::ByteString
                     && vm.with_byte_string(object, |s| s.as_bytes().first() == Some(&b'#'))?
@@ -758,8 +1154,13 @@ pub(crate) fn execute(
                     );
                 }
             }
-            let Some(mut index) = lua_integer(index) else {
-                return Err(argument());
+            let number = number(vm, index, None)?;
+            let Some(mut index) = lua_integer(number) else {
+                return Err(if number == Value::Nil {
+                    type_argument_error(vm, "select", 1, "number", Some(index))?
+                } else {
+                    argument_error(vm, "select", 1, "number has no integer representation")?
+                });
             };
             let total = i64::try_from(args.len()).map_err(|_| VmError::ArithmeticOverflow)?;
             if index < 0 {
@@ -770,7 +1171,7 @@ pub(crate) fn execute(
                 index = total;
             }
             if index < 1 {
-                return Err(argument());
+                return Err(argument_error(vm, "select", 1, "index out of range")?);
             }
             result(
                 vm,
@@ -778,7 +1179,7 @@ pub(crate) fn execute(
             )
         }
         BasicBuiltin::Type => {
-            let value = arg(args, 0)?;
+            let value = checked_arg(vm, args, 0, "type")?;
             let name = type_name(vm, value)?;
             let string = vm.allocate_byte_string(name)?;
             result(vm, &[Value::Object(string)])
@@ -790,30 +1191,29 @@ pub(crate) fn execute(
         }
         BasicBuiltin::ToNumber => result(vm, &[number(vm, arg(args, 0)?, args.get(1).copied())?]),
         BasicBuiltin::Next => {
-            let table = table_arg(vm, args, 0)?;
-            match vm.raw_next_value(table, args.get(1).copied().unwrap_or(Value::Nil))? {
+            let table = table_arg(vm, args, 0, "next")?;
+            let next = match vm.raw_next_value(table, args.get(1).copied().unwrap_or(Value::Nil)) {
+                Err(mut error)
+                    if error.kind == RuntimeErrorKind::InvalidNextKey
+                        && error.value == Value::Nil =>
+                {
+                    error.value = Value::Object(vm.allocate_byte_string(b"invalid key to 'next'")?);
+                    return Err(error);
+                }
+                other => other?,
+            };
+            match next {
                 Some((key, value)) => result(vm, &[key, value]),
                 None => result(vm, &[Value::Nil]),
             }
         }
         BasicBuiltin::Pairs => {
-            let table = table_arg(vm, args, 0)?;
+            let state = arg(args, 0)?;
             let iterator = vm.allocate_basic_builtin(BasicBuiltin::Next)?;
             if vm.language_profile() == rivetlua_core::LuaProfile::Lua54 {
-                result(
-                    vm,
-                    &[Value::Object(iterator), Value::Object(table), Value::Nil],
-                )
+                result(vm, &[Value::Object(iterator), state, Value::Nil])
             } else {
-                result(
-                    vm,
-                    &[
-                        Value::Object(iterator),
-                        Value::Object(table),
-                        Value::Nil,
-                        Value::Nil,
-                    ],
-                )
+                result(vm, &[Value::Object(iterator), state, Value::Nil, Value::Nil])
             }
         }
         BasicBuiltin::IPairs => {
@@ -821,70 +1221,78 @@ pub(crate) fn execute(
             let iterator = vm.allocate_basic_builtin(BasicBuiltin::IPairsAux)?;
             result(vm, &[Value::Object(iterator), state, Value::Integer(0)])
         }
-        BasicBuiltin::IPairsAux => {
-            let table = table_arg(vm, args, 0)?;
-            let Some(index) = lua_integer(arg(args, 1)?) else {
-                return Err(argument());
-            };
-            let next = index.wrapping_add(1);
-            let value = vm.raw_get(table, Value::Integer(next))?;
-            if value == Value::Nil {
-                result(vm, &[Value::Nil])
-            } else {
-                result(vm, &[Value::Integer(next), value])
-            }
-        }
+        BasicBuiltin::IPairsAux => Err(RuntimeError::new(RuntimeErrorKind::MissingEntryPoint)),
         BasicBuiltin::GetMetatable => {
             let value = arg(args, 0)?;
-            let Value::Object(object) = value else {
-                return result(vm, &[Value::Nil]);
-            };
-            let value = match vm.object_kind(object)? {
-                ObjectKind::Table | ObjectKind::Userdata => {
-                    protected_metatable(vm, object)?.unwrap_or(Value::Nil)
-                }
-                ObjectKind::ByteString => match vm.string_metatable() {
-                    Some(metatable) => protected_metatable_value(vm, metatable)?,
-                    None => Value::Nil,
-                },
-                _ => Value::Nil,
+            let value = match vm.get_metatable_for_value(value)? {
+                Some(metatable) => protected_metatable_value(vm, metatable)?,
+                None => Value::Nil,
             };
             result(vm, &[value])
         }
         BasicBuiltin::SetMetatable => {
-            let table = table_arg(vm, args, 0)?;
-            let metatable = match arg(args, 1)? {
-                Value::Nil => None,
-                Value::Object(object) if vm.object_kind(object)? == ObjectKind::Table => {
+            let table = table_arg(vm, args, 0, "setmetatable")?;
+            let metatable = match args.get(1).copied() {
+                Some(Value::Nil) => None,
+                Some(Value::Object(object)) if vm.object_kind(object)? == ObjectKind::Table => {
                     Some(object)
                 }
-                _ => return Err(argument()),
+                value => {
+                    return Err(type_argument_error(
+                        vm,
+                        "setmetatable",
+                        2,
+                        "nil or table",
+                        value,
+                    )?);
+                }
             };
             if let Some(existing) = vm.get_metatable(table)? {
                 if metatable_field(vm, existing)? != Value::Nil {
-                    return Err(argument());
+                    return Err(basic_error(vm, b"cannot change a protected metatable")?);
                 }
             }
             vm.set_metatable(table, metatable)?;
             result(vm, &[Value::Object(table)])
         }
         BasicBuiltin::RawGet => {
-            let table = table_arg(vm, args, 0)?;
-            let value = vm.raw_get(table, arg(args, 1)?)?;
+            let table = table_arg(vm, args, 0, "rawget")?;
+            let key = checked_arg(vm, args, 1, "rawget")?;
+            let value = vm.raw_get(table, key)?;
             result(vm, &[value])
         }
         BasicBuiltin::RawSet => {
-            let table = table_arg(vm, args, 0)?;
-            vm.raw_set(table, arg(args, 1)?, arg(args, 2)?)?;
+            let table = table_arg(vm, args, 0, "rawset")?;
+            let key = checked_arg(vm, args, 1, "rawset")?;
+            let value = checked_arg(vm, args, 2, "rawset")?;
+            match vm.raw_set(table, key, value) {
+                Err(error @ (VmError::NilTableKey | VmError::NaNTableKey)) => {
+                    let message = if error == VmError::NilTableKey {
+                        b"table index is nil".as_slice()
+                    } else {
+                        b"table index is NaN".as_slice()
+                    };
+                    let mut error = RuntimeError::from(error);
+                    if error.value == Value::Nil {
+                        error.value = Value::Object(vm.allocate_byte_string(message)?);
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error.into()),
+                Ok(()) => {}
+            }
             result(vm, &[Value::Object(table)])
         }
         BasicBuiltin::RawEqual => {
-            let equal = crate::vm::basic_raw_equal(vm, arg(args, 0)?, arg(args, 1)?)?;
+            let left = checked_arg(vm, args, 0, "rawequal")?;
+            let right = checked_arg(vm, args, 1, "rawequal")?;
+            let equal = crate::vm::basic_raw_equal(vm, left, right)?;
             result(vm, &[Value::Boolean(equal)])
         }
         BasicBuiltin::RawLen => {
-            let Value::Object(object) = arg(args, 0)? else {
-                return Err(argument());
+            let value = args.first().copied();
+            let Some(Value::Object(object)) = value else {
+                return Err(type_argument_error(vm, "rawlen", 1, "table or string", value)?);
             };
             let length = match vm.object_kind(object)? {
                 ObjectKind::ByteString => {
@@ -892,7 +1300,15 @@ pub(crate) fn execute(
                         .map_err(|_| VmError::ArithmeticOverflow)?
                 }
                 ObjectKind::Table => vm.with_table(object, |table| table.border_len())?,
-                _ => return Err(argument()),
+                _ => {
+                    return Err(type_argument_error(
+                        vm,
+                        "rawlen",
+                        1,
+                        "table or string",
+                        value,
+                    )?);
+                }
             };
             result(vm, &[Value::Integer(length)])
         }
@@ -906,12 +1322,12 @@ use core::fmt::Write;
 
 use rivetlua_core::{ObjectRef, Value};
 
-use crate::alloc::{AllocationLedger, FailPoint, Reservation, reserve_vec};
+use crate::alloc::{AllocationLedger, FailPoint, reserve_vec};
 use crate::errors::explicit_error;
-use crate::gc::GcParameter;
+use crate::gc::{GcControl, GcParameter};
 use crate::host::HostServiceError;
 use crate::vm::{RuntimeError, RuntimeErrorKind};
-use crate::{GcMode, GcPhase, ObjectKind, RootKind, Vm, VmError};
+use crate::{GcMode, ObjectKind, RootKind, Vm, VmError};
 
 #[cfg(test)]
 mod p13_a_tests {
@@ -1109,6 +1525,8 @@ mod p13_a_tests {
         assert_eq!(vm.ledger_snapshot().reserved, 0);
     }
 }
+
+
 
 #[cfg(test)]
 mod gc_running_tests {

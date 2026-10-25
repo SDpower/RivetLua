@@ -4,9 +4,9 @@ use crate::rust_alloc::vec::Vec;
 
 use rivetlua_core::{ObjectRef, Value};
 
-use crate::alloc::Reservation;
 use crate::pending_op::PrintArguments;
-use crate::stdlib::pattern::Found;
+use crate::stdlib::basic;
+use crate::stdlib::pattern::{Found, PatternError};
 use crate::stdlib::string::{self, Buffer};
 use crate::vm::{RuntimeError, RuntimeErrorKind};
 use crate::{ObjectKind, Vm, VmError};
@@ -15,6 +15,30 @@ pub(crate) enum Replacement {
     Text(Buffer),
     Function(Value),
     Table(Value),
+}
+
+pub(crate) enum GSubError {
+    Runtime(RuntimeError),
+    Pattern(PatternError),
+    InvalidReplacement(Value),
+}
+
+impl From<RuntimeError> for GSubError {
+    fn from(error: RuntimeError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+impl From<VmError> for GSubError {
+    fn from(error: VmError) -> Self {
+        Self::Runtime(error.into())
+    }
+}
+
+impl From<PatternError> for GSubError {
+    fn from(error: PatternError) -> Self {
+        Self::Pattern(error)
+    }
 }
 
 pub(crate) struct GSubState {
@@ -33,11 +57,75 @@ pub(crate) struct GSubState {
     pub(crate) callback_arguments: Option<PrintArguments>,
 }
 
-fn pattern_error() -> RuntimeError {
+fn runtime_pattern_error() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::StringPattern)
 }
 fn argument_error() -> RuntimeError {
     RuntimeError::new(RuntimeErrorKind::StringArgument)
+}
+
+fn replacement_error(value: Value, error: RuntimeError) -> GSubError {
+    if error.kind == RuntimeErrorKind::StringArgument {
+        GSubError::InvalidReplacement(value)
+    } else {
+        GSubError::Runtime(error)
+    }
+}
+
+pub(crate) fn materialize_error(
+    vm: &mut Vm,
+    error: GSubError,
+) -> Result<RuntimeError, RuntimeError> {
+    match error {
+        GSubError::Runtime(error) => Ok(error),
+        GSubError::Pattern(reason) => {
+            let Some(message) = reason.message() else {
+                return Ok(RuntimeError::new(RuntimeErrorKind::StringPattern));
+            };
+            let mut bytes = [0_u8; 96];
+            let mut length = message.len();
+            bytes[..length].copy_from_slice(message.as_bytes());
+            if let PatternError::InvalidCaptureIndex(index) = reason {
+                bytes[length] = b' ';
+                length += 1;
+                bytes[length] = b'%';
+                length += 1;
+                let mut digits = [0_u8; 3];
+                let mut digit_count = 0;
+                let mut remaining = index;
+                loop {
+                    digits[digit_count] = b'0' + remaining % 10;
+                    digit_count += 1;
+                    remaining /= 10;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                for digit in digits[..digit_count].iter().rev() {
+                    bytes[length] = *digit;
+                    length += 1;
+                }
+            }
+            let mut runtime = RuntimeError::new(RuntimeErrorKind::StringPattern);
+            runtime.value = Value::Object(vm.allocate_byte_string(&bytes[..length])?);
+            Ok(runtime)
+        }
+        GSubError::InvalidReplacement(value) => {
+            let name = basic::type_name(vm, value)?;
+            let prefix = b"invalid replacement value (a ";
+            let mut bytes = [0_u8; 64];
+            let mut length = prefix.len();
+            bytes[..length].copy_from_slice(prefix);
+            let end = length + name.len();
+            bytes[length..end].copy_from_slice(name);
+            length = end;
+            bytes[length] = b')';
+            length += 1;
+            let mut runtime = RuntimeError::new(RuntimeErrorKind::StringArgument);
+            runtime.value = Value::Object(vm.allocate_byte_string(&bytes[..length])?);
+            Ok(runtime)
+        }
+    }
 }
 
 impl GSubState {
@@ -53,12 +141,15 @@ impl GSubState {
                 Value::Integer(_) | Value::Float(_) => {
                     Replacement::Text(string::owned_bytes(vm, replacement_value)?)
                 }
+                Value::CFunction(id) if id.vm() == vm.id() => {
+                    Replacement::Function(replacement_value)
+                }
                 Value::Object(object) => match vm.object_kind(object)? {
                     ObjectKind::ByteString => {
                         Replacement::Text(string::owned_bytes(vm, replacement_value)?)
                     }
                     ObjectKind::Table => Replacement::Table(replacement_value),
-                    ObjectKind::Closure | ObjectKind::Builtin => {
+                    ObjectKind::Closure | ObjectKind::Builtin | ObjectKind::CClosure => {
                         Replacement::Function(replacement_value)
                     }
                     _ => return Err(argument_error()),
@@ -136,33 +227,37 @@ impl GSubState {
         self.output.append(bytes)
     }
 
-    fn capture_range(found: Found, index: usize) -> Result<(usize, usize, bool), RuntimeError> {
+    fn capture_range(found: Found, index: u8) -> Result<(usize, usize, bool), GSubError> {
         if index == 0 || (index == 1 && found.count == 0) {
             return Ok((found.start, found.end, false));
         }
+        let capture_index = index;
+        let index = usize::from(capture_index);
         let capture = found
             .captures
             .get(index - 1)
             .filter(|_| index <= found.count)
-            .ok_or_else(pattern_error)?;
+            .ok_or(PatternError::InvalidCaptureIndex(capture_index))?;
         Ok((
             capture.start,
-            capture.end.ok_or_else(pattern_error)?,
+            capture
+                .end
+                .ok_or(PatternError::UnfinishedCapture)?,
             capture.position,
         ))
     }
 
-    pub(crate) fn text_cost(&self, vm: &Vm, found: Found) -> Result<usize, RuntimeError> {
+    pub(crate) fn text_cost(&self, vm: &Vm, found: Found) -> Result<usize, GSubError> {
         let len = self.text_output_len(vm, found)?;
         let Replacement::Text(text) = &self.replacement else {
-            return Err(argument_error());
+            return Err(argument_error().into());
         };
         Ok(len.saturating_add(text.bytes.len()))
     }
 
-    fn text_output_len(&self, vm: &Vm, found: Found) -> Result<usize, RuntimeError> {
+    fn text_output_len(&self, vm: &Vm, found: Found) -> Result<usize, GSubError> {
         let Replacement::Text(text) = &self.replacement else {
-            return Err(argument_error());
+            return Err(argument_error().into());
         };
         let mut length = 0_usize;
         let mut cursor = 0;
@@ -172,12 +267,14 @@ impl GSubState {
                 cursor += 1;
                 continue;
             }
-            let marker = *text.bytes.get(cursor + 1).ok_or_else(pattern_error)?;
+            let marker = *text
+                .bytes
+                .get(cursor + 1)
+                .ok_or(PatternError::InvalidReplacementUse)?;
             let extra = match marker {
                 b'%' => 1,
                 b'0'..=b'9' => {
-                    let (first, last, position) =
-                        Self::capture_range(found, usize::from(marker - b'0'))?;
+                    let (first, last, position) = Self::capture_range(found, marker - b'0')?;
                     if position {
                         let value = Value::Integer(
                             i64::try_from(first + 1).map_err(|_| VmError::ArithmeticOverflow)?,
@@ -187,7 +284,7 @@ impl GSubState {
                         last - first
                     }
                 }
-                _ => return Err(pattern_error()),
+                _ => return Err(PatternError::InvalidReplacementUse.into()),
             };
             length = length
                 .checked_add(extra)
@@ -197,7 +294,7 @@ impl GSubState {
         Ok(length)
     }
 
-    pub(crate) fn append_text(&mut self, vm: &Vm, found: Found) -> Result<(), RuntimeError> {
+    pub(crate) fn append_text(&mut self, vm: &Vm, found: Found) -> Result<(), GSubError> {
         let output_len = self.text_output_len(vm, found)?;
         let next = self
             .output
@@ -206,11 +303,11 @@ impl GSubState {
             .checked_add(output_len)
             .ok_or(VmError::ArithmeticOverflow)?;
         if next > string::max_size(vm.language_profile()) {
-            return Err(argument_error());
+            return Err(argument_error().into());
         }
         self.output.reserve_extra(output_len)?;
         let Replacement::Text(text) = &self.replacement else {
-            return Err(argument_error());
+            return Err(argument_error().into());
         };
         let bytes = &text.bytes;
         let mut cursor = 0;
@@ -223,12 +320,13 @@ impl GSubState {
             self.output
                 .bytes
                 .extend_from_slice(&bytes[literal_start..cursor]);
-            let marker = *bytes.get(cursor + 1).ok_or_else(pattern_error)?;
+            let marker = *bytes
+                .get(cursor + 1)
+                .ok_or(PatternError::InvalidReplacementUse)?;
             match marker {
                 b'%' => self.output.bytes.push(b'%'),
                 b'0'..=b'9' => {
-                    let (first, last, position) =
-                        Self::capture_range(found, usize::from(marker - b'0'))?;
+                    let (first, last, position) = Self::capture_range(found, marker - b'0')?;
                     if position {
                         let value = Value::Integer(
                             i64::try_from(first + 1).map_err(|_| VmError::ArithmeticOverflow)?,
@@ -242,7 +340,7 @@ impl GSubState {
                             .extend_from_slice(&self.source.bytes[first..last]);
                     }
                 }
-                _ => return Err(pattern_error()),
+                _ => return Err(PatternError::InvalidReplacementUse.into()),
             }
             cursor += 2;
             literal_start = cursor;
@@ -252,20 +350,28 @@ impl GSubState {
         Ok(())
     }
 
-    pub(crate) fn answer_len(&self, vm: &Vm, value: Value) -> Result<usize, RuntimeError> {
+    pub(crate) fn answer_len(&self, vm: &Vm, value: Value) -> Result<usize, GSubError> {
         if matches!(value, Value::Nil | Value::Boolean(false)) {
-            let (start, end) = self.awaiting.ok_or_else(pattern_error)?;
+            let (start, end) = self
+                .awaiting
+                .ok_or_else(|| GSubError::Runtime(runtime_pattern_error()))?;
             return Ok(end - start);
         }
         string::with_bytes(vm, value, |bytes| Ok(bytes.len()))
+            .map_err(|error| replacement_error(value, error))
     }
 
-    pub(crate) fn append_answer(&mut self, vm: &mut Vm, value: Value) -> Result<(), RuntimeError> {
-        let (start, end) = self.awaiting.take().ok_or_else(pattern_error)?;
-        if let Some(mut args) = self.callback_arguments.take() {
-            args.clear_roots(vm)?;
-        }
+    pub(crate) fn append_answer(&mut self, vm: &mut Vm, value: Value) -> Result<(), GSubError> {
+        let (start, end) = self
+            .awaiting
+            .as_ref()
+            .copied()
+            .ok_or_else(|| GSubError::Runtime(runtime_pattern_error()))?;
         if matches!(value, Value::Nil | Value::Boolean(false)) {
+            self.awaiting = None;
+            if let Some(mut args) = self.callback_arguments.take() {
+                args.clear_roots(vm)?;
+            }
             let text = &self.source.bytes[start..end];
             let next = self
                 .output
@@ -274,11 +380,18 @@ impl GSubState {
                 .checked_add(text.len())
                 .ok_or(VmError::ArithmeticOverflow)?;
             if next > string::max_size(vm.language_profile()) {
-                return Err(argument_error());
+                return Err(argument_error().into());
             }
-            return self.output.append(text);
+            return self.output.append(text).map_err(GSubError::from);
         }
-        let bytes = string::owned_bytes(vm, value)?;
+        let bytes = match string::owned_bytes(vm, value) {
+            Ok(bytes) => bytes,
+            Err(error) => return Err(replacement_error(value, error)),
+        };
+        self.awaiting = None;
+        if let Some(mut args) = self.callback_arguments.take() {
+            args.clear_roots(vm)?;
+        }
         self.append(vm, &bytes.bytes)?;
         self.changed = true;
         Ok(())
@@ -287,7 +400,7 @@ impl GSubState {
     pub(crate) fn finish(
         &mut self,
         vm: &mut Vm,
-    ) -> Result<(Vec<Value>, Option<Reservation>), RuntimeError> {
+    ) -> Result<crate::OwnedValues, RuntimeError> {
         let result = if self.changed {
             let last = &self.source.bytes[self.cursor..];
             let next = self

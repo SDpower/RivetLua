@@ -25,9 +25,8 @@ pub(crate) enum IoBuiltin {
     FileToString,
     FileGc,
     LinesIterator {
-        file: ObjectRef,
         formats: ObjectRef,
-        count: usize,
-        auto_close: bool,
+        upvalues: [ObjectRef; 3],
+        capture_count: usize,
     },
 }

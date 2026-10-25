@@ -1,9 +1,9 @@
 //! 協程狀態與可由 heap 追蹤的暫停執行內容。
 
-use crate::rust_alloc::boxed::Box;
-use crate::rust_alloc::vec::Vec;
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{ErasedThinBlock, StateAllocator};
 
-use core::any::Any;
+use core::cell::Cell;
 
 use rivetlua_core::{ObjectRef, Register, ResultMode, Value};
 
@@ -30,22 +30,23 @@ pub(crate) struct YieldSite {
     pub(crate) result_mode: ResultMode,
     pub(crate) resume_pc: usize,
     pub(crate) tail_return: bool,
+    pub(crate) hook_retry: bool,
 }
 
 /// 已暫停時由 Coroutine payload trace；運行或等待子協程時由各欄位 roots 保護。
 pub(crate) struct ThreadContext {
     pub(crate) frame: CallFrame,
-    pub(crate) callers: Vec<CallFrame>,
+    pub(crate) callers: AllocVec<CallFrame, StateAllocator>,
     pub(crate) callers_charge: usize,
     pub(crate) callers_charges: AllocationCharges,
     pub(crate) pending_ops: PendingStack,
-    pub(crate) protected: Vec<ProtectedBoundary>,
+    pub(crate) protected: AllocVec<ProtectedBoundary, StateAllocator>,
     pub(crate) protected_charge: usize,
     pub(crate) protected_charges: AllocationCharges,
     pub(crate) error_root: Option<RootId>,
     pub(crate) yield_site: Option<YieldSite>,
     pub(crate) close_unwind: Option<CloseUnwind>,
-    pub(crate) suspended_close_for_handler: Vec<CloseUnwind>,
+    pub(crate) suspended_close_for_handler: AllocVec<CloseUnwind, StateAllocator>,
     pub(crate) suspended_close_charges: AllocationCharges,
 }
 
@@ -60,18 +61,18 @@ impl ThreadContext {
     pub(crate) fn new(frame: CallFrame, ledger: &AllocationLedger) -> Self {
         Self {
             frame,
-            callers: Vec::new(),
+            callers: AllocVec::new_in(ledger.backing_allocator()),
             callers_charge: 0,
-            callers_charges: AllocationCharges::new(),
+            callers_charges: AllocationCharges::new_in(ledger.backing_allocator()),
             pending_ops: PendingStack::new(ledger.clone()),
-            protected: Vec::new(),
+            protected: AllocVec::new_in(ledger.backing_allocator()),
             protected_charge: 0,
-            protected_charges: AllocationCharges::new(),
+            protected_charges: AllocationCharges::new_in(ledger.backing_allocator()),
             error_root: None,
             yield_site: None,
             close_unwind: None,
-            suspended_close_for_handler: Vec::new(),
-            suspended_close_charges: AllocationCharges::new(),
+            suspended_close_for_handler: AllocVec::new_in(ledger.backing_allocator()),
+            suspended_close_charges: AllocationCharges::new_in(ledger.backing_allocator()),
         }
     }
 
@@ -82,7 +83,7 @@ impl ThreadContext {
         }
         self.pending_ops.park_roots(vm)?;
         for boundary in &mut self.protected {
-            boundary.clear(vm)?;
+            boundary.park_roots(vm)?;
         }
         if let Some(root) = self.error_root.take() {
             vm.remove_root(root)?;
@@ -114,8 +115,8 @@ impl ThreadContext {
     }
 
     pub(crate) fn finish(&mut self, vm: &mut Vm) -> Result<(), RuntimeError> {
-        self.suspended_close_for_handler = Vec::new();
-        self.suspended_close_charges = AllocationCharges::new();
+        self.suspended_close_for_handler = AllocVec::new_in(vm.allocation_ledger().backing_allocator());
+        self.suspended_close_charges = AllocationCharges::new_in(vm.allocation_ledger().backing_allocator());
         if let Some(root) = self.error_root.take() {
             vm.remove_root(root)?;
         }
@@ -194,19 +195,31 @@ impl ThreadContext {
         match slot {
             ParkedLocalSlot::Register(register) => {
                 let index = usize::from(register.0);
-                if index >= frame.register_limit || frame.roots[index].is_some() {
+                if index >= frame.register_limit
+                    || frame.roots[index]
+                        .as_ref()
+                        .is_some_and(|root| root.has_object())
+                {
                     return false;
                 }
                 frame.registers[index] = value;
             }
             ParkedLocalSlot::Vararg(index) => {
-                if index >= frame.varargs.len() || frame.vararg_roots[index].is_some() {
+                if index >= frame.varargs.len()
+                    || frame.vararg_roots[index]
+                        .as_ref()
+                        .is_some_and(|root| root.has_object())
+                {
                     return false;
                 }
                 frame.varargs[index] = value;
             }
             ParkedLocalSlot::VarargTable => {
-                if frame.debug_vararg_table_root.is_some() {
+                if frame
+                    .debug_vararg_table_root
+                    .as_ref()
+                    .is_some_and(|root| root.has_object())
+                {
                     return false;
                 }
                 frame.debug_vararg_table = value;
@@ -223,7 +236,8 @@ impl ThreadContext {
                     .is_some_and(|index| index < frame.register_limit)
             });
         if let Some(frame) = frame {
-            frame.registers[slot - frame.stack_base] = value;
+            let index = slot - frame.stack_base;
+            frame.registers[index] = value;
             true
         } else {
             false
@@ -233,6 +247,8 @@ impl ThreadContext {
 
 pub(crate) struct Coroutine {
     pub(crate) state: CoroutineState,
+    /// 與 Lua logical thread 同壽命；停放／恢復執行框架不搬移 C 呼叫深度。
+    pub(crate) n_c_calls: Cell<u16>,
     pub(crate) entry: Value,
     pub(crate) context: Option<ThreadContext>,
     pub(crate) debug_revision: u64,
@@ -245,13 +261,14 @@ pub(crate) struct Coroutine {
     pub(crate) external_suspended: Option<ExternalSuspended>,
     pub(crate) debug_hook: Option<DebugHook>,
     /// 宿主控制配置隨 coroutine payload 回收，不屬於 Lua GC 子邊。
-    pub(crate) host_attachment: Option<Box<dyn Any>>,
+    pub(crate) host_attachment: Option<ErasedThinBlock>,
 }
 
 impl Coroutine {
     pub(crate) fn new(entry: Value) -> Self {
         Self {
             state: CoroutineState::Suspended,
+            n_c_calls: Cell::new(0),
             entry,
             context: None,
             debug_revision: 0,
@@ -293,7 +310,9 @@ impl Coroutine {
             visit(object)?;
         }
         if let Some(hook) = self.debug_hook {
-            visit(hook.function)?;
+            if let Value::Object(object) = hook.function {
+                visit(object)?;
+            }
         }
         if let Some(context) = &self.context {
             context.trace_children(&mut visit)?;

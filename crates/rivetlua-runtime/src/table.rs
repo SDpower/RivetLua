@@ -1,10 +1,12 @@
 //! P08 的 table 儲存與可儲存鍵分類。
 
-use crate::rust_alloc::vec::Vec;
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{StateAllocator, ThinBlock};
 
 use crate::hash::new_default_hasher;
 use core::hash::{Hash, Hasher};
 use core::mem::size_of;
+use core::ops::{Deref, DerefMut};
 
 #[cfg(not(feature = "std"))]
 use rivetlua_core::number::NoStdFloat;
@@ -12,7 +14,7 @@ use rivetlua_core::{ObjectId, ObjectRef, Value};
 
 use crate::alloc::{
     AllocationCharge, AllocationLedger, FailPoint, PairedLuaCharges, Reservation, checked_bytes,
-    reserve_vec,
+    reserve_state_vec_lua,
 };
 use crate::gc::WeakMode;
 use crate::{ByteString, ObjectKind, Vm, VmError};
@@ -20,31 +22,159 @@ use crate::{ByteString, ObjectKind, Vm, VmError};
 /// 保留 array 欄位與 hash bucket；以 raw 語意讀寫。
 pub struct Table {
     metatable: Option<ObjectRef>,
-    weak_mode: WeakMode,
-    hash_seed: u32,
-    mutation_version: u64,
-    array: Vec<Option<Value>>,
-    hash: Vec<Option<(CanonicalKey, Value)>>,
+    storage: ThinBlock<TableStorage>,
+    _storage_charge: AllocationCharge,
     charges: PairedLuaCharges,
 }
 
+#[doc(hidden)]
+pub struct TableStorage {
+    weak_mode: WeakMode,
+    hash_seed: u32,
+    mutation_version: u64,
+    array: AllocVec<Option<Value>, StateAllocator>,
+    hash: AllocVec<Option<(CanonicalKey, Value)>, StateAllocator>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TableGrowthPlan {
+    None,
+    Array(usize),
+    Hash(usize),
+}
+
+impl Deref for Table {
+    type Target = TableStorage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+impl DerefMut for Table {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage
+    }
+}
+
 impl Table {
+    fn growth_plan(&self, key: &CanonicalKey, value: Value) -> TableGrowthPlan {
+        if let Some((_, capacity)) = self.planned_array_growth(key, value) {
+            TableGrowthPlan::Array(capacity)
+        } else if let Some(capacity) = self.planned_hash_growth(key, value) {
+            TableGrowthPlan::Hash(capacity)
+        } else {
+            TableGrowthPlan::None
+        }
+    }
+
+    fn planned_hash_growth(&self, key: &CanonicalKey, value: Value) -> Option<usize> {
+        if value == Value::Nil
+            || self.find_hash(key).is_some()
+            || key
+                .array_index()
+                .and_then(|index| self.array.get(index))
+                .is_some_and(Option::is_some)
+        {
+            return None;
+        }
+        if self.find_any_hash(key).is_some() {
+            let needed = self.live_hash_count().checked_add(1)?;
+            let capacity = self.hash.len();
+            if needed <= capacity - capacity / 4 {
+                return None;
+            }
+        }
+        if let Some(index) = key.array_index() {
+            if index <= self.array.len() {
+                return None;
+            }
+        }
+        let needed = self.live_hash_count().checked_add(1)?;
+        let occupied = self.hash.iter().filter(|entry| entry.is_some()).count();
+        let capacity = self.hash.len();
+        if capacity == 0 || occupied >= capacity || needed > capacity - capacity / 4 {
+            capacity.checked_mul(2).map(|doubled| doubled.max(1))
+        } else {
+            None
+        }
+    }
+
+    fn planned_array_growth(&self, key: &CanonicalKey, value: Value) -> Option<(u64, usize)> {
+        if value == Value::Nil
+            || self.find_hash(key).is_some()
+            || self.array.get(key.array_index()?).is_some_and(Option::is_some)
+        {
+            return None;
+        }
+        if self.find_any_hash(key).is_some() {
+            let needed = self.live_hash_count().checked_add(1)?;
+            let capacity = self.hash.len();
+            if needed <= capacity - capacity / 4 {
+                return None;
+            }
+        }
+        (key.array_index()? == self.array.len()).then(|| {
+            (
+                self.mutation_version,
+                self.array.len().saturating_mul(2).max(4),
+            )
+        })
+    }
+
+    pub(crate) fn try_new_vm(
+        vm: &mut Vm,
+        array_capacity: usize,
+        hash_capacity: usize,
+        hash_seed: u32,
+    ) -> Result<(Self, Reservation, Reservation), VmError> {
+        let ledger = vm.allocation_ledger().clone();
+        let (mut array, array_ticket) =
+            vm.reserve_userdata_vec::<Option<Value>>(array_capacity, FailPoint::TableArrayReserve)?;
+        array.resize_with(array_capacity, || None);
+        let (mut hash, hash_ticket) = vm.reserve_userdata_vec::<Option<(CanonicalKey, Value)>>(
+            hash_capacity,
+            FailPoint::TableHashReserve,
+        )?;
+        hash.resize_with(hash_capacity, || None);
+        let (storage, storage_ticket) =
+            vm.reserve_state_thin::<TableStorage>(FailPoint::ObjectReserve)?;
+        let storage = storage.write(TableStorage {
+            weak_mode: WeakMode::Strong,
+            hash_seed,
+            mutation_version: 0,
+            array,
+            hash,
+        });
+        let storage_charge = storage_ticket.commit_charge()?;
+        Ok((
+            Self {
+                metatable: None,
+                storage,
+                _storage_charge: storage_charge,
+                charges: PairedLuaCharges::new(ledger),
+            },
+            array_ticket,
+            hash_ticket,
+        ))
+    }
+
     pub(crate) fn try_new(
         ledger: &AllocationLedger,
         array_capacity: usize,
         hash_capacity: usize,
         hash_seed: u32,
     ) -> Result<(Self, Reservation, Reservation), VmError> {
-        let mut array = Vec::new();
-        let array_ticket = reserve_vec(
+        let mut array = AllocVec::new_in(ledger.backing_allocator());
+        let array_ticket = reserve_state_vec_lua(
             ledger,
             &mut array,
             array_capacity,
             FailPoint::TableArrayReserve,
         )?;
         array.resize_with(array_capacity, || None);
-        let mut hash = Vec::new();
-        let hash_ticket = match reserve_vec(
+        let mut hash = AllocVec::new_in(ledger.backing_allocator());
+        let hash_ticket = match reserve_state_vec_lua(
             ledger,
             &mut hash,
             hash_capacity,
@@ -59,14 +189,34 @@ impl Table {
             }
         };
         hash.resize_with(hash_capacity, || None);
-        Ok((
-            Self {
-                metatable: None,
+        let physical = ledger.backing_allocator().is_lua();
+        let storage_ticket = ledger.reserve_userdata_vec(
+            StateAllocator::thin_block_size::<TableStorage>(),
+            FailPoint::ObjectReserve,
+            physical,
+        )?;
+        let storage = ledger
+            .backing_allocator()
+            .thin_block(TableStorage {
                 weak_mode: WeakMode::Strong,
                 hash_seed,
                 mutation_version: 0,
                 array,
                 hash,
+            }, 0)
+            .map_err(|_| {
+                if physical {
+                    storage_ticket.physical_reserve_failure()
+                } else {
+                    storage_ticket.rust_reserve_failure()
+                }
+            })?;
+        let storage_charge = storage_ticket.commit_charge()?;
+        Ok((
+            Self {
+                metatable: None,
+                storage,
+                _storage_charge: storage_charge,
                 charges: PairedLuaCharges::new(ledger.clone()),
             },
             array_ticket,
@@ -94,7 +244,7 @@ impl Table {
         self.metatable = metatable;
     }
 
-    pub(crate) const fn weak_mode(&self) -> WeakMode {
+    pub(crate) fn weak_mode(&self) -> WeakMode {
         self.weak_mode
     }
 
@@ -173,6 +323,12 @@ impl Table {
             checked_bytes(self.hash.len(), size_of::<Option<(CanonicalKey, Value)>>())?;
         array_bytes
             .checked_add(hash_bytes)
+            .ok_or(VmError::ArithmeticOverflow)
+    }
+
+    pub(crate) fn debt_bytes(&self) -> Result<usize, VmError> {
+        self.charge_bytes()?
+            .checked_add(self._storage_charge.bytes())
             .ok_or(VmError::ArithmeticOverflow)
     }
 
@@ -305,19 +461,21 @@ impl Table {
         if self.weak_mode == WeakMode::Strong {
             return Ok(0);
         }
+        let weak_mode = self.weak_mode;
+        let storage = &mut *self.storage;
         let mut cleared = 0;
-        if clear_values && matches!(self.weak_mode, WeakMode::Values | WeakMode::All) {
-            for entry in &mut self.array {
+        if clear_values && matches!(weak_mode, WeakMode::Values | WeakMode::All) {
+            for entry in &mut storage.array {
                 if let Some(Value::Object(object)) = entry {
                     if is_dead(*object)? {
                         *entry = None;
                         cleared += 1;
-                        self.mutation_version = self.mutation_version.saturating_add(1);
+                        storage.mutation_version = storage.mutation_version.saturating_add(1);
                     }
                 }
             }
         }
-        for entry in &mut self.hash {
+        for entry in &mut storage.hash {
             if clear_values
                 && entry
                     .as_ref()
@@ -325,13 +483,13 @@ impl Table {
             {
                 // 弱表的死鍵只供下次 GC 前的 next 邊界使用；GC 可釋放長字串副本。
                 *entry = None;
-                self.mutation_version = self.mutation_version.saturating_add(1);
+                storage.mutation_version = storage.mutation_version.saturating_add(1);
                 continue;
             }
             let Some((key, value)) = entry else {
                 continue;
             };
-            let dead_key = if clear_keys && matches!(self.weak_mode, WeakMode::Keys | WeakMode::All)
+            let dead_key = if clear_keys && matches!(weak_mode, WeakMode::Keys | WeakMode::All)
             {
                 match &key.kind {
                     KeyKind::Object(key) => is_dead(key.source)?,
@@ -341,7 +499,7 @@ impl Table {
                 false
             };
             let dead_value =
-                if clear_values && matches!(self.weak_mode, WeakMode::Values | WeakMode::All) {
+                if clear_values && matches!(weak_mode, WeakMode::Values | WeakMode::All) {
                     match value {
                         Value::Object(object) => is_dead(*object)?,
                         _ => false,
@@ -350,7 +508,7 @@ impl Table {
                     false
                 };
             if dead_key || dead_value {
-                let key_is_dead = if !dead_key && dead_value && self.weak_mode == WeakMode::All {
+                let key_is_dead = if !dead_key && dead_value && weak_mode == WeakMode::All {
                     match key.source_object() {
                         Some(source) => !is_live_key(source)?,
                         None => false,
@@ -367,11 +525,11 @@ impl Table {
                     *value = Value::Nil;
                 }
                 cleared += 1;
-                self.mutation_version = self.mutation_version.saturating_add(1);
+                storage.mutation_version = storage.mutation_version.saturating_add(1);
             }
         }
         if !self.hash.is_empty() && self.hash.iter().all(Option::is_none) {
-            self.hash = Vec::new();
+            self.hash = AllocVec::new_in(self.hash.allocator().clone());
             self.charges.clear_second();
             self.bump_mutation_version();
         }
@@ -592,6 +750,8 @@ impl Table {
         ledger: &AllocationLedger,
         mut key: CanonicalKey,
         value: Value,
+        mut staged_array: Option<(AllocVec<Option<Value>, StateAllocator>, Reservation)>,
+        mut staged_hash: Option<(AllocVec<Option<(CanonicalKey, Value)>, StateAllocator>, Reservation)>,
     ) -> Result<PreparedTableMutation, VmError> {
         let array_index = key.array_index();
         if let Some(index) = array_index {
@@ -636,9 +796,10 @@ impl Table {
                     .ok_or(VmError::ArithmeticOverflow)?;
                 checked_bytes(new_capacity, size_of::<Option<Value>>())?;
                 checked_bytes(old_capacity, size_of::<Option<Value>>())?;
-                let mut next = Vec::new();
-                let ticket =
-                    reserve_vec(ledger, &mut next, new_capacity, FailPoint::TableArrayGrow)?;
+                let (mut next, ticket) = staged_array.take().ok_or(VmError::LedgerInvariant)?;
+                if next.capacity() < new_capacity {
+                    return Err(VmError::LedgerInvariant);
+                }
                 next.resize_with(new_capacity, || None);
                 next[..old_capacity].copy_from_slice(&self.array);
                 ledger.checkpoint(FailPoint::TableInsert)?;
@@ -666,8 +827,10 @@ impl Table {
             let bucket_size = size_of::<Option<(CanonicalKey, Value)>>();
             checked_bytes(new_capacity, bucket_size)?;
             checked_bytes(capacity, bucket_size)?;
-            let mut next = Vec::new();
-            let ticket = reserve_vec(ledger, &mut next, new_capacity, FailPoint::TableHashGrow)?;
+            let (mut next, ticket) = staged_hash.take().ok_or(VmError::LedgerInvariant)?;
+            if next.capacity() < new_capacity {
+                return Err(VmError::LedgerInvariant);
+            }
             next.resize_with(new_capacity, || None);
             ledger.checkpoint(FailPoint::TableRehash)?;
             ledger.checkpoint(FailPoint::TableInsert)?;
@@ -686,6 +849,68 @@ impl Table {
         }
     }
 
+    fn planned_ref_pair_growth(
+        &self,
+        first: (i64, Value),
+        second: (i64, Value),
+    ) -> Result<(usize, usize), VmError> {
+        let values = if first.0 == second.0 {
+            [None, Some(second)]
+        } else {
+            [Some(first), Some(second)]
+        };
+        if values.iter().flatten().any(|(_, value)| *value == Value::Nil) {
+            return Err(VmError::LedgerInvariant);
+        }
+        let mut array_len = self.array.len();
+        for _ in 0..2 {
+            let boundary = values.iter().flatten().any(|(key, _)| {
+                let canonical = CanonicalKey { kind: KeyKind::Integer(*key) };
+                canonical.array_index() == Some(array_len) && self.find_hash(&canonical).is_none()
+            });
+            if !boundary {
+                break;
+            }
+            array_len = array_len
+                .checked_mul(2)
+                .map(|doubled| doubled.max(4))
+                .ok_or(VmError::ArithmeticOverflow)?;
+        }
+        let mut hash_inserts = 0usize;
+        for (key, _) in values.into_iter().flatten() {
+            let canonical = CanonicalKey { kind: KeyKind::Integer(key) };
+            let array_index = canonical.array_index();
+            if array_index.and_then(|index| self.array.get(index)).is_some_and(Option::is_some) {
+                continue;
+            }
+            if let Some(index) = self.find_any_hash(&canonical) {
+                if self.hash[index].as_ref().is_some_and(|(_, value)| *value == Value::Nil) {
+                    hash_inserts = hash_inserts.checked_add(1).ok_or(VmError::ArithmeticOverflow)?;
+                }
+            } else if !array_index.is_some_and(|index| index < array_len) {
+                hash_inserts = hash_inserts.checked_add(1).ok_or(VmError::ArithmeticOverflow)?;
+            }
+        }
+        let required_hash = self
+            .live_hash_count()
+            .checked_add(hash_inserts)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let occupied = self.hash.iter().filter(|entry| entry.is_some()).count();
+        let occupied_required = occupied
+            .checked_add(hash_inserts)
+            .ok_or(VmError::ArithmeticOverflow)?;
+        let mut hash_len = self.hash.len();
+        while required_hash > hash_len.saturating_sub(hash_len / 4)
+            || occupied_required > hash_len
+        {
+            hash_len = hash_len
+                .checked_mul(2)
+                .map(|doubled| doubled.max(1))
+                .ok_or(VmError::ArithmeticOverflow)?;
+        }
+        Ok((array_len, hash_len))
+    }
+
     /// refs 的兩個非 nil 整數欄位在原表上共同預備；任何配置或 checkpoint
     /// 失敗時，原 array/hash、GC edge 與帳本提交狀態都尚未改變。
     fn prepare_ref_pair(
@@ -693,6 +918,8 @@ impl Table {
         ledger: &AllocationLedger,
         first: (i64, Value),
         second: (i64, Value),
+        mut staged_array: Option<(AllocVec<Option<Value>, StateAllocator>, Reservation)>,
+        mut staged_hash: Option<(AllocVec<Option<(CanonicalKey, Value)>, StateAllocator>, Reservation)>,
     ) -> Result<PreparedRefPair, VmError> {
         let values = if first.0 == second.0 {
             [None, Some(second)]
@@ -765,8 +992,10 @@ impl Table {
         let array_growth = if array_len > self.array.len() {
             let old_bytes = checked_bytes(self.array.len(), size_of::<Option<Value>>())?;
             let new_bytes = checked_bytes(array_len, size_of::<Option<Value>>())?;
-            let mut next = Vec::new();
-            let ticket = reserve_vec(ledger, &mut next, array_len, FailPoint::TableArrayGrow)?;
+            let (mut next, ticket) = staged_array.take().ok_or(VmError::LedgerInvariant)?;
+            if next.capacity() < array_len {
+                return Err(VmError::LedgerInvariant);
+            }
             next.resize_with(array_len, || None);
             next[..self.array.len()].copy_from_slice(&self.array);
             Some(RefPairGrowth {
@@ -801,8 +1030,10 @@ impl Table {
             let old_bytes =
                 checked_bytes(self.hash.len(), size_of::<Option<(CanonicalKey, Value)>>())?;
             let new_bytes = checked_bytes(hash_len, size_of::<Option<(CanonicalKey, Value)>>())?;
-            let mut next = Vec::new();
-            let ticket = reserve_vec(ledger, &mut next, hash_len, FailPoint::TableHashGrow)?;
+            let (mut next, ticket) = staged_hash.take().ok_or(VmError::LedgerInvariant)?;
+            if next.capacity() < hash_len {
+                return Err(VmError::LedgerInvariant);
+            }
             next.resize_with(hash_len, || None);
             ledger.checkpoint(FailPoint::TableRehash)?;
             Some(RefPairGrowth {
@@ -892,7 +1123,7 @@ impl Table {
         if value == Value::Nil {
             self.hash[index] = None;
             if self.hash.iter().all(Option::is_none) {
-                self.hash = Vec::new();
+                self.hash = AllocVec::new_in(self.hash.allocator().clone());
                 self.charges.clear_second();
             }
         } else if let Some((_, stored)) = &mut self.hash[index] {
@@ -926,13 +1157,13 @@ pub(crate) enum PreparedTableMutation {
         value: Value,
     },
     GrowArray {
-        next: Vec<Option<Value>>,
+        next: AllocVec<Option<Value>, StateAllocator>,
         ticket: Option<Reservation>,
         charge: Option<AllocationCharge>,
         value: Value,
     },
     GrowHash {
-        next: Vec<Option<(CanonicalKey, Value)>>,
+        next: AllocVec<Option<(CanonicalKey, Value)>, StateAllocator>,
         ticket: Option<Reservation>,
         charge: Option<AllocationCharge>,
         existing_count: usize,
@@ -1018,7 +1249,8 @@ impl PreparedTableMutation {
             } => {
                 // prepare 已證明 existing_count + 1 <= next.len()；find_hash 掃遍
                 // 所有 bucket，因此連續 placement 與原先從 hash 起點探測等價。
-                let old = core::mem::take(&mut table.hash);
+                let allocator = table.hash.allocator().clone();
+                let old = core::mem::replace(&mut table.hash, AllocVec::new_in(allocator));
                 for (index, entry) in old
                     .into_iter()
                     .flatten()
@@ -1055,7 +1287,7 @@ struct RefPairEntry {
 }
 
 struct RefPairGrowth<T> {
-    next: Vec<T>,
+    next: AllocVec<T, StateAllocator>,
     ticket: Option<Reservation>,
     charge: Option<AllocationCharge>,
     old_bytes: usize,
@@ -1128,7 +1360,8 @@ impl PreparedRefPair {
             }
         }
         if let Some(mut growth) = self.hash_growth {
-            let old = core::mem::take(&mut table.hash);
+            let allocator = table.hash.allocator().clone();
+            let old = core::mem::replace(&mut table.hash, AllocVec::new_in(allocator));
             for (ordinal, entry) in old
                 .into_iter()
                 .flatten()
@@ -1183,7 +1416,7 @@ struct StringKey {
     _slot_extra_charge: Option<crate::alloc::AllocationCharge>,
 }
 
-struct LongStringKey(Vec<StringKey>);
+struct LongStringKey(AllocVec<StringKey, StateAllocator>);
 
 impl LongStringKey {
     fn get(&self) -> &StringKey {
@@ -1198,7 +1431,7 @@ impl LongStringKey {
 impl Drop for LongStringKey {
     fn drop(&mut self) {
         let entry = self.0.pop();
-        self.0 = Vec::new();
+        self.0 = AllocVec::new_in(self.0.allocator().clone());
         drop(entry);
     }
 }
@@ -1405,6 +1638,70 @@ impl Hash for CanonicalKey {
 }
 
 impl Vm {
+    fn reserve_table_growth<T>(
+        &mut self,
+        table: ObjectRef,
+        key: Value,
+        value: Value,
+        capacity: usize,
+        point: FailPoint,
+    ) -> Result<(AllocVec<T, StateAllocator>, Reservation), VmError>
+    where
+        T: Sized,
+    {
+        let ledger = self.allocation_ledger().clone();
+        let allocator = ledger.backing_allocator();
+        let mut staged = AllocVec::new_in(allocator.clone());
+        let before = allocator.refusal_count();
+        match reserve_state_vec_lua(&ledger, &mut staged, capacity, point) {
+            Ok(ticket) => Ok((staged, ticket)),
+            Err(error) if allocator.refusal_count() == before => Err(error),
+            Err(error) => self.with_table_mutation_roots(
+                [Value::Object(table), key, value],
+                |vm| {
+                    if !vm.emergency_collect_after_refusal(before)? {
+                        return Err(error);
+                    }
+                    let ticket = reserve_state_vec_lua(
+                        &ledger,
+                        &mut staged,
+                        capacity,
+                        point,
+                    )?;
+                    Ok((staged, ticket))
+                },
+            ),
+        }
+    }
+
+    fn with_table_mutation_roots<R>(
+        &mut self,
+        values: [Value; 3],
+        action: impl FnOnce(&mut Vm) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        let mut roots = [None; 3];
+        let mut result = (|| {
+            for (index, value) in values.iter().copied().enumerate() {
+                if let Value::Object(object) = value {
+                    roots[index] = Some(self.add_root_with_borrowed_roots(
+                        crate::RootKind::Temporary,
+                        object,
+                        &values,
+                    )?);
+                }
+            }
+            action(self)
+        })();
+        for root in roots.into_iter().rev().flatten() {
+            if let Err(error) = self.remove_root(root) {
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
+        }
+        result
+    }
+
     pub(crate) fn raw_get_byte_key(&self, table: ObjectRef, name: &[u8]) -> Result<Value, VmError> {
         self.with_table(table, |stored| stored.get_byte_key(name))
     }
@@ -1468,8 +1765,8 @@ impl Vm {
                             ByteString::try_from_bytes(ledger, string.as_bytes())?;
                         (copy, Some(byte_ticket.commit_charge()?))
                     };
-                    let mut stored = Vec::new();
-                    let ticket = reserve_vec(ledger, &mut stored, 1, FailPoint::TableKeyReserve)?;
+                    let mut stored = AllocVec::new_in(ledger.backing_allocator());
+                    let ticket = reserve_state_vec_lua(ledger, &mut stored, 1, FailPoint::TableKeyReserve)?;
                     let extra = stored.capacity() - 1;
                     let extra_charge = if extra == 0 {
                         None
@@ -1516,6 +1813,13 @@ impl Vm {
         if matches!(key, Value::Nil) || matches!(key, Value::Float(value) if value.is_nan()) {
             return Ok(Value::Nil);
         }
+        if let Value::Object(object) = key {
+            if self.object_kind(object)? == ObjectKind::ByteString {
+                return self.with_byte_string(object, |string| {
+                    self.raw_get_byte_key(table, string.as_bytes())
+                })?;
+            }
+        }
         let Some(key) = self.canonical_key(key)? else {
             return Ok(Value::Nil);
         };
@@ -1547,13 +1851,36 @@ impl Vm {
             Value::Float(number) if number.is_nan() => return Err(VmError::NaNTableKey),
             _ => {}
         }
-        // 準備期只有帳本預留、Vec 及純身分/hash 檢查；沒有 VM 物件配置、
-        // GC、finalizer 或宿主回呼，因此 table/key/value 無須暫存 root。
         let canonical = self.canonical_key(key)?.ok_or(VmError::LedgerInvariant)?;
         let ledger = self.allocation_ledger().clone();
-        let mutation = self.with_table(table, |stored| {
-            stored.prepare_set(&ledger, canonical, value)
-        })??;
+        let mutation = loop {
+            let plan = self.with_table(table, |stored| stored.growth_plan(&canonical, value))?;
+            let staged_array = match plan {
+                TableGrowthPlan::Array(capacity) => Some(self.reserve_table_growth::<Option<Value>>(
+                    table, key, value, capacity, FailPoint::TableArrayGrow,
+                )?),
+                _ => None,
+            };
+            let staged_hash = match plan {
+                TableGrowthPlan::Hash(capacity) => Some(
+                    self.reserve_table_growth::<Option<(CanonicalKey, Value)>>(
+                        table, key, value, capacity, FailPoint::TableHashGrow,
+                    )?,
+                ),
+                _ => None,
+            };
+            let current_plan =
+                self.with_table(table, |stored| stored.growth_plan(&canonical, value))?;
+            if current_plan != plan {
+                // 緊急 GC 可清理 weak table；改用清理後的成長種類重新預備。
+                continue;
+            }
+            // 即使 GC 改變版本或 weak mode，同種類與容量的 staged backing 可沿用；
+            // prepare_set 從當前表重新計算所有 slot，不使用先前的位址或索引。
+            break self.with_table(table, |stored| {
+                stored.prepare_set(&ledger, canonical, value, staged_array, staged_hash)
+            })??;
+        };
         let (key_edge, value_edge) = mutation.new_edges();
         let barrier = self.prepare_table_write_barrier(table, key_edge, value_edge)?;
         self.commit_prepared_table_write(table, barrier, mutation)?;
@@ -1580,9 +1907,35 @@ impl Vm {
             }
         }
         let ledger = self.allocation_ledger().clone();
-        let mutation = self.with_table(table, |stored| {
-            stored.prepare_ref_pair(&ledger, first, second)
-        })??;
+        let mutation = loop {
+            let (array_len, hash_len) = self.with_table(table, |stored| {
+                stored.planned_ref_pair_growth(first, second)
+            })??;
+            let staged_array = if array_len > self.with_table(table, |stored| stored.array.len())? {
+                Some(self.reserve_table_growth::<Option<Value>>(
+                    table, first.1, second.1, array_len, FailPoint::TableArrayGrow,
+                )?)
+            } else {
+                None
+            };
+            let staged_hash = if hash_len > self.with_table(table, |stored| stored.hash.len())? {
+                Some(self.reserve_table_growth::<Option<(CanonicalKey, Value)>>(
+                    table, first.1, second.1, hash_len, FailPoint::TableHashGrow,
+                )?)
+            } else {
+                None
+            };
+            let current = self.with_table(table, |stored| {
+                stored.planned_ref_pair_growth(first, second)
+            })??;
+            if current != (array_len, hash_len) {
+                // 緊急 GC 清理 weak 欄位後，依當前容量重新預備兩個 backing。
+                continue;
+            }
+            break self.with_table(table, |stored| {
+                stored.prepare_ref_pair(&ledger, first, second, staged_array, staged_hash)
+            })??;
+        };
         let [first_edge, second_edge] = mutation.value_edges();
         let barrier = self.prepare_table_ref_barrier(table, first_edge, second_edge)?;
         self.commit_prepared_ref_pair(table, barrier, mutation)

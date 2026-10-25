@@ -1,4 +1,5 @@
-use crate::rust_alloc::vec::Vec;
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::StateAllocator;
 
 pub(crate) mod trace;
 
@@ -161,12 +162,14 @@ pub(crate) struct GcState {
     pub phase: GcPhase,
     pub mode: GcMode,
     pub cycle: GcCycleKind,
-    pub(crate) slot_bits: Vec<GcSlotBits>,
-    pub(crate) slot_bit_charges: Vec<AllocationCharge>,
+    pub(crate) slot_bits: AllocVec<GcSlotBits, StateAllocator>,
+    pub(crate) slot_bit_charges: AllocVec<AllocationCharge, StateAllocator>,
+    pub(crate) slot_bits_lua_charge: Option<AllocationCharge>,
     pub(crate) occupied_count: usize,
     pub(crate) work_capacity: usize,
-    pub work: Vec<ObjectRef>,
-    pub roots: Vec<ObjectRef>,
+    pub work: AllocVec<ObjectRef, StateAllocator>,
+    pub roots: AllocVec<ObjectRef, StateAllocator>,
+    backing_allocator: StateAllocator,
     pub root_cursor: usize,
     pub remembered_cursor: usize,
     pub sweep_cursor: usize,
@@ -176,8 +179,9 @@ pub(crate) struct GcState {
     pub major_debt_bytes: usize,
     pub major_threshold_bytes: usize,
     pub promotion_survivals: u8,
-    pub remembered: Vec<ObjectRef>,
+    pub remembered: AllocVec<ObjectRef, StateAllocator>,
     pub remembered_charge: usize,
+    pub remembered_preallocated: bool,
     pub remembered_charges: AllocationCharges,
     pub barrier_count: usize,
     pub reclaimed_bytes: usize,
@@ -191,11 +195,12 @@ pub(crate) struct GcState {
     pub atomic_finalizer_stage: AtomicFinalizerStage,
     pub charge: usize,
     pub cycle_charges: AllocationCharges,
-    pub growth_charges: Vec<(usize, AllocationCharge)>,
+    pub growth_charges: AllocVec<(usize, AllocationCharge), StateAllocator>,
 }
 
 impl GcState {
-    pub fn new(profile: LuaProfile, _ledger: AllocationLedger) -> Self {
+    pub fn new(profile: LuaProfile, ledger: AllocationLedger) -> Self {
+        let backing_allocator = ledger.backing_allocator();
         Self {
             automatic_running: true,
             pause_code: match profile {
@@ -226,12 +231,14 @@ impl GcState {
             phase: GcPhase::Pause,
             mode: GcMode::Generational,
             cycle: GcCycleKind::Full,
-            slot_bits: Vec::new(),
-            slot_bit_charges: Vec::new(),
+            slot_bits: AllocVec::new_in(backing_allocator.clone()),
+            slot_bit_charges: AllocVec::new_in(backing_allocator.clone()),
+            slot_bits_lua_charge: None,
             occupied_count: 0,
             work_capacity: 0,
-            work: Vec::new(),
-            roots: Vec::new(),
+            work: AllocVec::new_in(backing_allocator.clone()),
+            roots: AllocVec::new_in(backing_allocator.clone()),
+            backing_allocator: backing_allocator.clone(),
             root_cursor: 0,
             remembered_cursor: 0,
             sweep_cursor: 0,
@@ -241,9 +248,10 @@ impl GcState {
             major_debt_bytes: 0,
             major_threshold_bytes: 4 * 1024 * 1024,
             promotion_survivals: 2,
-            remembered: Vec::new(),
+            remembered: AllocVec::new_in(backing_allocator.clone()),
             remembered_charge: 0,
-            remembered_charges: AllocationCharges::new(),
+            remembered_preallocated: false,
+            remembered_charges: AllocationCharges::new_in(backing_allocator.clone()),
             barrier_count: 0,
             reclaimed_bytes: 0,
             reclaimed_objects: 0,
@@ -255,8 +263,8 @@ impl GcState {
             weak_cleared_pairs: 0,
             atomic_finalizer_stage: AtomicFinalizerStage::BeforeWeakValues,
             charge: 0,
-            cycle_charges: AllocationCharges::new(),
-            growth_charges: Vec::new(),
+            cycle_charges: AllocationCharges::new_in(backing_allocator.clone()),
+            growth_charges: AllocVec::new_in(backing_allocator),
         }
     }
 
@@ -364,7 +372,9 @@ impl GcState {
         while self.slot_bits.len() > wanted {
             if let Some(page) = self.slot_bits.pop() {
                 debug_assert_eq!(page.occupied, 0);
-                self.slot_bit_charges.pop();
+                if self.slot_bits_lua_charge.is_none() {
+                    self.slot_bit_charges.pop();
+                }
             }
         }
         if physical_slots % 64 != 0 {
@@ -410,9 +420,9 @@ impl GcState {
 
     pub fn clear_cycle(&mut self) -> Result<(), crate::VmError> {
         self.clear_colors();
-        self.work = Vec::new();
-        self.roots = Vec::new();
-        self.cycle_charges = AllocationCharges::new();
+        self.work = AllocVec::new_in(self.backing_allocator.clone());
+        self.roots = AllocVec::new_in(self.backing_allocator.clone());
+        self.cycle_charges = AllocationCharges::new_in(self.backing_allocator.clone());
         self.growth_charges.clear();
         self.charge = 0;
         self.work_capacity = 0;
@@ -430,8 +440,13 @@ impl GcState {
     }
 
     pub fn clear_remembered(&mut self) -> Result<(), crate::VmError> {
-        self.remembered = Vec::new();
-        self.remembered_charges = AllocationCharges::new();
+        if self.remembered_preallocated {
+            self.remembered.clear();
+            self.remembered_cursor = 0;
+            return Ok(());
+        }
+        self.remembered = AllocVec::new_in(self.backing_allocator.clone());
+        self.remembered_charges = AllocationCharges::new_in(self.backing_allocator.clone());
         self.remembered_charge = 0;
         self.remembered_cursor = 0;
         Ok(())
