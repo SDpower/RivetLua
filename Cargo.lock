@@ -260,6 +260,9 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+dependencies = [
+ "allocator-api2",
+]
 
 [[package]]
 name = "hashbrown"
@@ -375,11 +378,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivetlua-alloc"
+version = "0.0.0"
+dependencies = [
+ "allocator-api2",
+]
+
+[[package]]
 name = "rivetlua-capi"
 version = "0.0.0"
 dependencies = [
+ "allocator-api2",
  "cc",
  "libc",
+ "rivetlua-alloc",
  "rivetlua-compiler",
  "rivetlua-core",
  "rivetlua-runtime",
@@ -399,6 +411,9 @@ dependencies = [
 name = "rivetlua-compiler"
 version = "0.0.0"
 dependencies = [
+ "allocator-api2",
+ "hashbrown 0.16.1",
+ "rivetlua-alloc",
  "rivetlua-core",
 ]
 
@@ -406,7 +421,9 @@ dependencies = [
 name = "rivetlua-core"
 version = "0.0.0"
 dependencies = [
+ "allocator-api2",
  "libm",
+ "rivetlua-alloc",
 ]
 
 [[package]]
@@ -424,6 +441,8 @@ dependencies = [
 name = "rivetlua-runtime"
 version = "0.0.0"
 dependencies = [
+ "allocator-api2",
+ "rivetlua-alloc",
  "rivetlua-compiler",
  "rivetlua-core",
  "rivetlua-native",

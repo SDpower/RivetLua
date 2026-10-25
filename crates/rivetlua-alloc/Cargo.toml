@@ -1,0 +1,16 @@
+[package]
+name = "rivetlua-alloc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RivetLua 的隔離 Lua 配置器封裝。"
+
+[features]
+default = ["std"]
+std = []
+test-support = []
+
+[dependencies]
+allocator-api2 = { version = "=0.2.21", default-features = false, features = ["alloc"] }
