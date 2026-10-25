@@ -1,52 +1,178 @@
 //! 將一般 RVLU_V2 原型降低成官方 Lua opcode。
 
-use alloc::vec::Vec;
+
+use rivetlua_alloc::{AllocationRecovery, StateAllocator};
+
 
 use super::codec::{
-    BytecodeConstant, BytecodeExitKind, BytecodeInstruction, BytecodePrototype,
-    BytecodeUpvalueSource,
+    BytecodeBindingId, BytecodeConstant, BytecodeExitKind, BytecodeInstruction,
+    BytecodePrototype,
+    BytecodeUpvalueSource, BytecodeVec, RetainedVec, Scratch,
 };
 use super::official::{
     OfficialAbsLine, OfficialChunk, OfficialChunkLimits, OfficialConstant, OfficialDebug,
     OfficialLocal, OfficialPrototype, OfficialUpvalue,
 };
 use super::official_export::{
-    OfficialExportError, OfficialExportErrorKind, copy_slice, error, work_charge,
+    OfficialExportError, OfficialExportErrorKind, copy_slice_with_recovery, error, work_charge,
 };
 use super::official_translation::OfficialWorkBudget;
 use super::{
     BinaryOperation, EnvironmentSource, Instruction, InstructionOffset, LuaProfile, ProtoId,
     Register, ResultMode, UnaryOperation, VerifiedModule,
 };
-use alloc::borrow::Cow;
+use core::ops::Deref;
 use core::mem::size_of;
 
 use super::native_debug::{
     NativeCloseGroup, NativeInitializerTemporary, NativeLocal, NativePrototypeDebug,
     NativeStorageInterval, NativeTemporary, register_access,
 };
-use super::official_execution::OfficialPlanCall;
+use super::official_execution::{OfficialPlanBuiltin, OfficialPlanCall};
 
-struct Layout {
+pub(super) struct Layout {
     anonymous_vararg_slot: Option<u8>,
     tuple_base: u16,
-    scratch: Vec<u16>,
-    parallel_spare: Vec<u16>,
-    call_cleanup_slots: Vec<(usize, [u8; 32])>,
+    numeric_width: u8,
+    numeric_tuples: BytecodeVec<u8>,
+    scratch: BytecodeVec<u16>,
+    parallel_spare: BytecodeVec<u16>,
+    call_cleanup_slots: BytecodeVec<(usize, [u8; 32])>,
     max_stack: u8,
     guest_upvalue_offset: u16,
     env_upvalue: Option<u16>,
-    mapped: Vec<u8>,
-    protected: Vec<u8>,
-    span: Vec<(usize, usize)>,
-    live_at: Vec<LiveRow>,
-    numeric_aliases: Vec<NumericAlias>,
+    mapped: BytecodeVec<u8>,
+    protected: BytecodeVec<u8>,
+    span: BytecodeVec<(usize, usize)>,
+    live_at: BytecodeVec<LiveRow>,
+    numeric_aliases: BytecodeVec<NumericAlias>,
+}
+
+impl Layout {
+    pub(super) fn temporary_backing_bytes(&self) -> Option<usize> {
+        let mut bytes = 0usize;
+        for part in [
+            self.scratch.capacity().checked_mul(size_of::<u16>())?,
+            self.parallel_spare.capacity().checked_mul(size_of::<u16>())?,
+            self.call_cleanup_slots.capacity()
+                .checked_mul(size_of::<(usize, [u8; 32])>())?,
+            self.mapped.capacity(),
+            self.protected.capacity(),
+            self.span.capacity().checked_mul(size_of::<(usize, usize)>())?,
+            self.live_at.capacity().checked_mul(size_of::<LiveRow>())?,
+            self.numeric_aliases.capacity().checked_mul(size_of::<NumericAlias>())?,
+            self.numeric_tuples.capacity(),
+        ] {
+            bytes = bytes.checked_add(part)?;
+        }
+        for row in &self.live_at {
+            if let LiveRow::Bits { bytes: bits, .. } = row {
+                bytes = bytes.checked_add(bits.capacity())?;
+            }
+        }
+        Some(bytes)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NativeChildren<'a> {
+    prototypes: &'a [BytecodePrototype],
+    parent: ProtoId,
+    indices: Option<&'a [usize]>,
+    source_index: Option<&'a [(ProtoId, usize)]>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Dump54ClosureSite {
+    pub(super) parent: ProtoId,
+    pub(super) child: ProtoId,
+    pub(super) pc: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Dump54Binding {
+    pub(super) parent: ProtoId,
+    pub(super) id: BytecodeBindingId,
+    pub(super) ordinal: usize,
+    pub(super) register: Register,
+}
+
+impl<'a> NativeChildren<'a> {
+    pub(super) fn all(prototypes: &'a [BytecodePrototype], parent: ProtoId) -> Self {
+        Self { prototypes, parent, indices: None, source_index: None }
+    }
+
+    pub(super) fn indexed(
+        prototypes: &'a [BytecodePrototype], parent: ProtoId,
+        indices: &'a [usize], source_index: &'a [(ProtoId, usize)],
+    ) -> Self {
+        Self { prototypes, parent, indices: Some(indices),
+            source_index: Some(source_index) }
+    }
+
+    fn iter_with_index(self) -> impl Iterator<Item = (usize, &'a BytecodePrototype)> {
+        let mut next = 0usize;
+        core::iter::from_fn(move || loop {
+            let index = if let Some(indices) = self.indices {
+                let index = *indices.get(next)?;
+                next += 1;
+                index
+            } else {
+                let index = next;
+                next += 1;
+                index
+            };
+            let proto = self.prototypes.get(index)?;
+            if proto.parent == Some(self.parent) {
+                return Some((index, proto));
+            }
+        })
+    }
+
+    fn iter(self) -> impl Iterator<Item = &'a BytecodePrototype> {
+        self.iter_with_index().map(|(_, proto)| proto)
+    }
+
+    fn len(self) -> usize {
+        match self.indices {
+            Some(indices) => indices.len(),
+            None => self.iter().count(),
+        }
+    }
+
+    fn scan_cost(self) -> usize {
+        self.indices.map_or(self.prototypes.len(), |indices| indices.len())
+    }
+
+    fn lookup_cost(self) -> usize {
+        match (self.indices, self.source_index) {
+            (Some(indices), Some(source_index)) =>
+                (usize::BITS - source_index.len().leading_zeros()) as usize
+                    + (usize::BITS - indices.len().leading_zeros()) as usize,
+            _ => self.prototypes.len(),
+        }
+    }
+
+    fn ordinal(self, child: ProtoId) -> Option<usize> {
+        if let (Some(indices), Some(source_index)) = (self.indices, self.source_index) {
+            let slot = source_index.binary_search_by_key(&child, |(id, _)| *id).ok()?;
+            return indices.binary_search(&source_index[slot].1).ok();
+        }
+        self.iter().position(|proto| proto.id == child)
+    }
+}
+
+struct EnvironmentFrame {
+    source_index: usize,
+    depth: usize,
+    next_child: usize,
+    entered: bool,
 }
 
 #[derive(Debug)]
 enum LiveRow {
     Uncomputed,
-    Bits { base_pc: usize, bytes: Vec<u8> },
+    Bits { base_pc: usize, bytes: BytecodeVec<u8> },
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +202,7 @@ fn numeric_alias_anchor_observed(
 // body 的 nil 寫入被省略後，只有在所有 CFG 路徑先確定覆寫 anchor，
 // 才能允許後續讀取重用同一個 guest register 的值。
 fn numeric_alias_later_reads_defined(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     proto: &BytecodePrototype,
     body_pc: usize,
     anchor: Register,
@@ -98,8 +225,8 @@ fn numeric_alias_later_reads_defined(
         proto.id,
         body_pc,
     )?;
-    let mut seen = Vec::new();
-    seen.try_reserve_exact(count).map_err(|_| {
+    let mut seen = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut seen, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -108,8 +235,8 @@ fn numeric_alias_later_reads_defined(
         )
     })?;
     seen.resize(count, 0u8);
-    let mut queue = Vec::<u32>::new();
-    queue.try_reserve_exact(count).map_err(|_| {
+    let mut queue = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut queue, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -291,15 +418,15 @@ fn numeric_alias_nil_only(
 fn numeric_alias_shared_home_eligible(
     proto: &BytecodePrototype,
     anchor: Register,
-    prototypes: &[BytecodePrototype],
+    children: NativeChildren<'_>,
     locals: &[NativeLocal],
     storage: &[NativeStorageInterval],
     pending: &[NativeTemporary],
     initializer: &[NativeInitializerTemporary],
     work: &mut OfficialWorkBudget,
 ) -> Result<bool, OfficialExportError> {
-    let metadata = prototypes
-        .len()
+    let metadata = children
+        .scan_cost()
         .checked_add(proto.binding_registers.len())
         .and_then(|n| n.checked_add(locals.len()))
         .and_then(|n| n.checked_add(storage.len()))
@@ -323,9 +450,8 @@ fn numeric_alias_shared_home_eligible(
             .binding_registers
             .iter()
             .any(|(_, register)| *register == anchor)
-        || prototypes.iter().any(|child| {
-            child.parent == Some(proto.id)
-                && matches!(child.frame.environment_source,
+        || children.iter().any(|child| {
+            matches!(child.frame.environment_source,
                     EnvironmentSource::ParentFrame { parent, register }
                         if parent == proto.id && register == anchor)
         })
@@ -359,15 +485,16 @@ struct TerminalCompareFusion {
 }
 
 fn terminal_compare_fusions(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     proto: &BytecodePrototype,
     meta: &Layout,
     debug: Option<&NativePrototypeDebug>,
     first: &[Option<CompareBranchFusion>],
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<Option<TerminalCompareFusion>>, OfficialExportError> {
+) -> Result<BytecodeVec<Option<TerminalCompareFusion>>, OfficialExportError> {
     let count = proto.instructions.len();
-    let mut result = Vec::new();
-    result.try_reserve_exact(count).map_err(|_| {
+    let mut result = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut result, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -684,16 +811,18 @@ fn loop_exit_nil_gap_safe(
 }
 
 fn loop_exit_nil_fusions(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
+    children: NativeChildren<'_>,
     meta: &Layout,
     pairs: &[NumericPair],
     profile: LuaProfile,
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<Option<LoopExitNilFusion>>, OfficialExportError> {
+) -> Result<BytecodeVec<Option<LoopExitNilFusion>>, OfficialExportError> {
     let count = proto.instructions.len();
-    let mut result = Vec::new();
-    result.try_reserve_exact(count).map_err(|_| {
+    let mut result = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut result, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -753,9 +882,7 @@ fn loop_exit_nil_fusions(
         }) else {
             continue;
         };
-        let child_work = module
-            .module()
-            .prototypes
+        let child_work = children
             .iter()
             .try_fold(0usize, |units, child| {
                 units.checked_add(child.upvalues.len())
@@ -779,7 +906,8 @@ fn loop_exit_nil_fusions(
                         .checked_mul(3)
                         .and_then(|locals| units.checked_add(locals))
                 })
-                .and_then(|units| units.checked_add(module.module().prototypes.len()))
+                .and_then(|units| children.scan_cost().checked_mul(2)
+                    .and_then(|scans| units.checked_add(scans)))
                 .and_then(|units| units.checked_add(child_work))
                 .ok_or_else(|| {
                     error(
@@ -792,9 +920,8 @@ fn loop_exit_nil_fusions(
             proto.id,
             pc,
         )?;
-        if module.module().prototypes.iter().any(|child| {
-            child.parent == Some(proto.id)
-                && child.upvalues.iter().any(|upvalue| {
+        if children.iter().any(|child| {
+            child.upvalues.iter().any(|upvalue| {
                     matches!(&upvalue.source, BytecodeUpvalueSource::ParentLocal(binding)
                     if *binding == local.binding)
                 })
@@ -991,14 +1118,15 @@ fn env_field_fusion_candidate(
 }
 
 fn env_field_fusions(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     meta: &Layout,
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<Option<EnvFieldFusion>>, OfficialExportError> {
+) -> Result<BytecodeVec<Option<EnvFieldFusion>>, OfficialExportError> {
     let count = proto.instructions.len();
-    let mut result = Vec::new();
-    result.try_reserve_exact(count).map_err(|_| {
+    let mut result = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut result, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -1022,14 +1150,14 @@ fn env_field_fusions(
 }
 
 fn direct_const_copies(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     meta: &Layout,
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<DirectConstCopy>, OfficialExportError> {
-    let mut plans = Vec::new();
-    plans
-        .try_reserve_exact(proto.instructions.len() / 4)
+) -> Result<BytecodeVec<DirectConstCopy>, OfficialExportError> {
+    let mut plans = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut plans, proto.instructions.len() / 4)
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -1315,14 +1443,15 @@ fn nil_after_direct_const_copy(
 }
 
 fn direct_numeric_inits(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     meta: &Layout,
     pairs: &[NumericPair],
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<DirectNumericInit>, OfficialExportError> {
-    let mut plans = Vec::new();
-    plans.try_reserve_exact(pairs.len()).map_err(|_| {
+) -> Result<BytecodeVec<DirectNumericInit>, OfficialExportError> {
+    let mut plans = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut plans, pairs.len()).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -1923,7 +2052,7 @@ fn emit_native_list_write(
             )
         })?;
     let lower = (zero_based % width) as u32;
-    let table = scratch_register(meta, 3, proto.id, pc)?;
+    let table = native_list_table_register(meta, proto.id, pc)?;
     let word = if profile == LuaProfile::Lua55 {
         u32::from(78u8) | (u32::from(table) << 7) | (u32::from(upper > 0) << 15) | (lower << 22)
     } else {
@@ -1933,6 +2062,47 @@ fn emit_native_list_write(
     if upper > 0 {
         builder.push(ax(extra_opcode(profile), upper), pc)?;
     }
+    Ok(())
+}
+
+fn native_list_table_register(
+    meta: &Layout,
+    id: ProtoId,
+    helper_pc: usize,
+) -> Result<u8, OfficialExportError> {
+    let producer_pc = helper_pc.checked_sub(1).ok_or_else(|| {
+        error(OfficialExportErrorKind::InvalidPrototype, id, helper_pc,
+            "native SETLIST 缺少 open producer")
+    })?;
+    scratch_register(meta, 3, id, producer_pc)
+}
+
+fn emit_native_global_nil_check(
+    builder: &mut Builder<'_>,
+    proto: &BytecodePrototype,
+    meta: &Layout,
+    pc: usize,
+    call: &OfficialPlanCall,
+) -> Result<(), OfficialExportError> {
+    let name_register = Register(call.function_register.0.checked_add(2).ok_or_else(|| {
+        error(OfficialExportErrorKind::InvalidPrototype, proto.id, pc, "native ERRNNIL name register 溢位")
+    })?);
+    let input_register = Register(call.function_register.0.checked_add(1).ok_or_else(|| {
+        error(OfficialExportErrorKind::InvalidPrototype, proto.id, pc, "native ERRNNIL input register 溢位")
+    })?);
+    if !matches!(proto.instructions.get(pc.checked_sub(2).ok_or_else(|| {
+        error(OfficialExportErrorKind::InvalidPrototype, proto.id, pc, "native ERRNNIL value 缺失")
+    })?).map(|entry| &entry.instruction),
+        Some(Instruction::Move { dest, .. }) if *dest == input_register)
+    {
+        return Err(error(OfficialExportErrorKind::InvalidPrototype, proto.id, pc, "native ERRNNIL value 無效"));
+    }
+    let name = match pc.checked_sub(1).and_then(|previous| proto.instructions.get(previous)).map(|entry| &entry.instruction) {
+        Some(Instruction::LoadConst { dest, constant }) if *dest == name_register =>
+            constant.0.checked_add(1).filter(|index| *index <= 0x1ffff).unwrap_or(0),
+        _ => return Err(error(OfficialExportErrorKind::InvalidPrototype, proto.id, pc, "native ERRNNIL name 無效")),
+    };
+    builder.push(abx(82, meta.register(input_register, proto.id, pc)?, name), pc)?;
     Ok(())
 }
 
@@ -1984,6 +2154,7 @@ fn env_read(instruction: &Instruction, env: Register) -> bool {
 }
 
 fn needs_environment(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     work: &mut OfficialWorkBudget,
@@ -1991,39 +2162,111 @@ fn needs_environment(
     limits: &OfficialChunkLimits,
 ) -> Result<bool, OfficialExportError> {
     if depth > limits.max_depth {
-        return Err(error(
-            OfficialExportErrorKind::LimitExceeded,
-            proto.id,
-            0,
-            "環境需求 prototype 深度超限",
-        ));
+        return Err(error(OfficialExportErrorKind::LimitExceeded, proto.id, 0, "環境需求 prototype 深度超限"));
     }
-    work_charge(work, proto.instructions.len(), proto.id, 0)?;
-    if proto
-        .instructions
-        .iter()
-        .any(|entry| env_read(&entry.instruction, proto.frame.environment))
-    {
-        return Ok(true);
-    }
-    work_charge(work, module.module().prototypes.len(), proto.id, 0)?;
-    for child in &module.module().prototypes {
-        if child.parent != Some(proto.id) {
-            continue;
+    let prototypes = &module.module().prototypes;
+    work_charge(work, prototypes.len(), proto.id, 0)?;
+    let source_index = prototypes.iter().position(|candidate| candidate.id == proto.id)
+        .ok_or_else(|| error(OfficialExportErrorKind::InvalidPrototype, proto.id, 0, "環境原型不存在"))?;
+    let mut pending = allocator_scratch.vec();
+    let mut cursor_budget = NativePreflight::default();
+    native_cursor_push(&mut pending, EnvironmentFrame { source_index, depth, next_child: 0, entered: false }, &mut cursor_budget,
+        limits, proto.id, allocator_scratch)?;
+    while let Some(frame) = pending.last_mut() {
+        let current = &prototypes[frame.source_index];
+        if frame.depth > limits.max_depth {
+            return Err(error(OfficialExportErrorKind::LimitExceeded, current.id, 0, "環境需求 prototype 深度超限"));
         }
-        work_charge(work, child.upvalues.len(), proto.id, 0)?;
-        if child.upvalues.iter().any(|upvalue| {
-            matches!(&upvalue.source, BytecodeUpvalueSource::ParentLocal(binding)
-                if *binding == proto.global_environment_binding)
-        }) || (matches!(
-            child.frame.environment_source,
-            EnvironmentSource::ParentFrame { .. }
-        ) && needs_environment(module, child, work, depth + 1, limits)?)
-        {
-            return Ok(true);
+        if !frame.entered {
+            if frame.source_index != source_index {
+                work_charge(work, prototypes.len(), current.id, 0)?;
+            }
+            work_charge(work, current.instructions.len(), current.id, 0)?;
+            if current.instructions.iter().any(|entry| env_read(&entry.instruction, current.frame.environment)) {
+                return Ok(true);
+            }
+            work_charge(work, prototypes.len(), current.id, 0)?;
+            frame.entered = true;
+        }
+        let mut next = None;
+        while frame.next_child < prototypes.len() {
+            let index = frame.next_child;
+            frame.next_child += 1;
+            let child = &prototypes[index];
+            if child.parent != Some(current.id) { continue; }
+            work_charge(work, child.upvalues.len(), current.id, 0)?;
+            if child.upvalues.iter().any(|upvalue| matches!(&upvalue.source,
+                BytecodeUpvalueSource::ParentLocal(binding) if *binding == current.global_environment_binding)) {
+                return Ok(true);
+            }
+            if matches!(child.frame.environment_source, EnvironmentSource::ParentFrame { .. }) {
+                let next_depth = frame.depth.checked_add(1).ok_or_else(||
+                    error(OfficialExportErrorKind::LimitExceeded, current.id, 0, "環境深度溢位"))?;
+                next = Some((index, next_depth));
+                break;
+            }
+        }
+        if let Some((source_index, depth)) = next {
+            native_cursor_push(&mut pending,
+                EnvironmentFrame { source_index, depth, next_child: 0, entered: false },
+                &mut cursor_budget, limits, current.id, allocator_scratch)?;
+        } else {
+            pending.pop();
         }
     }
     Ok(false)
+}
+
+/// 平坦圖上先標記本體或直接 child 的環境讀取，再沿 ParentFrame 向上傳播。
+pub(super) fn dump54_environment_needs<R: AllocationRecovery>(
+    scratch: &mut Scratch<'_, R>,
+    module: &VerifiedModule,
+    source_index: &[(ProtoId, usize)],
+    child_offsets: &[usize],
+    child_indices: &[usize],
+    work: &mut OfficialWorkBudget,
+) -> Result<BytecodeVec<bool>, OfficialExportError> {
+    let protos = &module.module().prototypes;
+    let mut needed = scratch.vec();
+    scratch.reserve_exact(&mut needed, protos.len()).map_err(|_| error(
+        OfficialExportErrorKind::AllocationFailed, ProtoId(0), 0,
+        "dump54 environment 索引配置失敗"))?;
+    needed.resize(protos.len(), false);
+    for (index, proto) in protos.iter().enumerate() {
+        let children = child_indices.get(child_offsets[index]..child_offsets[index + 1])
+            .ok_or_else(|| error(OfficialExportErrorKind::InvalidPrototype,
+                proto.id, 0, "dump54 child range 無效"))?;
+        work_charge(work, proto.instructions.len(), proto.id, 0)?;
+        needed[index] = proto.instructions.iter()
+            .any(|entry| env_read(&entry.instruction, proto.frame.environment));
+        for &child_index in children {
+            let child = protos.get(child_index).ok_or_else(|| error(
+                OfficialExportErrorKind::InvalidPrototype, proto.id, 0,
+                "dump54 child 索引無效"))?;
+            work_charge(work, child.upvalues.len(), proto.id, 0)?;
+            needed[index] |= child.upvalues.iter().any(|upvalue| matches!(
+                &upvalue.source,
+                BytecodeUpvalueSource::ParentLocal(binding)
+                    if *binding == proto.global_environment_binding));
+        }
+    }
+    for index in 0..protos.len() {
+        if !needed[index] { continue; }
+        let mut current = index;
+        while let EnvironmentSource::ParentFrame { parent, .. } =
+            protos[current].frame.environment_source
+        {
+            work_charge(work, 1, protos[current].id, 0)?;
+            let slot = source_index.binary_search_by_key(&parent, |(id, _)| *id)
+                .map_err(|_| error(OfficialExportErrorKind::InvalidPrototype,
+                    protos[current].id, 0, "dump54 environment parent 不存在"))?;
+            let parent_index = source_index[slot].1;
+            if needed[parent_index] { break; }
+            needed[parent_index] = true;
+            current = parent_index;
+        }
+    }
+    Ok(needed)
 }
 
 fn visit_range<F: FnMut(Register) -> Result<(), OfficialExportError>>(
@@ -2415,20 +2658,39 @@ fn environment_cache_slot_exclusive(
         == 1)
 }
 
+enum NativeCloseGroups<'a> {
+    Borrowed(&'a [NativeCloseGroup]),
+    Owned(BytecodeVec<NativeCloseGroup>),
+}
+
+impl Deref for NativeCloseGroups<'_> {
+    type Target = [NativeCloseGroup];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(groups) => groups,
+            Self::Owned(groups) => groups.as_slice(),
+        }
+    }
+}
+
 fn native_close_groups<'a>(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &'a VerifiedModule,
     proto: &BytecodePrototype,
     limits: &OfficialChunkLimits,
     work: &mut OfficialWorkBudget,
-) -> Result<Cow<'a, [NativeCloseGroup]>, OfficialExportError> {
+) -> Result<NativeCloseGroups<'a>, OfficialExportError> {
     if let Some(groups) = module
         .native_debug()
         .and_then(|debug| debug.close_groups_for(proto.id))
     {
-        return Ok(Cow::Borrowed(groups));
+        return Ok(NativeCloseGroups::Borrowed(groups));
     }
-    super::native_debug::build_close_groups(proto, work, limits.max_allocated_bytes)
-        .map(Cow::Owned)
+    super::native_debug::build_close_groups_with_recovery(
+        proto, work, limits.max_allocated_bytes, allocator_scratch,
+    )
+        .map(NativeCloseGroups::Owned)
         .map_err(|source| {
             native_debug_error(
                 source.code,
@@ -2513,6 +2775,7 @@ fn bare_close_cfg_bytes(proto: &BytecodePrototype) -> Result<(usize, usize), Off
 /// bare 匯出只信任 RVLU P05 指令與由指令推導的 group；逐個保護 register
 /// 比對單一 OP_CLOSE 會實際關閉的 open upvalue／TBC 狀態。
 fn verify_bare_close_layout(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     meta: &Layout,
@@ -2550,8 +2813,8 @@ fn verify_bare_close_layout(
         proto.id,
         0,
     )?;
-    let mut captures = Vec::new();
-    captures.try_reserve_exact(count).map_err(|_| {
+    let mut captures = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut captures, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -2560,8 +2823,8 @@ fn verify_bare_close_layout(
         )
     })?;
     captures.resize(count, 0u8);
-    let mut seen = Vec::new();
-    seen.try_reserve_exact(count).map_err(|_| {
+    let mut seen = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut seen, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -2570,8 +2833,8 @@ fn verify_bare_close_layout(
         )
     })?;
     seen.resize(count, 0u8);
-    let mut pending = Vec::new();
-    pending.try_reserve_exact(queue_count).map_err(|_| {
+    let mut pending = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut pending, queue_count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3034,7 +3297,7 @@ fn numeric_pair_tuple_owned(
     initializer: &[NativeInitializerTemporary],
     child_environment_registers: &[Register],
     seen: &mut [u8],
-    queue: &mut Vec<u32>,
+    queue: &mut BytecodeVec<u32>,
     work: &mut OfficialWorkBudget,
 ) -> Result<bool, OfficialExportError> {
     let count = proto.instructions.len();
@@ -3310,13 +3573,15 @@ fn numeric_pair_tuple_owned(
 }
 
 fn numeric_owned_next_pairs(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
+    children: NativeChildren<'_>,
     numeric: &[NumericPair],
     mapped: &[u8],
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<NumericOwnedNext>, OfficialExportError> {
-    let mut owned = Vec::new();
+) -> Result<BytecodeVec<NumericOwnedNext>, OfficialExportError> {
+    let mut owned = allocator_scratch.vec();
     let Some(native) = module.native_debug() else {
         return Ok(owned);
     };
@@ -3329,7 +3594,7 @@ fn numeric_owned_next_pairs(
     let count = proto.instructions.len();
     // 即使所有 pair 都在 proof 前被排除，visited 的初始化仍須計費。
     work_charge(work, count, proto.id, 0)?;
-    owned.try_reserve_exact(numeric.len()).map_err(|_| {
+    allocator_scratch.reserve_exact(&mut owned, numeric.len()).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3337,8 +3602,8 @@ fn numeric_owned_next_pairs(
             "numeric tuple-owned 稀疏索引配置失敗",
         )
     })?;
-    let mut seen = Vec::new();
-    seen.try_reserve_exact(count).map_err(|_| {
+    let mut seen = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut seen, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3347,8 +3612,8 @@ fn numeric_owned_next_pairs(
         )
     })?;
     seen.resize(count, 0u8);
-    let mut queue = Vec::new();
-    queue.try_reserve_exact(count).map_err(|_| {
+    let mut queue = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut queue, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3416,13 +3681,12 @@ fn numeric_owned_next_pairs(
             } => {
                 work_charge(
                     work,
-                    module.module().prototypes.len(),
+                    children.scan_cost(),
                     proto.id,
                     pair.prepare_pc,
                 )?;
-                module.module().prototypes.iter().any(|child| {
-                    child.parent == Some(proto.id)
-                        && matches!(child.frame.environment_source,
+                children.iter().any(|child| {
+                    matches!(child.frame.environment_source,
                             EnvironmentSource::ParentFrame { parent, register }
                                 if parent == proto.id
                                     && [control, limit, step].contains(&register))
@@ -3540,13 +3804,14 @@ fn cfg_successors(proto: &BytecodePrototype, pc: usize) -> [Option<usize>; 3] {
 /// 對每個暫存 register 逆向追蹤 CFG 的讀取來源，將回邊上的活躍 PC 也納入區間。
 /// 使用單一可重用 bitmap/worklist，不儲存 register × PC 矩陣。
 fn extend_live_spans(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     proto: &BytecodePrototype,
     mapped: &[u8],
     spans: &mut [(usize, usize)],
     owned: &[NumericOwnedNext],
     bitmap_limit: usize,
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<LiveRow>, OfficialExportError> {
+) -> Result<BytecodeVec<LiveRow>, OfficialExportError> {
     let count = proto.instructions.len();
     work_charge(
         work,
@@ -3561,8 +3826,8 @@ fn extend_live_spans(
         proto.id,
         0,
     )?;
-    let mut offsets = Vec::new();
-    offsets.try_reserve_exact(count + 1).map_err(|_| {
+    let mut offsets = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut offsets, count + 1).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3631,8 +3896,8 @@ fn extend_live_spans(
         proto.id,
         0,
     )?;
-    let mut cursor = Vec::new();
-    cursor.try_reserve_exact(count).map_err(|_| {
+    let mut cursor = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut cursor, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3641,8 +3906,8 @@ fn extend_live_spans(
         )
     })?;
     cursor.extend_from_slice(&offsets[..count]);
-    let mut edges = Vec::new();
-    edges.try_reserve_exact(edge_count).map_err(|_| {
+    let mut edges = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut edges, edge_count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3673,8 +3938,8 @@ fn extend_live_spans(
         proto.id,
         0,
     )?;
-    let mut effects = Vec::new();
-    effects.try_reserve_exact(count).map_err(|_| {
+    let mut effects = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut effects, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3683,8 +3948,8 @@ fn extend_live_spans(
         )
     })?;
     effects.resize(count, 0u8);
-    let mut live = Vec::new();
-    live.try_reserve_exact(count).map_err(|_| {
+    let mut live = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut live, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3693,8 +3958,8 @@ fn extend_live_spans(
         )
     })?;
     live.resize(count, 0u8);
-    let mut pending = Vec::new();
-    pending.try_reserve_exact(count).map_err(|_| {
+    let mut pending = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut pending, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3703,8 +3968,8 @@ fn extend_live_spans(
         )
     })?;
     work_charge(work, spans.len(), proto.id, 0)?;
-    let mut live_at = Vec::new();
-    live_at.try_reserve_exact(spans.len()).map_err(|_| {
+    let mut live_at = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut live_at, spans.len()).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -3838,8 +4103,8 @@ fn extend_live_spans(
                 "native CFG live snapshot 超過配置額度",
             ));
         }
-        let mut bits = Vec::new();
-        bits.try_reserve_exact(bytes).map_err(|_| {
+        let mut bits = allocator_scratch.vec();
+        allocator_scratch.reserve_exact(&mut bits, bytes).map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
                 proto.id,
@@ -4095,6 +4360,7 @@ fn generation_live_after_consumer(
 /// bare module 沒有 debug sidecar；由已驗證的 Closure/Close CFG 延長捕獲值的
 /// 實體儲存期間，直到每一可達路徑都關閉或 frame 結束。
 fn extend_capture_spans(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     spans: &mut [(usize, usize)],
@@ -4121,8 +4387,8 @@ fn extend_capture_spans(
         proto.id,
         0,
     )?;
-    let mut captures = Vec::new();
-    captures.try_reserve_exact(count).map_err(|_| {
+    let mut captures = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut captures, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -4131,8 +4397,8 @@ fn extend_capture_spans(
         )
     })?;
     captures.resize(count, 0u8);
-    let mut seen = Vec::new();
-    seen.try_reserve_exact(count).map_err(|_| {
+    let mut seen = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut seen, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -4149,8 +4415,8 @@ fn extend_capture_spans(
             "native capture CFG queue 溢位",
         )
     })?;
-    let mut pending = Vec::new();
-    pending.try_reserve_exact(queue_count).map_err(|_| {
+    let mut pending = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut pending, queue_count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -4668,20 +4934,23 @@ fn fixed_pending_birth_retained(
 }
 
 fn temporary_call_layouts(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     anonymous_vararg_slot: Option<u8>,
     numeric: &[NumericPair],
+    numeric_tuples: &[u8],
     tuple_base: Option<u16>,
+    homes: &[u8],
     mapped: &[u8],
     span: &[(usize, usize)],
     protected: &[u8],
     live_at: &[LiveRow],
     owned_next: &[NumericOwnedNext],
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<TemporaryCallLayout>, OfficialExportError> {
+) -> Result<BytecodeVec<TemporaryCallLayout>, OfficialExportError> {
     let Some(debug) = module.native_debug() else {
-        return Ok(Vec::new());
+        return Ok(allocator_scratch.vec());
     };
     let locals = &debug
         .prototype(proto.id)
@@ -4705,7 +4974,7 @@ fn temporary_call_layouts(
     let plan_calls = module
         .official_execution()
         .map_or(&[][..], |plan| plan.calls());
-    let mut calls: Vec<TemporaryCallLayout> = Vec::new();
+    let mut calls: BytecodeVec<TemporaryCallLayout> = allocator_scratch.vec();
     let call_count = proto
         .instructions
         .iter()
@@ -4721,7 +4990,7 @@ fn temporary_call_layouts(
         })
         .count();
     work_charge(work, proto.instructions.len(), proto.id, 0)?;
-    calls.try_reserve_exact(call_count).map_err(|_| {
+    allocator_scratch.reserve_exact(&mut calls, call_count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -4850,14 +5119,16 @@ fn temporary_call_layouts(
                     && storage.start_pc as usize <= at
                     && at < storage.end_pc as usize
                 {
-                    let home =
-                        official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, at)?;
+                    let home = projected_storage_slot(local.register, local.slot, homes,
+                        anonymous_vararg_slot, proto.id, at)?;
                     frontier = frontier.max(usize::from(home) + 1);
                 }
             }
             if let Some(tuple_base) = tuple_base {
-                for pair in numeric {
-                    if pair.prepare_pc <= at && at <= pair.next_pc {
+                for (index, pair) in numeric.iter().enumerate() {
+                    if pair.prepare_pc <= at && at <= pair.next_pc
+                        && numeric_tuples.get(index).copied().is_none_or(|slot| slot == u8::MAX)
+                    {
                         let end = pair
                             .block
                             .checked_add(1)
@@ -4928,8 +5199,8 @@ fn temporary_call_layouts(
                     {
                         continue;
                     }
-                    let home =
-                        official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, pc)?;
+                    let home = projected_storage_slot(local.register, local.slot, homes,
+                        anonymous_vararg_slot, proto.id, pc)?;
                     local_floor = local_floor.max(usize::from(home) + 1);
                 }
             }
@@ -5067,8 +5338,10 @@ fn temporary_call_layouts(
                         {
                             continue;
                         }
-                        let home = official_storage_slot(
+                        let home = projected_storage_slot(
+                            local.register,
                             local.slot,
+                            homes,
                             anonymous_vararg_slot,
                             proto.id,
                             birth,
@@ -5175,8 +5448,8 @@ fn temporary_call_layouts(
                     if local.start_pc as usize >= live_end || live_start >= local.end_pc as usize {
                         continue;
                     }
-                    let home =
-                        official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, pc)?;
+                    let home = projected_storage_slot(local.register, local.slot, homes,
+                        anonymous_vararg_slot, proto.id, pc)?;
                     local_floor = local_floor.max(usize::from(home) + 1);
                 }
                 frontier = frontier.max(local_floor.checked_add(current).ok_or_else(|| {
@@ -5230,8 +5503,8 @@ fn temporary_call_layouts(
                     if (local.start_pc as usize) >= range.1 || range.0 >= local.end_pc as usize {
                         continue;
                     }
-                    let home =
-                        official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, birth)?;
+                    let home = projected_storage_slot(local.register, local.slot, homes,
+                        anonymous_vararg_slot, proto.id, birth)?;
                     birth_floor = birth_floor.max(usize::from(home) + 1);
                 }
                 let live_birth = span
@@ -5545,8 +5818,8 @@ fn temporary_call_layouts(
     }
     // 同一 register 的 home 跨 Call 固定；先蒐集所有 Call 的低槽約束，
     // 再回頭校正 fixed Call，涵蓋較晚 Call 對較早出生值的限制。
-    let mut low_bound = Vec::new();
-    low_bound.try_reserve_exact(span.len()).map_err(|_| {
+    let mut low_bound = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut low_bound, span.len()).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -5644,8 +5917,8 @@ fn temporary_call_layouts(
             )
         })?);
         let pending = debug.temporaries_at(proto.id, call_pc).unwrap_or(&[]);
-        let mut crossing = Vec::new();
-        crossing.try_reserve_exact(span.len()).map_err(|_| {
+        let mut crossing = allocator_scratch.vec();
+        allocator_scratch.reserve_exact(&mut crossing, span.len()).map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
                 proto.id,
@@ -5754,8 +6027,10 @@ fn temporary_call_layouts(
                 for local in storage {
                     if (local.start_pc as usize) < span[register].1
                         && span[register].0 < local.end_pc as usize
-                        && u16::from(official_storage_slot(
+                        && u16::from(projected_storage_slot(
+                            local.register,
                             local.slot,
+                            homes,
                             anonymous_vararg_slot,
                             proto.id,
                             call.pc,
@@ -5830,11 +6105,12 @@ fn temporary_call_layouts(
             if local.start_pc as usize >= live_end || live_start >= local.end_pc as usize {
                 continue;
             }
-            let home = official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, call.pc)?;
+            let home = projected_storage_slot(local.register, local.slot, homes,
+                anonymous_vararg_slot, proto.id, call.pc)?;
             local_floor = local_floor.max(usize::from(home) + 1);
         }
-        let mut low_required = Vec::new();
-        low_required.try_reserve_exact(span.len()).map_err(|_| {
+        let mut low_required = allocator_scratch.vec();
+        allocator_scratch.reserve_exact(&mut low_required, span.len()).map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
                 proto.id,
@@ -5976,6 +6252,7 @@ fn temporary_call_layouts(
         module,
         proto,
         anonymous_vararg_slot,
+        homes,
         &mut calls,
         span,
         protected,
@@ -5985,9 +6262,11 @@ fn temporary_call_layouts(
         work,
     )?;
     align_reused_pending_prefixes(
+        allocator_scratch,
         module,
         proto,
         anonymous_vararg_slot,
+        homes,
         &mut calls,
         span,
         protected,
@@ -6002,9 +6281,11 @@ fn temporary_call_layouts(
 // 同一值的 home 不隨 Call 改變。分離的 Call 若為該值建立不同的
 // pending 前綴，須把相關窗口共同移到其低槽共存值之上。
 fn align_reused_pending_prefixes(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     anonymous_vararg_slot: Option<u8>,
+    homes: &[u8],
     calls: &mut [TemporaryCallLayout],
     span: &[(usize, usize)],
     protected: &[u8],
@@ -6024,8 +6305,8 @@ fn align_reused_pending_prefixes(
             "Call 前綴缺少 local storage",
         )
     })?;
-    let mut target = Vec::new();
-    target.try_reserve_exact(calls.len()).map_err(|_| {
+    let mut target = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut target, calls.len()).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -6137,8 +6418,10 @@ fn align_reused_pending_prefixes(
             if (local.start_pc as usize) < span[register].1
                 && span[register].0 < local.end_pc as usize
             {
-                let slot = official_storage_slot(
+                let slot = projected_storage_slot(
+                    local.register,
                     local.slot,
+                    homes,
                     anonymous_vararg_slot,
                     proto.id,
                     span[register].0,
@@ -6271,6 +6554,7 @@ fn refine_open_call_prefixes(
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     anonymous_vararg_slot: Option<u8>,
+    homes: &[u8],
     calls: &mut [TemporaryCallLayout],
     span: &[(usize, usize)],
     protected: &[u8],
@@ -6403,8 +6687,10 @@ fn refine_open_call_prefixes(
                 for local in storage {
                     if (local.start_pc as usize) < span[register].1
                         && span[register].0 < local.end_pc as usize
-                        && u16::from(official_storage_slot(
+                        && u16::from(projected_storage_slot(
+                            local.register,
                             local.slot,
+                            homes,
                             anonymous_vararg_slot,
                             proto.id,
                             call.pc,
@@ -6783,6 +7069,7 @@ fn pending_open_result_local_alias(
     source: Register,
     candidate: Register,
     locals: &[NativeLocal],
+    homes: &[u8],
     work: &mut OfficialWorkBudget,
 ) -> Result<Option<usize>, OfficialExportError> {
     let access = |pc: usize, register| {
@@ -6861,8 +7148,10 @@ fn pending_open_result_local_alias(
         {
             return Ok(None);
         }
-        let first = *first_slot.get_or_insert(local.slot);
-        if usize::from(local.slot) != usize::from(first) + index {
+        let home = homes.get(usize::from(local.register.0)).copied()
+            .filter(|home| *home != u8::MAX).unwrap_or(local.slot);
+        let first = *first_slot.get_or_insert(home);
+        if usize::from(home) != usize::from(first) + index {
             return Ok(None);
         }
     }
@@ -7079,7 +7368,7 @@ fn compact_map_base_bytes(
                 + size_of::<u16>()
                 + size_of::<usize>() * 2,
         )
-        .and_then(|bytes| bytes.checked_add(size_of::<Vec<usize>>()))
+        .and_then(|bytes| bytes.checked_add(size_of::<BytecodeVec<usize>>()))
         .and_then(|bytes| bytes.checked_add(255 * size_of::<usize>()))
         .and_then(|bytes| {
             storage_count
@@ -7089,7 +7378,7 @@ fn compact_map_base_bytes(
     let instruction_bytes = instructions
         .checked_mul(size_of::<usize>() * 6 + 4 + size_of::<u16>())
         .and_then(|bytes| bytes.checked_add(size_of::<usize>()))
-        .and_then(|bytes| bytes.checked_add(size_of::<Vec<(usize, [u8; 32])>>()));
+        .and_then(|bytes| bytes.checked_add(size_of::<BytecodeVec<(usize, [u8; 32])>>()));
     register_bytes
         .and_then(|bytes| instruction_bytes.and_then(|extra| bytes.checked_add(extra)))
         .and_then(|bytes| {
@@ -7123,6 +7412,15 @@ fn compact_map_base_bytes(
             if numeric_count == 0 {
                 Some(bytes)
             } else {
+                numeric_count.checked_add(registers)
+                    .and_then(|count| count.checked_mul(size_of::<u8>()))
+                    .and_then(|extra| bytes.checked_add(extra))
+            }
+        })
+        .and_then(|bytes| {
+            if numeric_count == 0 {
+                Some(bytes)
+            } else {
                 instructions
                     .checked_mul(2)
                     .and_then(|n| n.checked_mul(size_of::<u32>() + 1))
@@ -7139,16 +7437,115 @@ fn compact_map_base_bytes(
         })
 }
 
-fn numeric_local_aliases(
-    module: &VerifiedModule,
+fn numeric_debug_homes(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     proto: &BytecodePrototype,
+    debug: Option<&NativePrototypeDebug>,
     numeric: &[NumericPair],
     anonymous_vararg_slot: Option<u8>,
     profile: LuaProfile,
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<NumericAlias>, OfficialExportError> {
-    let mut aliases = Vec::new();
-    aliases.try_reserve_exact(numeric.len()).map_err(|_| {
+) -> Result<(BytecodeVec<u8>, BytecodeVec<u8>), OfficialExportError> {
+    let (Some(debug), false) = (debug, numeric.is_empty()) else {
+        return Ok((allocator_scratch.vec(), allocator_scratch.vec()));
+    };
+    let width = if profile == LuaProfile::Lua54 { 3usize } else { 2usize };
+    let mut tuples = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut tuples, numeric.len()).map_err(|_| {
+        error(OfficialExportErrorKind::AllocationFailed, proto.id, 0,
+            "numeric debug tuple 配置失敗")
+    })?;
+    tuples.resize(numeric.len(), u8::MAX);
+    work_charge(work, numeric.len().checked_mul(debug.locals.len()).and_then(|units|
+        units.checked_mul(2)).ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded,
+            proto.id, 0, "numeric debug local 投影工作量溢位"))?, proto.id, 0)?;
+    for (index, pair) in numeric.iter().enumerate() {
+        if let Some(local) = debug.locals.iter().find(|local| {
+            local.register == pair.visible
+                && local.start_pc as usize <= pair.body_pc
+                && local.end_pc as usize > pair.next_pc
+        }) {
+            tuples[index] = local.slot;
+        }
+    }
+    if tuples.iter().all(|tuple| *tuple == u8::MAX) {
+        return Ok((allocator_scratch.vec(), tuples));
+    }
+    let mut homes = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut homes, usize::from(proto.register_count)).map_err(|_| {
+        error(OfficialExportErrorKind::AllocationFailed, proto.id, 0,
+            "numeric debug local home 配置失敗")
+    })?;
+    homes.resize(usize::from(proto.register_count), u8::MAX);
+    for local in &debug.locals {
+        let shift = numeric.iter().zip(tuples.iter()).filter(|(pair, visible_slot)| {
+            **visible_slot != u8::MAX
+                && pair.body_pc <= local.start_pc as usize
+                && local.start_pc as usize <= pair.next_pc
+                && local.slot >= **visible_slot
+        }).count().checked_mul(width).ok_or_else(|| {
+            error(OfficialExportErrorKind::LimitExceeded, proto.id,
+                local.start_pc as usize, "numeric debug slot 位移溢位")
+        })?;
+        let logical = usize::from(local.slot).checked_add(shift)
+            .and_then(|slot| u8::try_from(slot).ok())
+            .filter(|slot| *slot < 255)
+            .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded, proto.id,
+                local.start_pc as usize, "numeric debug local 超出官方 stack"))?;
+        let home = official_storage_slot(logical, anonymous_vararg_slot, proto.id,
+            local.start_pc as usize)?;
+        let slot = homes.get_mut(usize::from(local.register.0)).ok_or_else(|| {
+            error(OfficialExportErrorKind::InvalidPrototype, proto.id,
+                local.start_pc as usize, "numeric debug local register 不存在")
+        })?;
+        if *slot != u8::MAX && *slot != home {
+            return Err(error(OfficialExportErrorKind::InvalidPrototype, proto.id,
+                local.start_pc as usize, "numeric debug local register 投影衝突"));
+        }
+        *slot = home;
+    }
+    for (pair, tuple) in numeric.iter().zip(tuples.iter_mut()) {
+        if *tuple == u8::MAX {
+            continue;
+        }
+        let visible = homes.get(usize::from(pair.visible.0)).copied().ok_or_else(|| {
+            error(OfficialExportErrorKind::InvalidPrototype, proto.id, pair.body_pc,
+                "numeric debug visible register 不存在")
+        })?;
+        *tuple = visible.checked_sub(width as u8).ok_or_else(|| {
+            error(OfficialExportErrorKind::LimitExceeded, proto.id, pair.body_pc,
+                "numeric debug tuple slot 溢位")
+        })?;
+    }
+    Ok((homes, tuples))
+}
+
+fn projected_storage_slot(
+    register: Register,
+    slot: u8,
+    homes: &[u8],
+    anonymous_vararg_slot: Option<u8>,
+    id: ProtoId,
+    pc: usize,
+) -> Result<u8, OfficialExportError> {
+    match homes.get(usize::from(register.0)).copied() {
+        Some(home) if home != u8::MAX => Ok(home),
+        _ => official_storage_slot(slot, anonymous_vararg_slot, id, pc),
+    }
+}
+
+fn numeric_local_aliases(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    children: NativeChildren<'_>,
+    numeric: &[NumericPair],
+    anonymous_vararg_slot: Option<u8>,
+    profile: LuaProfile,
+    work: &mut OfficialWorkBudget,
+) -> Result<BytecodeVec<NumericAlias>, OfficialExportError> {
+    let mut aliases = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut aliases, numeric.len()).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -7178,9 +7575,7 @@ fn numeric_local_aliases(
                 "numeric local alias PC 超出範圍",
             )
         })?);
-        let child_work = module
-            .module()
-            .prototypes
+        let child_work = children
             .iter()
             .try_fold(0usize, |total, child| {
                 total
@@ -7205,6 +7600,7 @@ fn numeric_local_aliases(
                 .and_then(|units| units.checked_add(storage.len()))
                 .and_then(|units| units.checked_add(numeric.len()))
                 .and_then(|units| units.checked_add(child_work))
+                .and_then(|units| units.checked_add(children.scan_cost()))
                 .ok_or_else(|| {
                     error(
                         OfficialExportErrorKind::LimitExceeded,
@@ -7290,7 +7686,7 @@ fn numeric_local_aliases(
         {
             continue;
         }
-        if later_read && !numeric_alias_later_reads_defined(proto, pair.body_pc, anchor, work)? {
+        if later_read && !numeric_alias_later_reads_defined(allocator_scratch, proto, pair.body_pc, anchor, work)? {
             continue;
         }
         let tuple =
@@ -7313,9 +7709,8 @@ fn numeric_local_aliases(
             continue;
         }
         // 同一 child prototype 的捕獲來源槽固定；跨 alias scope 建立時沿用舊佈局。
-        if module.module().prototypes.iter().any(|child| {
-            child.parent == Some(proto.id)
-                && child.upvalues.iter().any(|upvalue| {
+        if children.iter().any(|child| {
+            child.upvalues.iter().any(|upvalue| {
                     matches!(&upvalue.source, BytecodeUpvalueSource::ParentLocal(binding) if *binding == local.binding)
                 })
                 && proto.instructions.iter().enumerate().any(|(pc, entry)| {
@@ -7328,7 +7723,7 @@ fn numeric_local_aliases(
         let share_nil_slot = numeric_alias_shared_home_eligible(
             proto,
             anchor,
-            &module.module().prototypes,
+            children,
             locals,
             storage,
             debug.temporaries_for(proto.id).unwrap_or(&[]),
@@ -7351,8 +7746,10 @@ fn numeric_local_aliases(
 }
 
 fn compact_register_map(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
+    children: NativeChildren<'_>,
     numeric: &[NumericPair],
     numeric_blocks: u16,
     anonymous_vararg_slot: Option<u8>,
@@ -7363,16 +7760,17 @@ fn compact_register_map(
     work: &mut OfficialWorkBudget,
 ) -> Result<
     (
-        Vec<u8>,
-        Vec<u8>,
-        Vec<(usize, usize)>,
-        Vec<LiveRow>,
+        BytecodeVec<u8>,
+        BytecodeVec<u8>,
+        BytecodeVec<(usize, usize)>,
+        BytecodeVec<LiveRow>,
         u16,
-        Vec<u16>,
-        Vec<u16>,
-        Vec<(usize, [u8; 32])>,
+        BytecodeVec<u16>,
+        BytecodeVec<u16>,
+        BytecodeVec<(usize, [u8; 32])>,
         u8,
-        Vec<NumericAlias>,
+        BytecodeVec<NumericAlias>,
+        BytecodeVec<u8>,
     ),
     OfficialExportError,
 > {
@@ -7383,8 +7781,21 @@ fn compact_register_map(
         .native_debug()
         .and_then(|debug| debug.storage_for(proto.id))
         .unwrap_or(&[]);
-    let aliases =
-        numeric_local_aliases(module, proto, numeric, anonymous_vararg_slot, profile, work)?;
+    let (homes, numeric_tuples) = numeric_debug_homes(
+        allocator_scratch, proto, debug, numeric, anonymous_vararg_slot, profile, work,
+    )?;
+    let mut aliases =
+        numeric_local_aliases(allocator_scratch, module, proto, children,
+            numeric, anonymous_vararg_slot, profile, work)?;
+    for alias in &mut aliases {
+        if let Some((index, _)) = numeric.iter().enumerate()
+            .find(|(_, pair)| pair.body_pc == alias.body_pc)
+        {
+            if let Some(&tuple) = numeric_tuples.get(index) {
+                alias.tuple = tuple;
+            }
+        }
+    }
     let fixed_count = storage.len() + usize::from(anonymous_vararg_slot.is_some());
     work_charge(work, proto.instructions.len(), proto.id, 0)?;
     let call_count = if debug.is_some() {
@@ -7447,8 +7858,8 @@ fn compact_register_map(
         proto.id,
         0,
     )?;
-    let mut mapped = Vec::new();
-    mapped.try_reserve_exact(count).map_err(|_| {
+    let mut mapped = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut mapped, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -7458,7 +7869,8 @@ fn compact_register_map(
     })?;
     mapped.resize(count, u8::MAX);
     for local in storage {
-        let official_slot = official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, 0)?;
+        let official_slot = projected_storage_slot(local.register, local.slot,
+            &homes, anonymous_vararg_slot, proto.id, 0)?;
         let slot = mapped
             .get_mut(usize::from(local.register.0))
             .ok_or_else(|| {
@@ -7518,8 +7930,8 @@ fn compact_register_map(
             })?;
         }
     }
-    let mut span = Vec::new();
-    span.try_reserve_exact(count).map_err(|_| {
+    let mut span = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut span, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -7528,8 +7940,8 @@ fn compact_register_map(
         )
     })?;
     span.resize(count, (usize::MAX, 0usize));
-    let mut protected = Vec::new();
-    protected.try_reserve_exact(count).map_err(|_| {
+    let mut protected = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut protected, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -7556,9 +7968,15 @@ fn compact_register_map(
             Ok(())
         })?;
     }
-    let owned_next = numeric_owned_next_pairs(module, proto, numeric, &mapped, work)?;
-    let live_at = extend_live_spans(proto, &mapped, &mut span, &owned_next, bitmap_limit, work)?;
+    let owned_next = numeric_owned_next_pairs(allocator_scratch, module, proto,
+        children, numeric, &mapped, work)?;
+    let live_at = extend_live_spans(allocator_scratch, proto, &mapped, &mut span, &owned_next, bitmap_limit, work)?;
     let mut fixed = u16::from(debug.map_or(0, |entry| entry.max_active_locals));
+    for &home in &homes {
+        if home != u8::MAX {
+            fixed = fixed.max(u16::from(home) + 1);
+        }
+    }
     if debug.is_none() {
         fixed = proto
             .parameter_count
@@ -7572,7 +7990,7 @@ fn compact_register_map(
                 )
             })?;
     }
-    if anonymous_vararg_slot.is_some() {
+    if anonymous_vararg_slot.is_some() && homes.is_empty() {
         fixed = fixed.checked_add(1).ok_or_else(|| {
             error(
                 OfficialExportErrorKind::LimitExceeded,
@@ -7582,15 +8000,27 @@ fn compact_register_map(
             )
         })?;
     }
-    // 未別名化的數值控制值先於 Call 窗口；C callee 可在參數後推入值。
-    let low_tuple_base =
-        (debug.is_some() && !numeric.is_empty() && aliases.is_empty()).then_some(fixed);
-    let call_layouts = temporary_call_layouts(
+    if let Some(slot) = anonymous_vararg_slot {
+        fixed = fixed.max(u16::from(slot) + 1);
+    }
+    // 缺可見 local metadata 的 pair 沿用高槽；其餘 pair 可同時使用局部槽投影。
+    let high_numeric_blocks = numeric.iter().enumerate().filter(|(index, _)| {
+        numeric_tuples.get(*index).copied().is_none_or(|slot| slot == u8::MAX)
+    }).map(|(_, pair)| pair.block + 1).max().unwrap_or(0);
+    if high_numeric_blocks > numeric_blocks {
+        return Err(error(OfficialExportErrorKind::InvalidPrototype, proto.id, 0,
+            "numeric 高槽 block 超出配置上界"));
+    }
+    // 高槽控制值先於 Call 窗口；C callee 可在參數後推入值。
+    let low_tuple_base = (debug.is_some() && high_numeric_blocks != 0).then_some(fixed);
+    let call_layouts = temporary_call_layouts(allocator_scratch,
         module,
         proto,
         anonymous_vararg_slot,
         numeric,
+        &numeric_tuples,
         low_tuple_base,
+        &homes,
         &mapped,
         &span,
         &protected,
@@ -7610,7 +8040,7 @@ fn compact_register_map(
             .max()
             .unwrap_or(0),
     );
-    if !aliases.is_empty() {
+    if !aliases.is_empty() && homes.is_empty() {
         fixed = fixed
             .checked_add(numeric_blocks.checked_mul(3).ok_or_else(|| {
                 error(
@@ -7660,7 +8090,7 @@ fn compact_register_map(
     let tuple_base = low_tuple_base.unwrap_or(fixed);
     let (shared_nil_slot, alias_slots) = numeric_alias_nil_slots(&aliases, proto.id, work)?;
     let tuple_end = tuple_base
-        .checked_add(numeric_blocks.checked_mul(4).ok_or_else(|| {
+        .checked_add(high_numeric_blocks.checked_mul(4).ok_or_else(|| {
             error(
                 OfficialExportErrorKind::LimitExceeded,
                 proto.id,
@@ -7709,11 +8139,10 @@ fn compact_register_map(
         }
     }
     if debug.is_none() {
-        extend_capture_spans(module, proto, &mut span, &mut protected, work)?;
+        extend_capture_spans(allocator_scratch, module, proto, &mut span, &mut protected, work)?;
     }
-    let mut relay_reservations = Vec::new();
-    relay_reservations
-        .try_reserve_exact(temporary_count)
+    let mut relay_reservations = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut relay_reservations, temporary_count)
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -7722,9 +8151,8 @@ fn compact_register_map(
                 "native relay 保留區配置失敗",
             )
         })?;
-    let mut relay_pairs: Vec<PendingRelayPair> = Vec::new();
-    relay_pairs
-        .try_reserve_exact(temporary_count)
+    let mut relay_pairs: BytecodeVec<PendingRelayPair> = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut relay_pairs, temporary_count)
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -7856,6 +8284,7 @@ fn compact_register_map(
                             &debug
                                 .prototype(proto.id)
                                 .map_or(&[][..], |entry| &entry.locals),
+                            &homes,
                             work,
                         )?
                     };
@@ -7888,8 +8317,8 @@ fn compact_register_map(
             }
         }
     }
-    let mut intervals = Vec::new();
-    intervals.try_reserve_exact(count).map_err(|_| {
+    let mut intervals = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut intervals, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -7920,9 +8349,8 @@ fn compact_register_map(
         0,
     )?;
     intervals.sort_unstable_by_key(|&(start, _, register)| (start, register));
-    let mut fixed_intervals = Vec::new();
-    fixed_intervals
-        .try_reserve_exact(
+    let mut fixed_intervals = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut fixed_intervals,
             count
                 .checked_add(fixed_count)
                 .and_then(|count| count.checked_add(relay_reservations.len()))
@@ -7962,7 +8390,8 @@ fn compact_register_map(
         }
     }
     for local in storage {
-        let slot = official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, 0)?;
+        let slot = projected_storage_slot(local.register, local.slot, &homes,
+            anonymous_vararg_slot, proto.id, 0)?;
         fixed_intervals.push((slot, local.start_pc as usize, local.end_pc as usize));
     }
     fixed_intervals.extend_from_slice(&relay_reservations);
@@ -8022,7 +8451,7 @@ fn compact_register_map(
             work,
             storage
                 .len()
-                .checked_add(module.module().prototypes.len())
+                .checked_add(children.scan_cost())
                 .ok_or_else(|| {
                     error(
                         OfficialExportErrorKind::LimitExceeded,
@@ -8037,11 +8466,7 @@ fn compact_register_map(
         !storage
             .iter()
             .any(|local| usize::from(local.register.0) == environment)
-            && !module
-                .module()
-                .prototypes
-                .iter()
-                .any(|child| child.parent == Some(proto.id))
+            && children.len() == 0
     } else {
         false
     };
@@ -8061,10 +8486,9 @@ fn compact_register_map(
     } else {
         None
     };
-    let mut dead_open_cache = Vec::new();
+    let mut dead_open_cache = allocator_scratch.vec();
     work_charge(work, call_layouts.len(), proto.id, 0)?;
-    dead_open_cache
-        .try_reserve_exact(call_layouts.len())
+    allocator_scratch.reserve_exact(&mut dead_open_cache, call_layouts.len())
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -8076,8 +8500,8 @@ fn compact_register_map(
     dead_open_cache.resize(call_layouts.len(), (usize::MAX, false));
     let mut slot_end = [0usize; 255];
     let mut slot_head = [usize::MAX; 255];
-    let mut owner_next = Vec::new();
-    owner_next.try_reserve_exact(count).map_err(|_| {
+    let mut owner_next = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut owner_next, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -8172,10 +8596,13 @@ fn compact_register_map(
                         temporary.register,
                         local.register,
                         locals,
+                        &homes,
                         work,
                     )? {
-                        let home = official_storage_slot(
+                        let home = projected_storage_slot(
+                            local.register,
                             local.slot,
+                            &homes,
                             anonymous_vararg_slot,
                             proto.id,
                             copy_pc,
@@ -8214,15 +8641,14 @@ fn compact_register_map(
             if slot >= fixed.max(tuple_end) && slot < temp_base {
                 return Ok(false);
             }
-            if slot >= tuple_base && slot < tuple_end {
-                work_charge(work, numeric.len(), proto.id, candidate_start)?;
-                if numeric.iter().any(|pair| {
-                    let first = usize::from(tuple_base) + usize::from(pair.block) * 4;
-                    first <= usize::from(slot)
-                        && usize::from(slot) < first + 4
-                        && candidate_start <= pair.next_pc
-                        && pair.prepare_pc < candidate_end
-                }) {
+            work_charge(work, numeric.len(), proto.id, candidate_start)?;
+            for (index, pair) in numeric.iter().enumerate() {
+                let (first, end) = numeric_tuple_window(pair, index, &numeric_tuples,
+                    tuple_base, profile, proto.id)?;
+                if first <= slot && slot < end
+                    && candidate_start <= pair.next_pc
+                    && pair.prepare_pc < candidate_end
+                {
                     return Ok(false);
                 }
             }
@@ -8745,7 +9171,7 @@ fn compact_register_map(
             }
         }
     }
-    let mut scratch = Vec::new();
+    let mut scratch = allocator_scratch.vec();
     work_charge(
         work,
         proto.instructions.len().checked_mul(2).ok_or_else(|| {
@@ -8759,8 +9185,7 @@ fn compact_register_map(
         proto.id,
         0,
     )?;
-    scratch
-        .try_reserve_exact(proto.instructions.len())
+    allocator_scratch.reserve_exact(&mut scratch, proto.instructions.len())
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -8770,9 +9195,8 @@ fn compact_register_map(
             )
         })?;
     scratch.resize(proto.instructions.len(), temp_base);
-    let mut parallel_spare = Vec::new();
-    parallel_spare
-        .try_reserve_exact(proto.instructions.len())
+    let mut parallel_spare = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut parallel_spare, proto.instructions.len())
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -8833,38 +9257,17 @@ fn compact_register_map(
             }
             for local in storage {
                 if (local.start_pc as usize) <= at && at < local.end_pc as usize {
-                    let slot =
-                        official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, at)?;
+                    let slot = projected_storage_slot(local.register, local.slot, &homes,
+                        anonymous_vararg_slot, proto.id, at)?;
                     top = top.max(u16::from(slot) + 1);
                 }
             }
             work_charge(work, numeric.len(), proto.id, at)?;
-            for pair in numeric {
+            for (index, pair) in numeric.iter().enumerate() {
                 if pair.prepare_pc <= at && at <= pair.next_pc {
-                    top = top.max(
-                        tuple_base
-                            .checked_add(
-                                pair.block
-                                    .checked_add(1)
-                                    .and_then(|block| block.checked_mul(4))
-                                    .ok_or_else(|| {
-                                        error(
-                                            OfficialExportErrorKind::LimitExceeded,
-                                            proto.id,
-                                            at,
-                                            "numeric scratch floor 溢位",
-                                        )
-                                    })?,
-                            )
-                            .ok_or_else(|| {
-                                error(
-                                    OfficialExportErrorKind::LimitExceeded,
-                                    proto.id,
-                                    at,
-                                    "numeric scratch floor 溢位",
-                                )
-                            })?,
-                    );
+                    let (_, tuple_end) = numeric_tuple_window(pair, index,
+                        &numeric_tuples, tuple_base, profile, proto.id)?;
+                    top = top.max(tuple_end);
                 }
             }
         }
@@ -9159,8 +9562,8 @@ fn compact_register_map(
                 }
                 for local in storage {
                     if local.start_pc as usize <= pc && pc < local.end_pc as usize {
-                        let slot =
-                            official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, pc)?;
+                        let slot = projected_storage_slot(local.register, local.slot, &homes,
+                            anonymous_vararg_slot, proto.id, pc)?;
                         let result_written = is_vararg
                             && local.register.0 >= guest.0
                             && local.register.0 - guest.0 < scattered;
@@ -9203,14 +9606,15 @@ fn compact_register_map(
                         proto.id,
                         pc,
                     )?;
-                    for pair in numeric {
+                    for (index, pair) in numeric.iter().enumerate() {
                         if pair.prepare_pc <= pc && pc <= pair.next_pc {
+                            let (tuple_start, tuple_end) = numeric_tuple_window(pair,
+                                index, &numeric_tuples, tuple_base, profile, proto.id)?;
                             if is_call {
-                                call_floor = call_floor.max(tuple_base + (pair.block + 1) * 4);
+                                call_floor = call_floor.max(tuple_end);
                             }
                             if is_vararg {
-                                let base = tuple_base + pair.block * 4;
-                                for slot in base..base + 4 {
+                                for slot in tuple_start..tuple_end {
                                     let Some(protected_slot) = immutable.get_mut(usize::from(slot))
                                     else {
                                         return Err(error(
@@ -9321,9 +9725,8 @@ fn compact_register_map(
             "native maxstack 超過 255",
         )
     })?;
-    let mut call_cleanup_slots = Vec::new();
-    call_cleanup_slots
-        .try_reserve_exact(cleanup_count)
+    let mut call_cleanup_slots = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut call_cleanup_slots, cleanup_count)
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -9384,8 +9787,8 @@ fn compact_register_map(
                 && (local.start_pc as usize) <= pc
                 && pc < local.end_pc as usize
             {
-                let official_slot =
-                    official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, pc)?;
+                let official_slot = projected_storage_slot(local.register, local.slot, &homes,
+                    anonymous_vararg_slot, proto.id, pc)?;
                 let slot = occupied
                     .get_mut(usize::from(official_slot))
                     .ok_or_else(|| {
@@ -9410,16 +9813,17 @@ fn compact_register_map(
                     && local.initialized_pc as usize <= pc
                     && pc < local.end_pc as usize
                 {
-                    let slot =
-                        official_storage_slot(local.slot, anonymous_vararg_slot, proto.id, pc)?;
+                    let slot = projected_storage_slot(local.register, local.slot, &homes,
+                        anonymous_vararg_slot, proto.id, pc)?;
                     occupied[usize::from(slot)] = true;
                 }
             }
         }
-        for pair in numeric {
+        for (index, pair) in numeric.iter().enumerate() {
             if pair.prepare_pc <= pc && pc <= pair.next_pc {
-                let base = usize::from(tuple_base) + usize::from(pair.block) * 4;
-                let slots = occupied.get_mut(base..base + 4).ok_or_else(|| {
+                let (tuple_start, tuple_end) = numeric_tuple_window(pair,
+                    index, &numeric_tuples, tuple_base, profile, proto.id)?;
+                let slots = occupied.get_mut(usize::from(tuple_start)..usize::from(tuple_end)).ok_or_else(|| {
                     error(
                         OfficialExportErrorKind::LimitExceeded,
                         proto.id,
@@ -9567,7 +9971,7 @@ fn compact_register_map(
             })?;
             offset
         };
-        let slot = numeric_blocks
+        let slot = high_numeric_blocks
             .checked_mul(4)
             .and_then(|size| tuple_base.checked_add(size))
             .and_then(|slot| {
@@ -9597,13 +10001,16 @@ fn compact_register_map(
         call_cleanup_slots,
         max_stack,
         aliases,
+        numeric_tuples,
     ))
 }
 
 fn layout(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
-    root: bool,
+    children: NativeChildren<'_>,
+    prepared_env_needed: Option<bool>,
     profile: LuaProfile,
     numeric: &[NumericPair],
     numeric_blocks: u16,
@@ -9612,19 +10019,21 @@ fn layout(
     limits: &OfficialChunkLimits,
 ) -> Result<Layout, OfficialExportError> {
     let anonymous_vararg_slot = anonymous_vararg_slot(proto, profile)?;
-    let env_needed = needs_environment(module, proto, work, 1, limits)?;
+    let env_needed = match prepared_env_needed {
+        Some(needed) => needed,
+        None => needs_environment(allocator_scratch, module, proto, work, 1, limits)?,
+    };
     let synthetic = env_needed
         && matches!(
             proto.frame.environment_source,
             EnvironmentSource::RootExternal | EnvironmentSource::ParentFrame { .. }
         );
-    let guest_upvalue_offset = if root && synthetic { 1 } else { 0 };
+    // selected child 作為 root 時，環境 slot 仍跟在 guest captures 後方。
+    let guest_upvalue_offset = 0;
     let env_upvalue = if synthetic {
-        Some(if root {
-            0
-        } else {
-            native_guest_upvalues(module, proto) as u16
-        })
+        Some(u16::try_from(native_guest_upvalues(module, proto)).map_err(|_| error(
+            OfficialExportErrorKind::LimitExceeded, proto.id, 0,
+            "environment upvalue index 超出 u16"))?)
     } else if env_needed {
         match proto.frame.environment_source {
             EnvironmentSource::ParentLocal { upvalue }
@@ -9645,9 +10054,11 @@ fn layout(
         call_cleanup_slots,
         max_stack,
         numeric_aliases,
-    ) = compact_register_map(
+        numeric_tuples,
+    ) = compact_register_map(allocator_scratch,
         module,
         proto,
+        children,
         numeric,
         numeric_blocks,
         anonymous_vararg_slot,
@@ -9660,6 +10071,8 @@ fn layout(
     Ok(Layout {
         anonymous_vararg_slot,
         tuple_base,
+        numeric_width: if profile == LuaProfile::Lua54 { 3 } else { 2 },
+        numeric_tuples,
         scratch,
         parallel_spare,
         call_cleanup_slots,
@@ -9685,18 +10098,95 @@ struct NumericPair {
     exit: InstructionOffset,
 }
 
+fn numeric_debug_pair_for_local<'a>(
+    numeric: &'a [NumericPair],
+    local: &NativeLocal,
+) -> Option<&'a NumericPair> {
+    numeric.iter().find(|pair| {
+        pair.visible == local.register
+            && local.start_pc as usize <= pair.body_pc
+            && local.end_pc as usize > pair.next_pc
+    })
+}
+
+fn numeric_debug_control_count(
+    numeric: &[NumericPair],
+    locals: &[NativeLocal],
+    profile: LuaProfile,
+    id: ProtoId,
+    work: &mut OfficialWorkBudget,
+) -> Result<usize, OfficialExportError> {
+    let scan = numeric.len().checked_mul(locals.len()).ok_or_else(|| {
+        error(OfficialExportErrorKind::LimitExceeded, id, 0, "numeric debug 掃描量溢位")
+    })?;
+    work_charge(work, scan, id, 0)?;
+    let width = if profile == LuaProfile::Lua54 { 3 } else { 2 };
+    locals.iter().try_fold(0usize, |count, local| {
+        if numeric_debug_pair_for_local(numeric, local).is_some() {
+            count.checked_add(width).ok_or_else(|| {
+                error(OfficialExportErrorKind::LimitExceeded, id, 0, "numeric debug local 數溢位")
+            })
+        } else {
+            Ok(count)
+        }
+    })
+}
+
+fn numeric_tuple_window(
+    pair: &NumericPair,
+    index: usize,
+    projected_tuples: &[u8],
+    tuple_base: u16,
+    profile: LuaProfile,
+    id: ProtoId,
+) -> Result<(u16, u16), OfficialExportError> {
+    let projected = projected_tuples.get(index).copied().filter(|slot| *slot != u8::MAX);
+    let first = if let Some(slot) = projected {
+        u16::from(slot)
+    } else {
+        tuple_base.checked_add(pair.block.checked_mul(4).ok_or_else(|| {
+            error(OfficialExportErrorKind::LimitExceeded, id, pair.prepare_pc,
+                "numeric tuple 溢位")
+        })?).ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded, id,
+            pair.prepare_pc, "numeric tuple 溢位"))?
+    };
+    let width = if projected.is_some() && profile == LuaProfile::Lua55 { 3 } else { 4 };
+    let end = first.checked_add(width).filter(|end| *end <= 255).ok_or_else(|| {
+        error(OfficialExportErrorKind::LimitExceeded, id, pair.prepare_pc,
+            "numeric tuple 超出官方 stack")
+    })?;
+    Ok((first, end))
+}
+
+fn numeric_debug_end_pcs(
+    next_pc: usize,
+    source_pc: impl Fn(u32) -> Result<u32, OfficialExportError>,
+    id: ProtoId,
+) -> Result<(u32, u32), OfficialExportError> {
+    let visible_end = u32::try_from(next_pc).map_err(|_| {
+        error(OfficialExportErrorKind::LimitExceeded, id, next_pc, "numeric debug 終點溢位")
+    })?;
+    let control_end = next_pc.checked_add(1).and_then(|pc| u32::try_from(pc).ok())
+        .ok_or_else(|| {
+            error(OfficialExportErrorKind::LimitExceeded, id, next_pc,
+                "numeric debug 控制區終點溢位")
+        })?;
+    Ok((source_pc(visible_end)?, source_pc(control_end)?))
+}
+
 fn numeric_pairs(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     proto: &BytecodePrototype,
     work: &mut OfficialWorkBudget,
-) -> Result<(Vec<NumericPair>, u16), OfficialExportError> {
+) -> Result<(BytecodeVec<NumericPair>, u16), OfficialExportError> {
     work_charge(work, proto.instructions.len(), proto.id, 0)?;
     let count = proto
         .instructions
         .iter()
         .filter(|entry| matches!(entry.instruction, Instruction::NumericForPrepare { .. }))
         .count();
-    let mut pairs = Vec::new();
-    pairs.try_reserve_exact(count).map_err(|_| {
+    let mut pairs = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut pairs, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -9802,9 +10292,9 @@ struct Builder<'a> {
     work: &'a mut OfficialWorkBudget,
     total_instructions: &'a mut usize,
     max_words: usize,
-    code: Vec<u32>,
+    code: BytecodeVec<u32>,
     source_lines: Option<&'a [u32]>,
-    lines: Vec<u32>,
+    lines: BytecodeVec<u32>,
 }
 
 impl Builder<'_> {
@@ -9835,23 +10325,7 @@ impl Builder<'_> {
             ));
         }
         *self.total_instructions = next_total;
-        self.code.try_reserve(1).map_err(|_| {
-            error(
-                OfficialExportErrorKind::AllocationFailed,
-                self.id,
-                pc,
-                "官方指令配置失敗",
-            )
-        })?;
         if let Some(source) = self.source_lines {
-            self.lines.try_reserve(1).map_err(|_| {
-                error(
-                    OfficialExportErrorKind::AllocationFailed,
-                    self.id,
-                    pc,
-                    "官方行號配置失敗",
-                )
-            })?;
             self.lines.push(
                 source
                     .get(pc)
@@ -9866,13 +10340,14 @@ impl Builder<'_> {
 }
 
 fn native_line_info(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     id: ProtoId,
     lines: &[u32],
     line_defined: u32,
     work: &mut OfficialWorkBudget,
-) -> Result<(Vec<i8>, Vec<OfficialAbsLine>), OfficialExportError> {
-    let mut deltas = Vec::new();
-    deltas.try_reserve_exact(lines.len()).map_err(|_| {
+) -> Result<(BytecodeVec<i8>, BytecodeVec<OfficialAbsLine>), OfficialExportError> {
+    let mut deltas = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut deltas, lines.len()).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             id,
@@ -9880,8 +10355,8 @@ fn native_line_info(
             "native line info 配置失敗",
         )
     })?;
-    let mut absolute = Vec::new();
-    absolute.try_reserve_exact(lines.len()).map_err(|_| {
+    let mut absolute = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut absolute, lines.len()).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             id,
@@ -10126,6 +10601,7 @@ fn fixed_pending_spare_for_pairs(
 // 固定 Call 的 pending 值在官方 ABI 中位於 callee 以下。借用 pending
 // 搬出後騰空的 home 存放其他跨 Call 活值，返回時逆向搬回。
 fn fixed_call_pending_moves(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     meta: &Layout,
@@ -10387,7 +10863,7 @@ fn fixed_call_pending_moves(
                 occupied[usize::from(home)] = true;
             }
         }
-        let (numeric, _) = numeric_pairs(proto, work)?;
+        let (numeric, _) = numeric_pairs(allocator_scratch, proto, work)?;
         let numeric_scan = usize::from(meta.max_stack)
             .saturating_sub(usize::from(window_end))
             .checked_mul(numeric.len())
@@ -10405,19 +10881,18 @@ fn fixed_call_pending_moves(
             let slot = slot as u8;
             !occupied[usize::from(slot)]
                 && meta.anonymous_vararg_slot != Some(slot)
-                && !numeric.iter().any(|pair| {
+                && !numeric.iter().enumerate().any(|(index, pair)| {
                     if !(pair.prepare_pc <= pc && pc <= pair.next_pc) {
                         return false;
                     }
-                    let first = meta
-                        .numeric_aliases
-                        .iter()
-                        .find(|alias| alias.body_pc == pair.body_pc)
-                        .map_or(
-                            usize::from(meta.tuple_base) + usize::from(pair.block) * 4,
-                            |alias| usize::from(alias.tuple),
-                        );
-                    first <= usize::from(slot) && usize::from(slot) < first + 4
+                    let (first, width) = if let Some(tuple) = meta.numeric_tuples.get(index).copied()
+                        .filter(|slot| *slot != u8::MAX)
+                    {
+                        (usize::from(tuple), usize::from(meta.numeric_width) + 1)
+                    } else {
+                        (usize::from(meta.tuple_base) + usize::from(pair.block) * 4, 4)
+                    };
+                    first <= usize::from(slot) && usize::from(slot) < first + width
                 })
                 && (0..len).all(|index| source[index] != slot && destination[index] != slot)
         }) {
@@ -10447,6 +10922,7 @@ fn fixed_call_pending_moves(
 }
 
 fn emit_fixed_call_pending_moves(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     builder: &mut Builder<'_>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
@@ -10455,7 +10931,7 @@ fn emit_fixed_call_pending_moves(
     gather: bool,
 ) -> Result<(), OfficialExportError> {
     if let Some((plan, cleanup_spare)) =
-        fixed_call_pending_moves(module, proto, meta, pc, gather, builder.work)?
+        fixed_call_pending_moves(allocator_scratch, module, proto, meta, pc, gather, builder.work)?
     {
         emit_parallel_plan(builder, &plan, cleanup_spare, pc)?;
     }
@@ -10594,6 +11070,7 @@ fn emit_scatter(
 
 #[derive(Default)]
 struct NativePreflight {
+    state_owned: bool,
     prototypes: usize,
     instructions: usize,
     constants: usize,
@@ -10668,8 +11145,32 @@ impl NativePreflight {
             limits.max_total_string_bytes,
             id,
         )?;
-        self.bytes(bytes.len(), 1, limits, id)
+        self.bytes(bytes.len(), 1, limits, id)?;
+        if self.state_owned {
+            self.bytes(1, StateAllocator::shared_block_size::<BytecodeVec<u8>>(), limits, id)?;
+        }
+        Ok(())
     }
+}
+
+fn native_cursor_push<T, R: AllocationRecovery>(
+    values: &mut BytecodeVec<T>,
+    value: T,
+    stats: &mut NativePreflight,
+    limits: &OfficialChunkLimits,
+    id: ProtoId,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<(), OfficialExportError> {
+    if values.len() == values.capacity() {
+        let additional = values.capacity().max(1);
+        stats.bytes(additional, size_of::<T>(), limits, id)?;
+        let before = values.capacity();
+        scratch.reserve_exact(values, additional).map_err(|_| error(
+            OfficialExportErrorKind::AllocationFailed, id, 0, "native cursor 配置失敗"))?;
+        stats.bytes(values.capacity() - before - additional, size_of::<T>(), limits, id)?;
+    }
+    values.push(value);
+    Ok(())
 }
 
 fn preflight_native_fusion_arrays(
@@ -10723,6 +11224,7 @@ fn preflight_numeric_control_names(
 }
 
 fn native_opcode_words(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     groups: &[NativeCloseGroup],
     proto: &BytecodePrototype,
@@ -10822,9 +11324,9 @@ fn native_opcode_words(
             } else {
                 scattered
             };
-            let pending_before = fixed_call_pending_moves(module, proto, meta, pc, true, work)?
+            let pending_before = fixed_call_pending_moves(allocator_scratch, module, proto, meta, pc, true, work)?
                 .map_or(0, |(plan, spare)| plan.len + usize::from(spare.is_some()));
-            let pending_after = fixed_call_pending_moves(module, proto, meta, pc, false, work)?
+            let pending_after = fixed_call_pending_moves(allocator_scratch, module, proto, meta, pc, false, work)?
                 .map_or(0, |(plan, spare)| plan.len + usize::from(spare.is_some()));
             1usize
                 .checked_add(gathered)
@@ -10920,6 +11422,7 @@ fn native_opcode_words(
 }
 
 fn native_word_count(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     groups: &[NativeCloseGroup],
     proto: &BytecodePrototype,
@@ -10944,7 +11447,7 @@ fn native_word_count(
     work_charge(work, proto.instructions.len(), proto.id, 0)?;
     for pc in 0..proto.instructions.len() {
         words = words
-            .checked_add(native_opcode_words(module, groups, proto, meta, pc, work)?)
+            .checked_add(native_opcode_words(allocator_scratch, module, groups, proto, meta, pc, work)?)
             .ok_or_else(|| {
                 error(
                     OfficialExportErrorKind::LimitExceeded,
@@ -11024,8 +11527,11 @@ fn native_missing_end_line(
 }
 
 fn preflight_native_prototype(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
+    children: NativeChildren<'_>,
+    prepared_env_needed: Option<bool>,
     root: bool,
     profile: LuaProfile,
     strip: bool,
@@ -11033,6 +11539,7 @@ fn preflight_native_prototype(
     limits: &OfficialChunkLimits,
     work: &mut OfficialWorkBudget,
     stats: &mut NativePreflight,
+    include_source: bool,
 ) -> Result<(), OfficialExportError> {
     work_charge(work, 1, proto.id, 0)?;
     if depth > limits.max_depth {
@@ -11044,6 +11551,10 @@ fn preflight_native_prototype(
         ));
     }
     NativePreflight::add(&mut stats.prototypes, 1, limits.max_prototypes, proto.id)?;
+    stats.bytes(1, size_of::<OfficialPrototype>(), limits, proto.id)?;
+    if stats.state_owned {
+        stats.bytes(4, StateAllocator::shared_block_size::<BytecodeVec<u8>>(), limits, proto.id)?;
+    }
     if module.native_debug().is_none() {
         let (group_count, close_count) = super::native_debug::close_group_counts(proto, work)
             .map_err(|source| {
@@ -11057,13 +11568,16 @@ fn preflight_native_prototype(
             })?;
         stats.bytes(group_count, size_of::<NativeCloseGroup>(), limits, proto.id)?;
         stats.bytes(close_count, size_of::<(Register, u16)>(), limits, proto.id)?;
+        if stats.state_owned {
+            stats.bytes(group_count, StateAllocator::shared_block_size::<BytecodeVec<(Register, u16)>>(), limits, proto.id)?;
+        }
         stats.bytes(proto.instructions.len(), size_of::<u8>(), limits, proto.id)?;
         if group_count > 0 {
             let (_, cfg_bytes) = bare_close_cfg_bytes(proto)?;
             stats.bytes(1, cfg_bytes, limits, proto.id)?;
         }
     }
-    let close_groups = native_close_groups(module, proto, limits, work)?;
+    let close_groups = native_close_groups(allocator_scratch, module, proto, limits, work)?;
     work_charge(work, proto.instructions.len(), proto.id, 0)?;
     let numeric_count = proto
         .instructions
@@ -11130,11 +11644,12 @@ fn preflight_native_prototype(
     )?;
     stats.bytes(1, map_base, limits, proto.id)?;
     let bitmap_limit = limits.max_allocated_bytes - stats.allocated_bytes;
-    let (numeric, numeric_blocks) = numeric_pairs(proto, work)?;
-    let meta = layout(
+    let (numeric, numeric_blocks) = numeric_pairs(allocator_scratch, proto, work)?;
+    let meta = layout(allocator_scratch,
         module,
         proto,
-        root,
+        children,
+        prepared_env_needed,
         profile,
         &numeric,
         numeric_blocks,
@@ -11157,7 +11672,7 @@ fn preflight_native_prototype(
         })
     })?;
     stats.bytes(1, bitmap_bytes, limits, proto.id)?;
-    let (words, _) = native_word_count(module, &close_groups, proto, &meta, root, work)?;
+    let (words, _) = native_word_count(allocator_scratch, module, &close_groups, proto, &meta, root, work)?;
     NativePreflight::add(
         &mut stats.instructions,
         words,
@@ -11172,11 +11687,10 @@ fn preflight_native_prototype(
         proto.id,
     )?;
     let extra_upvalue = meta.env_upvalue.is_some()
-        && (root
-            || matches!(
-                proto.frame.environment_source,
-                EnvironmentSource::ParentFrame { .. }
-            ));
+        && (root && matches!(proto.frame.environment_source,
+            EnvironmentSource::RootExternal | EnvironmentSource::ParentFrame { .. })
+            || !root && matches!(proto.frame.environment_source,
+                EnvironmentSource::ParentFrame { .. }));
     let upvalues = proto.upvalues.len() + usize::from(extra_upvalue);
     NativePreflight::add(&mut stats.upvalues, upvalues, limits.max_upvalues, proto.id)?;
     stats.bytes(words, size_of::<u32>(), limits, proto.id)?;
@@ -11185,19 +11699,12 @@ fn preflight_native_prototype(
             .native_debug()
             .and_then(|debug| debug.prototype(proto.id))
         {
-            let control_locals = meta
-                .numeric_aliases
-                .iter()
-                .try_fold(0usize, |count, alias| {
-                    count.checked_add(usize::from(alias.width)).ok_or_else(|| {
-                        error(
-                            OfficialExportErrorKind::LimitExceeded,
-                            proto.id,
-                            alias.body_pc,
-                            "numeric debug local 數溢位",
-                        )
-                    })
-                })?;
+            if stats.state_owned {
+                stats.bytes(4, StateAllocator::shared_block_size::<BytecodeVec<u8>>(), limits, proto.id)?;
+            }
+            let control_locals = numeric_debug_control_count(
+                &numeric, &entry.locals, profile, proto.id, work,
+            )?;
             stats.bytes(words, size_of::<u32>(), limits, proto.id)?;
             stats.bytes(words, size_of::<i8>(), limits, proto.id)?;
             stats.bytes(words, size_of::<OfficialAbsLine>(), limits, proto.id)?;
@@ -11215,7 +11722,7 @@ fn preflight_native_prototype(
                     )
                 })?;
             stats.bytes(total_locals, size_of::<OfficialLocal>(), limits, proto.id)?;
-            stats.bytes(upvalues, size_of::<Option<Vec<u8>>>(), limits, proto.id)?;
+            stats.bytes(upvalues, size_of::<Option<RetainedVec<u8>>>(), limits, proto.id)?;
             work_charge(
                 work,
                 entry
@@ -11244,18 +11751,17 @@ fn preflight_native_prototype(
             if meta.anonymous_vararg_slot.is_some() {
                 stats.string(ANONYMOUS_VARARG_LOCAL, limits, proto.id)?;
             }
-            for name in &entry.upvalue_names {
+            let guest_count = native_guest_upvalues(module, proto);
+            for name in entry.upvalue_names.iter().take(guest_count) {
                 if let Some(name) = name {
                     stats.string(name, limits, proto.id)?;
                 }
             }
-            let synthetic = usize::from(root && meta.guest_upvalue_offset == 1);
-            let fallback = usize::from(entry.upvalue_names.len() + synthetic < upvalues);
-            for _ in 0..synthetic + fallback {
+            if upvalues > guest_count {
                 stats.string(b"_ENV", limits, proto.id)?;
             }
         }
-        if root {
+        if root && include_source {
             if let Some(native) = module.native_debug() {
                 stats.string(native.source_name(), limits, proto.id)?;
             } else {
@@ -11291,48 +11797,24 @@ fn preflight_native_prototype(
             work_charge(work, bytes.len(), proto.id, 0)?;
         }
     }
-    work_charge(work, module.module().prototypes.len(), proto.id, 0)?;
-    let child_count = module
-        .module()
-        .prototypes
-        .iter()
-        .filter(|child| child.parent == Some(proto.id))
-        .count();
+    work_charge(work, children.scan_cost(), proto.id, 0)?;
+    let child_count = children.len();
     stats.bytes(
         child_count,
-        size_of::<OfficialPrototype>(),
+        size_of::<ProtoId>(),
         limits,
         proto.id,
     )?;
-    work_charge(work, module.module().prototypes.len(), proto.id, 0)?;
-    for child in module
-        .module()
-        .prototypes
-        .iter()
-        .filter(|child| child.parent == Some(proto.id))
-    {
-        preflight_native_prototype(
-            module,
-            child,
-            false,
-            profile,
-            strip,
-            depth + 1,
-            limits,
-            work,
-            stats,
-        )?;
-    }
     Ok(())
 }
 
 fn native_constants(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     proto: &BytecodePrototype,
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<OfficialConstant>, OfficialExportError> {
-    let mut constants = Vec::new();
-    constants
-        .try_reserve_exact(proto.constants.len())
+) -> Result<BytecodeVec<OfficialConstant>, OfficialExportError> {
+    let mut constants = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut constants, proto.constants.len())
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -11349,7 +11831,7 @@ fn native_constants(
             BytecodeConstant::Boolean(value) => OfficialConstant::Boolean(*value),
             BytecodeConstant::Name(bytes) | BytecodeConstant::String(bytes) => {
                 OfficialConstant::String {
-                    bytes: copy_slice(bytes, proto.id, work)?,
+                    bytes: copy_slice_with_recovery(bytes, proto.id, work, allocator_scratch)?.into(),
                     long: bytes.len() > 40,
                 }
             }
@@ -11359,17 +11841,20 @@ fn native_constants(
 }
 
 fn native_upvalues(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     meta: &Layout,
     parent: Option<(&BytecodePrototype, &Layout)>,
+    closure_sites: Option<&[Dump54ClosureSite]>,
+    binding_sites: Option<&[Dump54Binding]>,
     root: bool,
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<OfficialUpvalue>, OfficialExportError> {
+) -> Result<BytecodeVec<OfficialUpvalue>, OfficialExportError> {
     let guest_count = native_guest_upvalues(module, proto);
     let capacity = guest_count + usize::from(meta.env_upvalue.is_some());
-    let mut upvalues = Vec::new();
-    upvalues.try_reserve_exact(capacity).map_err(|_| {
+    let mut upvalues = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut upvalues, capacity).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -11378,13 +11863,6 @@ fn native_upvalues(
         )
     })?;
     work_charge(work, proto.upvalues.len(), proto.id, 0)?;
-    if root && meta.guest_upvalue_offset == 1 {
-        upvalues.push(OfficialUpvalue {
-            in_stack: true,
-            index: 0,
-            kind: 0,
-        });
-    }
     for (index, upvalue) in proto.upvalues.iter().take(guest_count).enumerate() {
         let (in_stack, source) = if let Some((parent_proto, parent_layout)) = parent {
             match &upvalue.source {
@@ -11410,11 +11888,23 @@ fn native_upvalues(
                             })?,
                         )
                     } else {
-                        work_charge(work, parent_proto.binding_registers.len(), proto.id, 0)?;
-                        let register = parent_proto
-                            .binding_registers
-                            .iter()
-                            .find_map(|(id, register)| (id == binding).then_some(*register))
+                        work_charge(work, binding_sites.map_or(
+                            parent_proto.binding_registers.len(),
+                            |sites| (usize::BITS as usize
+                                - sites.len().saturating_sub(1).leading_zeros() as usize)
+                                .max(1)), proto.id, 0)?;
+                        let register = if let Some(sites) = binding_sites {
+                                let position = sites.partition_point(|site| {
+                                    (site.id.function, site.id.ordinal)
+                                        < (binding.function, binding.ordinal)
+                                });
+                                sites.get(position).filter(|site| site.id == *binding)
+                                    .map(|site| site.register)
+                            } else {
+                                parent_proto.binding_registers.iter()
+                                    .find_map(|(id, register)|
+                                        (id == binding).then_some(*register))
+                            }
                             .ok_or_else(|| {
                                 error(
                                     OfficialExportErrorKind::InvalidPrototype,
@@ -11423,15 +11913,10 @@ fn native_upvalues(
                                     "parent binding 不存在",
                                 )
                             })?;
-                        work_charge(work, parent_proto.instructions.len(), proto.id, 0)?;
+                        work_charge(work, closure_sites.map_or(
+                            parent_proto.instructions.len(), |sites| sites.len()), proto.id, 0)?;
                         let mut source = None;
-                        for (pc, instruction) in parent_proto.instructions.iter().enumerate() {
-                            if !matches!(
-                                instruction.instruction,
-                                Instruction::Closure { proto: child, .. } if child == proto.id
-                            ) {
-                                continue;
-                            }
+                        let mut observe = |pc: usize| -> Result<(), OfficialExportError> {
                             let slot = parent_layout.register(register, parent_proto.id, pc)?;
                             if source.is_some_and(|previous| previous != slot) {
                                 return Err(error(
@@ -11442,6 +11927,18 @@ fn native_upvalues(
                                 ));
                             }
                             source = Some(slot);
+                            Ok(())
+                        };
+                        if let Some(sites) = closure_sites {
+                            for site in sites { observe(site.pc)?; }
+                        } else {
+                            for (pc, instruction) in parent_proto.instructions.iter().enumerate() {
+                                if matches!(instruction.instruction,
+                                    Instruction::Closure { proto: child, .. } if child == proto.id)
+                                {
+                                    observe(pc)?;
+                                }
+                            }
                         }
                         (
                             true,
@@ -11475,41 +11972,53 @@ fn native_upvalues(
             kind: 0,
         });
     }
-    if !root
-        && matches!(
-            proto.frame.environment_source,
-            EnvironmentSource::ParentFrame { .. }
-        )
-        && meta.env_upvalue.is_some()
+    if meta.env_upvalue.is_some()
+        && (root && matches!(proto.frame.environment_source,
+            EnvironmentSource::RootExternal | EnvironmentSource::ParentFrame { .. })
+            || !root && matches!(proto.frame.environment_source,
+                EnvironmentSource::ParentFrame { .. }))
     {
-        let (_, parent_layout) = parent.ok_or_else(|| {
-            error(
-                OfficialExportErrorKind::InvalidPrototype,
-                proto.id,
-                0,
-                "child 缺 parent layout",
-            )
-        })?;
-        upvalues.push(OfficialUpvalue {
-            in_stack: false,
-            index: u8::try_from(parent_layout.env_upvalue.ok_or_else(|| {
+        if root {
+            upvalues.push(OfficialUpvalue {
+                in_stack: false,
+                index: u8::try_from(meta.env_upvalue.ok_or_else(|| error(
+                    OfficialExportErrorKind::InvalidPrototype, proto.id, 0,
+                    "root environment slot 不存在"))?).map_err(|_| {
+                    error(OfficialExportErrorKind::LimitExceeded, proto.id, 0,
+                        "root environment upvalue index 超限")
+                })?,
+                kind: 0,
+            });
+        } else {
+            let (_, parent_layout) = parent.ok_or_else(|| {
                 error(
                     OfficialExportErrorKind::InvalidPrototype,
                     proto.id,
                     0,
-                    "forwarded environment 缺共用 upvalue",
+                    "child 缺 parent layout",
                 )
-            })?)
-            .map_err(|_| {
-                error(
-                    OfficialExportErrorKind::LimitExceeded,
-                    proto.id,
-                    0,
-                    "forwarded environment upvalue index 超限",
-                )
-            })?,
-            kind: 0,
-        });
+            })?;
+            upvalues.push(OfficialUpvalue {
+                in_stack: false,
+                index: u8::try_from(parent_layout.env_upvalue.ok_or_else(|| {
+                    error(
+                        OfficialExportErrorKind::InvalidPrototype,
+                        proto.id,
+                        0,
+                        "forwarded environment 缺共用 upvalue",
+                    )
+                })?)
+                .map_err(|_| {
+                    error(
+                        OfficialExportErrorKind::LimitExceeded,
+                        proto.id,
+                        0,
+                        "forwarded environment upvalue index 超限",
+                    )
+                })?,
+                kind: 0,
+            });
+        }
     }
     if upvalues.len() > u8::MAX as usize {
         return Err(error(
@@ -11523,14 +12032,15 @@ fn native_upvalues(
 }
 
 fn compare_branch_fusions(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     meta: &Layout,
     work: &mut OfficialWorkBudget,
-) -> Result<Vec<Option<CompareBranchFusion>>, OfficialExportError> {
+) -> Result<BytecodeVec<Option<CompareBranchFusion>>, OfficialExportError> {
     let count = proto.instructions.len();
-    let mut result = Vec::new();
-    result.try_reserve_exact(count).map_err(|_| {
+    let mut result = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut result, count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             proto.id,
@@ -11811,9 +12321,12 @@ fn stripped_native_header_lines(
     Ok((0, 0))
 }
 
-fn native_prototype(
+fn native_prototype_one(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
-    id: ProtoId,
+    proto: &BytecodePrototype,
+    children_view: NativeChildren<'_>,
+    prepared_env_needed: Option<bool>,
     parent: Option<(&BytecodePrototype, &Layout)>,
     root: bool,
     strip: bool,
@@ -11822,7 +12335,10 @@ fn native_prototype(
     limits: &OfficialChunkLimits,
     work: &mut OfficialWorkBudget,
     total_instructions: &mut usize,
-) -> Result<OfficialPrototype, OfficialExportError> {
+    source_to_official: &[Option<ProtoId>],
+    include_source: bool,
+) -> Result<(OfficialPrototype, Layout), OfficialExportError> {
+    let id = proto.id;
     if depth > limits.max_depth {
         return Err(error(
             OfficialExportErrorKind::LimitExceeded,
@@ -11831,27 +12347,14 @@ fn native_prototype(
             "官方 prototype 深度超限",
         ));
     }
-    work_charge(work, module.module().prototypes.len(), id, 0)?;
-    let proto = module
-        .module()
-        .prototypes
-        .iter()
-        .find(|candidate| candidate.id == id)
-        .ok_or_else(|| {
-            error(
-                OfficialExportErrorKind::InvalidPrototype,
-                id,
-                0,
-                "prototype 不存在",
-            )
-        })?;
-    let close_groups = native_close_groups(module, proto, limits, work)?;
+    let close_groups = native_close_groups(allocator_scratch, module, proto, limits, work)?;
     let variadic = proto.is_variadic || root && proto.parent.is_none();
-    let (mut numeric, numeric_blocks) = numeric_pairs(proto, work)?;
-    let meta = layout(
+    let (mut numeric, numeric_blocks) = numeric_pairs(allocator_scratch, proto, work)?;
+    let meta = layout(allocator_scratch,
         module,
         proto,
-        root,
+        children_view,
+        prepared_env_needed,
         profile,
         &numeric,
         numeric_blocks,
@@ -11860,15 +12363,13 @@ fn native_prototype(
         limits,
     )?;
     let (word_limit, end_line) =
-        native_word_count(module, &close_groups, proto, &meta, root, work)?;
-    verify_bare_close_layout(module, proto, &meta, &close_groups, work, limits)?;
-    for pair in &mut numeric {
-        pair.tuple = if let Some(alias) = meta
-            .numeric_aliases
-            .iter()
-            .find(|alias| alias.body_pc == pair.body_pc)
+        native_word_count(allocator_scratch, module, &close_groups, proto, &meta, root, work)?;
+    verify_bare_close_layout(allocator_scratch, module, proto, &meta, &close_groups, work, limits)?;
+    for (index, pair) in numeric.iter_mut().enumerate() {
+        pair.tuple = if let Some(tuple) = meta.numeric_tuples.get(index).copied()
+            .filter(|slot| *slot != u8::MAX)
         {
-            alias.tuple
+            tuple
         } else {
             meta.tuple_base
                 .checked_add(pair.block.checked_mul(4).ok_or_else(|| {
@@ -11890,19 +12391,15 @@ fn native_prototype(
                 })?
         };
     }
-    let direct_inits = direct_numeric_inits(module, proto, &meta, &numeric, work)?;
-    let direct_copies = direct_const_copies(module, proto, &meta, work)?;
-    let constants = native_constants(proto, work)?;
-    let upvalues = native_upvalues(module, proto, &meta, parent, root, work)?;
-    let mut children = Vec::new();
-    work_charge(work, module.module().prototypes.len(), id, 0)?;
-    let child_count = module
-        .module()
-        .prototypes
-        .iter()
-        .filter(|candidate| candidate.parent == Some(id))
-        .count();
-    children.try_reserve_exact(child_count).map_err(|_| {
+    let direct_inits = direct_numeric_inits(allocator_scratch, module, proto, &meta, &numeric, work)?;
+    let direct_copies = direct_const_copies(allocator_scratch, module, proto, &meta, work)?;
+    let constants = native_constants(allocator_scratch, proto, work)?;
+    let upvalues = native_upvalues(allocator_scratch, module, proto, &meta,
+        parent, None, None, root, work)?;
+    let mut children = allocator_scratch.vec();
+    work_charge(work, children_view.scan_cost(), id, 0)?;
+    let child_count = children_view.len();
+    allocator_scratch.reserve_exact(&mut children, child_count).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             id,
@@ -11910,28 +12407,15 @@ fn native_prototype(
             "官方 child 配置失敗",
         )
     })?;
-    work_charge(work, module.module().prototypes.len(), id, 0)?;
-    for child in module
-        .module()
-        .prototypes
-        .iter()
-        .filter(|candidate| candidate.parent == Some(id))
-    {
-        children.push(native_prototype(
-            module,
-            child.id,
-            Some((proto, &meta)),
-            false,
-            strip,
-            depth + 1,
-            profile,
-            limits,
-            work,
-            total_instructions,
-        )?);
+    work_charge(work, children_view.scan_cost(), id, 0)?;
+    for (source_index, child) in children_view.iter_with_index() {
+        let official = source_to_official.get(source_index).copied().flatten()
+            .ok_or_else(|| error(OfficialExportErrorKind::InvalidPrototype, child.id, 0,
+                "native child 不在選定子樹"))?;
+        children.push(official);
     }
-    let mut compare_fusions = compare_branch_fusions(module, proto, &meta, work)?;
-    let terminal_fusions = terminal_compare_fusions(
+    let mut compare_fusions = compare_branch_fusions(allocator_scratch, module, proto, &meta, work)?;
+    let terminal_fusions = terminal_compare_fusions(allocator_scratch,
         proto,
         &meta,
         module.native_debug().and_then(|debug| debug.prototype(id)),
@@ -11953,8 +12437,9 @@ fn native_prototype(
             *plan = None;
         }
     }
-    let env_fusions = env_field_fusions(module, proto, &meta, work)?;
-    let exit_nil_fusions = loop_exit_nil_fusions(module, proto, &meta, &numeric, profile, work)?;
+    let env_fusions = env_field_fusions(allocator_scratch, module, proto, &meta, work)?;
+    let exit_nil_fusions = loop_exit_nil_fusions(allocator_scratch, module, proto,
+        children_view, &meta, &numeric, profile, work)?;
     let debug_entry = if strip {
         None
     } else {
@@ -11972,8 +12457,8 @@ fn native_prototype(
         })
     };
     let reserve_words = word_limit.min(limits.max_instructions.saturating_sub(*total_instructions));
-    let mut code = Vec::new();
-    code.try_reserve_exact(reserve_words).map_err(|_| {
+    let mut code = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut code, reserve_words).map_err(|_| {
         error(
             OfficialExportErrorKind::AllocationFailed,
             id,
@@ -11981,9 +12466,9 @@ fn native_prototype(
             "native 指令預付配置失敗",
         )
     })?;
-    let mut lines = Vec::new();
+    let mut lines = allocator_scratch.vec();
     if debug_entry.is_some() {
-        lines.try_reserve_exact(reserve_words).map_err(|_| {
+        allocator_scratch.reserve_exact(&mut lines, reserve_words).map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
                 id,
@@ -12055,9 +12540,8 @@ fn native_prototype(
             0,
         )?;
     }
-    let mut anchors = Vec::new();
-    anchors
-        .try_reserve_exact(proto.instructions.len())
+    let mut anchors = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut anchors, proto.instructions.len())
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -12066,9 +12550,8 @@ fn native_prototype(
                 "官方 PC anchor 配置失敗",
             )
         })?;
-    let mut patches: Vec<(usize, InstructionOffset)> = Vec::new();
-    patches
-        .try_reserve_exact(proto.instructions.len())
+    let mut patches: BytecodeVec<(usize, InstructionOffset)> = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut patches, proto.instructions.len())
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -12077,9 +12560,8 @@ fn native_prototype(
                 "官方 jump patch 配置失敗",
             )
         })?;
-    let mut conditional_false_jumps: Vec<(usize, usize)> = Vec::new();
-    conditional_false_jumps
-        .try_reserve_exact(proto.instructions.len())
+    let mut conditional_false_jumps: BytecodeVec<(usize, usize)> = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut conditional_false_jumps, proto.instructions.len())
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -12088,9 +12570,8 @@ fn native_prototype(
                 "條件短路 patch 配置失敗",
             )
         })?;
-    let mut conditional_false_blocks = Vec::new();
-    conditional_false_blocks
-        .try_reserve_exact(proto.instructions.len())
+    let mut conditional_false_blocks = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut conditional_false_blocks, proto.instructions.len())
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -12100,9 +12581,8 @@ fn native_prototype(
             )
         })?;
     conditional_false_blocks.resize(proto.instructions.len(), None);
-    let mut numeric_patch = Vec::new();
-    numeric_patch
-        .try_reserve_exact(numeric.len())
+    let mut numeric_patch = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut numeric_patch, numeric.len())
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -12111,9 +12591,8 @@ fn native_prototype(
                 "numeric patch 配置失敗",
             )
         })?;
-    let mut numeric_entry = Vec::new();
-    numeric_entry
-        .try_reserve_exact(numeric.len())
+    let mut numeric_entry = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut numeric_entry, numeric.len())
         .map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
@@ -12170,7 +12649,10 @@ fn native_prototype(
                 .any(|alias| alias.body_pc == pair.body_pc)
             {
                 let source = pair.tuple + if profile == LuaProfile::Lua54 { 3 } else { 2 };
-                builder.push(abc(0, r(pair.visible)?, source, 0, false), pc)?;
+                let destination = r(pair.visible)?;
+                if destination != source {
+                    builder.push(abc(0, destination, source, 0, false), pc)?;
+                }
             }
         }
         anchors.push(builder.code.len());
@@ -12639,13 +13121,8 @@ fn native_prototype(
                 }
             }
             Instruction::Closure { dest, proto: child } => {
-                work_charge(builder.work, module.module().prototypes.len(), id, pc)?;
-                let child_index = module
-                    .module()
-                    .prototypes
-                    .iter()
-                    .filter(|candidate| candidate.parent == Some(id))
-                    .position(|candidate| candidate.id == *child)
+                work_charge(builder.work, children_view.lookup_cost(), id, pc)?;
+                let child_index = children_view.ordinal(*child)
                     .ok_or_else(|| {
                         error(
                             OfficialExportErrorKind::InvalidPrototype,
@@ -12683,7 +13160,14 @@ fn native_prototype(
                 if let Some(call) =
                     native_plan.and_then(|plan| plan.call(id, InstructionOffset(pc as u32)))
                 {
-                    emit_native_list_write(&mut builder, proto, &meta, profile, pc, call)?;
+                    match call.builtin {
+                        OfficialPlanBuiltin::RawListWrite =>
+                            emit_native_list_write(&mut builder, proto, &meta, profile, pc, call)?,
+                        OfficialPlanBuiltin::GlobalNilCheck if profile == LuaProfile::Lua55 =>
+                            emit_native_global_nil_check(&mut builder, proto, &meta, pc, call)?,
+                        _ => return Err(error(OfficialExportErrorKind::InvalidPrototype, id, pc,
+                            "native builtin 無法輸出到此 Lua profile")),
+                    }
                 } else {
                     let open_root = if matches!(result_mode, ResultMode::All) {
                         Some(open_root_base(proto, pc, builder.work)?)
@@ -12708,15 +13192,16 @@ fn native_prototype(
                             })?;
                         emit_gather(&mut builder, &meta, gather_start, gather_count, 0, pc)?;
                     }
-                    emit_fixed_call_pending_moves(&mut builder, module, proto, &meta, pc, true)?;
+                    emit_fixed_call_pending_moves(allocator_scratch, &mut builder, module, proto, &meta, pc, true)?;
                     if let Some(helper) = native_plan
                         .and_then(|plan| plan.call(id, InstructionOffset((pc + 1) as u32)))
+                        .filter(|call| call.builtin == OfficialPlanBuiltin::RawListWrite)
                     {
                         let table_register = Register(helper.function_register.0 + 1);
                         builder.push(
                             abc(
                                 0,
-                                scratch_register(&meta, 3, id, pc)?,
+                                native_list_table_register(&meta, id, pc + 1)?,
                                 r(table_register)?,
                                 0,
                                 false,
@@ -12775,7 +13260,7 @@ fn native_prototype(
                         ),
                         pc,
                     )?;
-                    emit_fixed_call_pending_moves(&mut builder, module, proto, &meta, pc, false)?;
+                    emit_fixed_call_pending_moves(allocator_scratch, &mut builder, module, proto, &meta, pc, false)?;
                     if let ResultMode::Fixed(count) = result_mode {
                         emit_scatter(&mut builder, &meta, *base, *count, call_offset, pc)?;
                     }
@@ -12854,12 +13339,13 @@ fn native_prototype(
                     .official_execution()
                     .filter(|plan| plan.is_native_builtin())
                     .and_then(|plan| plan.call(id, InstructionOffset((pc + 1) as u32)))
+                    .filter(|call| call.builtin == OfficialPlanBuiltin::RawListWrite)
                 {
                     let table_register = Register(helper.function_register.0 + 1);
                     builder.push(
                         abc(
                             0,
-                            scratch_register(&meta, 3, id, pc)?,
+                            native_list_table_register(&meta, id, pc + 1)?,
                             r(table_register)?,
                             0,
                             false,
@@ -13191,21 +13677,11 @@ fn native_prototype(
     }
     let debug = if let Some(entry) = debug_entry {
         let (line_info, abs_line_info) =
-            native_line_info(id, &builder.lines, entry.line_defined, builder.work)?;
-        let mut locals = Vec::new();
-        let control_locals = meta
-            .numeric_aliases
-            .iter()
-            .try_fold(0usize, |count, alias| {
-                count.checked_add(usize::from(alias.width)).ok_or_else(|| {
-                    error(
-                        OfficialExportErrorKind::LimitExceeded,
-                        id,
-                        alias.body_pc,
-                        "numeric debug local 數溢位",
-                    )
-                })
-            })?;
+            native_line_info(allocator_scratch, id, &builder.lines, entry.line_defined, builder.work)?;
+        let mut locals = allocator_scratch.vec();
+        let control_locals = numeric_debug_control_count(
+            &numeric, &entry.locals, profile, id, builder.work,
+        )?;
         let total_locals = entry
             .locals
             .len()
@@ -13219,7 +13695,7 @@ fn native_prototype(
                     "numeric debug local 數溢位",
                 )
             })?;
-        locals.try_reserve_exact(total_locals).map_err(|_| {
+        allocator_scratch.reserve_exact(&mut locals, total_locals).map_err(|_| {
             error(
                 OfficialExportErrorKind::AllocationFailed,
                 id,
@@ -13255,46 +13731,37 @@ fn native_prototype(
                     )
                 })
             };
-            let mut alias_end_pc = None;
-            if let Some(alias) = meta.numeric_aliases.iter().find(|alias| {
-                alias.visible == local.register
-                    && local.start_pc as usize <= alias.body_pc
-                    && local.end_pc as usize > alias.next_pc
-            }) {
-                let start_pc = source_pc(u32::try_from(alias.prepare_pc).map_err(|_| {
+            let mut numeric_visible_end_pc = None;
+            if let Some(pair) = numeric_debug_pair_for_local(&numeric, local) {
+                let start_pc = source_pc(u32::try_from(pair.prepare_pc).map_err(|_| {
                     error(
                         OfficialExportErrorKind::LimitExceeded,
                         id,
-                        alias.prepare_pc,
+                        pair.prepare_pc,
                         "numeric debug 起點溢位",
                     )
                 })?)?;
-                let end_pc = source_pc(u32::try_from(alias.next_pc + 1).map_err(|_| {
-                    error(
-                        OfficialExportErrorKind::LimitExceeded,
-                        id,
-                        alias.next_pc,
-                        "numeric debug 終點溢位",
-                    )
-                })?)?;
-                alias_end_pc = Some(end_pc);
-                work_charge(builder.work, usize::from(alias.width), id, alias.body_pc)?;
-                for _ in 0..alias.width {
+                let (visible_end_pc, control_end_pc) =
+                    numeric_debug_end_pcs(pair.next_pc, &source_pc, id)?;
+                numeric_visible_end_pc = Some(visible_end_pc);
+                let width = if profile == LuaProfile::Lua54 { 3 } else { 2 };
+                work_charge(builder.work, width, id, pair.body_pc)?;
+                for _ in 0..width {
                     locals.push(OfficialLocal {
-                        name: Some(copy_slice(NUMERIC_CONTROL_LOCAL, id, builder.work)?),
+                        name: Some(copy_slice_with_recovery(NUMERIC_CONTROL_LOCAL, id, builder.work, allocator_scratch)?.into()),
                         start_pc,
-                        end_pc,
+                        end_pc: control_end_pc,
                     });
                 }
             }
             locals.push(OfficialLocal {
-                name: Some(copy_slice(&local.name, id, builder.work)?),
+                name: Some(copy_slice_with_recovery(&local.name, id, builder.work, allocator_scratch)?.into()),
                 start_pc: if parameter {
                     0
                 } else {
                     source_pc(local.start_pc)?
                 },
-                end_pc: if let Some(end_pc) = alias_end_pc {
+                end_pc: if let Some(end_pc) = numeric_visible_end_pc {
                     end_pc
                 } else {
                     source_pc(local.end_pc)?
@@ -13315,7 +13782,7 @@ fn native_prototype(
             locals.insert(
                 position,
                 OfficialLocal {
-                    name: Some(copy_slice(ANONYMOUS_VARARG_LOCAL, id, builder.work)?),
+                    name: Some(copy_slice_with_recovery(ANONYMOUS_VARARG_LOCAL, id, builder.work, allocator_scratch)?.into()),
                     start_pc: 1,
                     end_pc: u32::try_from(builder.code.len()).map_err(|_| {
                         error(
@@ -13328,9 +13795,8 @@ fn native_prototype(
                 },
             );
         }
-        let mut upvalue_names = Vec::new();
-        upvalue_names
-            .try_reserve_exact(upvalues.len())
+        let mut upvalue_names = allocator_scratch.vec();
+        allocator_scratch.reserve_exact(&mut upvalue_names, upvalues.len())
             .map_err(|_| {
                 error(
                     OfficialExportErrorKind::AllocationFailed,
@@ -13339,9 +13805,6 @@ fn native_prototype(
                     "native official upvalue names 配置失敗",
                 )
             })?;
-        if root && meta.guest_upvalue_offset == 1 {
-            upvalue_names.push(Some(copy_slice(b"_ENV", id, builder.work)?));
-        }
         work_charge(builder.work, entry.upvalue_names.len(), id, 0)?;
         for name in entry
             .upvalue_names
@@ -13350,33 +13813,37 @@ fn native_prototype(
         {
             upvalue_names.push(
                 name.as_ref()
-                    .map(|bytes| copy_slice(bytes, id, builder.work))
-                    .transpose()?,
+                    .map(|bytes| copy_slice_with_recovery(bytes, id, builder.work, allocator_scratch))
+                    .transpose()?.map(Into::into),
             );
         }
+        let guest_count = native_guest_upvalues(module, proto);
+        while upvalue_names.len() < guest_count {
+            upvalue_names.push(None);
+        }
         if upvalue_names.len() < upvalues.len() {
-            upvalue_names.push(Some(copy_slice(b"_ENV", id, builder.work)?));
+            upvalue_names.push(Some(copy_slice_with_recovery(b"_ENV", id, builder.work, allocator_scratch)?.into()));
         }
         OfficialDebug {
-            line_info,
-            abs_line_info,
-            locals,
-            upvalue_names,
+            line_info: allocator_scratch.retain(line_info).map_err(|_| error(OfficialExportErrorKind::AllocationFailed, id, 0, "native line info owner 配置失敗"))?,
+            abs_line_info: allocator_scratch.retain(abs_line_info).map_err(|_| error(OfficialExportErrorKind::AllocationFailed, id, 0, "native absolute line owner 配置失敗"))?,
+            locals: allocator_scratch.retain(locals).map_err(|_| error(OfficialExportErrorKind::AllocationFailed, id, 0, "native locals owner 配置失敗"))?,
+            upvalue_names: allocator_scratch.retain(upvalue_names).map_err(|_| error(OfficialExportErrorKind::AllocationFailed, id, 0, "native upvalue names owner 配置失敗"))?,
         }
     } else {
         OfficialDebug::default()
     };
-    let source = if root && !strip {
+    let source = if include_source && root && !strip {
         Some(if let Some(native) = module.native_debug() {
-            copy_slice(native.source_name(), id, builder.work)?
+            copy_slice_with_recovery(native.source_name(), id, builder.work, allocator_scratch)?
         } else {
-            copy_slice(b"=RivetLua", id, builder.work)?
+            copy_slice_with_recovery(b"=RivetLua", id, builder.work, allocator_scratch)?
         })
     } else {
         None
     };
-    Ok(OfficialPrototype {
-        source,
+    Ok((OfficialPrototype {
+        source: source.map(Into::into),
         line_defined,
         last_line_defined,
         num_params: u8::try_from(proto.parameter_count).map_err(|_| {
@@ -13393,15 +13860,16 @@ fn native_prototype(
             u8::from(variadic)
         },
         max_stack_size: meta.max_stack,
-        code: builder.code,
-        constants,
-        upvalues,
-        children,
+        code: allocator_scratch.retain(builder.code).map_err(|_| error(OfficialExportErrorKind::AllocationFailed, id, 0, "native code owner 配置失敗"))?,
+        constants: allocator_scratch.retain(constants).map_err(|_| error(OfficialExportErrorKind::AllocationFailed, id, 0, "native constants owner 配置失敗"))?,
+        upvalues: allocator_scratch.retain(upvalues).map_err(|_| error(OfficialExportErrorKind::AllocationFailed, id, 0, "native upvalues owner 配置失敗"))?,
+        children: allocator_scratch.retain(children).map_err(|_| error(OfficialExportErrorKind::AllocationFailed, id, 0, "native children owner 配置失敗"))?,
         debug,
-    })
+    }, meta))
 }
 
-pub(super) fn emit_native_chunk(
+pub(super) fn emit_native_chunk_with_recovery(
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
     module: &VerifiedModule,
     selected: ProtoId,
     profile: LuaProfile,
@@ -13410,10 +13878,13 @@ pub(super) fn emit_native_chunk(
     work: &mut OfficialWorkBudget,
 ) -> Result<OfficialChunk, OfficialExportError> {
     work_charge(work, 1, selected, 0)?;
-    let mut preflight = NativePreflight::default();
+    let mut preflight = NativePreflight {
+        state_owned: allocator_scratch.recovery().allocator().is_lua(),
+        ..NativePreflight::default()
+    };
     preflight.bytes(1, size_of::<OfficialChunk>(), limits, selected)?;
     work_charge(work, module.module().prototypes.len(), selected, 0)?;
-    let root = module
+    let _root = module
         .module()
         .prototypes
         .iter()
@@ -13426,32 +13897,87 @@ pub(super) fn emit_native_chunk(
                 "native selected prototype 不存在",
             )
         })?;
-    preflight_native_prototype(
-        module,
-        root,
-        true,
-        profile,
-        strip,
-        1,
-        limits,
-        work,
-        &mut preflight,
-    )?;
+    let source_count = module.module().prototypes.len();
+    let mut pending = allocator_scratch.vec();
+    let mut order = allocator_scratch.vec();
+    let environment_cursor_bound = source_count.checked_mul(2).ok_or_else(|| error(
+        OfficialExportErrorKind::LimitExceeded, selected, 0, "native 環境 cursor 容量溢位"))?;
+    preflight.bytes(environment_cursor_bound, size_of::<EnvironmentFrame>(), limits, selected)?;
+    preflight.bytes(source_count, size_of::<Option<ProtoId>>(), limits, selected)?;
+    let mut source_to_official = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut source_to_official, source_count).map_err(|_| error(
+        OfficialExportErrorKind::AllocationFailed, selected, 0, "native source ID 對照配置失敗"))?;
+    preflight.bytes(source_to_official.capacity() - source_count,
+        size_of::<Option<ProtoId>>(), limits, selected)?;
+    source_to_official.resize(source_count, None);
+    native_cursor_push(&mut pending, (selected, 1usize), &mut preflight,
+        limits, selected, allocator_scratch)?;
+    let mut max_depth = 0usize;
+    while let Some((id, depth)) = pending.pop() {
+        if depth > limits.max_depth || order.len() >= source_count || order.len() >= limits.max_prototypes {
+            return Err(error(OfficialExportErrorKind::LimitExceeded, id, 0,
+                "native 子樹深度或原型數超限"));
+        }
+        max_depth = max_depth.max(depth);
+        work_charge(work, source_count, id, 0)?;
+        let (source_index, proto) = module.module().prototypes.iter().enumerate()
+            .find(|(_, candidate)| candidate.id == id)
+            .ok_or_else(|| error(OfficialExportErrorKind::InvalidPrototype, id, 0,
+                "native 子樹原型不存在"))?;
+        source_to_official[source_index] = Some(ProtoId(u32::try_from(order.len()).map_err(|_| error(
+            OfficialExportErrorKind::LimitExceeded, id, 0, "native 官方 ID 溢位"))?));
+        native_cursor_push(&mut order, (id, depth), &mut preflight,
+            limits, id, allocator_scratch)?;
+        work_charge(work, source_count, id, 0)?;
+        for child in module.module().prototypes.iter().rev() {
+            if child.parent == Some(id) {
+                let child_depth = depth.checked_add(1).ok_or_else(|| error(
+                    OfficialExportErrorKind::LimitExceeded, id, 0, "native 深度溢位"))?;
+                native_cursor_push(&mut pending, (child.id, child_depth), &mut preflight,
+                    limits, id, allocator_scratch)?;
+            }
+        }
+        preflight_native_prototype(allocator_scratch, module, proto,
+            NativeChildren::all(&module.module().prototypes, id), None, depth == 1,
+            profile, strip, depth, limits, work, &mut preflight, true)?;
+    }
+    preflight.bytes(source_count, size_of::<(ProtoId, usize)>(), limits, selected)?;
+    preflight.bytes(max_depth, size_of::<(ProtoId, Layout)>(), limits, selected)?;
+    if preflight.state_owned {
+        preflight.bytes(1, StateAllocator::shared_block_size::<BytecodeVec<OfficialPrototype>>(),
+            limits, selected)?;
+    }
     work_charge(work, preflight.allocated_bytes, selected, 0)?;
     let mut total_instructions = 0;
-    let main = native_prototype(
-        module,
-        selected,
-        None,
-        true,
-        strip,
-        1,
-        profile,
-        limits,
-        work,
-        &mut total_instructions,
-    )?;
-    let root_upvalues = u8::try_from(main.upvalues.len()).map_err(|_| {
+    let mut prototypes = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut prototypes, order.len()).map_err(|_| error(
+        OfficialExportErrorKind::AllocationFailed, selected, 0, "native arena 配置失敗"))?;
+    preflight.bytes(prototypes.capacity() - order.len(), size_of::<OfficialPrototype>(), limits, selected)?;
+    let mut active = allocator_scratch.vec();
+    allocator_scratch.reserve_exact(&mut active, max_depth).map_err(|_| error(
+        OfficialExportErrorKind::AllocationFailed, selected, 0, "native parent layout cursor 配置失敗"))?;
+    preflight.bytes(active.capacity() - max_depth, size_of::<(ProtoId, Layout)>(), limits, selected)?;
+    for &(id, depth) in &order {
+        while active.len() >= depth { active.pop(); }
+        let proto = module.module().prototypes.iter()
+            .find(|proto| proto.id == id)
+            .ok_or_else(|| error(OfficialExportErrorKind::InvalidPrototype,
+                id, 0, "native prototype 不存在"))?;
+        let parent = if let Some((parent_id, layout)) = active.last() {
+            Some((module.module().prototypes.iter().find(|proto| proto.id == *parent_id)
+                .ok_or_else(|| error(OfficialExportErrorKind::InvalidPrototype,
+                    id, 0, "native parent prototype 不存在"))?, layout))
+        } else {
+            None
+        };
+        let (prototype, layout) = native_prototype_one(allocator_scratch, module, proto,
+            NativeChildren::all(&module.module().prototypes, id), None, parent,
+            depth == 1, strip, depth, profile, limits, work,
+            &mut total_instructions, &source_to_official, true)?;
+        prototypes.push(prototype);
+        active.push((id, layout));
+    }
+    let root_upvalues = u8::try_from(prototypes[0].upvalues.len()).map_err(|_| {
         error(
             OfficialExportErrorKind::LimitExceeded,
             selected,
@@ -13462,8 +13988,77 @@ pub(super) fn emit_native_chunk(
     Ok(OfficialChunk {
         profile,
         root_upvalues,
-        main,
+        main: ProtoId(0),
+        prototypes: allocator_scratch.retain(prototypes).map_err(|_| error(
+            OfficialExportErrorKind::AllocationFailed, selected, 0, "native arena owner 配置失敗"))?,
     })
+}
+
+
+/// 每個來源原型各降低一次；獨立 body 不依賴 parent 捕獲描述。
+pub(super) fn lower_dump54_body<R: AllocationRecovery>(
+    scratch: &mut Scratch<'_, R>,
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    children: NativeChildren<'_>,
+    env_needed: bool,
+    limits: &OfficialChunkLimits,
+    work: &mut OfficialWorkBudget,
+    source_to_official: &[Option<ProtoId>],
+    total_instructions: &mut usize,
+) -> Result<(OfficialPrototype, Layout, usize), OfficialExportError> {
+    let mut preflight = NativePreflight {
+        state_owned: scratch.recovery().allocator().is_lua(),
+        ..NativePreflight::default()
+    };
+    preflight_native_prototype(scratch, module, proto, children, Some(env_needed),
+        true, LuaProfile::Lua54,
+        false, 1, limits, work, &mut preflight, false)?;
+    work_charge(work, preflight.allocated_bytes, proto.id, 0)?;
+    let (body, layout) = native_prototype_one(scratch, module, proto, children,
+        Some(env_needed), None,
+        true, false, 1, LuaProfile::Lua54, limits, work, total_instructions,
+        source_to_official, false)?;
+    Ok((body, layout, preflight.allocated_bytes))
+}
+
+/// 非根邊使用 parent layout 形成描述，不能覆寫 body 的 standalone 順序。
+pub(super) fn dump54_incoming_upvalues<R: AllocationRecovery>(
+    scratch: &mut Scratch<'_, R>,
+    module: &VerifiedModule,
+    proto: &BytecodePrototype,
+    layout: &Layout,
+    parent: &BytecodePrototype,
+    parent_layout: &Layout,
+    closure_sites: &[Dump54ClosureSite],
+    binding_sites: &[Dump54Binding],
+    work: &mut OfficialWorkBudget,
+    max_new_bytes: usize,
+) -> Result<RetainedVec<OfficialUpvalue>, OfficialExportError> {
+    let count = native_guest_upvalues(module, proto)
+        .checked_add(usize::from(layout.env_upvalue.is_some()))
+        .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded,
+            proto.id, 0, "incoming upvalue 數量溢位"))?;
+    let backing = count.checked_mul(size_of::<OfficialUpvalue>())
+        .and_then(|bytes| bytes.checked_add(
+            if count != 0 && scratch.recovery().allocator().is_lua() {
+                StateAllocator::shared_block_size::<BytecodeVec<OfficialUpvalue>>()
+            } else { 0 }))
+        .ok_or_else(|| error(OfficialExportErrorKind::LimitExceeded,
+            proto.id, 0, "incoming upvalue 配置大小溢位"))?;
+    if backing > max_new_bytes {
+        return Err(error(OfficialExportErrorKind::LimitExceeded,
+            proto.id, 0, "incoming upvalue 超過配置額度"));
+    }
+    let descriptors = native_upvalues(scratch, module, proto, layout,
+        Some((parent, parent_layout)), Some(closure_sites),
+        Some(binding_sites), false, work)?;
+    if descriptors.is_empty() {
+        return Ok(RetainedVec::default());
+    }
+    scratch.retain(descriptors).map_err(|_| error(
+        OfficialExportErrorKind::AllocationFailed, proto.id, 0,
+        "incoming upvalue owner 配置失敗"))
 }
 
 #[cfg(test)]

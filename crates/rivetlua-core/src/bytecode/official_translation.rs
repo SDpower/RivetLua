@@ -4,6 +4,8 @@ use alloc::string::String;
 #[cfg(not(feature = "std"))]
 use alloc::string::ToString;
 use alloc::vec::Vec;
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{AllocationRecovery, GlobalAllocation, ReserveError, StateAllocator};
 
 use alloc::rc::Rc;
 use alloc::sync::Arc;
@@ -11,19 +13,21 @@ use core::mem::size_of;
 
 use super::official::{
     OfficialChunk, OfficialChunkError, OfficialChunkErrorKind, OfficialChunkLimits,
-    OfficialConstant, OfficialPrototype, clone_official_chunk_checked,
+    OfficialChunkRecoveryError, OfficialConstant, OfficialPrototype,
+    clone_official_chunk_checked_with_recovery,
 };
 use super::official_artifact::OfficialArtifact;
 pub use super::official_artifact::OfficialRvluPc;
+use super::codec::{BytecodeRecoveryError, BytecodeVec, RetainedArc, RetainedVec, Scratch};
 use super::{
     BinaryOperation, BytecodeBindingId, BytecodeClosePath, BytecodeConstant, BytecodeError,
     BytecodeErrorCode, BytecodeExitKind, BytecodeInstruction, BytecodeModule, BytecodePrototype,
     BytecodeSpan, BytecodeUpvalue, BytecodeUpvalueSource, ConstId, EnvironmentSource, FrameLayout,
     Instruction, InstructionOffset, LuaProfile, OfficialPlanBuiltin, OfficialPlanCall,
-    OfficialPlanCandidate, OfficialPlanFrameInput, OfficialPlanFrameInputSource,
+    StateOfficialPlanCandidate, OfficialPlanFrameInput, OfficialPlanFrameInputSource,
     OfficialPlanRootBinding, OfficialPlanRootSource, OfficialPlanUpvalueMap, ProtoId,
     RVLU_NUMERIC_I64_F64, RVLU_V2, Register, ResultMode, UnaryOperation, UpvalueId, VerifiedModule,
-    VerifyLimits, verify_module, verify_official_execution_plan,
+    VerifyLimits, verify_module_with_recovery, verify_official_execution_plan_with_recovery,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +56,12 @@ impl core::fmt::Display for OfficialTranslationError {
 }
 
 impl core::error::Error for OfficialTranslationError {}
+
+#[derive(Debug)]
+pub enum OfficialTranslationRecoveryError<E> {
+    Translation(OfficialTranslationError),
+    Reserve(ReserveError<E>),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReserveFailure {
@@ -106,6 +116,76 @@ impl<T> BoundedVecReserve for Vec<T> {
     }
 }
 
+impl<T> BoundedVecReserve for AllocVec<T, StateAllocator> {
+    fn try_reserve_bounded_exact(&mut self, additional: usize) -> Result<(), ReserveFailure> {
+        let requested = self.len().checked_add(additional).ok_or(ReserveFailure::ExcessCapacity)?;
+        let allowed = requested.max(4).checked_mul(2).ok_or(ReserveFailure::ExcessCapacity)?;
+        if self.capacity() >= requested {
+            return Ok(());
+        }
+        self.try_reserve_exact(additional).map_err(|_| ReserveFailure::Allocation)?;
+        if self.capacity() > allowed {
+            return Err(ReserveFailure::ExcessCapacity);
+        }
+        Ok(())
+    }
+
+    fn try_reserve_bounded(&mut self, additional: usize) -> Result<(), ReserveFailure> {
+        let requested = self.len().checked_add(additional).ok_or(ReserveFailure::ExcessCapacity)?;
+        let allowed = requested.max(4).checked_mul(2).ok_or(ReserveFailure::ExcessCapacity)?;
+        if self.capacity() >= requested {
+            return Ok(());
+        }
+        self.try_reserve(additional).map_err(|_| ReserveFailure::Allocation)?;
+        if self.capacity() > allowed {
+            return Err(ReserveFailure::ExcessCapacity);
+        }
+        Ok(())
+    }
+}
+
+trait RecoveryBoundedVecReserve {
+    fn try_reserve_bounded_exact_with<R: AllocationRecovery>(
+        &mut self,
+        additional: usize,
+        allocator_scratch: &mut Scratch<'_, R>,
+    ) -> Result<(), ReserveFailure>;
+    fn try_reserve_bounded_with<R: AllocationRecovery>(
+        &mut self,
+        additional: usize,
+        allocator_scratch: &mut Scratch<'_, R>,
+    ) -> Result<(), ReserveFailure>;
+}
+
+impl<T> RecoveryBoundedVecReserve for BytecodeVec<T> {
+    fn try_reserve_bounded_exact_with<R: AllocationRecovery>(
+        &mut self,
+        additional: usize,
+        allocator_scratch: &mut Scratch<'_, R>,
+    ) -> Result<(), ReserveFailure> {
+        let requested = self.len().checked_add(additional).ok_or(ReserveFailure::ExcessCapacity)?;
+        let allowed = requested.max(4).checked_mul(2).ok_or(ReserveFailure::ExcessCapacity)?;
+        if self.capacity() >= requested { return Ok(()); }
+        allocator_scratch.reserve_exact(self, additional).map_err(|_| ReserveFailure::Allocation)?;
+        if self.capacity() > allowed { return Err(ReserveFailure::ExcessCapacity); }
+        Ok(())
+    }
+
+    fn try_reserve_bounded_with<R: AllocationRecovery>(
+        &mut self,
+        additional: usize,
+        allocator_scratch: &mut Scratch<'_, R>,
+    ) -> Result<(), ReserveFailure> {
+        let requested = self.len().checked_add(additional).ok_or(ReserveFailure::ExcessCapacity)?;
+        let allowed = requested.max(4).checked_mul(2).ok_or(ReserveFailure::ExcessCapacity)?;
+        if self.capacity() >= requested { return Ok(()); }
+        let target = self.capacity().saturating_mul(2).max(4).max(requested).min(allowed);
+        allocator_scratch.reserve_exact(self, target - self.len()).map_err(|_| ReserveFailure::Allocation)?;
+        if self.capacity() > allowed { return Err(ReserveFailure::ExcessCapacity); }
+        Ok(())
+    }
+}
+
 /// 離線 P05 轉譯工作額度。各階段在掃描或配置前扣除保守上界。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OfficialWorkBudget {
@@ -148,7 +228,8 @@ impl OfficialWorkBudget {
                     .and_then(|extra| value.checked_add(extra))
             })
             .and_then(|value| u64::try_from(value).ok())
-            .ok_or_else(|| limited(ProtoId(0), 0, "P05 預設 work 額度溢位"))?;
+            // 上界估計可超出 u64；實際 work 仍由 charge 逐次扣除。
+            .unwrap_or(u64::MAX);
         Ok(Self::new(units))
     }
 
@@ -194,9 +275,9 @@ impl OfficialWorkBudget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfficialPcMap {
     prototype: ProtoId,
-    official_to_rvlu: Vec<Option<InstructionOffset>>,
-    rvlu_to_official: Vec<OfficialRvluPc>,
-    lines: Vec<Option<u32>>,
+    official_to_rvlu: RetainedVec<Option<InstructionOffset>>,
+    rvlu_to_official: RetainedVec<OfficialRvluPc>,
+    lines: RetainedVec<Option<u32>>,
 }
 
 impl OfficialPcMap {
@@ -220,29 +301,36 @@ impl OfficialPcMap {
     }
     pub(crate) fn allocated_bytes(&self) -> Option<usize> {
         self.official_to_rvlu
-            .capacity()
-            .checked_mul(size_of::<Option<InstructionOffset>>())?
+            .retained_bytes()?
             .checked_add(
                 self.rvlu_to_official
-                    .capacity()
-                    .checked_mul(size_of::<OfficialRvluPc>())?,
+                    .retained_bytes()?,
             )?
             .checked_add(
                 self.lines
-                    .capacity()
-                    .checked_mul(size_of::<Option<u32>>())?,
+                    .retained_bytes()?,
             )
+    }
+
+    pub(crate) fn rehome<R: AllocationRecovery>(
+        &mut self,
+        recovery: &mut R,
+    ) -> Result<(), ReserveError<R::Error>> {
+        self.official_to_rvlu.rehome(recovery)?;
+        self.rvlu_to_official.rehome(recovery)?;
+        self.lines.rehome(recovery)?;
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OfficialTranslation {
     verified: VerifiedModule,
-    artifact: Arc<OfficialArtifact>,
-    internal_calls: Vec<OfficialInternalCall>,
-    frame_inputs: Vec<OfficialFrameInput>,
-    upvalue_maps: Vec<OfficialUpvalueMap>,
-    root_bindings: Vec<OfficialRootBinding>,
+    artifact: RetainedArc<OfficialArtifact>,
+    internal_calls: RetainedVec<OfficialInternalCall>,
+    frame_inputs: RetainedVec<OfficialFrameInput>,
+    upvalue_maps: RetainedVec<OfficialUpvalueMap>,
+    root_bindings: RetainedVec<OfficialRootBinding>,
 }
 
 impl OfficialTranslation {
@@ -335,7 +423,7 @@ pub struct OfficialInternalCall {
     call_pc: InstructionOffset,
     function_register: Register,
     source_upvalue: UpvalueId,
-    inputs: Vec<Register>,
+    inputs: RetainedVec<Register>,
     open_tail: Option<Register>,
     builtin: OfficialFixedBuiltin,
 }
@@ -393,7 +481,7 @@ impl OfficialRootBinding {
 pub struct OfficialUpvalueMap {
     prototype: ProtoId,
     guest_count: u16,
-    hidden: Vec<(OfficialFixedBuiltin, UpvalueId)>,
+    hidden: RetainedVec<(OfficialFixedBuiltin, UpvalueId)>,
 }
 
 impl OfficialUpvalueMap {
@@ -492,11 +580,12 @@ fn charge_artifact_bytes(
 fn make_pc_map(
     entry: &PrototypeRef<'_>,
     validated: &ValidatedCode,
-    mapping: Vec<Option<InstructionOffset>>,
+    mapping: BytecodeVec<Option<InstructionOffset>>,
     instructions: &[BytecodeInstruction],
     artifact_bytes: &mut usize,
     limits: &VerifyLimits,
     work: &mut OfficialWorkBudget,
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<OfficialPcMap, OfficialTranslationError> {
     let id = entry.id;
     let source = entry.source;
@@ -551,9 +640,9 @@ fn make_pc_map(
         id,
         0,
     )?;
-    let mut reverse = Vec::new();
+    let mut reverse = allocator_scratch.vec();
     reverse
-        .try_reserve_bounded_exact(instructions.len())
+        .try_reserve_bounded_exact_with(instructions.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, id, 0, "反向 PC map 配置失敗"))?;
     charge_artifact_bytes(
         artifact_bytes,
@@ -589,7 +678,7 @@ fn make_pc_map(
             id,
         )?;
     }
-    let mut lines = Vec::new();
+    let mut lines = allocator_scratch.vec();
     if !source.debug.line_info.is_empty() {
         let line_bytes = source
             .code
@@ -598,7 +687,7 @@ fn make_pc_map(
             .ok_or_else(|| limited(id, 0, "行號 map bytes 溢位"))?;
         charge_artifact_bytes(artifact_bytes, line_bytes, limits.max_artifact_bytes, id, 0)?;
         lines
-            .try_reserve_bounded_exact(source.code.len())
+            .try_reserve_bounded_exact_with(source.code.len(), allocator_scratch)
             .map_err(|error| reserve_failure(error, id, 0, "行號 map 配置失敗"))?;
         charge_artifact_bytes(
             artifact_bytes,
@@ -635,9 +724,9 @@ fn make_pc_map(
     }
     Ok(OfficialPcMap {
         prototype: id,
-        official_to_rvlu: mapping,
-        rvlu_to_official: reverse,
-        lines,
+        official_to_rvlu: allocator_scratch.retain(mapping).map_err(|_| allocation_failed(id, 0, "PC map owner 配置失敗"))?,
+        rvlu_to_official: allocator_scratch.retain(reverse).map_err(|_| allocation_failed(id, 0, "反向 PC map owner 配置失敗"))?,
+        lines: allocator_scratch.retain(lines).map_err(|_| allocation_failed(id, 0, "line map owner 配置失敗"))?,
     })
 }
 
@@ -721,39 +810,40 @@ impl Decoded {
 }
 
 struct ValidatedCode {
-    ops: Vec<Decoded>,
-    data: Vec<bool>,
-    edges: Vec<Vec<usize>>,
+    ops: BytecodeVec<Decoded>,
+    data: BytecodeVec<bool>,
+    edges: BytecodeVec<BytecodeVec<usize>>,
 }
 
 struct OpenListPlans {
-    preparation_at: Vec<Option<(usize, u16)>>,
-    producer_at: Vec<Option<usize>>,
+    preparation_at: BytecodeVec<Option<(usize, u16)>>,
+    producer_at: BytecodeVec<Option<usize>>,
 }
 
 fn plan_open_lists(
     entry: &PrototypeRef<'_>,
     code: &ValidatedCode,
     profile: LuaProfile,
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<OpenListPlans, OfficialTranslationError> {
-    let mut preparation_at = Vec::new();
+    let mut preparation_at = allocator_scratch.vec();
     preparation_at
-        .try_reserve_bounded_exact(code.ops.len())
+        .try_reserve_bounded_exact_with(code.ops.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "open list 索引配置失敗"))?;
     preparation_at.resize(code.ops.len(), None);
-    let mut producer_at = Vec::new();
+    let mut producer_at = allocator_scratch.vec();
     producer_at
-        .try_reserve_bounded_exact(code.ops.len())
+        .try_reserve_bounded_exact_with(code.ops.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "open producer 索引配置失敗"))?;
     producer_at.resize(code.ops.len(), None);
-    let mut predecessors = Vec::new();
+    let mut predecessors = allocator_scratch.vec();
     predecessors
-        .try_reserve_bounded_exact(code.ops.len())
+        .try_reserve_bounded_exact_with(code.ops.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "CFG predecessor 配置失敗"))?;
-    predecessors.resize_with(code.ops.len(), Vec::new);
+    predecessors.resize_with(code.ops.len(), || allocator_scratch.vec());
     for (pc, edges) in code.edges.iter().enumerate() {
         for &next in edges {
-            predecessors[next].try_reserve_bounded(1).map_err(|error| {
+            predecessors[next].try_reserve_bounded_with(1, allocator_scratch).map_err(|error| {
                 reserve_failure(error, entry.id, pc, "CFG predecessor 配置失敗")
             })?;
             predecessors[next].push(pc);
@@ -1031,6 +1121,7 @@ fn validate_code(
     entry: &PrototypeRef<'_>,
     profile: LuaProfile,
     limits: &VerifyLimits,
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<ValidatedCode, OfficialTranslationError> {
     let source = entry.source;
     match profile {
@@ -1053,21 +1144,21 @@ fn validate_code(
     if source.code.len() > limits.max_instructions {
         return Err(limited(entry.id, 0, "官方指令數超過 P05 限制"));
     }
-    let mut ops = Vec::new();
-    ops.try_reserve_bounded_exact(source.code.len())
+    let mut ops = allocator_scratch.vec();
+    ops.try_reserve_bounded_exact_with(source.code.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "opcode 配置失敗"))?;
     for &word in &source.code {
         ops.push(Decoded::new(word));
     }
-    let mut data = Vec::new();
-    data.try_reserve_bounded_exact(ops.len())
+    let mut data = allocator_scratch.vec();
+    data.try_reserve_bounded_exact_with(ops.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "opcode data mask 配置失敗"))?;
     data.resize(ops.len(), false);
-    let mut edges = Vec::new();
+    let mut edges = allocator_scratch.vec();
     edges
-        .try_reserve_bounded_exact(ops.len())
+        .try_reserve_bounded_exact_with(ops.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "CFG edge 索引配置失敗"))?;
-    edges.resize_with(ops.len(), Vec::new);
+    edges.resize_with(ops.len(), || allocator_scratch.vec());
     for (pc, op) in ops.iter().enumerate() {
         if data[pc] {
             continue;
@@ -1363,9 +1454,9 @@ fn validate_code(
             }
             _ => return Err(invalid(entry.id, pc, "opcode 結構未定義")),
         }
-        let mut successors = Vec::new();
+        let mut successors = allocator_scratch.vec();
         successors
-            .try_reserve_bounded_exact(2)
+            .try_reserve_bounded_exact_with(2, allocator_scratch)
             .map_err(|error| reserve_failure(error, entry.id, pc, "CFG successor 配置失敗"))?;
         match op.opcode {
             56 => successors.push(pc as i64 + 1 + i64::from(op.sj)),
@@ -1396,7 +1487,7 @@ fn validate_code(
             ),
         }
         edges[pc]
-            .try_reserve_bounded_exact(successors.len())
+            .try_reserve_bounded_exact_with(successors.len(), allocator_scratch)
             .map_err(|error| reserve_failure(error, entry.id, pc, "CFG edge 配置失敗"))?;
         for target in successors {
             edges[pc].push(checked_target(entry, pc, target, &data)?);
@@ -1486,16 +1577,17 @@ fn analyze_close_flow(
     entry: &PrototypeRef<'_>,
     code: &ValidatedCode,
     profile: LuaProfile,
-) -> Result<Vec<Option<CloseState>>, OfficialTranslationError> {
-    let mut before: Vec<Option<CloseState>> = Vec::new();
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
+) -> Result<BytecodeVec<Option<CloseState>>, OfficialTranslationError> {
+    let mut before: BytecodeVec<Option<CloseState>> = allocator_scratch.vec();
     before
-        .try_reserve_bounded_exact(code.ops.len())
+        .try_reserve_bounded_exact_with(code.ops.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "close CFG state 配置失敗"))?;
     before.resize(code.ops.len(), None);
     before[0] = Some(None);
-    let mut worklist = Vec::new();
+    let mut worklist = allocator_scratch.vec();
     worklist
-        .try_reserve_bounded_exact(code.ops.len())
+        .try_reserve_bounded_exact_with(code.ops.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "close CFG worklist 配置失敗"))?;
     worklist.push(0usize);
     while let Some(pc) = worklist.pop() {
@@ -1551,11 +1643,12 @@ fn active_closes(
     base: u16,
     id: ProtoId,
     pc: usize,
-) -> Result<Vec<CloseDecl>, OfficialTranslationError> {
-    let mut declarations = Vec::new();
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
+) -> Result<BytecodeVec<CloseDecl>, OfficialTranslationError> {
+    let mut declarations = allocator_scratch.vec();
     let depth = state.as_ref().map_or(0, |node| node.depth);
     declarations
-        .try_reserve_bounded_exact(depth)
+        .try_reserve_bounded_exact_with(depth, allocator_scratch)
         .map_err(|error| reserve_failure(error, id, pc, "close state 配置失敗"))?;
     while let Some(node) = state {
         if node.decl.register.0 < base {
@@ -1599,27 +1692,10 @@ fn charge_close_metadata(
 
 fn clone_close_path(
     path: &BytecodeClosePath,
-    id: ProtoId,
-    pc: usize,
+    _id: ProtoId,
+    _pc: usize,
 ) -> Result<BytecodeClosePath, OfficialTranslationError> {
-    let mut bindings = Vec::new();
-    bindings
-        .try_reserve_bounded_exact(path.bindings.len())
-        .map_err(|error| reserve_failure(error, id, pc, "close binding 配置失敗"))?;
-    bindings.extend_from_slice(&path.bindings);
-    let mut registers = Vec::new();
-    registers
-        .try_reserve_bounded_exact(path.registers.len())
-        .map_err(|error| reserve_failure(error, id, pc, "close register 配置失敗"))?;
-    registers.extend_from_slice(&path.registers);
-    Ok(BytecodeClosePath {
-        kind: path.kind,
-        span: path.span,
-        from_scope: path.from_scope,
-        target_scope: path.target_scope,
-        bindings,
-        registers,
-    })
+    Ok(path.clone())
 }
 
 fn emit_close_sequence(
@@ -1631,15 +1707,16 @@ fn emit_close_sequence(
     kind: BytecodeExitKind,
     state: CloseState,
     captured: &[Register],
-    instructions: &mut Vec<BytecodeInstruction>,
-    close_paths: &mut Vec<BytecodeClosePath>,
+    instructions: &mut BytecodeVec<BytecodeInstruction>,
+    close_paths: &mut BytecodeVec<BytecodeClosePath>,
     metadata_bytes: &mut usize,
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<(), OfficialTranslationError> {
     let captured_count = captured
         .iter()
         .filter(|register| register.0 >= guest_base + base)
         .count();
-    let active = active_closes(state, base, entry.id, pc)?;
+    let active = active_closes(state, base, entry.id, pc, allocator_scratch)?;
     let required = captured_count
         .checked_add(active.len())
         .ok_or_else(|| invalid(entry.id, pc, "close 指令數溢位"))?;
@@ -1666,8 +1743,7 @@ fn emit_close_sequence(
                     base: register,
                     count: 0,
                 },
-            ),
-        )?;
+            ), allocator_scratch)?;
     }
     if active.is_empty() {
         return Ok(());
@@ -1681,19 +1757,19 @@ fn emit_close_sequence(
         active.len() + 1,
     )?;
     let scope = u32::try_from(pc + 1).map_err(|_| invalid(entry.id, pc, "close scope ID 溢位"))?;
-    let mut bindings = Vec::new();
+    let mut bindings = allocator_scratch.vec();
     bindings
-        .try_reserve_bounded_exact(active.len())
+        .try_reserve_bounded_exact_with(active.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, pc, "close binding 配置失敗"))?;
-    let mut registers = Vec::new();
+    let mut registers = allocator_scratch.vec();
     registers
-        .try_reserve_bounded_exact(active.len())
+        .try_reserve_bounded_exact_with(active.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, pc, "close register 配置失敗"))?;
     for declaration in &active {
         bindings.push(declaration.binding);
         registers.push(Register(guest_base + declaration.register.0));
     }
-    let path = BytecodeClosePath {
+    let path = allocator_scratch.shared(super::codec::BytecodeClosePathData {
         kind,
         span: BytecodeSpan {
             start_byte: pc as u64 * 4,
@@ -1707,9 +1783,9 @@ fn emit_close_sequence(
         },
         bindings,
         registers,
-    };
+    }).map_err(|_| allocation_failed(entry.id, pc, "close path owner 配置失敗"))?;
     close_paths
-        .try_reserve_bounded(1)
+        .try_reserve_bounded_with(1, allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, pc, "close path 配置失敗"))?;
     close_paths.push(clone_close_path(&path, entry.id, pc)?);
     for register in &path.registers {
@@ -1725,8 +1801,7 @@ fn emit_close_sequence(
                 },
                 span: path.span,
                 close_path: Some(clone_close_path(&path, entry.id, pc)?),
-            },
-        )?;
+            }, allocator_scratch)?;
     }
     Ok(())
 }
@@ -1736,9 +1811,10 @@ fn emit_close_marker(
     pc: usize,
     register: Register,
     limits: &VerifyLimits,
-    binding_registers: &mut Vec<(BytecodeBindingId, Register)>,
-    instructions: &mut Vec<BytecodeInstruction>,
+    binding_registers: &mut BytecodeVec<(BytecodeBindingId, Register)>,
+    instructions: &mut BytecodeVec<BytecodeInstruction>,
     metadata_bytes: &mut usize,
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<(), OfficialTranslationError> {
     let declaration = close_declaration(entry, pc, register)?;
     let scope = u32::try_from(pc + 1).map_err(|_| invalid(entry.id, pc, "close scope ID 溢位"))?;
@@ -1748,17 +1824,17 @@ fn emit_close_marker(
     };
     charge_close_metadata(metadata_bytes, limits, entry.id, pc, 1, 1)?;
     binding_registers
-        .try_reserve_bounded(1)
+        .try_reserve_bounded_with(1, allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, pc, "close binding register 配置失敗"))?;
     binding_registers.push((declaration.binding, register));
-    let mut bindings = Vec::new();
+    let mut bindings = allocator_scratch.vec();
     bindings
-        .try_reserve_bounded_exact(1)
+        .try_reserve_bounded_exact_with(1, allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, pc, "close marker binding 配置失敗"))?;
     bindings.push(declaration.binding);
-    let mut registers = Vec::new();
+    let mut registers = allocator_scratch.vec();
     registers
-        .try_reserve_bounded_exact(1)
+        .try_reserve_bounded_exact_with(1, allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, pc, "close marker register 配置失敗"))?;
     registers.push(register);
     push_instruction(
@@ -1772,16 +1848,15 @@ fn emit_close_marker(
                 src: register,
             },
             span,
-            close_path: Some(BytecodeClosePath {
+            close_path: Some(allocator_scratch.shared(super::codec::BytecodeClosePathData {
                 kind: BytecodeExitKind::Normal,
                 span,
                 from_scope: scope,
                 target_scope: Some(scope),
                 bindings,
                 registers,
-            }),
-        },
-    )?;
+            }).map_err(|_| allocation_failed(entry.id, pc, "close marker owner 配置失敗"))?),
+        }, allocator_scratch)?;
     Ok(())
 }
 
@@ -1815,28 +1890,30 @@ fn entry_at(pc: usize, instruction: Instruction) -> BytecodeInstruction {
 }
 
 fn push_instruction(
-    instructions: &mut Vec<BytecodeInstruction>,
+    instructions: &mut BytecodeVec<BytecodeInstruction>,
     limits: &VerifyLimits,
     id: ProtoId,
     pc: usize,
     instruction: BytecodeInstruction,
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<(), OfficialTranslationError> {
     if instructions.len() >= limits.max_instructions {
         return Err(limited(id, pc, "轉譯指令超過 P05 限制"));
     }
     instructions
-        .try_reserve_bounded(1)
+        .try_reserve_bounded_with(1, allocator_scratch)
         .map_err(|error| reserve_failure(error, id, pc, "轉譯指令配置失敗"))?;
     instructions.push(instruction);
     Ok(())
 }
 
 fn append_constant(
-    constants: &mut Vec<BytecodeConstant>,
+    constants: &mut BytecodeVec<BytecodeConstant>,
     limits: &VerifyLimits,
     prototype: ProtoId,
     pc: usize,
     value: BytecodeConstant,
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<ConstId, OfficialTranslationError> {
     if constants.len() >= limits.max_constants {
         return Err(limited(prototype, pc, "轉譯常數超過 P05 限制"));
@@ -1845,7 +1922,7 @@ fn append_constant(
         u32::try_from(constants.len()).map_err(|_| invalid(prototype, pc, "轉譯常數 ID 溢位"))?,
     );
     constants
-        .try_reserve_bounded(1)
+        .try_reserve_bounded_with(1, allocator_scratch)
         .map_err(|error| reserve_failure(error, prototype, pc, "轉譯常數配置失敗"))?;
     constants.push(value);
     Ok(id)
@@ -1869,7 +1946,7 @@ struct PrototypeRef<'a> {
     id: ProtoId,
     parent: Option<ProtoId>,
     source: &'a OfficialPrototype,
-    children: Vec<ProtoId>,
+    children: &'a [ProtoId],
 }
 
 struct Preflight {
@@ -1883,16 +1960,12 @@ struct Preflight {
 fn preflight(
     prototype: &OfficialPrototype,
     profile: LuaProfile,
-    depth: usize,
     state: &mut Preflight,
     limits: &VerifyLimits,
     work: &mut OfficialWorkBudget,
 ) -> Result<(), OfficialTranslationError> {
     let fail = |detail| invalid(ProtoId(0), 0, detail);
     let limit_fail = |detail| limited(ProtoId(0), 0, detail);
-    if depth > 64 {
-        return Err(limit_fail("官方 prototype 遞迴超過安全深度"));
-    }
     let scan_units = prototype
         .code
         .len()
@@ -1972,7 +2045,7 @@ fn preflight(
     let debug_string_bytes = prototype
         .source
         .as_ref()
-        .map_or(0, Vec::len)
+        .map_or(0, |name| name.len())
         .checked_add(
             prototype
                 .debug
@@ -2026,44 +2099,40 @@ fn preflight(
     if prototype.upvalues.len() > limits.max_upvalues_per_prototype {
         return Err(limit_fail("官方 upvalue 超過 P05 限制"));
     }
-    for child in &prototype.children {
-        preflight(child, profile, depth + 1, state, limits, work)?;
-    }
     Ok(())
 }
 
 fn collect<'a>(
-    source: &'a OfficialPrototype,
-    parent: Option<ProtoId>,
-    depth: usize,
-    refs: &mut Vec<PrototypeRef<'a>>,
+    chunk: &'a OfficialChunk,
+    refs: &mut BytecodeVec<PrototypeRef<'a>>,
     limits: &VerifyLimits,
-) -> Result<ProtoId, OfficialTranslationError> {
-    if depth > 64 || refs.len() >= limits.max_prototypes {
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
+) -> Result<(), OfficialTranslationError> {
+    if chunk.main != ProtoId(0) || chunk.prototypes.is_empty() || chunk.prototypes.len() > limits.max_prototypes {
         return Err(limited(
-            parent.unwrap_or(ProtoId(0)),
+            ProtoId(0),
             0,
             "prototype 數超過 P05 限制",
         ));
     }
-    let id = ProtoId(
-        u32::try_from(refs.len()).map_err(|_| invalid(ProtoId(0), 0, "prototype ID 溢位"))?,
-    );
-    let mut children = Vec::new();
-    children
-        .try_reserve_bounded_exact(source.children.len())
-        .map_err(|error| reserve_failure(error, id, 0, "child 索引配置失敗"))?;
-    refs.push(PrototypeRef {
-        id,
-        parent,
-        source,
-        children,
-    });
-    for child in &source.children {
-        let child_id = collect(child, Some(id), depth + 1, refs, limits)?;
-        refs[id.0 as usize].children.push(child_id);
+    let mut parents = allocator_scratch.vec();
+    parents.try_reserve_bounded_exact_with(chunk.prototypes.len(), allocator_scratch)
+        .map_err(|error| reserve_failure(error, ProtoId(0), 0, "parent 索引配置失敗"))?;
+    parents.resize(chunk.prototypes.len(), None);
+    for (index, source) in chunk.prototypes.iter().enumerate() {
+        let id = ProtoId(u32::try_from(index).map_err(|_| invalid(ProtoId(0), 0, "prototype ID 溢位"))?);
+        for &child in &source.children {
+            let Some(parent) = parents.get_mut(child.0 as usize) else {
+                return Err(invalid(id, 0, "child prototype ID 不存在"));
+            };
+            if child.0 as usize <= index || parent.is_some() {
+                return Err(invalid(id, 0, "prototype parent 不唯一"));
+            }
+            *parent = Some(id);
+        }
+        refs.push(PrototypeRef { id, parent: parents[index], source, children: &source.children });
     }
-    Ok(id)
+    Ok(())
 }
 
 pub fn translate_official_chunk(
@@ -2079,7 +2148,38 @@ pub fn translate_official_chunk_with_work(
     limits: &VerifyLimits,
     work: &mut OfficialWorkBudget,
 ) -> Result<OfficialTranslation, OfficialTranslationError> {
-    if usize::from(chunk.root_upvalues) != chunk.main.upvalues.len() {
+    let mut recovery = GlobalAllocation;
+    translate_official_chunk_with_work_and_recovery(chunk, limits, work, &mut recovery)
+        .map_err(|error| match error {
+            OfficialTranslationRecoveryError::Translation(error) => error,
+            OfficialTranslationRecoveryError::Reserve(ReserveError::Recovery(never)) => match never {},
+            OfficialTranslationRecoveryError::Reserve(_) => {
+                allocation_failed(ProtoId(0), 0, "官方轉譯配置失敗")
+            }
+        })
+}
+
+pub fn translate_official_chunk_with_work_and_recovery<R: AllocationRecovery>(
+    chunk: &OfficialChunk,
+    limits: &VerifyLimits,
+    work: &mut OfficialWorkBudget,
+    recovery: &mut R,
+) -> Result<OfficialTranslation, OfficialTranslationRecoveryError<R::Error>> {
+    let mut allocator_scratch = Scratch::new(recovery);
+    let result = translate_official_chunk_with_work_inner(chunk, limits, work, &mut allocator_scratch);
+    result.map_err(|error| match allocator_scratch.take_refusal() {
+        Some(refusal) => OfficialTranslationRecoveryError::Reserve(refusal),
+        None => OfficialTranslationRecoveryError::Translation(error),
+    })
+}
+
+fn translate_official_chunk_with_work_inner(
+    chunk: &OfficialChunk,
+    limits: &VerifyLimits,
+    work: &mut OfficialWorkBudget,
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
+) -> Result<OfficialTranslation, OfficialTranslationError> {
+    if chunk.main != ProtoId(0) || chunk.prototypes.first().is_none_or(|root| usize::from(chunk.root_upvalues) != root.upvalues.len()) {
         return Err(invalid(ProtoId(0), 0, "root upvalue 數不符"));
     }
     let mut preflight_state = Preflight {
@@ -2089,14 +2189,9 @@ pub fn translate_official_chunk_with_work(
         source_bytes: 0,
         debug_bytes: 0,
     };
-    preflight(
-        &chunk.main,
-        chunk.profile,
-        1,
-        &mut preflight_state,
-        limits,
-        work,
-    )?;
+    for prototype in &chunk.prototypes {
+        preflight(prototype, chunk.profile, &mut preflight_state, limits, work)?;
+    }
     work.charge(
         preflight_state
             .source_bytes
@@ -2109,6 +2204,7 @@ pub fn translate_official_chunk_with_work(
     )?;
     let official_limits = OfficialChunkLimits {
         max_bytes: limits.max_artifact_bytes,
+        max_depth: limits.max_prototypes,
         max_prototypes: limits.max_prototypes,
         max_instructions: limits.max_instructions,
         max_constants: limits.max_constants,
@@ -2116,8 +2212,18 @@ pub fn translate_official_chunk_with_work(
         max_allocated_bytes: limits.max_artifact_bytes,
         ..OfficialChunkLimits::default()
     };
-    let (owned_chunk, chunk_bytes) =
-        clone_official_chunk_checked(chunk, &official_limits).map_err(from_official_chunk_error)?;
+    let (owned_chunk, chunk_bytes) = clone_official_chunk_checked_with_recovery(
+        chunk,
+        &official_limits,
+        allocator_scratch.recovery(),
+    )
+    .map_err(|error| match error {
+        OfficialChunkRecoveryError::Chunk(error) => from_official_chunk_error(error),
+        OfficialChunkRecoveryError::Reserve(error) => {
+            allocator_scratch.record_refusal(error);
+            allocation_failed(ProtoId(0), 0, "官方 artifact 複製配置失敗")
+        }
+    })?;
     let mut artifact_bytes = chunk_bytes;
     charge_artifact_bytes(
         &mut artifact_bytes,
@@ -2126,13 +2232,13 @@ pub fn translate_official_chunk_with_work(
         ProtoId(0),
         0,
     )?;
-    let mut refs = Vec::new();
-    refs.try_reserve_bounded_exact(preflight_state.prototypes)
+    let mut refs = allocator_scratch.vec();
+    refs.try_reserve_bounded_exact_with(preflight_state.prototypes, allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "prototype 索引配置失敗"))?;
-    collect(&chunk.main, None, 1, &mut refs, limits)?;
-    let mut validated_codes = Vec::new();
+    collect(chunk, &mut refs, limits, allocator_scratch)?;
+    let mut validated_codes = allocator_scratch.vec();
     validated_codes
-        .try_reserve_bounded_exact(refs.len())
+        .try_reserve_bounded_exact_with(refs.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "opcode 索引配置失敗"))?;
     for entry in &refs {
         work.charge(
@@ -2146,11 +2252,11 @@ pub fn translate_official_chunk_with_work(
             entry.id,
             0,
         )?;
-        validated_codes.push(validate_code(entry, chunk.profile, limits)?);
+        validated_codes.push(validate_code(entry, chunk.profile, limits, allocator_scratch)?);
     }
-    let mut hidden = Vec::new();
+    let mut hidden = allocator_scratch.vec();
     hidden
-        .try_reserve_bounded_exact(refs.len())
+        .try_reserve_bounded_exact_with(refs.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "hidden binding 索引配置失敗"))?;
     hidden.resize(refs.len(), 0_u8);
     for index in (0..refs.len()).rev() {
@@ -2174,13 +2280,13 @@ pub fn translate_official_chunk_with_work(
                 _ => {}
             }
         }
-        for &child in &refs[index].children {
+        for &child in refs[index].children {
             hidden[index] |= hidden[child.0 as usize];
         }
     }
-    let mut upvalue_maps = Vec::new();
+    let mut upvalue_maps = allocator_scratch.vec();
     upvalue_maps
-        .try_reserve_bounded_exact(refs.len())
+        .try_reserve_bounded_exact_with(refs.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "upvalue mapping 配置失敗"))?;
     for (index, entry) in refs.iter().enumerate() {
         let source_work = entry
@@ -2221,9 +2327,9 @@ pub fn translate_official_chunk_with_work(
         if total > limits.max_upvalues_per_prototype || total > usize::from(u16::MAX) {
             return Err(limited(entry.id, 0, "guest + hidden upvalue 超過 P05 限制"));
         }
-        let mut slots = Vec::new();
+        let mut slots = allocator_scratch.vec();
         slots
-            .try_reserve_bounded_exact(hidden[index].count_ones() as usize)
+            .try_reserve_bounded_exact_with(hidden[index].count_ones() as usize, allocator_scratch)
             .map_err(|error| reserve_failure(error, entry.id, 0, "hidden upvalue 配置失敗"))?;
         for kind in BUILTIN_ORDER {
             if hidden[index] & builtin_bit(kind) != 0 {
@@ -2233,14 +2339,13 @@ pub fn translate_official_chunk_with_work(
         upvalue_maps.push(OfficialUpvalueMap {
             prototype: entry.id,
             guest_count,
-            hidden: slots,
+            hidden: allocator_scratch.retain(slots).map_err(|_| allocation_failed(entry.id, 0, "hidden owner 配置失敗"))?,
         });
     }
-    let mut root_bindings = Vec::new();
+    let mut root_bindings = allocator_scratch.vec();
     root_bindings
-        .try_reserve_bounded_exact(
-            upvalue_maps[0].guest_count as usize + upvalue_maps[0].hidden.len(),
-        )
+        .try_reserve_bounded_exact_with(
+            upvalue_maps[0].guest_count as usize + upvalue_maps[0].hidden.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "root binding 配置失敗"))?;
     for index in 0..usize::from(upvalue_maps[0].guest_count) {
         root_bindings.push(OfficialRootBinding {
@@ -2258,11 +2363,11 @@ pub fn translate_official_chunk_with_work(
             source: OfficialRootBindingSource::FixedBuiltin(kind),
         });
     }
-    let mut prototypes = Vec::new();
+    let mut prototypes = allocator_scratch.vec();
     prototypes
-        .try_reserve_bounded_exact(refs.len())
+        .try_reserve_bounded_exact_with(refs.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "轉譯 prototype 配置失敗"))?;
-    let mut pc_mappings = Vec::new();
+    let mut pc_mappings = allocator_scratch.vec();
     charge_artifact_bytes(
         &mut artifact_bytes,
         refs.len()
@@ -2273,7 +2378,7 @@ pub fn translate_official_chunk_with_work(
         0,
     )?;
     pc_mappings
-        .try_reserve_bounded_exact(refs.len())
+        .try_reserve_bounded_exact_with(refs.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "PC mapping 配置失敗"))?;
     charge_artifact_bytes(
         &mut artifact_bytes,
@@ -2282,14 +2387,13 @@ pub fn translate_official_chunk_with_work(
         ProtoId(0),
         0,
     )?;
-    let mut internal_calls = Vec::new();
-    let mut frame_inputs = Vec::new();
+    let mut internal_calls = allocator_scratch.vec();
+    let mut frame_inputs = allocator_scratch.vec();
     frame_inputs
-        .try_reserve_bounded_exact(
+        .try_reserve_bounded_exact_with(
             refs.len()
                 .checked_mul(3)
-                .ok_or_else(|| invalid(ProtoId(0), 0, "frame input 數溢位"))?,
-        )
+                .ok_or_else(|| invalid(ProtoId(0), 0, "frame input 數溢位"))?, allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "frame input 索引配置失敗"))?;
     let mut translated_instructions = 0usize;
     let mut translated_constants = 0usize;
@@ -2314,8 +2418,7 @@ pub fn translate_official_chunk_with_work(
             &remaining,
             &mut close_metadata_bytes,
             &mut artifact_bytes,
-            work,
-        )?;
+            work, allocator_scratch)?;
         translated_instructions = translated_instructions
             .checked_add(prototype.instructions.len())
             .ok_or_else(|| invalid(entry.id, 0, "轉譯指令總數溢位"))?;
@@ -2331,7 +2434,7 @@ pub fn translate_official_chunk_with_work(
         pc_mappings.push(mapping);
         frame_inputs.extend(inputs);
         internal_calls
-            .try_reserve_bounded(calls.len())
+            .try_reserve_bounded_with(calls.len(), allocator_scratch)
             .map_err(|error| reserve_failure(error, entry.id, 0, "內部 Call 總索引配置失敗"))?;
         internal_calls.extend(calls);
     }
@@ -2343,9 +2446,9 @@ pub fn translate_official_chunk_with_work(
             .max()
             .unwrap_or(0),
     };
-    let mut function_prototypes = Vec::new();
+    let mut function_prototypes = allocator_scratch.vec();
     function_prototypes
-        .try_reserve_bounded_exact(prototypes.len())
+        .try_reserve_bounded_exact_with(prototypes.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "function 索引配置失敗"))?;
     for prototype in &prototypes {
         function_prototypes.push((prototype.function, prototype.id));
@@ -2375,7 +2478,14 @@ pub fn translate_official_chunk_with_work(
         ProtoId(0),
         0,
     )?;
-    let verified = verify_module(module, chunk.profile, limits).map_err(from_bytecode_error)?;
+    let verified = verify_module_with_recovery(module, chunk.profile, limits, allocator_scratch.recovery())
+        .map_err(|error| match error {
+            BytecodeRecoveryError::Bytecode(error) => from_bytecode_error(error),
+            BytecodeRecoveryError::Reserve(error) => {
+                allocator_scratch.record_refusal(error);
+                allocation_failed(ProtoId(0), 0, "P05 module 驗證配置失敗")
+            }
+        })?;
     work.charge(refs.len(), ProtoId(0), 0)?;
     let actual_register_work = verified
         .module()
@@ -2603,24 +2713,31 @@ pub fn translate_official_chunk_with_work(
         &frame_inputs,
         &internal_calls,
         &refs,
-        limits,
-    )?;
-    let artifact = OfficialArtifact::new(
+        limits, allocator_scratch)?;
+    let artifact = OfficialArtifact::new_with_recovery(
         owned_chunk,
         chunk_bytes,
         pc_mappings,
         limits.max_artifact_bytes,
+        allocator_scratch,
     )
+    .map_err(|_| allocation_failed(ProtoId(0), 0, "官方 artifact owner 配置失敗"))?
     .ok_or_else(|| limited(ProtoId(0), 0, "官方 artifact 總配置超過 P05 限制"))?;
-    let artifact = Arc::new(artifact);
-    verified.set_official_artifact(Arc::clone(&artifact));
+    let artifact = if allocator_scratch.recovery().allocator().is_lua() {
+        RetainedArc::State(allocator_scratch.shared(artifact).map_err(|_| {
+            allocation_failed(ProtoId(0), 0, "官方 artifact shared owner 配置失敗")
+        })?)
+    } else {
+        RetainedArc::Global(Arc::new(artifact))
+    };
+    verified.set_official_artifact(artifact.clone());
     Ok(OfficialTranslation {
         verified,
         artifact,
-        internal_calls,
-        frame_inputs,
-        upvalue_maps,
-        root_bindings,
+        internal_calls: allocator_scratch.retain(internal_calls).map_err(|_| allocation_failed(ProtoId(0), 0, "Call owner 配置失敗"))?,
+        frame_inputs: allocator_scratch.retain(frame_inputs).map_err(|_| allocation_failed(ProtoId(0), 0, "frame owner 配置失敗"))?,
+        upvalue_maps: allocator_scratch.retain(upvalue_maps).map_err(|_| allocation_failed(ProtoId(0), 0, "upvalue owner 配置失敗"))?,
+        root_bindings: allocator_scratch.retain(root_bindings).map_err(|_| allocation_failed(ProtoId(0), 0, "root owner 配置失敗"))?,
     })
 }
 
@@ -2632,11 +2749,12 @@ fn attach_official_plan(
     calls: &[OfficialInternalCall],
     refs: &[PrototypeRef<'_>],
     limits: &VerifyLimits,
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<VerifiedModule, OfficialTranslationError> {
     let fail = |detail| invalid(ProtoId(0), 0, detail);
-    let mut root_bindings = Vec::new();
+    let mut root_bindings = allocator_scratch.vec();
     root_bindings
-        .try_reserve_bounded_exact(roots.len())
+        .try_reserve_bounded_exact_with(roots.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "P05 root 描述配置失敗"))?;
     for root in roots {
         let source = match root.source {
@@ -2653,9 +2771,9 @@ fn attach_official_plan(
             source,
         });
     }
-    let mut upvalue_maps = Vec::new();
+    let mut upvalue_maps = allocator_scratch.vec();
     upvalue_maps
-        .try_reserve_bounded_exact(maps.len())
+        .try_reserve_bounded_exact_with(maps.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "P05 upvalue 描述配置失敗"))?;
     for (index, map) in maps.iter().enumerate() {
         let guest_start = verified.module().prototypes[index]
@@ -2665,9 +2783,9 @@ fn attach_official_plan(
                 (binding.function == map.prototype.0 && binding.ordinal == 1).then_some(*register)
             })
             .ok_or_else(|| fail("P05 guest R0 binding 缺失"))?;
-        let mut hidden = Vec::new();
+        let mut hidden = allocator_scratch.vec();
         hidden
-            .try_reserve_bounded_exact(map.hidden.len())
+            .try_reserve_bounded_exact_with(map.hidden.len(), allocator_scratch)
             .map_err(|error| {
                 reserve_failure(error, ProtoId(0), 0, "P05 hidden upvalue 描述配置失敗")
             })?;
@@ -2679,12 +2797,12 @@ fn attach_official_plan(
             guest_count: map.guest_count,
             guest_start,
             guest_register_count: u16::from(refs[index].source.max_stack_size),
-            hidden,
+            hidden: allocator_scratch.retain(hidden).map_err(|_| allocation_failed(ProtoId(0), 0, "plan hidden owner 配置失敗"))?,
         });
     }
-    let mut frame_inputs = Vec::new();
+    let mut frame_inputs = allocator_scratch.vec();
     frame_inputs
-        .try_reserve_bounded_exact(inputs.len())
+        .try_reserve_bounded_exact_with(inputs.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "P05 frame input 描述配置失敗"))?;
     for input in inputs {
         let source = match input.source {
@@ -2702,14 +2820,14 @@ fn attach_official_plan(
             source,
         });
     }
-    let mut plan_calls = Vec::new();
+    let mut plan_calls = allocator_scratch.vec();
     plan_calls
-        .try_reserve_bounded_exact(calls.len())
+        .try_reserve_bounded_exact_with(calls.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, ProtoId(0), 0, "P05 Call 描述配置失敗"))?;
     for call in calls {
-        let mut inputs = Vec::new();
+        let mut inputs = allocator_scratch.vec();
         inputs
-            .try_reserve_bounded_exact(call.inputs.len())
+            .try_reserve_bounded_exact_with(call.inputs.len(), allocator_scratch)
             .map_err(|error| reserve_failure(error, ProtoId(0), 0, "P05 Call 輸入描述配置失敗"))?;
         inputs.extend_from_slice(&call.inputs);
         plan_calls.push(OfficialPlanCall {
@@ -2717,22 +2835,29 @@ fn attach_official_plan(
             call_pc: call.call_pc,
             function_register: call.function_register,
             source_upvalue: call.source_upvalue,
-            inputs,
+            inputs: allocator_scratch.retain(inputs).map_err(|_| allocation_failed(ProtoId(0), 0, "plan input owner 配置失敗"))?,
             open_tail: call.open_tail,
             builtin: plan_builtin(call.builtin),
         });
     }
-    verify_official_execution_plan(
+    verify_official_execution_plan_with_recovery(
         verified,
-        OfficialPlanCandidate {
-            root_bindings,
-            upvalue_maps,
-            frame_inputs,
-            calls: plan_calls,
+        StateOfficialPlanCandidate {
+            root_bindings: allocator_scratch.retain(root_bindings).map_err(|_| allocation_failed(ProtoId(0), 0, "plan root owner 配置失敗"))?,
+            upvalue_maps: allocator_scratch.retain(upvalue_maps).map_err(|_| allocation_failed(ProtoId(0), 0, "plan upvalue owner 配置失敗"))?,
+            frame_inputs: allocator_scratch.retain(frame_inputs).map_err(|_| allocation_failed(ProtoId(0), 0, "plan frame owner 配置失敗"))?,
+            calls: allocator_scratch.retain(plan_calls).map_err(|_| allocation_failed(ProtoId(0), 0, "plan call owner 配置失敗"))?,
         },
         limits,
+        allocator_scratch.recovery(),
     )
-    .map_err(from_bytecode_error)
+    .map_err(|error| match error {
+        BytecodeRecoveryError::Bytecode(error) => from_bytecode_error(error),
+        BytecodeRecoveryError::Reserve(error) => {
+            allocator_scratch.record_refusal(error);
+            allocation_failed(ProtoId(0), 0, "P05 plan 驗證配置失敗")
+        }
+    })
 }
 
 fn translate_prototype(
@@ -2745,18 +2870,19 @@ fn translate_prototype(
     metadata_bytes: &mut usize,
     artifact_bytes: &mut usize,
     work: &mut OfficialWorkBudget,
+    allocator_scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<
     (
         BytecodePrototype,
         OfficialPcMap,
-        Vec<OfficialInternalCall>,
-        Vec<OfficialFrameInput>,
+        BytecodeVec<OfficialInternalCall>,
+        BytecodeVec<OfficialFrameInput>,
     ),
     OfficialTranslationError,
 > {
     let source = entry.source;
-    let close_states = analyze_close_flow(entry, &validated, profile)?;
-    let open_plans = plan_open_lists(entry, validated, profile)?;
+    let close_states = analyze_close_flow(entry, &validated, profile, allocator_scratch)?;
+    let open_plans = plan_open_lists(entry, validated, profile, allocator_scratch)?;
     if source.code.is_empty() {
         return Err(invalid(entry.id, 0, "官方 prototype 不可無指令"));
     }
@@ -2787,9 +2913,9 @@ fn translate_prototype(
         .checked_add(maximum_list.max(3) + 4)
         .ok_or_else(|| invalid(entry.id, 0, "frame register 溢位"))?;
     let mut next_tuple = tuple_start;
-    let mut numeric_tuples = Vec::new();
+    let mut numeric_tuples = allocator_scratch.vec();
     numeric_tuples
-        .try_reserve_bounded_exact(source.code.len())
+        .try_reserve_bounded_exact_with(source.code.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "numeric tuple 配置失敗"))?;
     numeric_tuples.resize(source.code.len(), None);
     for (pc, op) in validated.ops.iter().enumerate() {
@@ -2835,9 +2961,9 @@ fn translate_prototype(
         function: entry.id.0,
         ordinal: 0,
     };
-    let mut binding_registers = Vec::new();
+    let mut binding_registers = allocator_scratch.vec();
     binding_registers
-        .try_reserve_bounded_exact(2 + usize::from(source.max_stack_size) + source.code.len())
+        .try_reserve_bounded_exact_with(2 + usize::from(source.max_stack_size) + source.code.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "binding register 配置失敗"))?;
     binding_registers.push((global_environment_binding, environment));
     for register in 0..u16::from(source.max_stack_size) {
@@ -2864,12 +2990,11 @@ fn translate_prototype(
     if uses_active_varargs {
         binding_registers.push((active_vararg_binding, active_varargs));
     }
-    let mut upvalues = Vec::new();
+    let mut upvalues = allocator_scratch.vec();
     upvalues
-        .try_reserve_bounded_exact(
+        .try_reserve_bounded_exact_with(
             upvalue_maps[entry.id.0 as usize].guest_count as usize
-                + upvalue_maps[entry.id.0 as usize].hidden.len(),
-        )
+                + upvalue_maps[entry.id.0 as usize].hidden.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "upvalue 配置失敗"))?;
     for (index, upvalue) in source.upvalues.iter().enumerate() {
         let origin = if let Some(parent) = entry.parent {
@@ -2912,7 +3037,7 @@ fn translate_prototype(
             source: origin,
         });
     }
-    let mut constants = Vec::new();
+    let mut constants = allocator_scratch.vec();
     for constant in &source.constants {
         let copied = match constant {
             OfficialConstant::Nil => BytecodeConstant::Boolean(false),
@@ -2920,21 +3045,21 @@ fn translate_prototype(
             OfficialConstant::Integer(value) => BytecodeConstant::Integer(*value),
             OfficialConstant::Number(value) => BytecodeConstant::FloatBits(value.to_bits()),
             OfficialConstant::String { bytes, .. } => {
-                let mut copy = Vec::new();
-                copy.try_reserve_bounded_exact(bytes.len())
+                let mut copy = allocator_scratch.vec();
+                copy.try_reserve_bounded_exact_with(bytes.len(), allocator_scratch)
                     .map_err(|error| reserve_failure(error, entry.id, 0, "字串常數配置失敗"))?;
                 copy.extend_from_slice(bytes);
-                BytecodeConstant::String(copy)
+                BytecodeConstant::String(allocator_scratch.shared(copy).map_err(|_| allocation_failed(entry.id, 0, "字串 owner 配置失敗"))?)
             }
         };
-        append_constant(&mut constants, limits, entry.id, 0, copied)?;
+        append_constant(&mut constants, limits, entry.id, 0, copied, allocator_scratch)?;
     }
     let span = BytecodeSpan {
         start_byte: 0,
         end_byte: source.code.len() as u64 * 4,
     };
-    let mut instructions = Vec::new();
-    let mut mapping = Vec::new();
+    let mut instructions = allocator_scratch.vec();
+    let mut mapping = allocator_scratch.vec();
     charge_artifact_bytes(
         artifact_bytes,
         source
@@ -2947,7 +3072,7 @@ fn translate_prototype(
         0,
     )?;
     mapping
-        .try_reserve_bounded_exact(source.code.len())
+        .try_reserve_bounded_exact_with(source.code.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "PC mapping 配置失敗"))?;
     charge_artifact_bytes(
         artifact_bytes,
@@ -2956,27 +3081,26 @@ fn translate_prototype(
         entry.id,
         0,
     )?;
-    let mut patches = Vec::<(usize, usize)>::new();
+    let mut patches = allocator_scratch.vec();
     patches
-        .try_reserve_bounded_exact(
+        .try_reserve_bounded_exact_with(
             source
                 .code
                 .len()
                 .checked_mul(2)
-                .ok_or_else(|| invalid(entry.id, 0, "CFG patch 數溢位"))?,
-        )
+                .ok_or_else(|| invalid(entry.id, 0, "CFG patch 數溢位"))?, allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "CFG patch 配置失敗"))?;
-    let mut numeric_exit_patches = Vec::<(usize, usize)>::new();
+    let mut numeric_exit_patches = allocator_scratch.vec();
     numeric_exit_patches
-        .try_reserve_bounded_exact(source.code.len())
+        .try_reserve_bounded_exact_with(source.code.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "numeric exit 配置失敗"))?;
-    let mut internal_calls = Vec::new();
+    let mut internal_calls = allocator_scratch.vec();
     internal_calls
-        .try_reserve_bounded_exact(source.code.len())
+        .try_reserve_bounded_exact_with(source.code.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "內部 Call mapping 配置失敗"))?;
-    let mut close_paths = Vec::new();
+    let mut close_paths = allocator_scratch.vec();
     close_paths
-        .try_reserve_bounded_exact(source.code.len())
+        .try_reserve_bounded_exact_with(source.code.len(), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "close path 配置失敗"))?;
     let mut captured_flags = [false; 256];
     for child in refs.iter().filter(|child| child.parent == Some(entry.id)) {
@@ -2989,9 +3113,9 @@ fn translate_prototype(
             }
         }
     }
-    let mut captured = Vec::new();
+    let mut captured = allocator_scratch.vec();
     captured
-        .try_reserve_bounded_exact(usize::from(source.max_stack_size))
+        .try_reserve_bounded_exact_with(usize::from(source.max_stack_size), allocator_scratch)
         .map_err(|error| reserve_failure(error, entry.id, 0, "captured register 配置失敗"))?;
     for (register, needed) in captured_flags.into_iter().enumerate() {
         if needed {
@@ -3011,8 +3135,7 @@ fn translate_prototype(
                     dest: guest(register),
                     src: Register(register + 1),
                 },
-            ),
-        )?;
+            ), allocator_scratch)?;
     }
     for pc in 0..source.code.len() {
         if validated.data[pc] {
@@ -3031,15 +3154,13 @@ fn translate_prototype(
                 limits,
                 entry.id,
                 pc,
-                BytecodeConstant::Integer(first),
-            )?;
+                BytecodeConstant::Integer(first), allocator_scratch)?;
             let skip_id = append_constant(
                 &mut constants,
                 limits,
                 entry.id,
                 pc,
-                BytecodeConstant::Integer(i64::from(validated.ops[sink].a) + 1),
-            )?;
+                BytecodeConstant::Integer(i64::from(validated.ops[sink].a) + 1), allocator_scratch)?;
             push_instruction(
                 &mut instructions,
                 limits,
@@ -3051,8 +3172,7 @@ fn translate_prototype(
                         dest: open_base,
                         upvalue: source_upvalue,
                     },
-                ),
-            )?;
+                ), allocator_scratch)?;
             push_instruction(
                 &mut instructions,
                 limits,
@@ -3064,8 +3184,7 @@ fn translate_prototype(
                         dest: Register(open_base.0 + 1),
                         src: table,
                     },
-                ),
-            )?;
+                ), allocator_scratch)?;
             push_instruction(
                 &mut instructions,
                 limits,
@@ -3077,8 +3196,7 @@ fn translate_prototype(
                         dest: Register(open_base.0 + 2),
                         constant: first_id,
                     },
-                ),
-            )?;
+                ), allocator_scratch)?;
             push_instruction(
                 &mut instructions,
                 limits,
@@ -3090,8 +3208,7 @@ fn translate_prototype(
                         dest: Register(open_base.0 + 3),
                         constant: skip_id,
                     },
-                ),
-            )?;
+                ), allocator_scratch)?;
         }
         if usize::from(decoded.opcode)
             >= match profile {
@@ -3110,8 +3227,7 @@ fn translate_prototype(
                     limits,
                     &mut binding_registers,
                     &mut instructions,
-                    metadata_bytes,
-                )?;
+                    metadata_bytes, allocator_scratch)?;
             } else {
                 push_instruction(
                     &mut instructions,
@@ -3124,8 +3240,7 @@ fn translate_prototype(
                             dest: scratch,
                             src: scratch,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
             }
             continue;
         }
@@ -3142,8 +3257,7 @@ fn translate_prototype(
                 &captured,
                 &mut instructions,
                 &mut close_paths,
-                metadata_bytes,
-            )?;
+                metadata_bytes, allocator_scratch)?;
             if instructions.len() == start {
                 push_instruction(
                     &mut instructions,
@@ -3156,13 +3270,12 @@ fn translate_prototype(
                             dest: scratch,
                             src: scratch,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
             }
             continue;
         }
         if decoded.opcode == 69 {
-            let active = active_closes(close_states[pc].clone().flatten(), 0, entry.id, pc)?;
+            let active = active_closes(close_states[pc].clone().flatten(), 0, entry.id, pc, allocator_scratch)?;
             if !active.is_empty() || !captured.is_empty() {
                 push_instruction(
                     &mut instructions,
@@ -3180,8 +3293,7 @@ fn translate_prototype(
                             },
                             result_mode: ResultMode::All,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 emit_close_sequence(
                     entry,
                     pc,
@@ -3193,8 +3305,7 @@ fn translate_prototype(
                     &captured,
                     &mut instructions,
                     &mut close_paths,
-                    metadata_bytes,
-                )?;
+                    metadata_bytes, allocator_scratch)?;
                 push_instruction(
                     &mut instructions,
                     limits,
@@ -3206,8 +3317,7 @@ fn translate_prototype(
                             base: guest(decoded.a),
                             result_mode: ResultMode::All,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 continue;
             }
         }
@@ -3223,8 +3333,7 @@ fn translate_prototype(
                 &captured,
                 &mut instructions,
                 &mut close_paths,
-                metadata_bytes,
-            )?;
+                metadata_bytes, allocator_scratch)?;
         }
         let instruction = match decoded.opcode {
             0 => Instruction::Move {
@@ -3238,16 +3347,14 @@ fn translate_prototype(
                         limits,
                         entry.id,
                         pc,
-                        BytecodeConstant::Integer(i64::from(decoded.sbx)),
-                    )?
+                        BytecodeConstant::Integer(i64::from(decoded.sbx)), allocator_scratch)?
                 } else {
                     append_constant(
                         &mut constants,
                         limits,
                         entry.id,
                         pc,
-                        BytecodeConstant::FloatBits(f64::from(decoded.sbx).to_bits()),
-                    )?
+                        BytecodeConstant::FloatBits(f64::from(decoded.sbx).to_bits()), allocator_scratch)?
                 };
                 Instruction::LoadConst {
                     dest: guest(decoded.a),
@@ -3262,8 +3369,7 @@ fn translate_prototype(
                     limits,
                     entry.id,
                     pc,
-                    BytecodeConstant::Boolean(decoded.opcode == 7),
-                )?;
+                    BytecodeConstant::Boolean(decoded.opcode == 7), allocator_scratch)?;
                 Instruction::LoadConst {
                     dest: guest(decoded.a),
                     constant,
@@ -3286,7 +3392,7 @@ fn translate_prototype(
                     dest: scratch,
                     upvalue: UpvalueId(decoded.b),
                 };
-                push_instruction(&mut instructions, limits, entry.id, pc, entry_at(pc, get))?;
+                push_instruction(&mut instructions, limits, entry.id, pc, entry_at(pc, get), allocator_scratch)?;
                 push_instruction(
                     &mut instructions,
                     limits,
@@ -3295,8 +3401,7 @@ fn translate_prototype(
                     entry_at(
                         pc,
                         original_constant_load(source, scratch1, u32::from(decoded.c)),
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 Instruction::GetTable {
                     dest: guest(decoded.a),
                     table: scratch,
@@ -3314,8 +3419,7 @@ fn translate_prototype(
                     limits,
                     entry.id,
                     pc,
-                    BytecodeConstant::Integer(i64::from(decoded.c)),
-                )?;
+                    BytecodeConstant::Integer(i64::from(decoded.c)), allocator_scratch)?;
                 push_instruction(
                     &mut instructions,
                     limits,
@@ -3327,8 +3431,7 @@ fn translate_prototype(
                             dest: scratch,
                             constant: key,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 Instruction::GetTable {
                     dest: guest(decoded.a),
                     table: guest(decoded.b),
@@ -3344,8 +3447,7 @@ fn translate_prototype(
                     entry_at(
                         pc,
                         original_constant_load(source, scratch, u32::from(decoded.c)),
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 Instruction::GetTable {
                     dest: guest(decoded.a),
                     table: guest(decoded.b),
@@ -3357,7 +3459,7 @@ fn translate_prototype(
                     dest: scratch,
                     upvalue: UpvalueId(decoded.a),
                 };
-                push_instruction(&mut instructions, limits, entry.id, pc, entry_at(pc, get))?;
+                push_instruction(&mut instructions, limits, entry.id, pc, entry_at(pc, get), allocator_scratch)?;
                 push_instruction(
                     &mut instructions,
                     limits,
@@ -3366,8 +3468,7 @@ fn translate_prototype(
                     entry_at(
                         pc,
                         original_constant_load(source, scratch1, u32::from(decoded.b)),
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 let value = if decoded.k {
                     push_instruction(
                         &mut instructions,
@@ -3377,8 +3478,7 @@ fn translate_prototype(
                         entry_at(
                             pc,
                             original_constant_load(source, scratch2, u32::from(decoded.c)),
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     scratch2
                 } else {
                     guest(decoded.c)
@@ -3399,8 +3499,7 @@ fn translate_prototype(
                         entry_at(
                             pc,
                             original_constant_load(source, scratch, u32::from(decoded.c)),
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     scratch
                 } else {
                     guest(decoded.c)
@@ -3417,8 +3516,7 @@ fn translate_prototype(
                     limits,
                     entry.id,
                     pc,
-                    BytecodeConstant::Integer(i64::from(decoded.b)),
-                )?;
+                    BytecodeConstant::Integer(i64::from(decoded.b)), allocator_scratch)?;
                 push_instruction(
                     &mut instructions,
                     limits,
@@ -3430,8 +3528,7 @@ fn translate_prototype(
                             dest: scratch,
                             constant: key,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 let value = if decoded.k {
                     push_instruction(
                         &mut instructions,
@@ -3441,8 +3538,7 @@ fn translate_prototype(
                         entry_at(
                             pc,
                             original_constant_load(source, scratch1, u32::from(decoded.c)),
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     scratch1
                 } else {
                     guest(decoded.c)
@@ -3462,8 +3558,7 @@ fn translate_prototype(
                     entry_at(
                         pc,
                         original_constant_load(source, scratch, u32::from(decoded.b)),
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 let value = if decoded.k {
                     push_instruction(
                         &mut instructions,
@@ -3473,8 +3568,7 @@ fn translate_prototype(
                         entry_at(
                             pc,
                             original_constant_load(source, scratch1, u32::from(decoded.c)),
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     scratch1
                 } else {
                     guest(decoded.c)
@@ -3500,8 +3594,7 @@ fn translate_prototype(
                             dest: scratch,
                             src: guest(decoded.b),
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 let key = if profile == LuaProfile::Lua55 || decoded.k {
                     push_instruction(
                         &mut instructions,
@@ -3511,8 +3604,7 @@ fn translate_prototype(
                         entry_at(
                             pc,
                             original_constant_load(source, scratch1, u32::from(decoded.c)),
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     scratch1
                 } else {
                     guest(decoded.c)
@@ -3528,8 +3620,7 @@ fn translate_prototype(
                             dest: guest(decoded.a + 1),
                             src: scratch,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 Instruction::GetTable {
                     dest: guest(decoded.a),
                     table: scratch,
@@ -3570,8 +3661,7 @@ fn translate_prototype(
                             limits,
                             entry.id,
                             pc,
-                            BytecodeConstant::Integer(value),
-                        )?
+                            BytecodeConstant::Integer(value), allocator_scratch)?
                     };
                     push_instruction(
                         &mut instructions,
@@ -3584,8 +3674,7 @@ fn translate_prototype(
                                 dest: scratch,
                                 constant,
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     right = scratch;
                     if adjacent.k {
                         core::mem::swap(&mut left, &mut right);
@@ -3620,8 +3709,7 @@ fn translate_prototype(
                             dest: scratch,
                             src: guest(decoded.a + decoded.b - 1),
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 for register in (decoded.a..decoded.a + decoded.b - 1).rev() {
                     push_instruction(
                         &mut instructions,
@@ -3636,8 +3724,7 @@ fn translate_prototype(
                                 left: guest(register),
                                 right: scratch,
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                 }
                 Instruction::Move {
                     dest: guest(decoded.a),
@@ -3650,8 +3737,7 @@ fn translate_prototype(
                     limits,
                     entry.id,
                     pc,
-                    BytecodeConstant::Boolean(false),
-                )?;
+                    BytecodeConstant::Boolean(false), allocator_scratch)?;
                 push_instruction(
                     &mut instructions,
                     limits,
@@ -3663,8 +3749,7 @@ fn translate_prototype(
                             dest: guest(decoded.a),
                             constant,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 patches.push((instructions.len(), pc + 2));
                 Instruction::Jump {
                     target: InstructionOffset(0),
@@ -3689,8 +3774,7 @@ fn translate_prototype(
                                 dest: scratch2,
                                 src: scratch2,
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                 }
                 patches.push((instructions.len(), target));
                 Instruction::Jump {
@@ -3715,8 +3799,7 @@ fn translate_prototype(
                         entry_at(
                             pc,
                             original_constant_load(source, scratch1, u32::from(decoded.b)),
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     scratch1
                 } else if decoded.opcode >= 61 {
                     let constant = append_constant(
@@ -3724,8 +3807,7 @@ fn translate_prototype(
                         limits,
                         entry.id,
                         pc,
-                        BytecodeConstant::Integer(i64::from(decoded.sb)),
-                    )?;
+                        BytecodeConstant::Integer(i64::from(decoded.sb)), allocator_scratch)?;
                     push_instruction(
                         &mut instructions,
                         limits,
@@ -3737,8 +3819,7 @@ fn translate_prototype(
                                 dest: scratch1,
                                 constant,
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     scratch1
                 } else {
                     guest(decoded.b)
@@ -3756,8 +3837,7 @@ fn translate_prototype(
                             left: guest(decoded.a),
                             right,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 if !decoded.k {
                     push_instruction(
                         &mut instructions,
@@ -3771,8 +3851,7 @@ fn translate_prototype(
                                 op: UnaryOperation::Not,
                                 src: scratch,
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                 }
                 patches.push((instructions.len(), pc + 2));
                 Instruction::JumpIfFalse {
@@ -3805,8 +3884,7 @@ fn translate_prototype(
                             end_byte: (pc as u64 + 1) * 4,
                         },
                         close_path: None,
-                    },
-                )?;
+                    }, allocator_scratch)?;
                 patches.push((instructions.len(), pc + 2));
                 Instruction::JumpIfFalse {
                     condition: scratch,
@@ -3831,8 +3909,7 @@ fn translate_prototype(
                     limits,
                     entry.id,
                     pc,
-                    entry_at(pc, condition),
-                )?;
+                    entry_at(pc, condition), allocator_scratch)?;
                 patches.push((instructions.len(), pc + 2));
                 push_instruction(
                     &mut instructions,
@@ -3845,8 +3922,7 @@ fn translate_prototype(
                             condition: scratch,
                             target: InstructionOffset(0),
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 Instruction::Move {
                     dest: guest(decoded.a),
                     src: guest(decoded.b),
@@ -3931,8 +4007,7 @@ fn translate_prototype(
                                 dest,
                                 src: guest(src),
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                 }
                 patches.push((instructions.len(), pc + decoded.bx as usize + 2));
                 Instruction::NumericForPrepare {
@@ -3956,8 +4031,7 @@ fn translate_prototype(
                                 dest: scratch,
                                 src: guest(decoded.a + 2),
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     push_instruction(
                         &mut instructions,
                         limits,
@@ -3969,8 +4043,7 @@ fn translate_prototype(
                                 dest: guest(decoded.a + 2),
                                 src: guest(decoded.a + 3),
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     push_instruction(
                         &mut instructions,
                         limits,
@@ -3982,8 +4055,7 @@ fn translate_prototype(
                                 dest: guest(decoded.a + 3),
                                 src: scratch,
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                 }
                 if close_states[pc].is_some() {
                     let closing =
@@ -3995,8 +4067,7 @@ fn translate_prototype(
                         limits,
                         &mut binding_registers,
                         &mut instructions,
-                        metadata_bytes,
-                    )?;
+                        metadata_bytes, allocator_scratch)?;
                 }
                 patches.push((instructions.len(), pc + decoded.bx as usize + 1));
                 Instruction::Jump {
@@ -4016,8 +4087,7 @@ fn translate_prototype(
                         limits,
                         entry.id,
                         pc,
-                        entry_at(pc, Instruction::Move { dest, src }),
-                    )?;
+                        entry_at(pc, Instruction::Move { dest, src }), allocator_scratch)?;
                 }
                 for (dest, src) in [
                     (call_base, scratch),
@@ -4029,8 +4099,7 @@ fn translate_prototype(
                         limits,
                         entry.id,
                         pc,
-                        entry_at(pc, Instruction::Move { dest, src }),
-                    )?;
+                        entry_at(pc, Instruction::Move { dest, src }), allocator_scratch)?;
                 }
                 Instruction::Call {
                     base: call_base,
@@ -4051,8 +4120,7 @@ fn translate_prototype(
                             start: scratch,
                             count: 1,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 push_instruction(
                     &mut instructions,
                     limits,
@@ -4066,8 +4134,7 @@ fn translate_prototype(
                             left: result,
                             right: scratch,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 let target = (pc + 1)
                     .checked_sub(decoded.bx as usize)
                     .ok_or_else(|| invalid(entry.id, pc, "TFORLOOP 回邊欠位"))?;
@@ -4090,8 +4157,7 @@ fn translate_prototype(
                                 condition: scratch1,
                                 target: InstructionOffset(move_index as u32),
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     patches.push((instructions.len(), pc + 1));
                     push_instruction(
                         &mut instructions,
@@ -4103,8 +4169,7 @@ fn translate_prototype(
                             Instruction::Jump {
                                 target: InstructionOffset(0),
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     push_instruction(
                         &mut instructions,
                         limits,
@@ -4116,8 +4181,7 @@ fn translate_prototype(
                                 dest: guest(decoded.a + 2),
                                 src: result,
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     patches.push((instructions.len(), target));
                     Instruction::Jump {
                         target: InstructionOffset(0),
@@ -4137,9 +4201,9 @@ fn translate_prototype(
                         .ok_or_else(|| invalid(entry.id, pc, "開放 SETLIST producer 映射缺失"))?;
                     let producer = guest(validated.ops[producer_pc].a);
                     let call_pc = InstructionOffset(instructions.len() as u32);
-                    let mut inputs = Vec::new();
+                    let mut inputs = allocator_scratch.vec();
                     inputs
-                        .try_reserve_bounded_exact(usize::from(producer.0 - open_base.0 - 1))
+                        .try_reserve_bounded_exact_with(usize::from(producer.0 - open_base.0 - 1), allocator_scratch)
                         .map_err(|error| {
                             reserve_failure(error, entry.id, pc, "開放 SETLIST 引數索引配置失敗")
                         })?;
@@ -4152,7 +4216,7 @@ fn translate_prototype(
                         call_pc,
                         function_register: open_base,
                         source_upvalue,
-                        inputs,
+                        inputs: allocator_scratch.retain(inputs).map_err(|_| allocation_failed(entry.id, pc, "Call input owner 配置失敗"))?,
                         open_tail: Some(producer),
                         builtin,
                     });
@@ -4173,8 +4237,7 @@ fn translate_prototype(
                                 dest: builtin_base,
                                 upvalue: source_upvalue,
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     let first = list_first_index(entry, validated, pc, profile)?;
                     push_instruction(
                         &mut instructions,
@@ -4187,15 +4250,13 @@ fn translate_prototype(
                                 dest: Register(builtin_base.0 + 1),
                                 src: guest(decoded.a),
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     let index = append_constant(
                         &mut constants,
                         limits,
                         entry.id,
                         pc,
-                        BytecodeConstant::Integer(first),
-                    )?;
+                        BytecodeConstant::Integer(first), allocator_scratch)?;
                     push_instruction(
                         &mut instructions,
                         limits,
@@ -4207,15 +4268,13 @@ fn translate_prototype(
                                 dest: Register(builtin_base.0 + 2),
                                 constant: index,
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     let skip = append_constant(
                         &mut constants,
                         limits,
                         entry.id,
                         pc,
-                        BytecodeConstant::Integer(0),
-                    )?;
+                        BytecodeConstant::Integer(0), allocator_scratch)?;
                     push_instruction(
                         &mut instructions,
                         limits,
@@ -4227,8 +4286,7 @@ fn translate_prototype(
                                 dest: Register(builtin_base.0 + 3),
                                 constant: skip,
                             },
-                        ),
-                    )?;
+                        ), allocator_scratch)?;
                     for offset in 0..count {
                         push_instruction(
                             &mut instructions,
@@ -4241,13 +4299,12 @@ fn translate_prototype(
                                     dest: Register(builtin_base.0 + 4 + offset),
                                     src: guest(decoded.a + 1 + offset),
                                 },
-                            ),
-                        )?;
+                            ), allocator_scratch)?;
                     }
                     let call_pc = InstructionOffset(instructions.len() as u32);
-                    let mut inputs = Vec::new();
+                    let mut inputs = allocator_scratch.vec();
                     inputs
-                        .try_reserve_bounded_exact(usize::from(count + 3))
+                        .try_reserve_bounded_exact_with(usize::from(count + 3), allocator_scratch)
                         .map_err(|error| {
                             reserve_failure(error, entry.id, pc, "SETLIST 引數索引配置失敗")
                         })?;
@@ -4260,7 +4317,7 @@ fn translate_prototype(
                         call_pc,
                         function_register: builtin_base,
                         source_upvalue,
-                        inputs,
+                        inputs: allocator_scratch.retain(inputs).map_err(|_| allocation_failed(entry.id, pc, "Call input owner 配置失敗"))?,
                         open_tail: None,
                         builtin,
                     });
@@ -4291,8 +4348,7 @@ fn translate_prototype(
                                     dest: builtin_base,
                                     upvalue: source_upvalue,
                                 },
-                            ),
-                        )?;
+                            ), allocator_scratch)?;
                         push_instruction(
                             &mut instructions,
                             limits,
@@ -4304,8 +4360,7 @@ fn translate_prototype(
                                     dest: Register(builtin_base.0 + 1),
                                     src: guest(decoded.b),
                                 },
-                            ),
-                        )?;
+                            ), allocator_scratch)?;
                         let wanted = if decoded.c == 0 {
                             -1
                         } else {
@@ -4316,8 +4371,7 @@ fn translate_prototype(
                             limits,
                             entry.id,
                             pc,
-                            BytecodeConstant::Integer(wanted),
-                        )?;
+                            BytecodeConstant::Integer(wanted), allocator_scratch)?;
                         push_instruction(
                             &mut instructions,
                             limits,
@@ -4329,11 +4383,10 @@ fn translate_prototype(
                                     dest: Register(builtin_base.0 + 2),
                                     constant: count,
                                 },
-                            ),
-                        )?;
+                            ), allocator_scratch)?;
                         let call_pc = InstructionOffset(instructions.len() as u32);
-                        let mut inputs = Vec::new();
-                        inputs.try_reserve_bounded_exact(2).map_err(|error| {
+                        let mut inputs = allocator_scratch.vec();
+                        inputs.try_reserve_bounded_exact_with(2, allocator_scratch).map_err(|error| {
                             reserve_failure(error, entry.id, pc, "PackUnpack 引數索引配置失敗")
                         })?;
                         inputs.extend([Register(builtin_base.0 + 1), Register(builtin_base.0 + 2)]);
@@ -4343,7 +4396,7 @@ fn translate_prototype(
                             call_pc,
                             function_register: builtin_base,
                             source_upvalue,
-                            inputs,
+                            inputs: allocator_scratch.retain(inputs).map_err(|_| allocation_failed(entry.id, pc, "Call input owner 配置失敗"))?,
                             open_tail: None,
                             builtin,
                         });
@@ -4359,8 +4412,7 @@ fn translate_prototype(
                                     arg_count: 2,
                                     result_mode: ResultMode::Fixed(1),
                                 },
-                            ),
-                        )?;
+                            ), allocator_scratch)?;
                         push_instruction(
                             &mut instructions,
                             limits,
@@ -4372,8 +4424,7 @@ fn translate_prototype(
                                     dest: active_varargs,
                                     src: builtin_base,
                                 },
-                            ),
-                        )?;
+                            ), allocator_scratch)?;
                     } else {
                         push_instruction(
                             &mut instructions,
@@ -4386,8 +4437,7 @@ fn translate_prototype(
                                     dest: active_varargs,
                                     src: raw_varargs,
                                 },
-                            ),
-                        )?;
+                            ), allocator_scratch)?;
                     }
                 }
                 Instruction::Vararg {
@@ -4413,8 +4463,7 @@ fn translate_prototype(
                             dest: builtin_base,
                             upvalue: source_upvalue,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 push_instruction(
                     &mut instructions,
                     limits,
@@ -4426,8 +4475,7 @@ fn translate_prototype(
                             dest: Register(builtin_base.0 + 1),
                             src: raw_varargs,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 push_instruction(
                     &mut instructions,
                     limits,
@@ -4439,11 +4487,10 @@ fn translate_prototype(
                             dest: Register(builtin_base.0 + 2),
                             src: guest(decoded.c),
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 let call_pc = InstructionOffset(instructions.len() as u32);
-                let mut inputs = Vec::new();
-                inputs.try_reserve_bounded_exact(2).map_err(|error| {
+                let mut inputs = allocator_scratch.vec();
+                inputs.try_reserve_bounded_exact_with(2, allocator_scratch).map_err(|error| {
                     reserve_failure(error, entry.id, pc, "VarargGet 引數索引配置失敗")
                 })?;
                 inputs.extend([Register(builtin_base.0 + 1), Register(builtin_base.0 + 2)]);
@@ -4453,7 +4500,7 @@ fn translate_prototype(
                     call_pc,
                     function_register: builtin_base,
                     source_upvalue,
-                    inputs,
+                    inputs: allocator_scratch.retain(inputs).map_err(|_| allocation_failed(entry.id, pc, "Call input owner 配置失敗"))?,
                     open_tail: None,
                     builtin,
                 });
@@ -4469,8 +4516,7 @@ fn translate_prototype(
                             arg_count: 2,
                             result_mode: ResultMode::Fixed(1),
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 Instruction::Move {
                     dest: guest(decoded.a),
                     src: builtin_base,
@@ -4490,8 +4536,7 @@ fn translate_prototype(
                             dest: builtin_base,
                             upvalue: source_upvalue,
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 push_instruction(
                     &mut instructions,
                     limits,
@@ -4503,8 +4548,7 @@ fn translate_prototype(
                             dest: Register(builtin_base.0 + 1),
                             src: guest(decoded.a),
                         },
-                    ),
-                )?;
+                    ), allocator_scratch)?;
                 let name = Register(builtin_base.0 + 2);
                 let load_name = if decoded.bx == 0 {
                     Instruction::LoadNil {
@@ -4519,11 +4563,10 @@ fn translate_prototype(
                     limits,
                     entry.id,
                     pc,
-                    entry_at(pc, load_name),
-                )?;
+                    entry_at(pc, load_name), allocator_scratch)?;
                 let call_pc = InstructionOffset(instructions.len() as u32);
-                let mut inputs = Vec::new();
-                inputs.try_reserve_bounded_exact(2).map_err(|error| {
+                let mut inputs = allocator_scratch.vec();
+                inputs.try_reserve_bounded_exact_with(2, allocator_scratch).map_err(|error| {
                     reserve_failure(error, entry.id, pc, "GlobalNilCheck 引數索引配置失敗")
                 })?;
                 inputs.extend([Register(builtin_base.0 + 1), name]);
@@ -4533,7 +4576,7 @@ fn translate_prototype(
                     call_pc,
                     function_register: builtin_base,
                     source_upvalue,
-                    inputs,
+                    inputs: allocator_scratch.retain(inputs).map_err(|_| allocation_failed(entry.id, pc, "Call input owner 配置失敗"))?,
                     open_tail: None,
                     builtin,
                 });
@@ -4567,8 +4610,7 @@ fn translate_prototype(
                     end_byte: (pc as u64 + 1) * 4,
                 },
                 close_path: None,
-            },
-        )?;
+            }, allocator_scratch)?;
         if (57..=67).contains(&decoded.opcode) {
             // 官方條件指令在同一次 dispatch 內消費緊接的 JMP；保留原 JMP 的
             // 獨立 anchor，讓其他合法入邊直接進入時仍以一般指令計數。
@@ -4597,8 +4639,7 @@ fn translate_prototype(
                     Instruction::Jump {
                         target: InstructionOffset(0),
                     },
-                ),
-            )?;
+                ), allocator_scratch)?;
         }
         if decoded.opcode == 78 || decoded.opcode == 82 && profile == LuaProfile::Lua55 {
             let register = if decoded.opcode == 78
@@ -4623,8 +4664,7 @@ fn translate_prototype(
                         start: register,
                         count: 1,
                     },
-                ),
-            )?;
+                ), allocator_scratch)?;
         }
     }
     for (index, target) in patches {
@@ -4701,10 +4741,10 @@ fn translate_prototype(
         instructions,
         close_paths,
     };
-    let mut frame_inputs = Vec::new();
+    let mut frame_inputs = allocator_scratch.vec();
     if profile == LuaProfile::Lua55 {
         frame_inputs
-            .try_reserve_bounded_exact(3)
+            .try_reserve_bounded_exact_with(3, allocator_scratch)
             .map_err(|error| reserve_failure(error, entry.id, 0, "frame input 配置失敗"))?;
         if validated
             .ops
@@ -4739,8 +4779,7 @@ fn translate_prototype(
         &prototype.instructions,
         artifact_bytes,
         limits,
-        work,
-    )?;
+        work, allocator_scratch)?;
     Ok((prototype, pc_map, internal_calls, frame_inputs))
 }
 

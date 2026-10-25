@@ -12,7 +12,12 @@ path = "src/lib.rs"
 
 [features]
 default = ["std"]
-std = []
+std = ["rivetlua-alloc/std"]
 
 [dependencies]
+allocator-api2 = { version = "=0.2.21", default-features = false, features = ["alloc"] }
+rivetlua-alloc = { path = "../rivetlua-alloc", default-features = false }
 libm = { version = "0.2.16", default-features = false }
+
+[dev-dependencies]
+rivetlua-alloc = { path = "../rivetlua-alloc", default-features = false, features = ["test-support"] }

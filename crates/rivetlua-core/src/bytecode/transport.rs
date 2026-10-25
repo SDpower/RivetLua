@@ -4,9 +4,13 @@ use alloc::vec::Vec;
 
 use alloc::sync::Arc;
 use core::mem::size_of;
+use rivetlua_alloc::{
+    AllocationRecovery, GlobalAllocation, ReserveError, StateAllocator, try_reserve_exact_with,
+};
 
 use super::codec::{
-    BytecodeClosePath, BytecodeConstant, BytecodeError, BytecodeErrorCode, BytecodeModule,
+    BytecodeClosePath, BytecodeClosePathData, BytecodeConstant, BytecodeError,
+    BytecodeErrorCode, BytecodeInstruction, BytecodeModule, BytecodeVec,
     VerifiedModule, VerifyLimits, decode_module, encode_verified_module_bytes_bounded,
 };
 use super::native_debug::{
@@ -181,6 +185,24 @@ pub struct TransportError {
     pub kind: TransportErrorKind,
     pub offset: usize,
     pub detail: &'static str,
+}
+
+#[derive(Debug)]
+pub enum TransportMeasureRecoveryError<E> {
+    Transport(TransportError),
+    Reserve(ReserveError<E>),
+}
+
+impl<E> From<TransportError> for TransportMeasureRecoveryError<E> {
+    fn from(error: TransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+impl<E> From<ReserveError<E>> for TransportMeasureRecoveryError<E> {
+    fn from(error: ReserveError<E>) -> Self {
+        Self::Reserve(error)
+    }
 }
 
 impl core::fmt::Display for TransportError {
@@ -518,23 +540,25 @@ fn write_native_declarations(
     bytes.extend_from_slice(&sha256(rvlu)?);
     bytes.extend_from_slice(&checked_u32(plan.calls().len())?.to_le_bytes());
     for call in plan.calls() {
-        let Some(tail) = call.open_tail else {
-            return Err(invalid(0, "native helper open tail 缺失"));
+        let (tag, count, tail) = match (call.builtin, call.inputs.len(), call.open_tail) {
+            (OfficialPlanBuiltin::RawListWrite, 3, Some(tail)) => (0u8, 3u16, Some(tail)),
+            (OfficialPlanBuiltin::GlobalNilCheck, 2, None) => (1u8, 2u16, None),
+            _ => return Err(invalid(0, "native helper 宣告 ABI 無效")),
         };
-        if call.builtin != OfficialPlanBuiltin::RawListWrite || call.inputs.len() != 3 {
-            return Err(invalid(0, "native helper 宣告不符合 RawListWrite ABI"));
-        }
         bytes.extend_from_slice(&call.prototype.0.to_le_bytes());
         bytes.extend_from_slice(&call.call_pc.0.to_le_bytes());
         bytes.extend_from_slice(&call.function_register.0.to_le_bytes());
         bytes.extend_from_slice(&call.source_upvalue.0.to_le_bytes());
-        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
         for input in &call.inputs {
             bytes.extend_from_slice(&input.0.to_le_bytes());
         }
-        bytes.push(1);
-        bytes.extend_from_slice(&tail.0.to_le_bytes());
-        bytes.push(0);
+        if count == 2 {
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+        }
+        bytes.push(u8::from(tail.is_some()));
+        bytes.extend_from_slice(&tail.map_or(0, |register| register.0).to_le_bytes());
+        bytes.push(tag);
     }
     match debug {
         Some(debug) => {
@@ -574,26 +598,25 @@ fn scan_native_declarations(
         let pc = reader.u32()?;
         let base = reader.u16()?;
         let _upvalue = reader.u16()?;
-        if reader.u16()? != 3 {
-            return Err(invalid(reader.at, "native helper input count 無效"));
-        }
+        let count = reader.u16()?;
+        let mut inputs = [0u16; 3];
         for offset in 1..=3 {
-            if reader.u16()?
-                != base
-                    .checked_add(offset)
-                    .ok_or_else(|| invalid(reader.at, "native helper register 溢位"))?
-            {
-                return Err(invalid(reader.at, "native helper inputs 不連續"));
-            }
+            inputs[offset - 1] = reader.u16()?;
         }
-        if reader.u8()? != 1
-            || reader.u16()?
-                != base
-                    .checked_add(4)
-                    .ok_or_else(|| invalid(reader.at, "native helper tail register 溢位"))?
-            || reader.u8()? != 0
-        {
-            return Err(invalid(reader.at, "native helper tail/builtin 無效"));
+        let tail_flag = reader.u8()?;
+        let tail = reader.u16()?;
+        let kind = reader.u8()?;
+        let valid = match (kind, count, tail_flag) {
+            (0, 3, 1) => inputs.iter().enumerate().all(|(index, input)| {
+                base.checked_add(index as u16 + 1) == Some(*input)
+            }) && base.checked_add(4) == Some(tail),
+            (1, 2, 0) => base.checked_add(1) == Some(inputs[0])
+                && base.checked_add(2) == Some(inputs[1])
+                && inputs[2] == 0 && tail == 0,
+            _ => false,
+        };
+        if !valid {
+            return Err(invalid(reader.at, "native helper input/tail/builtin 無效"));
         }
         if previous.is_some_and(|last| last >= (prototype, pc)) {
             return Err(invalid(reader.at, "native helper call 重複或順序無效"));
@@ -630,29 +653,36 @@ fn read_native_declarations(
         let call_pc = InstructionOffset(reader.u32()?);
         let function_register = Register(reader.u16()?);
         let source_upvalue = UpvalueId(reader.u16()?);
-        if reader.u16()? != 3 {
-            return Err(invalid(reader.at, "native helper input count 無效"));
+        let input_count = reader.u16()?;
+        let raw_inputs = [reader.u16()?, reader.u16()?, reader.u16()?];
+        let tail_flag = reader.u8()?;
+        let tail = reader.u16()?;
+        let tag = reader.u8()?;
+        let (builtin, count, open_tail) = match (tag, input_count, tail_flag) {
+            (0, 3, 1) if function_register.0.checked_add(4) == Some(tail) =>
+                (OfficialPlanBuiltin::RawListWrite, 3, Some(Register(tail))),
+            (1, 2, 0) if raw_inputs[2] == 0 && tail == 0 =>
+                (OfficialPlanBuiltin::GlobalNilCheck, 2, None),
+            _ => return Err(invalid(reader.at, "native helper input/tail/builtin 無效")),
+        };
+        if raw_inputs[..count].iter().enumerate().any(|(index, input)| {
+            function_register.0.checked_add(index as u16 + 1) != Some(*input)
+        }) {
+            return Err(invalid(reader.at, "native helper inputs 不連續"));
         }
         let mut inputs = Vec::new();
-        meter.reserve(&mut inputs, 3)?;
-        for _ in 0..3 {
-            inputs.push(Register(reader.u16()?));
-        }
-        if reader.u8()? != 1 {
-            return Err(invalid(reader.at, "native helper open tail 缺失"));
-        }
-        let open_tail = Some(Register(reader.u16()?));
-        if reader.u8()? != 0 {
-            return Err(invalid(reader.at, "native helper builtin 未知"));
+        meter.reserve(&mut inputs, count)?;
+        for input in &raw_inputs[..count] {
+            inputs.push(Register(*input));
         }
         calls.push(OfficialPlanCall {
             prototype,
             call_pc,
             function_register,
             source_upvalue,
-            inputs,
+            inputs: inputs.into(),
             open_tail,
-            builtin: OfficialPlanBuiltin::RawListWrite,
+            builtin,
         });
     }
     let debug = match reader.u8()? {
@@ -788,7 +818,7 @@ fn read_native_body(
                 initialized_pc: reader.u32()?,
                 start_pc: reader.u32()?,
                 end_pc: reader.u32()?,
-                name: read_copy(&mut reader, meter)?,
+                name: read_copy(&mut reader, meter)?.into(),
             });
         }
         let name_count = reader.u32()? as usize;
@@ -808,9 +838,10 @@ fn read_native_body(
             prototype,
             line_defined,
             last_line_defined,
-            lines,
-            locals,
-            upvalue_names,
+            lines: lines.into(),
+            locals: locals.into(),
+            upvalue_names: upvalue_names.into_iter()
+                .map(|name| name.map(Into::into)).collect::<Vec<_>>().into(),
             max_active_locals,
         });
     }
@@ -830,6 +861,7 @@ struct RvluCounts {
     prototypes: usize,
     instructions: usize,
     constants: usize,
+    close_paths: usize,
     metadata_quadratic: usize,
 }
 
@@ -896,10 +928,11 @@ fn scan_result_mode(reader: &mut Cursor<'_>) -> Result<(), TransportError> {
 fn scan_instructions(
     section: &[u8],
     limits: &VerifyLimits,
-) -> Result<(usize, usize), TransportError> {
+) -> Result<(usize, usize, usize), TransportError> {
     let mut reader = Cursor::new(section);
     let count = reader.u32()? as usize;
     let mut close_bindings = 0usize;
+    let mut close_paths = 0usize;
     if count > limits.max_instructions {
         return Err(limit("RVLU instruction count 超限"));
     }
@@ -946,6 +979,7 @@ fn scan_instructions(
         match reader.u8()? {
             0 => {}
             1 => {
+                close_paths = checked_add(close_paths, 1)?;
                 close_bindings =
                     checked_add(close_bindings, scan_close_path(&mut reader, limits)?)?;
             }
@@ -953,13 +987,13 @@ fn scan_instructions(
         }
     }
     reader.end()?;
-    Ok((count, close_bindings))
+    Ok((count, close_bindings, close_paths))
 }
 
 fn scan_metadata(
     section: &[u8],
     limits: &VerifyLimits,
-) -> Result<(usize, usize, usize), TransportError> {
+) -> Result<(usize, usize, usize, usize), TransportError> {
     let mut reader = Cursor::new(section);
     let bindings = reader.u32()? as usize;
     if bindings > limits.max_constants {
@@ -991,7 +1025,7 @@ fn scan_metadata(
         close_bindings = checked_add(close_bindings, scan_close_path(&mut reader, limits)?)?;
     }
     reader.end()?;
-    Ok((bindings, upvalues, close_bindings))
+    Ok((bindings, upvalues, close_bindings, close))
 }
 
 fn scan_rvlu(
@@ -1063,9 +1097,15 @@ fn scan_rvlu(
         let metadata = proto.section()?;
         proto.end()?;
         stats.constants = checked_add(stats.constants, scan_constants(constants, limits)?)?;
-        let (instruction_count, inline_close) = scan_instructions(instructions, limits)?;
+        let (instruction_count, inline_close, inline_close_paths) =
+            scan_instructions(instructions, limits)?;
         stats.instructions = checked_add(stats.instructions, instruction_count)?;
-        let (bindings, upvalues, metadata_close) = scan_metadata(metadata, limits)?;
+        let (bindings, upvalues, metadata_close, metadata_close_paths) =
+            scan_metadata(metadata, limits)?;
+        stats.close_paths = checked_add(
+            stats.close_paths,
+            checked_add(inline_close_paths, metadata_close_paths)?,
+        )?;
         let close = checked_add(inline_close, metadata_close)?;
         let b_plus_close = checked_add(bindings, close)?;
         let i_plus_close = checked_add(instruction_count, close)?;
@@ -1170,9 +1210,24 @@ pub fn preflight_transport_decode(
         )?,
         checked_mul(rvlu_stats.metadata_quadratic, 256)?,
     )?;
-    let mut temporary = checked_mul(rvlu.len(), 256)?;
-    let mut retained = checked_mul(rvlu.len(), 128)?;
-    let mut subsequent_work = base_work;
+    let mut temporary = checked_add(
+        checked_mul(rvlu.len(), 256)?,
+        checked_mul(
+            checked_add(rvlu_stats.constants, rvlu_stats.close_paths)?,
+            size_of::<(usize, usize)>(),
+        )?,
+    )?;
+    let mut retained = checked_add(
+        checked_mul(rvlu.len(), 128)?,
+        checked_mul(
+            rvlu_stats.constants,
+            StateAllocator::shared_block_size::<BytecodeVec<u8>>(),
+        )?,
+    )?;
+    let mut subsequent_work = checked_add(
+        base_work,
+        owner_sort_work(checked_add(rvlu_stats.constants, rvlu_stats.close_paths)?)?,
+    )?;
     match kind {
         0 => {}
         1 => {
@@ -1281,14 +1336,14 @@ fn close_wire_upper(close: &BytecodeClosePath) -> Result<usize, TransportError> 
     )
 }
 
-fn vector_bytes<T>(values: &Vec<T>) -> Result<usize, TransportError> {
+fn vector_bytes<T>(values: &BytecodeVec<T>) -> Result<usize, TransportError> {
     checked_mul(values.capacity(), size_of::<T>())
 }
 
 fn close_retained(close: &BytecodeClosePath) -> Result<usize, TransportError> {
     checked_add(
-        vector_bytes(&close.bindings)?,
-        vector_bytes(&close.registers)?,
+        StateAllocator::shared_block_size::<BytecodeClosePathData>(),
+        checked_add(vector_bytes(&close.bindings)?, vector_bytes(&close.registers)?)?,
     )
 }
 
@@ -1296,7 +1351,15 @@ fn close_retained(close: &BytecodeClosePath) -> Result<usize, TransportError> {
 pub fn verified_module_allocation_bytes(
     verified: &VerifiedModule,
 ) -> Result<usize, TransportError> {
-    let mut bytes = bytecode_module_allocation_bytes(verified.module())?;
+    verified_module_allocation_bytes_with_recovery(verified, &mut GlobalAllocation)
+        .map_err(global_measure_error)
+}
+
+pub fn verified_module_allocation_bytes_with_recovery<R: AllocationRecovery>(
+    verified: &VerifiedModule,
+    recovery: &mut R,
+) -> Result<usize, TransportMeasureRecoveryError<R::Error>> {
+    let mut bytes = bytecode_module_allocation_bytes_with_recovery(verified.module(), recovery)?;
     bytes = checked_add(
         bytes,
         size_of::<VerifiedModule>()
@@ -1331,37 +1394,110 @@ pub fn verified_module_measurement_work(
         })
         .transpose()?
         .unwrap_or(0);
-    checked_add(
+    let sort_work = owner_sort_work(verified.measurement_owner_count())?;
+    checked_add(checked_add(
         checked_mul(checked_add(verified.transport_scan_units(), plan_items)?, 4)?,
         8,
-    )
+    )?, sort_work)
 }
 
-/// 編碼前的 owned candidate 實際巢狀 Vec 容量；不視其為已驗證模組。
+/// 最終 owner 量測的暫存容量；驗證時已快取字串及 close path 引用數量。
+pub fn verified_module_measurement_scratch_bytes(
+    verified: &VerifiedModule,
+) -> Result<usize, TransportError> {
+    checked_mul(verified.measurement_owner_count(), size_of::<(usize, usize)>())
+}
+
+fn owner_sort_work(count: usize) -> Result<usize, TransportError> {
+    let levels = if count == 0 { 0 } else { usize::BITS - count.leading_zeros() };
+    checked_mul(count, (levels as usize + 1) * 2)
+}
+
+/// 編碼前的 owned candidate 實際巢狀容量；共享 owner 只計一次。
 pub fn bytecode_module_allocation_bytes(module: &BytecodeModule) -> Result<usize, TransportError> {
+    bytecode_module_allocation_bytes_with_recovery(module, &mut GlobalAllocation)
+        .map_err(global_measure_error)
+}
+
+fn global_measure_error(
+    error: TransportMeasureRecoveryError<core::convert::Infallible>,
+) -> TransportError {
+    match error {
+        TransportMeasureRecoveryError::Transport(error) => error,
+        TransportMeasureRecoveryError::Reserve(ReserveError::Recovery(never)) => match never {},
+        TransportMeasureRecoveryError::Reserve(_) => allocated("模組容量量測暫存配置失敗"),
+    }
+}
+
+pub fn bytecode_module_allocation_bytes_with_recovery<R: AllocationRecovery>(
+    module: &BytecodeModule,
+    recovery: &mut R,
+) -> Result<usize, TransportMeasureRecoveryError<R::Error>> {
+    let owner_count = module.prototypes.iter().try_fold(0usize, |count, proto| {
+        let strings = proto.constants.iter().filter(|constant| {
+            matches!(constant, BytecodeConstant::Name(_) | BytecodeConstant::String(_))
+        }).count();
+        let instructions = proto
+            .instructions
+            .iter()
+            .filter(|entry| entry.close_path.is_some())
+            .count();
+        checked_add(
+            checked_add(checked_add(count, strings)?, proto.close_paths.len())?,
+            instructions,
+        )
+    })?;
+    let mut owners: BytecodeVec<(usize, usize)> = BytecodeVec::new_in(recovery.allocator());
+    try_reserve_exact_with(&mut owners, owner_count, recovery)?;
     let mut bytes = checked_add(
         size_of::<BytecodeModule>(),
-        vector_bytes(&module.prototypes)?,
+        checked_mul(module.prototypes.capacity(), size_of::<super::codec::BytecodePrototype>())?,
     )?;
-    bytes = checked_add(bytes, vector_bytes(&module.function_prototypes)?)?;
+    bytes = checked_add(
+        bytes,
+        checked_mul(module.function_prototypes.capacity(), size_of::<(u32, ProtoId)>())?,
+    )?;
     for proto in &module.prototypes {
-        bytes = checked_add(bytes, vector_bytes(&proto.binding_registers)?)?;
+        bytes = checked_add(bytes, checked_mul(proto.binding_registers.capacity(), size_of::<(BytecodeBindingId, Register)>())?)?;
         bytes = checked_add(bytes, vector_bytes(&proto.constants)?)?;
         bytes = checked_add(bytes, vector_bytes(&proto.upvalues)?)?;
-        bytes = checked_add(bytes, vector_bytes(&proto.instructions)?)?;
+        bytes = checked_add(
+            bytes,
+            checked_mul(proto.instructions.capacity(), size_of::<BytecodeInstruction>())?,
+        )?;
         bytes = checked_add(bytes, vector_bytes(&proto.close_paths)?)?;
         for constant in &proto.constants {
             if let BytecodeConstant::Name(value) | BytecodeConstant::String(value) = constant {
-                bytes = checked_add(bytes, value.capacity())?;
+                owners.push((
+                    core::ptr::from_ref::<BytecodeVec<u8>>(value.as_ref()).addr(),
+                    checked_add(
+                        value.capacity(),
+                        StateAllocator::shared_block_size::<BytecodeVec<u8>>(),
+                    )?,
+                ));
             }
         }
         for path in &proto.close_paths {
-            bytes = checked_add(bytes, close_retained(path)?)?;
+            owners.push((
+                core::ptr::from_ref::<BytecodeClosePathData>(path.as_ref()).addr(),
+                close_retained(path)?,
+            ));
         }
         for instruction in &proto.instructions {
             if let Some(path) = &instruction.close_path {
-                bytes = checked_add(bytes, close_retained(path)?)?;
+                owners.push((
+                    core::ptr::from_ref::<BytecodeClosePathData>(path.as_ref()).addr(),
+                    close_retained(path)?,
+                ));
             }
+        }
+    }
+    owners.sort_unstable_by_key(|entry| entry.0);
+    let mut previous = None;
+    for (address, retained) in owners {
+        if previous != Some(address) {
+            bytes = checked_add(bytes, retained)?;
+            previous = Some(address);
         }
     }
     Ok(bytes)

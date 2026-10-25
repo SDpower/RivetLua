@@ -1,13 +1,14 @@
 //! P05 驗證的一般 RVLU 來源除錯資料；不屬於 RVLU_V2 wire。
 
 use alloc::vec::Vec;
+use rivetlua_alloc::{AllocationRecovery, GlobalAllocation, ReserveError};
 
 use core::mem::size_of;
 use core::ops::Range;
 
 use super::codec::{
     BytecodeBindingId, BytecodeClosePath, BytecodeError, BytecodeErrorCode, BytecodeInstruction,
-    BytecodePrototype, VerifyLimits,
+    BytecodePrototype, BytecodeRecoveryError, BytecodeVec, RetainedVec, Scratch, VerifyLimits,
 };
 use super::official_translation::OfficialWorkBudget;
 use super::{
@@ -23,7 +24,7 @@ pub struct NativeLocal {
     pub initialized_pc: u32,
     pub start_pc: u32,
     pub end_pc: u32,
-    pub name: Vec<u8>,
+    pub name: RetainedVec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,9 +32,9 @@ pub struct NativePrototypeDebug {
     pub prototype: ProtoId,
     pub line_defined: u32,
     pub last_line_defined: u32,
-    pub lines: Vec<u32>,
-    pub locals: Vec<NativeLocal>,
-    pub upvalue_names: Vec<Option<Vec<u8>>>,
+    pub lines: RetainedVec<u32>,
+    pub locals: RetainedVec<NativeLocal>,
+    pub upvalue_names: RetainedVec<Option<RetainedVec<u8>>>,
     pub max_active_locals: u8,
 }
 
@@ -44,6 +45,28 @@ pub struct NativeDebugCandidate {
     pub temporaries: Vec<NativeTemporary>,
     pub initializer_temporaries: Vec<NativeInitializerTemporary>,
     pub non_counted_pcs: Vec<(ProtoId, InstructionOffset)>,
+}
+
+/// 已由指定 allocator 建構的來源除錯候選資料；公開 Global 候選型別保持原 API。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateNativeDebugCandidate {
+    pub source_name: RetainedVec<u8>,
+    pub prototypes: RetainedVec<NativePrototypeDebug>,
+    pub temporaries: RetainedVec<NativeTemporary>,
+    pub initializer_temporaries: RetainedVec<NativeInitializerTemporary>,
+    pub non_counted_pcs: RetainedVec<(ProtoId, InstructionOffset)>,
+}
+
+impl From<NativeDebugCandidate> for StateNativeDebugCandidate {
+    fn from(candidate: NativeDebugCandidate) -> Self {
+        Self {
+            source_name: candidate.source_name.into(),
+            prototypes: candidate.prototypes.into(),
+            temporaries: candidate.temporaries.into(),
+            initializer_temporaries: candidate.initializer_temporaries.into(),
+            non_counted_pcs: candidate.non_counted_pcs.into(),
+        }
+    }
 }
 
 /// 編譯器在一般來源的 Call 暫停點宣告的父表達式 pending value。
@@ -68,16 +91,17 @@ pub struct NativeInitializerTemporary {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeDebug {
-    source_name: Vec<u8>,
-    prototypes: Vec<NativePrototypeDebug>,
-    semantic_upvalues: Vec<NativeSemanticUpvalueMap>,
-    storage: Vec<Vec<NativeStorageInterval>>,
-    close_groups: Vec<Vec<NativeCloseGroup>>,
-    temporaries: Vec<NativeTemporary>,
-    temporary_ranges: Vec<Range<usize>>,
-    initializer_temporaries: Vec<NativeInitializerTemporary>,
-    initializer_ranges: Vec<Range<usize>>,
-    non_counted_pcs: Vec<(ProtoId, InstructionOffset)>,
+    source_name: RetainedVec<u8>,
+    prototypes: RetainedVec<NativePrototypeDebug>,
+    prototype_index: RetainedVec<(ProtoId, usize)>,
+    semantic_upvalues: RetainedVec<NativeSemanticUpvalueMap>,
+    storage: RetainedVec<RetainedVec<NativeStorageInterval>>,
+    close_groups: RetainedVec<RetainedVec<NativeCloseGroup>>,
+    temporaries: RetainedVec<NativeTemporary>,
+    temporary_ranges: RetainedVec<Range<usize>>,
+    initializer_temporaries: RetainedVec<NativeInitializerTemporary>,
+    initializer_ranges: RetainedVec<Range<usize>>,
+    non_counted_pcs: RetainedVec<(ProtoId, InstructionOffset)>,
     allocated_bytes: usize,
 }
 
@@ -99,7 +123,7 @@ pub struct NativeCloseGroup {
     pub start_pc: u32,
     pub end_pc: u32,
     pub emit_pc: u32,
-    operands: Vec<(Register, u16)>,
+    operands: RetainedVec<(Register, u16)>,
 }
 
 impl NativeCloseGroup {
@@ -120,6 +144,131 @@ pub struct NativeStorageInterval {
 }
 
 impl NativeDebug {
+    pub(crate) fn is_state_for(&self, allocator: &rivetlua_alloc::StateAllocator) -> bool {
+        self.source_name.is_state_for(allocator)
+            && self.prototypes.is_state_for(allocator)
+            && self.prototype_index.is_state_for(allocator)
+            && self.semantic_upvalues.is_state_for(allocator)
+            && self.storage.is_state_for(allocator)
+            && self.close_groups.is_state_for(allocator)
+            && self.temporaries.is_state_for(allocator)
+            && self.temporary_ranges.is_state_for(allocator)
+            && self.initializer_temporaries.is_state_for(allocator)
+            && self.initializer_ranges.is_state_for(allocator)
+            && self.non_counted_pcs.is_state_for(allocator)
+    }
+
+    pub(crate) fn rehome<R: AllocationRecovery>(
+        &mut self,
+        recovery: &mut R,
+    ) -> Result<(), ReserveError<R::Error>> {
+        let allocator = recovery.allocator();
+        if let Some(prototypes) = self.prototypes.global_mut() {
+            for prototype in prototypes {
+                prototype.lines.rehome(recovery)?;
+                if let Some(locals) = prototype.locals.global_mut() {
+                    for local in locals {
+                        local.name.rehome(recovery)?;
+                    }
+                } else if !prototype.locals.is_state_for(&allocator) {
+                    return Err(ReserveError::AllocatorMismatch);
+                }
+                prototype.locals.rehome(recovery)?;
+                if let Some(names) = prototype.upvalue_names.global_mut() {
+                    for name in names {
+                        if let Some(name) = name {
+                            name.rehome(recovery)?;
+                        }
+                    }
+                } else if !prototype.upvalue_names.is_state_for(&allocator) {
+                    return Err(ReserveError::AllocatorMismatch);
+                }
+                prototype.upvalue_names.rehome(recovery)?;
+            }
+        } else if !self.prototypes.is_state_for(&allocator) {
+            return Err(ReserveError::AllocatorMismatch);
+        }
+        if let Some(storage) = self.storage.global_mut() {
+            for entry in storage {
+                entry.rehome(recovery)?;
+            }
+        } else if !self.storage.is_state_for(&allocator) {
+            return Err(ReserveError::AllocatorMismatch);
+        }
+        if let Some(all_groups) = self.close_groups.global_mut() {
+            for groups in all_groups {
+                if let Some(entries) = groups.global_mut() {
+                    for group in entries {
+                        group.operands.rehome(recovery)?;
+                    }
+                } else if !groups.is_state_for(&allocator) {
+                    return Err(ReserveError::AllocatorMismatch);
+                }
+                groups.rehome(recovery)?;
+            }
+        } else if !self.close_groups.is_state_for(&allocator) {
+            return Err(ReserveError::AllocatorMismatch);
+        }
+        self.source_name.rehome(recovery)?;
+        self.prototypes.rehome(recovery)?;
+        self.prototype_index.rehome(recovery)?;
+        self.semantic_upvalues.rehome(recovery)?;
+        self.storage.rehome(recovery)?;
+        self.close_groups.rehome(recovery)?;
+        self.temporaries.rehome(recovery)?;
+        self.temporary_ranges.rehome(recovery)?;
+        self.initializer_temporaries.rehome(recovery)?;
+        self.initializer_ranges.rehome(recovery)?;
+        self.non_counted_pcs.rehome(recovery)?;
+        self.allocated_bytes = self.state_allocated_bytes().ok_or(ReserveError::AllocationFailed)?;
+        Ok(())
+    }
+
+    fn state_allocated_bytes(&self) -> Option<usize> {
+        let mut bytes = rivetlua_alloc::StateAllocator::shared_block_size::<Self>();
+        for size in [
+            self.source_name.retained_bytes()?,
+            self.prototypes.retained_bytes()?,
+            self.prototype_index.retained_bytes()?,
+            self.semantic_upvalues.retained_bytes()?,
+            self.storage.retained_bytes()?,
+            self.close_groups.retained_bytes()?,
+            self.temporaries.retained_bytes()?,
+            self.temporary_ranges.retained_bytes()?,
+            self.initializer_temporaries.retained_bytes()?,
+            self.initializer_ranges.retained_bytes()?,
+            self.non_counted_pcs.retained_bytes()?,
+        ] {
+            bytes = bytes.checked_add(size)?;
+        }
+        for prototype in &self.prototypes {
+            for size in [
+                prototype.lines.retained_bytes()?,
+                prototype.locals.retained_bytes()?,
+                prototype.upvalue_names.retained_bytes()?,
+            ] {
+                bytes = bytes.checked_add(size)?;
+            }
+            for local in &prototype.locals {
+                bytes = bytes.checked_add(local.name.retained_bytes()?)?;
+            }
+            for name in &prototype.upvalue_names {
+                if let Some(name) = name {
+                    bytes = bytes.checked_add(name.retained_bytes()?)?;
+                }
+            }
+        }
+        for storage in &self.storage {
+            bytes = bytes.checked_add(storage.retained_bytes()?)?;
+        }
+        for groups in &self.close_groups {
+            bytes = bytes.checked_add(groups.retained_bytes()?)?;
+            for group in groups {
+                bytes = bytes.checked_add(group.operands.retained_bytes()?)?;
+            }
+        }
+        Some(bytes)
+    }
     pub fn source_name(&self) -> &[u8] {
         &self.source_name
     }
@@ -128,8 +277,13 @@ impl NativeDebug {
         &self.prototypes
     }
 
+    fn prototype_index(&self, id: ProtoId) -> Option<usize> {
+        let slot = self.prototype_index.binary_search_by_key(&id, |(key, _)| *key).ok()?;
+        Some(self.prototype_index[slot].1)
+    }
+
     pub fn prototype(&self, id: ProtoId) -> Option<&NativePrototypeDebug> {
-        self.prototypes.iter().find(|entry| entry.prototype == id)
+        self.prototype_index(id).and_then(|index| self.prototypes.get(index))
     }
 
     pub fn allocated_bytes(&self) -> usize {
@@ -137,25 +291,18 @@ impl NativeDebug {
     }
 
     pub fn storage_for(&self, id: ProtoId) -> Option<&[NativeStorageInterval]> {
-        self.prototypes
-            .iter()
-            .position(|entry| entry.prototype == id)
-            .and_then(|index| self.storage.get(index).map(Vec::as_slice))
+        self.prototype_index(id)
+            .and_then(|index| self.storage.get(index).map(AsRef::as_ref))
     }
 
     pub fn semantic_upvalue_count(&self, id: ProtoId) -> Option<usize> {
-        self.prototypes
-            .iter()
-            .position(|entry| entry.prototype == id)
+        self.prototype_index(id)
             .and_then(|index| self.semantic_upvalues.get(index))
             .map(|entry| usize::from(entry.physical_guest_count) + usize::from(entry.environment))
     }
 
     pub fn semantic_upvalue(&self, id: ProtoId, index: usize) -> Option<NativeSemanticUpvalue> {
-        let map = self
-            .prototypes
-            .iter()
-            .position(|entry| entry.prototype == id)
+        let map = self.prototype_index(id)
             .and_then(|index| self.semantic_upvalues.get(index))?;
         if index < usize::from(map.physical_guest_count) {
             Some(NativeSemanticUpvalue::Closure(UpvalueId(index as u16)))
@@ -174,17 +321,12 @@ impl NativeDebug {
     }
 
     pub fn close_groups_for(&self, id: ProtoId) -> Option<&[NativeCloseGroup]> {
-        self.prototypes
-            .iter()
-            .position(|entry| entry.prototype == id)
-            .and_then(|index| self.close_groups.get(index).map(Vec::as_slice))
+        self.prototype_index(id)
+            .and_then(|index| self.close_groups.get(index).map(AsRef::as_ref))
     }
 
     pub fn temporaries_for(&self, id: ProtoId) -> Option<&[NativeTemporary]> {
-        let index = self
-            .prototypes
-            .iter()
-            .position(|entry| entry.prototype == id)?;
+        let index = self.prototype_index(id)?;
         self.temporary_ranges
             .get(index)
             .and_then(|range| self.temporaries.get(range.clone()))
@@ -205,10 +347,7 @@ impl NativeDebug {
         &self,
         id: ProtoId,
     ) -> Option<&[NativeInitializerTemporary]> {
-        let index = self
-            .prototypes
-            .iter()
-            .position(|entry| entry.prototype == id)?;
+        let index = self.prototype_index(id)?;
         self.initializer_ranges
             .get(index)
             .and_then(|range| self.initializer_temporaries.get(range.clone()))
@@ -431,13 +570,14 @@ fn temporary_semantic_read(instruction: &Instruction, register: Register) -> boo
     )
 }
 
-fn verify_initializer_interval(
+fn verify_initializer_interval<R: AllocationRecovery>(
     module: &VerifiedModule,
     proto: &BytecodePrototype,
     local: &NativeLocal,
     interval: &NativeInitializerTemporary,
     work: &mut OfficialWorkBudget,
     max_temporary_bytes: usize,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<(), BytecodeError> {
     let count = proto.instructions.len();
     let start = interval.start_pc as usize;
@@ -459,10 +599,10 @@ fn verify_initializer_interval(
     {
         return Err(invalid("native debug initializer slot/binding/PC 無效"));
     }
-    let scratch = count
+    let scratch_bytes = count
         .checked_mul(size_of::<u8>() + size_of::<usize>())
         .ok_or_else(|| limit("native debug initializer CFG 暫存大小溢位"))?;
-    if scratch > max_temporary_bytes {
+    if scratch_bytes > max_temporary_bytes {
         return Err(limit("native debug initializer CFG 暫存配置額度超限"));
     }
     charge(
@@ -471,13 +611,13 @@ fn verify_initializer_interval(
             .checked_mul(16)
             .ok_or_else(|| limit("native debug initializer CFG work 溢位"))?,
     )?;
-    let mut seen = Vec::new();
-    seen.try_reserve_exact(count)
+    let mut seen = scratch.vec();
+    scratch.reserve_exact(&mut seen, count)
         .map_err(|_| limit("native debug initializer CFG 配置失敗"))?;
     seen.resize(count, 0u8);
-    let mut pending = Vec::new();
-    pending
-        .try_reserve_exact(count)
+    let mut pending = scratch.vec();
+    scratch
+        .reserve_exact(&mut pending, count)
         .map_err(|_| limit("native debug initializer CFG worklist 配置失敗"))?;
     if seen
         .capacity()
@@ -550,12 +690,13 @@ fn verify_initializer_interval(
     Ok(())
 }
 
-fn verify_temporary_initialized(
+fn verify_temporary_initialized<R: AllocationRecovery>(
     proto: &BytecodePrototype,
     call_pc: usize,
     register: Register,
     work: &mut OfficialWorkBudget,
     max_temporary_bytes: usize,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<(), BytecodeError> {
     let count = proto.instructions.len();
     let states = count
@@ -571,13 +712,13 @@ fn verify_temporary_initialized(
     if needed > max_temporary_bytes {
         return Err(limit("native debug temporary CFG 暫存額度超限"));
     }
-    let mut seen = Vec::new();
-    seen.try_reserve_exact(count)
+    let mut seen = scratch.vec();
+    scratch.reserve_exact(&mut seen, count)
         .map_err(|_| limit("native debug temporary CFG 配置失敗"))?;
     seen.resize(count, 0u8);
-    let mut pending = Vec::new();
-    pending
-        .try_reserve_exact(states)
+    let mut pending = scratch.vec();
+    scratch
+        .reserve_exact(&mut pending, states)
         .map_err(|_| limit("native debug temporary CFG 配置失敗"))?;
     if seen
         .capacity()
@@ -629,27 +770,29 @@ fn verify_temporary_initialized(
     Ok(())
 }
 
-fn verify_temporary_consumed(
+fn verify_temporary_consumed<R: AllocationRecovery>(
     proto: &BytecodePrototype,
     call_pc: usize,
     register: Register,
     work: &mut OfficialWorkBudget,
     max_temporary_bytes: usize,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<(), BytecodeError> {
     let first = call_pc
         .checked_add(1)
         .filter(|pc| *pc < proto.instructions.len())
         .ok_or_else(|| invalid("native debug temporary Call 後缺少語意使用"))?;
-    verify_temporary_consumed_from(proto, first, register, false, work, max_temporary_bytes)
+    verify_temporary_consumed_from(proto, first, register, false, work, max_temporary_bytes, scratch)
 }
 
-fn verify_temporary_consumed_from(
+fn verify_temporary_consumed_from<R: AllocationRecovery>(
     proto: &BytecodePrototype,
     first: usize,
     register: Register,
     moved_to_call: bool,
     work: &mut OfficialWorkBudget,
     max_temporary_bytes: usize,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<(), BytecodeError> {
     let count = proto.instructions.len();
     let stack_slots = count
@@ -665,14 +808,14 @@ fn verify_temporary_consumed_from(
     if needed > max_temporary_bytes {
         return Err(limit("native debug temporary CFG 暫存額度超限"));
     }
-    let mut colors = Vec::new();
-    colors
-        .try_reserve_exact(count)
+    let mut colors = scratch.vec();
+    scratch
+        .reserve_exact(&mut colors, count)
         .map_err(|_| limit("native debug temporary CFG 配置失敗"))?;
     colors.resize(count, 0u8);
-    let mut pending = Vec::new();
-    pending
-        .try_reserve_exact(stack_slots)
+    let mut pending = scratch.vec();
+    scratch
+        .reserve_exact(&mut pending, stack_slots)
         .map_err(|_| limit("native debug temporary CFG 配置失敗"))?;
     if colors
         .capacity()
@@ -701,7 +844,10 @@ fn verify_temporary_consumed_from(
         let instruction = &proto.instructions[pc].instruction;
         let (read, write, possible_write, _) =
             prototype_register_access(proto, instruction, register);
-        if read {
+        // 同槽 Move 不消費暫存值；仍須沿 CFG 找到真正的父運算讀取。
+        let identity_move = matches!(instruction, Instruction::Move { dest, src }
+            if *dest == register && *src == register);
+        if read && !identity_move {
             if let Instruction::Move { dest, src } = instruction {
                 if !moved_to_call && *src == register && *dest != register {
                     let allocated = colors
@@ -720,7 +866,9 @@ fn verify_temporary_consumed_from(
                         .checked_add(1)
                         .filter(|next| *next < count)
                         .ok_or_else(|| invalid("native debug temporary Move 後缺少外層 Call"))?;
-                    verify_temporary_consumed_from(proto, next, *dest, true, work, remaining)?;
+                    verify_temporary_consumed_from(
+                        proto, next, *dest, true, work, remaining, scratch,
+                    )?;
                     colors[pc] = 2;
                     continue;
                 }
@@ -738,7 +886,7 @@ fn verify_temporary_consumed_from(
             colors[pc] = 2;
             continue;
         }
-        if write || possible_write {
+        if (write || possible_write) && !identity_move {
             return Err(invalid("native debug temporary 在語意使用前被覆寫"));
         }
         let successors = temporary_successors(proto, pc)?;
@@ -855,6 +1003,23 @@ pub(super) fn build_close_groups(
     work: &mut OfficialWorkBudget,
     max_temporary_bytes: usize,
 ) -> Result<Vec<NativeCloseGroup>, BytecodeError> {
+    let mut recovery = GlobalAllocation;
+    let mut scratch = Scratch::new(&mut recovery);
+    let groups = build_close_groups_with_recovery(proto, work, max_temporary_bytes, &mut scratch)?;
+    let mut global = Vec::new();
+    global
+        .try_reserve_exact(groups.len())
+        .map_err(|_| limit("native debug close group 配置失敗"))?;
+    global.extend(groups);
+    Ok(global)
+}
+
+pub(super) fn build_close_groups_with_recovery<R: AllocationRecovery>(
+    proto: &BytecodePrototype,
+    work: &mut OfficialWorkBudget,
+    max_temporary_bytes: usize,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<NativeCloseGroup>, BytecodeError> {
     let (group_count, _) = close_group_counts(proto, work)?;
     let count = proto.instructions.len();
     if count > max_temporary_bytes {
@@ -866,9 +1031,9 @@ pub(super) fn build_close_groups(
             .checked_mul(3)
             .ok_or_else(|| limit("native debug close branch work 溢位"))?,
     )?;
-    let mut targets = Vec::new();
-    targets
-        .try_reserve_exact(count)
+    let mut targets = scratch.vec();
+    scratch
+        .reserve_exact(&mut targets, count)
         .map_err(|_| limit("native debug close branch bitmap 配置失敗"))?;
     targets.resize(count, 0u8);
     for entry in &proto.instructions {
@@ -891,9 +1056,9 @@ pub(super) fn build_close_groups(
             _ => {}
         }
     }
-    let mut groups = Vec::new();
-    groups
-        .try_reserve_exact(group_count)
+    let mut groups = scratch.vec();
+    scratch
+        .reserve_exact(&mut groups, group_count)
         .map_err(|_| limit("native debug close group 配置失敗"))?;
     charge(
         work,
@@ -910,9 +1075,9 @@ pub(super) fn build_close_groups(
         if targets[pc + 1..end].contains(&1) {
             return Err(invalid("native debug branch 進入 close group 中段"));
         }
-        let mut operands = Vec::new();
-        operands
-            .try_reserve_exact(end - pc)
+        let mut operands = scratch.vec();
+        scratch
+            .reserve_exact(&mut operands, end - pc)
             .map_err(|_| limit("native debug close operand 配置失敗"))?;
         for entry in &proto.instructions[pc..end] {
             let Instruction::Close { base, count } = entry.instruction else {
@@ -924,7 +1089,9 @@ pub(super) fn build_close_groups(
             start_pc: u32::try_from(pc).map_err(|_| limit("native debug close PC 溢位"))?,
             end_pc: u32::try_from(end).map_err(|_| limit("native debug close PC 溢位"))?,
             emit_pc: u32::try_from(emit).map_err(|_| limit("native debug close PC 溢位"))?,
-            operands,
+            operands: scratch
+                .retain(operands)
+                .map_err(|_| limit("native debug close operand owner 配置失敗"))?,
         });
         pc = end;
     }
@@ -944,7 +1111,7 @@ fn close_group_at<'a>(
         .filter(|group| pc < group.end_pc as usize))
 }
 
-fn check_storage_cfg(
+fn check_storage_cfg<R: AllocationRecovery>(
     module: &VerifiedModule,
     proto: &super::codec::BytecodePrototype,
     local: &NativeLocal,
@@ -953,6 +1120,7 @@ fn check_storage_cfg(
     groups: &[NativeCloseGroup],
     work: &mut OfficialWorkBudget,
     max_temporary_bytes: usize,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<(), BytecodeError> {
     let count = proto.instructions.len();
     let queue_count = count
@@ -975,9 +1143,9 @@ fn check_storage_cfg(
             .checked_mul(32)
             .ok_or_else(|| limit("native debug CFG work 溢位"))?,
     )?;
-    let mut captures = Vec::new();
-    captures
-        .try_reserve_exact(count)
+    let mut captures = scratch.vec();
+    scratch
+        .reserve_exact(&mut captures, count)
         .map_err(|_| limit("native debug capture bitmap 配置失敗"))?;
     for instruction in &proto.instructions {
         captures.push(u8::from(capture_at(
@@ -987,13 +1155,13 @@ fn check_storage_cfg(
             work,
         )?));
     }
-    let mut seen = Vec::new();
-    seen.try_reserve_exact(count)
+    let mut seen = scratch.vec();
+    scratch.reserve_exact(&mut seen, count)
         .map_err(|_| limit("native debug CFG state 配置失敗"))?;
     seen.resize(count, 0u8);
-    let mut pending = Vec::new();
-    pending
-        .try_reserve_exact(queue_count)
+    let mut pending = scratch.vec();
+    scratch
+        .reserve_exact(&mut pending, queue_count)
         .map_err(|_| limit("native debug CFG worklist 配置失敗"))?;
     if count == 0 {
         return Ok(());
@@ -1196,14 +1364,15 @@ fn validate_required_local_coverage(
     Ok(())
 }
 
-fn validate_locals(
+fn validate_locals<R: AllocationRecovery>(
     entry: &NativePrototypeDebug,
     proto: &super::codec::BytecodePrototype,
     module: &VerifiedModule,
     groups: &[NativeCloseGroup],
     work: &mut OfficialWorkBudget,
     max_temporary_bytes: usize,
-) -> Result<Vec<NativeStorageInterval>, BytecodeError> {
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<NativeStorageInterval>, BytecodeError> {
     if entry.max_active_locals as usize > proto.register_count as usize
         || proto.parameter_count > u16::from(u8::MAX)
     {
@@ -1226,13 +1395,13 @@ fn validate_locals(
             .checked_add(entry.locals.len())
             .ok_or_else(|| limit("native debug local work 溢位"))?,
     )?;
-    let mut events = Vec::new();
-    events
-        .try_reserve_exact(event_count)
+    let mut events = scratch.vec();
+    scratch
+        .reserve_exact(&mut events, event_count)
         .map_err(|_| limit("native debug local event 配置失敗"))?;
-    let mut storage: Vec<NativeStorageInterval> = Vec::new();
-    storage
-        .try_reserve_exact(entry.locals.len())
+    let mut storage: BytecodeVec<NativeStorageInterval> = scratch.vec();
+    scratch
+        .reserve_exact(&mut storage, entry.locals.len())
         .map_err(|_| limit("native debug storage 配置失敗"))?;
     for (index, local) in entry.locals.iter().enumerate() {
         charge(
@@ -1390,6 +1559,7 @@ fn validate_locals(
             groups,
             work,
             max_temporary_bytes,
+            scratch,
         )?;
     }
     charge(
@@ -1425,9 +1595,10 @@ fn validate_locals(
 
 fn preflight_native_debug_bytes(
     module: &VerifiedModule,
-    candidate: &NativeDebugCandidate,
+    candidate: &StateNativeDebugCandidate,
     limits: &VerifyLimits,
     work: &mut OfficialWorkBudget,
+    state_owned: bool,
 ) -> Result<usize, BytecodeError> {
     let arc_header = size_of::<usize>()
         .checked_mul(2)
@@ -1451,6 +1622,20 @@ fn preflight_native_debug_bytes(
         size_of::<NativePrototypeDebug>(),
         limits.max_artifact_bytes,
     )?;
+    add_bytes(
+        &mut bytes,
+        candidate.prototypes.len(),
+        size_of::<(ProtoId, usize)>(),
+        limits.max_artifact_bytes,
+    )?;
+    if state_owned {
+        add_bytes(
+            &mut bytes,
+            1,
+            rivetlua_alloc::StateAllocator::shared_block_size::<BytecodeVec<(ProtoId, usize)>>(),
+            limits.max_artifact_bytes,
+        )?;
+    }
     add_bytes(
         &mut bytes,
         candidate.temporaries.capacity(),
@@ -1484,13 +1669,13 @@ fn preflight_native_debug_bytes(
     add_bytes(
         &mut bytes,
         candidate.prototypes.len(),
-        size_of::<Vec<NativeStorageInterval>>(),
+        size_of::<RetainedVec<NativeStorageInterval>>(),
         limits.max_artifact_bytes,
     )?;
     add_bytes(
         &mut bytes,
         candidate.prototypes.len(),
-        size_of::<Vec<NativeCloseGroup>>(),
+        size_of::<RetainedVec<NativeCloseGroup>>(),
         limits.max_artifact_bytes,
     )?;
     add_bytes(
@@ -1554,7 +1739,7 @@ fn preflight_native_debug_bytes(
         add_bytes(
             &mut bytes,
             entry.upvalue_names.capacity(),
-            size_of::<Option<Vec<u8>>>(),
+            size_of::<Option<RetainedVec<u8>>>(),
             limits.max_artifact_bytes,
         )?;
         for local in &entry.locals {
@@ -1642,6 +1827,37 @@ pub fn verify_native_debug(
     limits: &VerifyLimits,
     work: &mut OfficialWorkBudget,
 ) -> Result<NativeDebug, BytecodeError> {
+    let mut recovery = GlobalAllocation;
+    verify_native_debug_with_recovery(module, candidate.into(), limits, work, &mut recovery)
+        .map_err(|error| match error {
+            BytecodeRecoveryError::Bytecode(error) => error,
+            BytecodeRecoveryError::Reserve(ReserveError::Recovery(never)) => match never {},
+            BytecodeRecoveryError::Reserve(_) => limit("native debug 配置失敗"),
+        })
+}
+
+pub fn verify_native_debug_with_recovery<R: AllocationRecovery>(
+    module: &VerifiedModule,
+    candidate: StateNativeDebugCandidate,
+    limits: &VerifyLimits,
+    work: &mut OfficialWorkBudget,
+    recovery: &mut R,
+) -> Result<NativeDebug, BytecodeRecoveryError<R::Error>> {
+    let mut scratch = Scratch::new(recovery);
+    let result = verify_native_debug_inner(module, candidate, limits, work, &mut scratch);
+    result.map_err(|error| match scratch.take_refusal() {
+        Some(refusal) => BytecodeRecoveryError::Reserve(refusal),
+        None => BytecodeRecoveryError::Bytecode(error),
+    })
+}
+
+fn verify_native_debug_inner<R: AllocationRecovery>(
+    module: &VerifiedModule,
+    candidate: StateNativeDebugCandidate,
+    limits: &VerifyLimits,
+    work: &mut OfficialWorkBudget,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<NativeDebug, BytecodeError> {
     if module.official_artifact().is_some()
         || module
             .official_execution()
@@ -1655,9 +1871,10 @@ pub fn verify_native_debug(
     {
         return Err(invalid("native debug prototype 數不符"));
     }
-    let mut bytes = preflight_native_debug_bytes(module, &candidate, limits, work)?;
+    let state_owned = scratch.recovery().allocator().is_lua();
+    let mut bytes = preflight_native_debug_bytes(module, &candidate, limits, work, state_owned)?;
     let mut prior_non_counted = None;
-    for &(prototype, offset) in &candidate.non_counted_pcs {
+    for &(prototype, offset) in candidate.non_counted_pcs.iter() {
         charge(work, module.module().prototypes.len().saturating_add(1))?;
         let key = (prototype.0, offset.0);
         if prior_non_counted.is_some_and(|prior| key <= prior) {
@@ -1687,26 +1904,26 @@ pub fn verify_native_debug(
         }
         prior_non_counted = Some(key);
     }
-    let mut storage = Vec::new();
-    storage
-        .try_reserve_exact(candidate.prototypes.len())
+    let mut storage = scratch.vec();
+    scratch
+        .reserve_exact(&mut storage, candidate.prototypes.len())
         .map_err(|_| limit("native debug storage 清單配置失敗"))?;
-    let mut close_groups = Vec::new();
-    close_groups
-        .try_reserve_exact(candidate.prototypes.len())
+    let mut close_groups = scratch.vec();
+    scratch
+        .reserve_exact(&mut close_groups, candidate.prototypes.len())
         .map_err(|_| limit("native debug close group 清單配置失敗"))?;
-    let mut semantic_upvalues = Vec::new();
-    semantic_upvalues
-        .try_reserve_exact(candidate.prototypes.len())
+    let mut semantic_upvalues = scratch.vec();
+    scratch
+        .reserve_exact(&mut semantic_upvalues, candidate.prototypes.len())
         .map_err(|_| limit("native debug 語意 upvalue 清單配置失敗"))?;
-    let mut temporary_ranges = Vec::new();
-    temporary_ranges
-        .try_reserve_exact(candidate.prototypes.len())
+    let mut temporary_ranges = scratch.vec();
+    scratch
+        .reserve_exact(&mut temporary_ranges, candidate.prototypes.len())
         .map_err(|_| limit("native debug temporary range 配置失敗"))?;
     let mut temporary_cursor = 0usize;
-    let mut initializer_ranges = Vec::new();
-    initializer_ranges
-        .try_reserve_exact(candidate.prototypes.len())
+    let mut initializer_ranges = scratch.vec();
+    scratch
+        .reserve_exact(&mut initializer_ranges, candidate.prototypes.len())
         .map_err(|_| limit("native debug initializer range 配置失敗"))?;
     let mut initializer_cursor = 0usize;
     for (entry, proto) in candidate.prototypes.iter().zip(&module.module().prototypes) {
@@ -1733,8 +1950,12 @@ pub fn verify_native_debug(
             return Err(invalid("native debug 行號無效"));
         }
         validate_required_local_coverage(entry, proto, module, work)?;
-        let groups =
-            build_close_groups(proto, work, limits.max_artifact_bytes.saturating_sub(bytes))?;
+        let groups = build_close_groups_with_recovery(
+            proto,
+            work,
+            limits.max_artifact_bytes.saturating_sub(bytes),
+            scratch,
+        )?;
         let local_storage = validate_locals(
             entry,
             proto,
@@ -1742,6 +1963,7 @@ pub fn verify_native_debug(
             &groups,
             work,
             limits.max_artifact_bytes.saturating_sub(bytes),
+            scratch,
         )?;
         let start = temporary_cursor;
         while candidate
@@ -1827,9 +2049,23 @@ pub fn verify_native_debug(
             if input || output || possible_output {
                 return Err(invalid("native debug temporary 與 Call input/output 重疊"));
             }
-            let scratch = limits.max_artifact_bytes.saturating_sub(bytes);
-            verify_temporary_initialized(proto, pc, temporary.register, work, scratch)?;
-            verify_temporary_consumed(proto, pc, temporary.register, work, scratch)?;
+            let temporary_limit = limits.max_artifact_bytes.saturating_sub(bytes);
+            verify_temporary_initialized(
+                proto,
+                pc,
+                temporary.register,
+                work,
+                temporary_limit,
+                scratch,
+            )?;
+            verify_temporary_consumed(
+                proto,
+                pc,
+                temporary.register,
+                work,
+                temporary_limit,
+                scratch,
+            )?;
             prior_pc = Some(pc);
             prior_register = Some((temporary.register, temporary.ordinal));
         }
@@ -1895,6 +2131,7 @@ pub fn verify_native_debug(
                 initializer,
                 work,
                 limits.max_artifact_bytes.saturating_sub(bytes),
+                scratch,
             )?;
             previous_initializer =
                 Some((initializer.start_pc, initializer.end_pc, initializer.slot));
@@ -1928,7 +2165,11 @@ pub fn verify_native_debug(
             size_of::<NativeStorageInterval>(),
             limits.max_artifact_bytes,
         )?;
-        storage.push(local_storage);
+        storage.push(
+            scratch
+                .retain(local_storage)
+                .map_err(|_| limit("native debug storage owner 配置失敗"))?,
+        );
         let (expected_groups, expected_closes) = close_group_counts(proto, work)?;
         add_bytes(
             &mut bytes,
@@ -1948,7 +2189,11 @@ pub fn verify_native_debug(
             size_of::<(Register, u16)>(),
             limits.max_artifact_bytes,
         )?;
-        close_groups.push(groups);
+        close_groups.push(
+            scratch
+                .retain(groups)
+                .map_err(|_| limit("native debug close group owner 配置失敗"))?,
+        );
     }
     if temporary_cursor != candidate.temporaries.len() {
         return Err(invalid("native debug temporary prototype 順序無效"));
@@ -1961,7 +2206,7 @@ pub fn verify_native_debug(
         storage
             .capacity()
             .saturating_sub(candidate.prototypes.len()),
-        size_of::<Vec<NativeStorageInterval>>(),
+        size_of::<RetainedVec<NativeStorageInterval>>(),
         limits.max_artifact_bytes,
     )?;
     add_bytes(
@@ -1969,7 +2214,7 @@ pub fn verify_native_debug(
         close_groups
             .capacity()
             .saturating_sub(candidate.prototypes.len()),
-        size_of::<Vec<NativeCloseGroup>>(),
+        size_of::<RetainedVec<NativeCloseGroup>>(),
         limits.max_artifact_bytes,
     )?;
     add_bytes(
@@ -1996,19 +2241,67 @@ pub fn verify_native_debug(
         size_of::<Range<usize>>(),
         limits.max_artifact_bytes,
     )?;
-    Ok(NativeDebug {
+    let mut prototype_index = scratch.vec();
+    scratch
+        .reserve_exact(&mut prototype_index, candidate.prototypes.len())
+        .map_err(|_| limit("native debug prototype 索引配置失敗"))?;
+    for (index, prototype) in candidate.prototypes.iter().enumerate() {
+        prototype_index.push((prototype.prototype, index));
+    }
+    let sort_work = candidate.prototypes.len()
+        .checked_mul((usize::BITS - candidate.prototypes.len().leading_zeros()) as usize)
+        .ok_or_else(|| limit("native debug prototype 索引工作量溢位"))?;
+    charge(work, sort_work)?;
+    prototype_index.sort_unstable_by_key(|(id, _)| *id);
+    let index_capacity = prototype_index.capacity();
+    add_bytes(
+        &mut bytes,
+        index_capacity.saturating_sub(candidate.prototypes.len()),
+        size_of::<(ProtoId, usize)>(),
+        limits.max_artifact_bytes,
+    )?;
+    let prototype_index = scratch
+        .retain(prototype_index)
+        .map_err(|_| limit("native debug prototype 索引 owner 配置失敗"))?;
+    add_bytes(
+        &mut bytes,
+        prototype_index.capacity().saturating_sub(index_capacity),
+        size_of::<(ProtoId, usize)>(),
+        limits.max_artifact_bytes,
+    )?;
+    let mut debug = NativeDebug {
         source_name: candidate.source_name,
         prototypes: candidate.prototypes,
-        semantic_upvalues,
-        storage,
-        close_groups,
+        prototype_index,
+        semantic_upvalues: scratch
+            .retain(semantic_upvalues)
+            .map_err(|_| limit("native debug 語意 upvalue owner 配置失敗"))?,
+        storage: scratch
+            .retain(storage)
+            .map_err(|_| limit("native debug storage owner 配置失敗"))?,
+        close_groups: scratch
+            .retain(close_groups)
+            .map_err(|_| limit("native debug close group owner 配置失敗"))?,
         temporaries: candidate.temporaries,
-        temporary_ranges,
+        temporary_ranges: scratch
+            .retain(temporary_ranges)
+            .map_err(|_| limit("native debug temporary range owner 配置失敗"))?,
         initializer_temporaries: candidate.initializer_temporaries,
-        initializer_ranges,
+        initializer_ranges: scratch
+            .retain(initializer_ranges)
+            .map_err(|_| limit("native debug initializer range owner 配置失敗"))?,
         non_counted_pcs: candidate.non_counted_pcs,
         allocated_bytes: bytes,
-    })
+    };
+    if scratch.recovery().allocator().is_lua() {
+        debug.allocated_bytes = debug
+            .state_allocated_bytes()
+            .ok_or_else(|| limit("native debug state backing 大小溢位"))?;
+        if debug.allocated_bytes > limits.max_artifact_bytes {
+            return Err(limit("native debug state backing 超出額度"));
+        }
+    }
+    Ok(debug)
 }
 
 #[cfg(test)]

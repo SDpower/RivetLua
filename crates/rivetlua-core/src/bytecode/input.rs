@@ -1,16 +1,19 @@
 //! P05 的語言輸入分類與無 sidecar 載入准入。
 
 use super::LuaProfile;
-use super::codec::{BytecodeError, BytecodeErrorCode, VerifiedModule, decode_module};
-use super::official::{OfficialChunkError, OfficialChunkErrorKind, decode_official_chunk};
-use super::official_preflight::{OfficialChunkPreflight, preflight_official_chunk};
+use rivetlua_alloc::{AllocationRecovery, ReserveError};
+use super::codec::{BytecodeError, BytecodeErrorCode, BytecodeRecoveryError, VerifiedModule, decode_module, decode_module_with_recovery};
+use super::official::{OfficialChunkError, OfficialChunkErrorKind, OfficialChunkLimits, OfficialChunkRecoveryError, decode_official_chunk, decode_official_chunk_with_recovery};
+use super::official_preflight::{OfficialChunkPreflight, preflight_official_chunk, preflight_official_chunk_with_recovery};
 use super::official_translation::{
-    OfficialTranslationError, OfficialTranslationErrorKind, OfficialWorkBudget,
-    translate_official_chunk_with_work,
+    OfficialTranslationError, OfficialTranslationErrorKind, OfficialTranslationRecoveryError,
+    OfficialWorkBudget, translate_official_chunk_with_work,
+    translate_official_chunk_with_work_and_recovery,
 };
 use super::transport::{
-    TransportError, TransportErrorKind, TransportLimits, TransportScanAdmission,
-    preflight_transport_decode, transport_scan_admission, verified_module_allocation_bytes,
+    TransportError, TransportErrorKind, TransportLimits, TransportMeasureRecoveryError,
+    TransportScanAdmission, preflight_transport_decode, transport_scan_admission,
+    verified_module_allocation_bytes, verified_module_allocation_bytes_with_recovery,
 };
 
 // kind 0 的固定 RVAS header 僅在 Core 內供 raw RVLU 預掃描使用；沒有可還原的 sidecar。
@@ -206,14 +209,44 @@ pub fn preflight_input_module<'a>(
     profile: LuaProfile,
     limits: &TransportLimits,
 ) -> Result<InputPreflight<'a>, InputError> {
+    preflight_input_module_core(bytes, profile, limits, |bytes, profile, official, verify| {
+        preflight_official_chunk(bytes, profile, official, verify).map_err(InputError::from)
+    })
+}
+
+pub fn preflight_input_module_with_recovery<'a, R: AllocationRecovery>(
+    bytes: &'a [u8],
+    profile: LuaProfile,
+    limits: &TransportLimits,
+    recovery: &mut R,
+) -> Result<InputPreflight<'a>, InputDecodeRecoveryError<R::Error>> {
+    preflight_input_module_core(bytes, profile, limits, |bytes, profile, official, verify| {
+        preflight_official_chunk_with_recovery(bytes, profile, official, verify, recovery)
+            .map_err(|failure| match failure {
+                OfficialChunkRecoveryError::Chunk(error) => InputDecodeRecoveryError::Input(error.into()),
+                OfficialChunkRecoveryError::Reserve(error) => InputDecodeRecoveryError::Reserve(error),
+            })
+    })
+}
+
+fn preflight_input_module_core<'a, E, F>(
+    bytes: &'a [u8],
+    profile: LuaProfile,
+    limits: &TransportLimits,
+    official_scan: F,
+) -> Result<InputPreflight<'a>, E>
+where
+    E: From<InputError>,
+    F: FnOnce(&[u8], LuaProfile, &OfficialChunkLimits, &super::VerifyLimits) -> Result<OfficialChunkPreflight, E>,
+{
     let format = classify_input(bytes);
-    let scan = input_scan_admission(bytes.len(), format)?;
+    let scan = input_scan_admission(bytes.len(), format).map_err(E::from)?;
     if scan.work > limits.max_work {
-        return Err(limit("輸入掃描工作量超限"));
+        return Err(E::from(limit("輸入掃描工作量超限")));
     }
     let (subsequent_work, temporary_bytes, retained_bytes, official) = match format {
         InputFormat::RawRvlu => {
-            let admission = preflight_transport_decode(bytes, &RAW_NONE_SIDECAR, profile, limits)?;
+            let admission = preflight_transport_decode(bytes, &RAW_NONE_SIDECAR, profile, limits).map_err(|error| E::from(error.into()))?;
             (
                 admission.subsequent_work,
                 admission.temporary_bytes,
@@ -226,7 +259,7 @@ pub fn preflight_input_module<'a>(
             official_limits.max_allocated_bytes = official_limits
                 .max_allocated_bytes
                 .min(limits.max_temporary_bytes);
-            let stats = preflight_official_chunk(bytes, profile, &official_limits, &limits.verify)?;
+            let stats = official_scan(bytes, profile, &official_limits, &limits.verify)?;
             (
                 stats.subsequent_work,
                 stats.temporary_bytes,
@@ -235,7 +268,7 @@ pub fn preflight_input_module<'a>(
             )
         }
         InputFormat::Source | InputFormat::UnsupportedBinary => {
-            return Err(invalid("無法解碼為 bytecode"));
+            return Err(E::from(invalid("無法解碼為 bytecode")));
         }
     };
     if scan
@@ -245,7 +278,7 @@ pub fn preflight_input_module<'a>(
         || temporary_bytes > limits.max_temporary_bytes
         || retained_bytes > limits.max_retained_bytes
     {
-        return Err(limit("輸入資源准入超限"));
+        return Err(E::from(limit("輸入資源准入超限")));
     }
     Ok(InputPreflight {
         bytes,
@@ -299,6 +332,89 @@ pub fn decode_input_module(preflight: InputPreflight<'_>) -> Result<VerifiedModu
     };
     if verified_module_allocation_bytes(&module)? > admission.retained_bytes {
         return Err(limit("模組實際保留容量超出預准入"));
+    }
+    Ok(module)
+}
+
+#[derive(Debug)]
+pub enum InputDecodeRecoveryError<E> {
+    Input(InputError),
+    Reserve(ReserveError<E>),
+}
+
+impl<E> From<InputError> for InputDecodeRecoveryError<E> {
+    fn from(error: InputError) -> Self {
+        Self::Input(error)
+    }
+}
+
+/// 由載入安全點傳入可回收 context，發布前保留相同 callback 的 prototype backing。
+pub fn decode_input_module_with_recovery<R: AllocationRecovery>(
+    preflight: InputPreflight<'_>,
+    recovery: &mut R,
+) -> Result<VerifiedModule, InputDecodeRecoveryError<R::Error>> {
+    let admission = preflight.admission;
+    let module = match preflight.format {
+        InputFormat::RawRvlu => decode_module_with_recovery(
+            preflight.bytes,
+            preflight.profile,
+            &preflight.limits.verify,
+            recovery,
+        )
+        .map_err(|error| match error {
+            BytecodeRecoveryError::Bytecode(error) => InputDecodeRecoveryError::Input(error.into()),
+            BytecodeRecoveryError::Reserve(error) => InputDecodeRecoveryError::Reserve(error),
+        })?,
+        InputFormat::Official => {
+            let stats = preflight.official.ok_or_else(|| InputDecodeRecoveryError::Input(invalid("官方預掃描缺失")))?;
+            let mut official_limits = preflight.limits.official;
+            official_limits.max_allocated_bytes = official_limits.max_allocated_bytes
+                .min(stats.decoded_bytes)
+                .min(admission.temporary_bytes);
+            let decoded = decode_official_chunk_with_recovery(
+                preflight.bytes,
+                preflight.profile,
+                &official_limits,
+                recovery,
+            )
+            .map_err(|error| match error {
+                OfficialChunkRecoveryError::Chunk(error) => InputDecodeRecoveryError::Input(error.into()),
+                OfficialChunkRecoveryError::Reserve(error) => InputDecodeRecoveryError::Reserve(error),
+            })?;
+            let mut work = OfficialWorkBudget::new(admission.subsequent_work);
+            translate_official_chunk_with_work_and_recovery(
+                &decoded,
+                &preflight.limits.verify,
+                &mut work,
+                recovery,
+            )
+            .map_err(|error| match error {
+                OfficialTranslationRecoveryError::Translation(error) => {
+                    InputDecodeRecoveryError::Input(if work.exhausted() {
+                        limit("官方翻譯工作量超限")
+                    } else {
+                        error.into()
+                    })
+                }
+                OfficialTranslationRecoveryError::Reserve(error) => InputDecodeRecoveryError::Reserve(error),
+            })?
+            .into_verified()
+        }
+        InputFormat::Source | InputFormat::UnsupportedBinary => {
+            return Err(InputDecodeRecoveryError::Input(invalid("無法解碼為 bytecode")));
+        }
+    };
+    let actual = verified_module_allocation_bytes_with_recovery(&module, recovery)
+        .map_err(|error| match error {
+            TransportMeasureRecoveryError::Transport(error) =>
+                InputDecodeRecoveryError::Input(error.into()),
+            TransportMeasureRecoveryError::Reserve(error) =>
+                InputDecodeRecoveryError::Reserve(error),
+        })?;
+    if actual > admission.retained_bytes {
+        return Err(InputDecodeRecoveryError::Input(limit(
+            "模組實際保留容量超出預准入",
+        )));
     }
     Ok(module)
 }

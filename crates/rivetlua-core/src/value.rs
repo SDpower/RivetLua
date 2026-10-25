@@ -37,11 +37,12 @@ impl VmId {
     }
 }
 
-/// 宿主 C 函式在單一 VM 內的不可解參照身分；指標只留在 C API registry。
+/// 宿主函式身分；light C function 直接保存有效函式位址，不配置 registry。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct HostFunctionId {
     vm: VmId,
     token: NonZeroU64,
+    c_function: bool,
 }
 
 impl HostFunctionId {
@@ -49,7 +50,20 @@ impl HostFunctionId {
         Some(Self {
             vm,
             token: next_unique_id(&NEXT_HOST_FUNCTION_ID)?,
+            c_function: false,
         })
+    }
+
+    #[doc(hidden)]
+    pub fn from_c_function(vm: VmId,
+        function: unsafe extern "C" fn(*mut core::ffi::c_void) -> core::ffi::c_int) -> Self {
+        Self { vm, token: NonZeroU64::new(function as usize as u64)
+            .expect("有效 C 函式位址不得為零"), c_function: true }
+    }
+
+    #[doc(hidden)]
+    pub fn c_function_address(self) -> Option<usize> {
+        self.c_function.then_some(self.token.get() as usize)
     }
 
     pub const fn vm(self) -> VmId {
@@ -116,13 +130,29 @@ impl ObjectId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ObjectRef(ObjectRefKind);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+// 手寫相等仍逐欄比較；衍生 Hash 使用相同的 variant、完整身分與 token。
+#[allow(clippy::derived_hash_with_manual_eq)]
+#[derive(Clone, Copy, Debug, Eq, Hash)]
 enum ObjectRefKind {
     Opaque(NonZeroU64),
     Heap {
         id: ObjectId,
         token: Option<NonZeroU64>,
     },
+}
+
+impl PartialEq for ObjectRefKind {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Opaque(left), Self::Opaque(right)) => left == right,
+            (
+                Self::Heap { id: left_id, token: left_token },
+                Self::Heap { id: right_id, token: right_token },
+            ) => left_id == right_id && left_token == right_token,
+            _ => false,
+        }
+    }
 }
 
 impl ObjectRef {

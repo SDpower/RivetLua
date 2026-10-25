@@ -1,12 +1,16 @@
 //! P05 對官方 chunk 轉譯所得私有執行描述的驗證；描述不屬於 RVLU_V2 wire。
 
 use alloc::vec::Vec;
+use rivetlua_alloc::{AllocationRecovery, GlobalAllocation, ReserveError};
 
-use super::codec::{BytecodeError, BytecodeErrorCode, VerifiedModule, VerifyLimits};
+use super::codec::{
+    BytecodeError, BytecodeErrorCode, BytecodeRecoveryError, BytecodeVec, RetainedVec, Scratch,
+    VerifiedModule, VerifyLimits,
+};
 use super::official_translation::{BoundedVecReserve, ReserveFailure};
 use super::{
-    BytecodeBindingId, BytecodeUpvalueSource, Instruction, InstructionOffset, ProtoId, Register,
-    ResultMode, UpvalueId,
+    BytecodeBindingId, BytecodeUpvalueSource, Instruction, InstructionOffset, LuaProfile, ProtoId,
+    Register, ResultMode, UpvalueId,
 };
 
 #[cfg(test)]
@@ -49,6 +53,27 @@ pub enum OfficialPlanBuiltin {
     GlobalNilCheck,
 }
 
+const NATIVE_BUILTINS: [OfficialPlanBuiltin; 2] = [
+    OfficialPlanBuiltin::RawListWrite,
+    OfficialPlanBuiltin::GlobalNilCheck,
+];
+
+fn native_builtin_bit(builtin: OfficialPlanBuiltin) -> Option<u8> {
+    match builtin {
+        OfficialPlanBuiltin::RawListWrite => Some(1),
+        OfficialPlanBuiltin::GlobalNilCheck => Some(2),
+        _ => None,
+    }
+}
+
+fn native_hidden_id(guest_count: u16, needed: u8, builtin: OfficialPlanBuiltin) -> Option<UpvalueId> {
+    let bit = native_builtin_bit(builtin)?;
+    (needed & bit != 0)
+        .then_some(u16::from(bit == 2 && needed & 1 != 0))
+        .and_then(|offset| guest_count.checked_add(offset))
+        .map(UpvalueId)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OfficialPlanRootSource {
     ExternalEnvironment,
@@ -68,7 +93,7 @@ pub struct OfficialPlanUpvalueMap {
     pub guest_count: u16,
     pub guest_start: Register,
     pub guest_register_count: u16,
-    pub hidden: Vec<(OfficialPlanBuiltin, UpvalueId)>,
+    pub hidden: RetainedVec<(OfficialPlanBuiltin, UpvalueId)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,7 +116,7 @@ pub struct OfficialPlanCall {
     pub call_pc: InstructionOffset,
     pub function_register: Register,
     pub source_upvalue: UpvalueId,
-    pub inputs: Vec<Register>,
+    pub inputs: RetainedVec<Register>,
     pub open_tail: Option<Register>,
     pub builtin: OfficialPlanBuiltin,
 }
@@ -102,6 +127,45 @@ pub struct OfficialPlanCandidate {
     pub upvalue_maps: Vec<OfficialPlanUpvalueMap>,
     pub frame_inputs: Vec<OfficialPlanFrameInput>,
     pub calls: Vec<OfficialPlanCall>,
+}
+
+/// 已在指定 allocator 建構的官方執行描述候選資料。
+#[derive(Debug)]
+pub struct StateOfficialPlanCandidate {
+    pub root_bindings: RetainedVec<OfficialPlanRootBinding>,
+    pub upvalue_maps: RetainedVec<OfficialPlanUpvalueMap>,
+    pub frame_inputs: RetainedVec<OfficialPlanFrameInput>,
+    pub calls: RetainedVec<OfficialPlanCall>,
+}
+
+impl From<OfficialPlanCandidate> for StateOfficialPlanCandidate {
+    fn from(candidate: OfficialPlanCandidate) -> Self {
+        Self {
+            root_bindings: candidate.root_bindings.into(),
+            upvalue_maps: candidate.upvalue_maps.into(),
+            frame_inputs: candidate.frame_inputs.into(),
+            calls: candidate.calls.into(),
+        }
+    }
+}
+
+impl StateOfficialPlanCandidate {
+    fn allocated_bytes(&self) -> Option<usize> {
+        let mut bytes = self
+            .root_bindings
+            .capacity()
+            .checked_mul(core::mem::size_of::<OfficialPlanRootBinding>())?
+            .checked_add(self.upvalue_maps.capacity().checked_mul(core::mem::size_of::<OfficialPlanUpvalueMap>())?)?
+            .checked_add(self.frame_inputs.capacity().checked_mul(core::mem::size_of::<OfficialPlanFrameInput>())?)?
+            .checked_add(self.calls.capacity().checked_mul(core::mem::size_of::<OfficialPlanCall>())?)?;
+        for mapping in self.upvalue_maps.iter() {
+            bytes = bytes.checked_add(mapping.hidden.retained_bytes()?)?;
+        }
+        for call in self.calls.iter() {
+            bytes = bytes.checked_add(call.inputs.retained_bytes()?)?;
+        }
+        Some(bytes)
+    }
 }
 
 impl OfficialPlanCandidate {
@@ -126,19 +190,10 @@ impl OfficialPlanCandidate {
                     .checked_mul(core::mem::size_of::<OfficialPlanCall>())?,
             )?;
         for mapping in &self.upvalue_maps {
-            bytes = bytes.checked_add(
-                mapping
-                    .hidden
-                    .capacity()
-                    .checked_mul(core::mem::size_of::<(OfficialPlanBuiltin, UpvalueId)>())?,
-            )?;
+            bytes = bytes.checked_add(mapping.hidden.retained_bytes()?)?;
         }
         for call in &self.calls {
-            bytes = bytes.checked_add(
-                call.inputs
-                    .capacity()
-                    .checked_mul(core::mem::size_of::<Register>())?,
-            )?;
+            bytes = bytes.checked_add(call.inputs.retained_bytes()?)?;
         }
         Some(bytes)
     }
@@ -147,13 +202,38 @@ impl OfficialPlanCandidate {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OfficialExecutionPlan {
     native_builtin: bool,
-    root_bindings: Vec<OfficialPlanRootBinding>,
-    upvalue_maps: Vec<OfficialPlanUpvalueMap>,
-    frame_inputs: Vec<OfficialPlanFrameInput>,
-    calls: Vec<OfficialPlanCall>,
+    root_bindings: RetainedVec<OfficialPlanRootBinding>,
+    upvalue_maps: RetainedVec<OfficialPlanUpvalueMap>,
+    frame_inputs: RetainedVec<OfficialPlanFrameInput>,
+    calls: RetainedVec<OfficialPlanCall>,
 }
 
 impl OfficialExecutionPlan {
+    pub(crate) fn rehome<R: AllocationRecovery>(
+        &mut self,
+        recovery: &mut R,
+    ) -> Result<(), ReserveError<R::Error>> {
+        let allocator = recovery.allocator();
+        if let Some(maps) = self.upvalue_maps.global_mut() {
+            for map in maps {
+                map.hidden.rehome(recovery)?;
+            }
+        } else if !self.upvalue_maps.is_state_for(&allocator) {
+            return Err(ReserveError::AllocatorMismatch);
+        }
+        if let Some(calls) = self.calls.global_mut() {
+            for call in calls {
+                call.inputs.rehome(recovery)?;
+            }
+        } else if !self.calls.is_state_for(&allocator) {
+            return Err(ReserveError::AllocatorMismatch);
+        }
+        self.root_bindings.rehome(recovery)?;
+        self.upvalue_maps.rehome(recovery)?;
+        self.frame_inputs.rehome(recovery)?;
+        self.calls.rehome(recovery)?;
+        Ok(())
+    }
     pub fn is_native_builtin(&self) -> bool {
         self.native_builtin
     }
@@ -201,37 +281,15 @@ impl OfficialExecutionPlan {
     pub fn allocated_bytes(&self) -> Option<usize> {
         let mut bytes = self
             .root_bindings
-            .capacity()
-            .checked_mul(core::mem::size_of::<OfficialPlanRootBinding>())?
-            .checked_add(
-                self.upvalue_maps
-                    .capacity()
-                    .checked_mul(core::mem::size_of::<OfficialPlanUpvalueMap>())?,
-            )?
-            .checked_add(
-                self.frame_inputs
-                    .capacity()
-                    .checked_mul(core::mem::size_of::<OfficialPlanFrameInput>())?,
-            )?;
+            .retained_bytes()?
+            .checked_add(self.upvalue_maps.retained_bytes()?)?
+            .checked_add(self.frame_inputs.retained_bytes()?)?;
         for mapping in &self.upvalue_maps {
-            bytes = bytes.checked_add(
-                mapping
-                    .hidden
-                    .capacity()
-                    .checked_mul(core::mem::size_of::<(OfficialPlanBuiltin, UpvalueId)>())?,
-            )?;
+            bytes = bytes.checked_add(mapping.hidden.retained_bytes()?)?;
         }
-        bytes = bytes.checked_add(
-            self.calls
-                .capacity()
-                .checked_mul(core::mem::size_of::<OfficialPlanCall>())?,
-        )?;
+        bytes = bytes.checked_add(self.calls.retained_bytes()?)?;
         for call in &self.calls {
-            bytes = bytes.checked_add(
-                call.inputs
-                    .capacity()
-                    .checked_mul(core::mem::size_of::<Register>())?,
-            )?;
+            bytes = bytes.checked_add(call.inputs.retained_bytes()?)?;
         }
         Some(bytes)
     }
@@ -253,6 +311,16 @@ fn limited(message: &'static str) -> BytecodeError {
     }
 }
 
+fn global_plan_recovery_error(
+    error: BytecodeRecoveryError<core::convert::Infallible>,
+) -> BytecodeError {
+    match error {
+        BytecodeRecoveryError::Bytecode(error) => error,
+        BytecodeRecoveryError::Reserve(ReserveError::Recovery(never)) => match never {},
+        BytecodeRecoveryError::Reserve(_) => limited("官方計畫配置失敗"),
+    }
+}
+
 fn reserve_error(error: ReserveFailure, message: &'static str) -> BytecodeError {
     BytecodeError {
         code: match error {
@@ -265,7 +333,7 @@ fn reserve_error(error: ReserveFailure, message: &'static str) -> BytecodeError 
 }
 
 fn push_allowed_read(
-    reads: &mut Vec<(usize, usize, u16)>,
+    reads: &mut BytecodeVec<(usize, usize, u16)>,
     bound: usize,
     item: (usize, usize, u16),
 ) -> Result<(), BytecodeError> {
@@ -338,9 +406,6 @@ fn writes_register(instruction: &Instruction, register: Register) -> bool {
         Instruction::Call {
             base, result_mode, ..
         }
-        | Instruction::TailCall {
-            base, result_mode, ..
-        }
         | Instruction::Vararg { base, result_mode } => match result_mode {
             ResultMode::Fixed(count) => in_range(register, *base, *count),
             ResultMode::All => register.0 >= base.0,
@@ -357,9 +422,39 @@ fn writes_register(instruction: &Instruction, register: Register) -> bool {
 
 /// 附加的描述不由 RVLU decode 推導；裸 RVLU 永遠不會產生固定 VM binding。
 pub fn verify_official_execution_plan(
-    mut verified: VerifiedModule,
+    verified: VerifiedModule,
     candidate: OfficialPlanCandidate,
     limits: &VerifyLimits,
+) -> Result<VerifiedModule, BytecodeError> {
+    let mut recovery = GlobalAllocation;
+    verify_official_execution_plan_with_recovery(
+        verified,
+        candidate.into(),
+        limits,
+        &mut recovery,
+    )
+    .map_err(global_plan_recovery_error)
+}
+
+pub fn verify_official_execution_plan_with_recovery<R: AllocationRecovery>(
+    verified: VerifiedModule,
+    candidate: StateOfficialPlanCandidate,
+    limits: &VerifyLimits,
+    recovery: &mut R,
+) -> Result<VerifiedModule, BytecodeRecoveryError<R::Error>> {
+    let mut scratch = Scratch::new(recovery);
+    let result = verify_official_execution_plan_inner(verified, candidate, limits, &mut scratch);
+    result.map_err(|error| match scratch.take_refusal() {
+        Some(refusal) => BytecodeRecoveryError::Reserve(refusal),
+        None => BytecodeRecoveryError::Bytecode(error),
+    })
+}
+
+fn verify_official_execution_plan_inner<R: AllocationRecovery>(
+    mut verified: VerifiedModule,
+    candidate: StateOfficialPlanCandidate,
+    limits: &VerifyLimits,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<VerifiedModule, BytecodeError> {
     let module = verified.module();
     if verified.official_execution().is_some() {
@@ -637,9 +732,9 @@ pub fn verify_official_execution_plan(
         })
         .and_then(|bytes| {
             bytes.checked_add(module.prototypes.len().checked_mul(
-                core::mem::size_of::<Vec<bool>>()
-                    + core::mem::size_of::<Vec<i32>>()
-                    + core::mem::size_of::<Vec<Register>>(),
+                core::mem::size_of::<BytecodeVec<bool>>()
+                    + core::mem::size_of::<BytecodeVec<i32>>()
+                    + core::mem::size_of::<BytecodeVec<Register>>(),
             )?)
         })
         .ok_or_else(|| limited("官方工作索引 bytes 溢位"))?;
@@ -650,37 +745,37 @@ pub fn verify_official_execution_plan(
     {
         return Err(limited("官方描述與工作索引 bytes 超過限制"));
     }
-    let mut covered = Vec::new();
-    covered
-        .try_reserve_bounded_exact(module.prototypes.len())
-        .map_err(|error| reserve_error(error, "官方 Call 覆蓋索引配置失敗"))?;
+    let mut covered = scratch.vec();
+    scratch
+        .reserve_exact(&mut covered, module.prototypes.len())
+        .map_err(|_| limited("官方 Call 覆蓋索引配置失敗"))?;
     for proto in &module.prototypes {
-        let mut flags = Vec::new();
-        flags
-            .try_reserve_bounded_exact(proto.instructions.len())
-            .map_err(|error| reserve_error(error, "官方 Call 覆蓋索引配置失敗"))?;
+        let mut flags = scratch.vec();
+        scratch
+            .reserve_exact(&mut flags, proto.instructions.len())
+            .map_err(|_| limited("官方 Call 覆蓋索引配置失敗"))?;
         flags.resize(proto.instructions.len(), false);
         covered.push(flags);
     }
-    let mut protected = Vec::new();
-    protected
-        .try_reserve_bounded_exact(module.prototypes.len())
-        .map_err(|error| reserve_error(error, "官方 CFG 索引配置失敗"))?;
-    let mut sensitive = Vec::new();
-    sensitive
-        .try_reserve_bounded_exact(module.prototypes.len())
-        .map_err(|error| reserve_error(error, "官方私有 register 索引配置失敗"))?;
+    let mut protected = scratch.vec();
+    scratch
+        .reserve_exact(&mut protected, module.prototypes.len())
+        .map_err(|_| limited("官方 CFG 索引配置失敗"))?;
+    let mut sensitive = scratch.vec();
+    scratch
+        .reserve_exact(&mut sensitive, module.prototypes.len())
+        .map_err(|_| limited("官方私有 register 索引配置失敗"))?;
     for proto in &module.prototypes {
-        let mut differences = Vec::new();
-        differences
-            .try_reserve_bounded_exact(proto.instructions.len() + 1)
-            .map_err(|error| reserve_error(error, "官方 CFG 索引配置失敗"))?;
+        let mut differences = scratch.vec();
+        scratch
+            .reserve_exact(&mut differences, proto.instructions.len() + 1)
+            .map_err(|_| limited("官方 CFG 索引配置失敗"))?;
         differences.resize(proto.instructions.len() + 1, 0_i32);
         protected.push(differences);
-        let mut registers = Vec::new();
-        registers
-            .try_reserve_bounded_exact(proto.register_count as usize)
-            .map_err(|error| reserve_error(error, "官方私有 register 索引配置失敗"))?;
+        let mut registers = scratch.vec();
+        scratch
+            .reserve_exact(&mut registers, proto.register_count as usize)
+            .map_err(|_| limited("官方私有 register 索引配置失敗"))?;
         for input in candidate
             .frame_inputs
             .iter()
@@ -692,10 +787,10 @@ pub fn verify_official_execution_plan(
         }
         sensitive.push(registers);
     }
-    let mut allowed_reads = Vec::<(usize, usize, u16)>::new();
-    allowed_reads
-        .try_reserve_bounded_exact(access_capacity)
-        .map_err(|error| reserve_error(error, "官方讀取索引配置失敗"))?;
+    let mut allowed_reads: BytecodeVec<(usize, usize, u16)> = scratch.vec();
+    scratch
+        .reserve_exact(&mut allowed_reads, access_capacity)
+        .map_err(|_| limited("官方讀取索引配置失敗"))?;
     for call in &candidate.calls {
         let index = module
             .prototypes
@@ -1246,7 +1341,7 @@ pub fn verify_official_execution_plan(
     Ok(verified)
 }
 
-/// Native 編譯器的 RawListWrite 候選只授權 table constructor 的末尾開放欄位。
+/// Native 編譯器的 helper 候選只授權已驗證的 constructor 與 global 初始化形狀。
 /// 候選可來自編譯器或 sidecar；每次均須與已驗證的 RVLU 重新核對。
 pub fn verify_native_builtin_plan(
     verified: VerifiedModule,
@@ -1257,10 +1352,49 @@ pub fn verify_native_builtin_plan(
 }
 
 pub(crate) fn verify_native_builtin_plan_metered(
-    mut verified: VerifiedModule,
+    verified: VerifiedModule,
     candidate: OfficialPlanCandidate,
     limits: &VerifyLimits,
     max_scratch_bytes: usize,
+) -> Result<VerifiedModule, BytecodeError> {
+    let mut recovery = GlobalAllocation;
+    verify_native_builtin_plan_with_recovery(
+        verified,
+        candidate.into(),
+        limits,
+        max_scratch_bytes,
+        &mut recovery,
+    )
+    .map_err(global_plan_recovery_error)
+}
+
+pub fn verify_native_builtin_plan_with_recovery<R: AllocationRecovery>(
+    verified: VerifiedModule,
+    candidate: StateOfficialPlanCandidate,
+    limits: &VerifyLimits,
+    max_scratch_bytes: usize,
+    recovery: &mut R,
+) -> Result<VerifiedModule, BytecodeRecoveryError<R::Error>> {
+    let mut scratch = Scratch::new(recovery);
+    let result = verify_native_builtin_plan_inner(
+        verified,
+        candidate,
+        limits,
+        max_scratch_bytes,
+        &mut scratch,
+    );
+    result.map_err(|error| match scratch.take_refusal() {
+        Some(refusal) => BytecodeRecoveryError::Reserve(refusal),
+        None => BytecodeRecoveryError::Bytecode(error),
+    })
+}
+
+fn verify_native_builtin_plan_inner<R: AllocationRecovery>(
+    mut verified: VerifiedModule,
+    candidate: StateOfficialPlanCandidate,
+    limits: &VerifyLimits,
+    max_scratch_bytes: usize,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<VerifiedModule, BytecodeError> {
     if verified.official_execution().is_some() || verified.official_artifact().is_some() {
         return Err(invalid("native helper 不可附加官方來源或其他計畫"));
@@ -1270,37 +1404,33 @@ pub(crate) fn verify_native_builtin_plan_metered(
         || candidate.calls.len() > limits.max_instructions
         || candidate.upvalue_maps.len() != module.prototypes.len()
         || !candidate.frame_inputs.is_empty()
-        || candidate.root_bindings.len() != 1
-        || candidate.root_bindings[0]
-            != (OfficialPlanRootBinding {
-                upvalue: UpvalueId(0),
-                source: OfficialPlanRootSource::FixedBuiltin(OfficialPlanBuiltin::RawListWrite),
-            })
     {
-        return Err(invalid("native RawListWrite 宣告形狀無效"));
+        return Err(invalid("native builtin 宣告形狀無效"));
     }
-    let mut needed = Vec::new();
+    let mut needed = scratch.vec();
     let needed_requested = module
         .prototypes
         .len()
-        .checked_mul(core::mem::size_of::<bool>())
+        .checked_mul(core::mem::size_of::<u8>())
         .ok_or_else(|| limited("native helper needed 容量溢位"))?;
     if needed_requested > max_scratch_bytes {
         return Err(limited("native helper needed 超出預准入"));
     }
-    native_reserve_exact(&mut needed, module.prototypes.len())
-        .map_err(|error| reserve_error(error, "native helper needed 索引配置失敗"))?;
+    scratch
+        .reserve_exact(&mut needed, module.prototypes.len())
+        .map_err(|_| limited("native helper needed 索引配置失敗"))?;
     let needed_bytes = needed
         .capacity()
-        .checked_mul(core::mem::size_of::<bool>())
+        .checked_mul(core::mem::size_of::<u8>())
         .ok_or_else(|| limited("native helper needed 容量溢位"))?;
     if needed_bytes > max_scratch_bytes {
         return Err(limited("native helper needed 超出預准入"));
     }
-    needed.resize(module.prototypes.len(), false);
+    needed.resize(module.prototypes.len(), 0u8);
     for (index, call) in candidate.calls.iter().enumerate() {
-        if call.builtin != OfficialPlanBuiltin::RawListWrite
-            || index > 0
+        let bit = native_builtin_bit(call.builtin)
+            .ok_or_else(|| invalid("native helper 種類無效"))?;
+        if index > 0
                 && (
                     candidate.calls[index - 1].prototype,
                     candidate.calls[index - 1].call_pc,
@@ -1323,10 +1453,10 @@ pub(crate) fn verify_native_builtin_plan_metered(
                 .iter()
                 .position(|proto| proto.id == id)
                 .ok_or_else(|| invalid("native helper prototype 無效"))?;
-            if needed[position] {
+            if needed[position] & bit != 0 {
                 break;
             }
-            needed[position] = true;
+            needed[position] |= bit;
             current = module.prototypes[position].parent;
         }
     }
@@ -1339,14 +1469,17 @@ pub(crate) fn verify_native_builtin_plan_metered(
         if map.prototype != proto.id
             || map.guest_start != Register(0)
             || map.guest_register_count != proto.register_count
-            || map.hidden.len() != usize::from(needed[index])
+            || map.hidden.len() != needed[index].count_ones() as usize
             || usize::from(map.guest_count) + map.hidden.len() != proto.upvalues.len()
         {
             return Err(invalid("native helper upvalue/register mapping 無效"));
         }
-        if needed[index] {
-            let hidden = UpvalueId(map.guest_count);
-            if map.hidden != [(OfficialPlanBuiltin::RawListWrite, hidden)] {
+        for (ordinal, &builtin) in NATIVE_BUILTINS.iter().filter(|&&builtin| {
+            native_builtin_bit(builtin).is_some_and(|bit| needed[index] & bit != 0)
+        }).enumerate() {
+            let hidden = native_hidden_id(map.guest_count, needed[index], builtin)
+                .ok_or_else(|| invalid("native helper hidden binding ID 溢位"))?;
+            if map.hidden.get(ordinal) != Some(&(builtin, hidden)) {
                 return Err(invalid("native helper hidden binding 無效"));
             }
             let expected = match proto.parent {
@@ -1356,7 +1489,12 @@ pub(crate) fn verify_native_builtin_plan_metered(
                         .iter()
                         .find(|entry| entry.prototype == parent)
                         .ok_or_else(|| invalid("native helper parent mapping 缺失"))?;
-                    BytecodeUpvalueSource::ParentUpvalue(UpvalueId(parent_map.guest_count))
+                    let parent_index = module.prototypes.iter().position(|entry| entry.id == parent)
+                        .ok_or_else(|| invalid("native helper parent prototype 無效"))?;
+                    BytecodeUpvalueSource::ParentUpvalue(
+                        native_hidden_id(parent_map.guest_count, needed[parent_index], builtin)
+                            .ok_or_else(|| invalid("native helper parent binding 缺失"))?
+                    )
                 }
                 None => BytecodeUpvalueSource::ParentLocal(proto.global_environment_binding),
             };
@@ -1389,12 +1527,20 @@ pub(crate) fn verify_native_builtin_plan_metered(
         .ok_or_else(|| invalid("native root prototype 缺失"))?;
     if root.parent.is_some()
         || candidate.upvalue_maps[0].guest_count != 0
-        || !needed[0]
-        || root.upvalues.len() != 1
+        || needed[0] == 0
+        || root.upvalues.len() != needed[0].count_ones() as usize
+        || candidate.root_bindings.len() != needed[0].count_ones() as usize
+        || NATIVE_BUILTINS.iter().filter(|&&builtin| {
+            native_builtin_bit(builtin).is_some_and(|bit| needed[0] & bit != 0)
+        }).enumerate().any(|(index, &builtin)| candidate.root_bindings[index]
+            != OfficialPlanRootBinding {
+                upvalue: UpvalueId(index as u16),
+                source: OfficialPlanRootSource::FixedBuiltin(builtin),
+            })
     {
         return Err(invalid("native root helper binding 無效"));
     }
-    let mut allowed_hidden_reads = Vec::new();
+    let mut allowed_hidden_reads = scratch.vec();
     let allowed_requested = candidate
         .calls
         .len()
@@ -1404,8 +1550,9 @@ pub(crate) fn verify_native_builtin_plan_metered(
     if allowed_requested > max_scratch_bytes {
         return Err(limited("native helper read index 超出預准入"));
     }
-    native_reserve_exact(&mut allowed_hidden_reads, candidate.calls.len())
-        .map_err(|error| reserve_error(error, "native helper read index 配置失敗"))?;
+    scratch
+        .reserve_exact(&mut allowed_hidden_reads, candidate.calls.len())
+        .map_err(|_| limited("native helper read index 配置失敗"))?;
     let scratch_bytes = needed_bytes
         .checked_add(
             allowed_hidden_reads
@@ -1427,6 +1574,11 @@ pub(crate) fn verify_native_builtin_plan_metered(
         let map = &candidate.upvalue_maps[proto_index];
         let pc = call.call_pc.0 as usize;
         let base = call.function_register;
+        if (call.builtin == OfficialPlanBuiltin::GlobalNilCheck && module.profile != LuaProfile::Lua55)
+            || Some(call.source_upvalue) != native_hidden_id(map.guest_count, needed[proto_index], call.builtin) {
+            return Err(invalid("native helper call hidden binding 無效"));
+        }
+        if call.builtin == OfficialPlanBuiltin::RawListWrite {
         let slots = [
             base.0,
             base.0
@@ -1444,7 +1596,7 @@ pub(crate) fn verify_native_builtin_plan_metered(
         ];
         if slots[4] >= proto.register_count
             || call.source_upvalue != UpvalueId(map.guest_count)
-            || call.inputs
+            || call.inputs.as_ref()
                 != [Register(slots[1]), Register(slots[2]), Register(slots[3])]
             || call.open_tail != Some(Register(slots[4]))
             || base.0 < proto.frame.initial_top.0
@@ -1502,7 +1654,26 @@ pub(crate) fn verify_native_builtin_plan_metered(
         for (position, entry) in proto.instructions.iter().enumerate() {
             for &private in &slots[..4] {
                 let private = Register(private);
-                let permitted_read = position == pc;
+                // verify_module 的 CFG 保證相鄰 open producer/consumer；dynamic top 排除殘留 private 值。
+                let open_result_write = position > pc + 1
+                    && matches!(entry.instruction,
+                        Instruction::Call { base, result_mode: ResultMode::All, .. }
+                        | Instruction::Vararg { base, result_mode: ResultMode::All }
+                            if base.0 <= private.0)
+                    && matches!(proto.instructions.get(position + 1).map(|next| &next.instruction),
+                        Some(Instruction::Call { base, arg_count: u16::MAX, .. }
+                            | Instruction::TailCall { base, arg_count: u16::MAX, .. })
+                            if base.0 < private.0);
+                let open_result_read = position > pc + 1
+                    && matches!(entry.instruction,
+                        Instruction::Call { base, arg_count: u16::MAX, .. }
+                        | Instruction::TailCall { base, arg_count: u16::MAX, .. }
+                            if base.0 < private.0)
+                    && matches!(position.checked_sub(1).and_then(|previous| proto.instructions.get(previous)).map(|previous| &previous.instruction),
+                        Some(Instruction::Call { base, result_mode: ResultMode::All, .. }
+                            | Instruction::Vararg { base, result_mode: ResultMode::All })
+                            if base.0 <= private.0);
+                let permitted_read = position == pc || open_result_read;
                 let permitted_write = position == load_pc && private == base
                     || position == load_pc + 1 && private.0 == slots[1]
                     || position == load_pc + 2 && private.0 == slots[2]
@@ -1511,7 +1682,8 @@ pub(crate) fn verify_native_builtin_plan_metered(
                     || position == pc + 1 && private == base
                     // 賦值語句完成後可清空暫存；private 區段內仍只能由 setup/call 寫入。
                     || position > pc + 1
-                        && matches!(entry.instruction, Instruction::LoadNil { .. });
+                        && matches!(entry.instruction, Instruction::LoadNil { .. })
+                    || open_result_write;
                 if position >= load_pc
                     && (reads_register(&entry.instruction, private) && !permitted_read
                         || writes_register(&entry.instruction, private) && !permitted_write)
@@ -1541,6 +1713,95 @@ pub(crate) fn verify_native_builtin_plan_metered(
                 )
             {
                 return Err(invalid("native helper private 區段提前離開"));
+            }
+        }
+        } else {
+            let load_pc = pc.checked_sub(3).ok_or_else(|| invalid("GlobalNilCheck setup 缺失"))?;
+            let read_pc = pc.checked_sub(4).ok_or_else(|| invalid("GlobalNilCheck global read 缺失"))?;
+            let key_pc = pc.checked_sub(5).ok_or_else(|| invalid("GlobalNilCheck key 缺失"))?;
+            let value = Register(base.0.checked_sub(1).ok_or_else(|| invalid("GlobalNilCheck value register 無效"))?);
+            let input = Register(base.0.checked_add(1).ok_or_else(|| invalid("GlobalNilCheck input register 溢位"))?);
+            let name = Register(base.0.checked_add(2).ok_or_else(|| invalid("GlobalNilCheck name register 溢位"))?);
+            if name.0 >= proto.register_count
+                || base.0 < proto.frame.initial_top.0
+                || call.inputs.as_ref() != [input, name]
+                || call.open_tail.is_some()
+                || [base, input, name].contains(&proto.global_environment)
+                || proto.binding_registers.iter().any(|(_, register)| [base, input, name].contains(register))
+                || matches!(proto.named_vararg, Some((_, register)) if [base, input, name].contains(&register))
+                || module.prototypes.iter().any(|child| {
+                    child.parent == Some(proto.id) && child.upvalues.iter().any(|upvalue| {
+                        matches!(upvalue.source, BytecodeUpvalueSource::ParentLocal(binding)
+                            if proto.binding_registers.iter().any(|(id, register)| *id == binding && [base, input, name].contains(register)))
+                    })
+                })
+                || !matches!(proto.instructions.get(load_pc).map(|entry| &entry.instruction),
+                    Some(Instruction::GetUpvalue { dest, upvalue }) if *dest == base && *upvalue == call.source_upvalue)
+                || !matches!(proto.instructions.get(load_pc + 1).map(|entry| &entry.instruction),
+                    Some(Instruction::Move { dest, src }) if *dest == input && *src == value)
+                || !matches!(proto.instructions.get(load_pc + 2).map(|entry| &entry.instruction),
+                    Some(Instruction::LoadConst { dest, .. }) if *dest == name)
+                || !matches!(proto.instructions.get(pc).map(|entry| &entry.instruction),
+                    Some(Instruction::Call { base: actual, arg_count: 2, result_mode: ResultMode::Fixed(0) }) if *actual == base)
+                || !matches!(proto.instructions.get(pc + 1).map(|entry| &entry.instruction),
+                    Some(Instruction::LoadNil { start, count: 1 }) if *start == base)
+            {
+                return Err(invalid("native GlobalNilCheck private call ABI 無效"));
+            }
+            let (key, key_constant) = match (
+                &proto.instructions[key_pc].instruction,
+                &proto.instructions[read_pc].instruction,
+            ) {
+                (
+                    Instruction::LoadConst { dest: key, constant },
+                    Instruction::GetTable { dest, table, key: read_key },
+                ) if *dest == value && *table == proto.global_environment && *read_key == *key => {
+                    (*key, *constant)
+                }
+                _ => return Err(invalid("native GlobalNilCheck global read 無效")),
+            };
+            let name_constant = match &proto.instructions[pc - 1].instruction {
+                Instruction::LoadConst { constant, .. } => *constant,
+                _ => return Err(invalid("native GlobalNilCheck name load 無效")),
+            };
+            if !matches!(proto.constants.get(key_constant.0 as usize),
+                Some(super::BytecodeConstant::Name(_) | super::BytecodeConstant::String(_)))
+                || proto.constants.get(key_constant.0 as usize) != proto.constants.get(name_constant.0 as usize)
+                || !matches!(proto.instructions.get(pc + 2).map(|entry| &entry.instruction),
+                    Some(Instruction::SetTable { table, key: store_key, .. })
+                        if *table == proto.global_environment && *store_key == key)
+            {
+                return Err(invalid("native GlobalNilCheck name/store 無效"));
+            }
+            allowed_hidden_reads.push((proto.id, load_pc));
+            for (position, entry) in proto.instructions.iter().enumerate() {
+                for private in [base, input, name] {
+                    let permitted_write = position == load_pc && private == base
+                        || position == load_pc + 1 && private == input
+                        || position == load_pc + 2 && private == name
+                        || position == pc && private == base
+                        || position == pc + 1 && private == base
+                        || position > pc + 1 && matches!(entry.instruction, Instruction::LoadNil { .. });
+                    if position >= load_pc
+                        && (reads_register(&entry.instruction, private) && position != pc
+                            || writes_register(&entry.instruction, private) && !permitted_write)
+                    {
+                        return Err(invalid("native GlobalNilCheck private register 被 guest 讀寫"));
+                    }
+                }
+                let targets = match entry.instruction {
+                    Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } => [Some(target), None],
+                    Instruction::NumericForPrepare { exit, .. } => [Some(exit), None],
+                    Instruction::NumericForNext { target, exit, .. } => [Some(target), Some(exit)],
+                    _ => [None, None],
+                };
+                for target in targets.into_iter().flatten() {
+                    if (key_pc + 1..=pc + 2).contains(&position)
+                        != (key_pc + 1..=pc + 2).contains(&(target.0 as usize))
+                    {
+                        return Err(invalid("native GlobalNilCheck CFG 跨越 private 區段"));
+                    }
+                }
             }
         }
     }
@@ -1609,23 +1870,25 @@ pub(crate) fn native_builtin_candidate_from_calls_metered(
         .map_err(|error| reserve_error(error, "native helper needed 配置失敗"))?;
     let needed_bytes = needed
         .capacity()
-        .checked_mul(core::mem::size_of::<bool>())
+        .checked_mul(core::mem::size_of::<u8>())
         .ok_or_else(|| limited("native helper needed 容量溢位"))?;
     if needed_bytes > max_additional_bytes {
         return Err(limited("native helper needed 超出預准入"));
     }
-    needed.resize(protos.len(), false);
+    needed.resize(protos.len(), 0u8);
     for call in &calls {
+        let bit = native_builtin_bit(call.builtin)
+            .ok_or_else(|| invalid("native helper 種類無效"))?;
         let mut current = Some(call.prototype);
         while let Some(id) = current {
             let index = protos
                 .iter()
                 .position(|proto| proto.id == id)
                 .ok_or_else(|| invalid("native helper call prototype 無效"))?;
-            if needed[index] {
+            if needed[index] & bit != 0 {
                 break;
             }
-            needed[index] = true;
+            needed[index] |= bit;
             current = protos[index].parent;
         }
     }
@@ -1651,59 +1914,68 @@ pub(crate) fn native_builtin_candidate_from_calls_metered(
     if additional_used > max_additional_bytes {
         return Err(limited("native helper mapping 超出預准入"));
     }
-    for (proto, hidden) in protos.iter().zip(needed) {
+    for (proto, kinds) in protos.iter().zip(needed.iter().copied()) {
         let count = proto
             .upvalues
             .len()
-            .checked_sub(usize::from(hidden))
+            .checked_sub(kinds.count_ones() as usize)
             .ok_or_else(|| invalid("native helper upvalue 缺失"))?;
         let guest_count = u16::try_from(count).map_err(|_| limited("native guest upvalue 超限"))?;
         let mut hidden_bindings = Vec::new();
-        if hidden {
-            let requested = core::mem::size_of::<(OfficialPlanBuiltin, UpvalueId)>();
-            if additional_used
-                .checked_add(requested)
-                .is_none_or(|bytes| bytes > max_additional_bytes)
-            {
-                return Err(limited("native helper hidden binding 超出預准入"));
-            }
-            native_reserve_exact(&mut hidden_bindings, 1)
-                .map_err(|error| reserve_error(error, "native helper hidden binding 配置失敗"))?;
-            additional_used = additional_used
-                .checked_add(
-                    hidden_bindings
-                        .capacity()
-                        .checked_mul(requested)
-                        .ok_or_else(|| limited("native helper hidden binding 容量溢位"))?,
-                )
-                .ok_or_else(|| limited("native helper hidden binding 容量溢位"))?;
-            if additional_used > max_additional_bytes {
-                return Err(limited("native helper hidden binding 超出預准入"));
-            }
-            hidden_bindings.push((OfficialPlanBuiltin::RawListWrite, UpvalueId(guest_count)));
+        let hidden_requested = (kinds.count_ones() as usize)
+            .checked_mul(core::mem::size_of::<(OfficialPlanBuiltin, UpvalueId)>())
+            .ok_or_else(|| limited("native helper hidden binding 容量溢位"))?;
+        if additional_used.checked_add(hidden_requested).is_none_or(|bytes| bytes > max_additional_bytes) {
+            return Err(limited("native helper hidden binding 超出預准入"));
+        }
+        native_reserve_exact(&mut hidden_bindings, kinds.count_ones() as usize)
+            .map_err(|error| reserve_error(error, "native helper hidden binding 配置失敗"))?;
+        additional_used = additional_used
+            .checked_add(hidden_bindings.capacity()
+                .checked_mul(core::mem::size_of::<(OfficialPlanBuiltin, UpvalueId)>())
+                .ok_or_else(|| limited("native helper hidden binding 容量溢位"))?)
+            .ok_or_else(|| limited("native helper hidden binding 容量溢位"))?;
+        if additional_used > max_additional_bytes {
+            return Err(limited("native helper hidden binding 超出預准入"));
+        }
+        for builtin in NATIVE_BUILTINS.into_iter().filter(|&builtin| {
+            native_builtin_bit(builtin).is_some_and(|bit| kinds & bit != 0)
+        }) {
+            hidden_bindings.push((
+                builtin,
+                native_hidden_id(guest_count, kinds, builtin)
+                    .ok_or_else(|| limited("native helper hidden binding ID 溢位"))?,
+            ));
         }
         upvalue_maps.push(OfficialPlanUpvalueMap {
             prototype: proto.id,
             guest_count,
             guest_start: Register(0),
             guest_register_count: proto.register_count,
-            hidden: hidden_bindings,
+            hidden: hidden_bindings.into(),
         });
     }
     let mut root_bindings = Vec::new();
-    let root_requested = core::mem::size_of::<OfficialPlanRootBinding>();
+    let root_requested = (needed[0].count_ones() as usize)
+        .checked_mul(core::mem::size_of::<OfficialPlanRootBinding>())
+        .ok_or_else(|| limited("native helper root binding 容量溢位"))?;
     if additional_used
         .checked_add(root_requested)
         .is_none_or(|bytes| bytes > max_additional_bytes)
     {
         return Err(limited("native helper root binding 超出預准入"));
     }
-    native_reserve_exact(&mut root_bindings, 1)
+    native_reserve_exact(&mut root_bindings, needed[0].count_ones() as usize)
         .map_err(|error| reserve_error(error, "native helper root binding 配置失敗"))?;
-    root_bindings.push(OfficialPlanRootBinding {
-        upvalue: UpvalueId(0),
-        source: OfficialPlanRootSource::FixedBuiltin(OfficialPlanBuiltin::RawListWrite),
-    });
+    for builtin in NATIVE_BUILTINS.into_iter().filter(|&builtin| {
+        native_builtin_bit(builtin).is_some_and(|bit| needed[0] & bit != 0)
+    }) {
+        root_bindings.push(OfficialPlanRootBinding {
+            upvalue: native_hidden_id(0, needed[0], builtin)
+                .ok_or_else(|| limited("native helper root binding ID 溢位"))?,
+            source: OfficialPlanRootSource::FixedBuiltin(builtin),
+        });
+    }
     let candidate = OfficialPlanCandidate {
         root_bindings,
         upvalue_maps,
@@ -1721,6 +1993,165 @@ pub(crate) fn native_builtin_candidate_from_calls_metered(
         return Err(limited("native helper mapping 超出預准入"));
     }
     Ok((candidate, extra_bytes, resident_extra_bytes))
+}
+
+/// 以 state-backed calls 建構 native helper mapping，保留原有的容量上限。
+pub fn native_builtin_candidate_from_calls_with_recovery<R: AllocationRecovery>(
+    verified: &VerifiedModule,
+    calls: RetainedVec<OfficialPlanCall>,
+    max_additional_bytes: usize,
+    recovery: &mut R,
+) -> Result<StateOfficialPlanCandidate, BytecodeRecoveryError<R::Error>> {
+    let mut scratch = Scratch::new(recovery);
+    let result = native_builtin_candidate_from_calls_inner(
+        verified,
+        calls,
+        max_additional_bytes,
+        &mut scratch,
+    );
+    result.map_err(|error| match scratch.take_refusal() {
+        Some(refusal) => BytecodeRecoveryError::Reserve(refusal),
+        None => BytecodeRecoveryError::Bytecode(error),
+    })
+}
+
+fn native_builtin_candidate_from_calls_inner<R: AllocationRecovery>(
+    verified: &VerifiedModule,
+    calls: RetainedVec<OfficialPlanCall>,
+    max_additional_bytes: usize,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<StateOfficialPlanCandidate, BytecodeError> {
+    let protos = &verified.module().prototypes;
+    let mut needed = scratch.vec();
+    if protos.len() > max_additional_bytes {
+        return Err(limited("native helper needed 超出預准入"));
+    }
+    scratch
+        .reserve_exact(&mut needed, protos.len())
+        .map_err(|_| limited("native helper needed 配置失敗"))?;
+    let needed_bytes = needed
+        .capacity()
+        .checked_mul(core::mem::size_of::<u8>())
+        .ok_or_else(|| limited("native helper needed 容量溢位"))?;
+    if needed_bytes > max_additional_bytes {
+        return Err(limited("native helper needed 超出預准入"));
+    }
+    needed.resize(protos.len(), 0u8);
+    for call in calls.iter() {
+        let bit = native_builtin_bit(call.builtin)
+            .ok_or_else(|| invalid("native helper 種類無效"))?;
+        let mut current = Some(call.prototype);
+        while let Some(id) = current {
+            let index = protos
+                .iter()
+                .position(|proto| proto.id == id)
+                .ok_or_else(|| invalid("native helper call prototype 無效"))?;
+            if needed[index] & bit != 0 {
+                break;
+            }
+            needed[index] |= bit;
+            current = protos[index].parent;
+        }
+    }
+    let requested = protos
+        .len()
+        .checked_mul(core::mem::size_of::<OfficialPlanUpvalueMap>())
+        .and_then(|bytes| bytes.checked_add(needed_bytes))
+        .ok_or_else(|| limited("native helper mapping 容量溢位"))?;
+    if requested > max_additional_bytes {
+        return Err(limited("native helper mapping 超出預准入"));
+    }
+    let mut upvalue_maps = scratch.vec();
+    scratch
+        .reserve_exact(&mut upvalue_maps, protos.len())
+        .map_err(|_| limited("native helper mapping 配置失敗"))?;
+    let mut additional_used = needed_bytes
+        .checked_add(upvalue_maps.capacity().checked_mul(core::mem::size_of::<OfficialPlanUpvalueMap>())
+            .ok_or_else(|| limited("native helper mapping 容量溢位"))?)
+        .ok_or_else(|| limited("native helper mapping 容量溢位"))?;
+    if additional_used > max_additional_bytes {
+        return Err(limited("native helper mapping 超出預准入"));
+    }
+    for (proto, kinds) in protos.iter().zip(needed.iter().copied()) {
+        let count = proto
+            .upvalues
+            .len()
+            .checked_sub(kinds.count_ones() as usize)
+            .ok_or_else(|| invalid("native helper upvalue 缺失"))?;
+        let guest_count = u16::try_from(count).map_err(|_| limited("native guest upvalue 超限"))?;
+        let mut hidden_bindings = scratch.vec();
+        let item_bytes = core::mem::size_of::<(OfficialPlanBuiltin, UpvalueId)>();
+        let hidden_requested = (kinds.count_ones() as usize)
+            .checked_mul(item_bytes)
+            .ok_or_else(|| limited("native helper hidden binding 容量溢位"))?;
+        if additional_used.checked_add(hidden_requested).is_none_or(|bytes| bytes > max_additional_bytes) {
+            return Err(limited("native helper hidden binding 超出預准入"));
+        }
+        scratch
+            .reserve_exact(&mut hidden_bindings, kinds.count_ones() as usize)
+            .map_err(|_| limited("native helper hidden binding 配置失敗"))?;
+        additional_used = additional_used
+            .checked_add(hidden_bindings.capacity().checked_mul(item_bytes)
+                .ok_or_else(|| limited("native helper hidden binding 容量溢位"))?)
+            .ok_or_else(|| limited("native helper hidden binding 容量溢位"))?;
+        if additional_used > max_additional_bytes {
+            return Err(limited("native helper hidden binding 超出預准入"));
+        }
+        for builtin in NATIVE_BUILTINS.into_iter().filter(|&builtin| {
+            native_builtin_bit(builtin).is_some_and(|bit| kinds & bit != 0)
+        }) {
+            hidden_bindings.push((
+                builtin,
+                native_hidden_id(guest_count, kinds, builtin)
+                    .ok_or_else(|| limited("native helper hidden binding ID 溢位"))?,
+            ));
+        }
+        upvalue_maps.push(OfficialPlanUpvalueMap {
+            prototype: proto.id,
+            guest_count,
+            guest_start: Register(0),
+            guest_register_count: proto.register_count,
+            hidden: scratch
+                .retain(hidden_bindings)
+                .map_err(|_| limited("native helper hidden binding owner 配置失敗"))?,
+        });
+    }
+    let mut root_bindings = scratch.vec();
+    let root_requested = (needed[0].count_ones() as usize)
+        .checked_mul(core::mem::size_of::<OfficialPlanRootBinding>())
+        .ok_or_else(|| limited("native helper root binding 容量溢位"))?;
+    if additional_used
+        .checked_add(root_requested)
+        .is_none_or(|bytes| bytes > max_additional_bytes)
+    {
+        return Err(limited("native helper root binding 超出預准入"));
+    }
+    scratch
+        .reserve_exact(&mut root_bindings, needed[0].count_ones() as usize)
+        .map_err(|_| limited("native helper root binding 配置失敗"))?;
+    for builtin in NATIVE_BUILTINS.into_iter().filter(|&builtin| {
+        native_builtin_bit(builtin).is_some_and(|bit| needed[0] & bit != 0)
+    }) {
+        root_bindings.push(OfficialPlanRootBinding {
+            upvalue: native_hidden_id(0, needed[0], builtin)
+                .ok_or_else(|| limited("native helper root binding ID 溢位"))?,
+            source: OfficialPlanRootSource::FixedBuiltin(builtin),
+        });
+    }
+    let empty_frame_inputs = scratch.vec();
+    let candidate = StateOfficialPlanCandidate {
+        root_bindings: scratch
+            .retain(root_bindings)
+            .map_err(|_| limited("native helper root binding owner 配置失敗"))?,
+        upvalue_maps: scratch
+            .retain(upvalue_maps)
+            .map_err(|_| limited("native helper mapping owner 配置失敗"))?,
+        frame_inputs: scratch
+            .retain(empty_frame_inputs)
+            .map_err(|_| limited("native helper frame input owner 配置失敗"))?,
+        calls,
+    };
+    Ok(candidate)
 }
 
 #[cfg(test)]

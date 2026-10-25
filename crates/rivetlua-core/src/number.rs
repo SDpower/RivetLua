@@ -17,13 +17,16 @@ pub trait NoStdFloat {
     fn asin(self) -> f64;
     fn atan2(self, other: f64) -> f64;
     fn cos(self) -> f64;
+    fn cosh(self) -> f64;
     fn exp(self) -> f64;
     fn ln(self) -> f64;
     fn log2(self) -> f64;
     fn log10(self) -> f64;
     fn sin(self) -> f64;
+    fn sinh(self) -> f64;
     fn sqrt(self) -> f64;
     fn tan(self) -> f64;
+    fn tanh(self) -> f64;
 }
 
 #[cfg(not(feature = "std"))]
@@ -59,6 +62,9 @@ impl NoStdFloat for f64 {
     fn cos(self) -> f64 {
         libm::cos(self)
     }
+    fn cosh(self) -> f64 {
+        libm::cosh(self)
+    }
     fn exp(self) -> f64 {
         libm::exp(self)
     }
@@ -74,13 +80,21 @@ impl NoStdFloat for f64 {
     fn sin(self) -> f64 {
         libm::sin(self)
     }
+    fn sinh(self) -> f64 {
+        libm::sinh(self)
+    }
     fn sqrt(self) -> f64 {
         libm::sqrt(self)
     }
     fn tan(self) -> f64 {
         libm::tan(self)
     }
+    fn tanh(self) -> f64 {
+        libm::tanh(self)
+    }
 }
+
+
 
 /// 十六進位浮點解析中的 2^n，保留整數指數與次正規邊界。
 #[cfg(not(feature = "std"))]
@@ -211,13 +225,26 @@ pub fn modulo(left: Number, right: Number) -> Result<Number, CoreError> {
             Ok(Number::Integer(remainder))
         }
         _ => {
-            let quotient = (left.as_float() / right.as_float()).floor();
-            Ok(Number::Float(left.as_float() - quotient * right.as_float()))
+            let left = left.as_float();
+            let right = right.as_float();
+            #[cfg(feature = "std")]
+            let remainder = left % right;
+            #[cfg(not(feature = "std"))]
+            let remainder = libm::fmod(left, right);
+            let remainder = if (remainder > 0.0 && right < 0.0)
+                || (remainder < 0.0 && right > 0.0)
+            {
+                remainder + right
+            } else {
+                remainder
+            };
+            Ok(Number::Float(remainder))
         }
     }
 }
 
 /// 不將 Integer 降為 Float 的數值比較；NaN 沒有順序。
+#[inline(always)]
 pub fn compare(left: Number, right: Number) -> Option<Ordering> {
     match (left, right) {
         (Number::Integer(left), Number::Integer(right)) => Some(left.cmp(&right)),

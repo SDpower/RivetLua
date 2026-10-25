@@ -2,8 +2,14 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{
+    AllocationRecovery, GlobalAllocation, ReserveError, SharedBlock, StateAllocator,
+    try_reserve_exact_with, try_shared_uninit_with,
+};
 
 use alloc::sync::Arc;
+use core::ops::Deref;
 
 use super::{
     BinaryOperation, BytecodeVersion, EnvironmentSource, FrameLayout, Instruction,
@@ -13,6 +19,259 @@ use super::{
 
 pub const RVLU_MAGIC: [u8; 4] = *b"RVLU";
 pub const RVLU_NUMERIC_I64_F64: u8 = 1;
+
+/// C-owned 候選資料的配置錯誤須保留 callback recovery 原因。
+#[derive(Debug)]
+pub enum BytecodeRecoveryError<E> {
+    Bytecode(BytecodeError),
+    Reserve(ReserveError<E>),
+}
+
+/// 讓既有驗證函式保留語意錯誤型別，同時把實體配置拒絕傳回外層。
+pub(crate) struct Scratch<'a, R: AllocationRecovery> {
+    recovery: &'a mut R,
+    refusal: Option<ReserveError<R::Error>>,
+}
+
+impl<'a, R: AllocationRecovery> Scratch<'a, R> {
+    pub(crate) fn new(recovery: &'a mut R) -> Self {
+        Self {
+            recovery,
+            refusal: None,
+        }
+    }
+
+    pub(crate) fn vec<T>(&self) -> BytecodeVec<T> {
+        AllocVec::new_in(self.recovery.allocator())
+    }
+
+    pub(crate) fn reserve_exact<T>(
+        &mut self,
+        values: &mut BytecodeVec<T>,
+        additional: usize,
+    ) -> Result<(), ()> {
+        match try_reserve_exact_with(values, additional, self.recovery) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if self.refusal.is_none() {
+                    self.refusal = Some(error);
+                }
+                Err(())
+            }
+        }
+    }
+
+    pub(crate) fn recovery(&mut self) -> &mut R {
+        self.recovery
+    }
+
+    pub(crate) fn retain<T>(&mut self, values: BytecodeVec<T>) -> Result<RetainedVec<T>, ()> {
+        if self.recovery.allocator().is_lua() {
+            return RetainedVec::from_state_vec_with_recovery(values, self.recovery).map_err(
+                |error| {
+                    if self.refusal.is_none() {
+                        self.refusal = Some(error);
+                    }
+                },
+            );
+        }
+        let mut global = Vec::new();
+        if global.try_reserve_exact(values.capacity()).is_err() {
+            if self.refusal.is_none() {
+                self.refusal = Some(ReserveError::AllocationFailed);
+            }
+            return Err(());
+        }
+        global.extend(values);
+        Ok(RetainedVec::Global(global))
+    }
+
+    pub(crate) fn shared<T>(&mut self, value: T) -> Result<SharedBlock<T>, ()> {
+        match try_shared_uninit_with::<T, _>(self.recovery, 0) {
+            Ok(owner) => Ok(owner.write(value)),
+            Err(error) => {
+                if self.refusal.is_none() {
+                    self.refusal = Some(error);
+                }
+                Err(())
+            }
+        }
+    }
+
+    pub(crate) fn take_refusal(&mut self) -> Option<ReserveError<R::Error>> {
+        self.refusal.take()
+    }
+
+    pub(crate) fn record_refusal(&mut self, error: ReserveError<R::Error>) {
+        if self.refusal.is_none() {
+            self.refusal = Some(error);
+        }
+    }
+}
+
+/// 驗證時沿用候選 Vec；發布到 C state 前才把保留 backing 搬到該 state。
+#[derive(Clone, Debug)]
+pub enum RetainedVec<T> {
+    Global(Vec<T>),
+    State(SharedBlock<AllocVec<T, StateAllocator>>),
+}
+
+/// Global 建構期沿用 Arc；state 發布後共享同一 callback block。
+#[derive(Debug)]
+pub enum RetainedArc<T> {
+    Global(Arc<T>),
+    State(SharedBlock<T>),
+}
+
+impl<T> Clone for RetainedArc<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Global(value) => Self::Global(Arc::clone(value)),
+            Self::State(value) => Self::State(value.clone()),
+        }
+    }
+}
+
+impl<T> Deref for RetainedArc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Global(value) => value,
+            Self::State(value) => value,
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for RetainedArc<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deref() == other.deref()
+    }
+}
+
+impl<T: Eq> Eq for RetainedArc<T> {}
+
+impl<T> From<Vec<T>> for RetainedVec<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self::Global(values)
+    }
+}
+
+impl<T> Default for RetainedVec<T> {
+    fn default() -> Self {
+        Self::Global(Vec::new())
+    }
+}
+
+impl<T> RetainedVec<T> {
+    /// 將已由同一 state 配置的候選容器直接交給共享 owner，避免發布前複製 backing。
+    pub fn from_state_vec_with_recovery<R: AllocationRecovery>(
+        values: AllocVec<T, StateAllocator>,
+        recovery: &mut R,
+    ) -> Result<Self, ReserveError<R::Error>> {
+        if !values.allocator().same_binding(&recovery.allocator()) {
+            return Err(ReserveError::AllocatorMismatch);
+        }
+        let owner = try_shared_uninit_with::<AllocVec<T, StateAllocator>, _>(recovery, 0)?;
+        Ok(Self::State(owner.write(values)))
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        self
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        match self {
+            Self::Global(values) => values.capacity(),
+            Self::State(values) => values.capacity(),
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Option<usize> {
+        let backing = self.capacity().checked_mul(core::mem::size_of::<T>())?;
+        match self {
+            Self::Global(_) => Some(backing),
+            Self::State(_) => backing.checked_add(
+                StateAllocator::shared_block_size::<AllocVec<T, StateAllocator>>(),
+            ),
+        }
+    }
+
+    pub(crate) fn global_mut(&mut self) -> Option<&mut [T]> {
+        match self {
+            Self::Global(values) => Some(values),
+            Self::State(_) => None,
+        }
+    }
+
+    /// 候選資料可變；已發布的 state backing 僅供讀取。
+    pub fn global_vec_mut(&mut self) -> Option<&mut Vec<T>> {
+        match self {
+            Self::Global(values) => Some(values),
+            Self::State(_) => None,
+        }
+    }
+
+    pub(crate) fn is_state_for(&self, allocator: &StateAllocator) -> bool {
+        matches!(self, Self::State(values) if values.allocator().same_binding(allocator))
+    }
+
+    pub(crate) fn rehome<R: AllocationRecovery>(
+        &mut self,
+        recovery: &mut R,
+    ) -> Result<(), ReserveError<R::Error>> {
+        if let Self::State(values) = self {
+            return if values.allocator().same_binding(&recovery.allocator()) {
+                Ok(())
+            } else {
+                Err(ReserveError::AllocatorMismatch)
+            };
+        }
+        let mut next = AllocVec::new_in(recovery.allocator());
+        try_reserve_exact_with(&mut next, self.len(), recovery)?;
+        let owner = try_shared_uninit_with::<AllocVec<T, StateAllocator>, _>(recovery, 0)?;
+        if let Self::Global(values) = self {
+            next.extend(core::mem::take(values));
+        }
+        *self = Self::State(owner.write(next));
+        Ok(())
+    }
+}
+
+impl<T> Deref for RetainedVec<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Global(values) => values,
+            Self::State(values) => values,
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for RetainedVec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl<T: Eq> Eq for RetainedVec<T> {}
+
+impl<T> AsRef<[T]> for RetainedVec<T> {
+    fn as_ref(&self) -> &[T] {
+        self
+    }
+}
+
+impl<'a, T> IntoIterator for &'a RetainedVec<T> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BytecodeErrorCode {
@@ -94,22 +353,26 @@ pub struct BytecodeUpvalue {
     pub source: BytecodeUpvalueSource,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BytecodeClosePath {
+pub type BytecodeVec<T> = AllocVec<T, StateAllocator>;
+pub type BytecodeBytes = SharedBlock<BytecodeVec<u8>>;
+pub type BytecodeClosePath = SharedBlock<BytecodeClosePathData>;
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct BytecodeClosePathData {
     pub kind: BytecodeExitKind,
     pub span: BytecodeSpan,
     pub from_scope: u32,
     pub target_scope: Option<u32>,
-    pub bindings: Vec<BytecodeBindingId>,
-    pub registers: Vec<Register>,
+    pub bindings: BytecodeVec<BytecodeBindingId>,
+    pub registers: BytecodeVec<Register>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BytecodeConstant {
     Integer(i64),
     FloatBits(u64),
-    Name(Vec<u8>),
-    String(Vec<u8>),
+    Name(BytecodeBytes),
+    String(BytecodeBytes),
     Boolean(bool),
 }
 
@@ -134,11 +397,11 @@ pub struct BytecodePrototype {
     pub frame: FrameLayout,
     pub global_environment: Register,
     pub global_environment_binding: BytecodeBindingId,
-    pub binding_registers: Vec<(BytecodeBindingId, Register)>,
-    pub constants: Vec<BytecodeConstant>,
-    pub upvalues: Vec<BytecodeUpvalue>,
-    pub instructions: Vec<BytecodeInstruction>,
-    pub close_paths: Vec<BytecodeClosePath>,
+    pub binding_registers: AllocVec<(BytecodeBindingId, Register), StateAllocator>,
+    pub constants: BytecodeVec<BytecodeConstant>,
+    pub upvalues: BytecodeVec<BytecodeUpvalue>,
+    pub instructions: AllocVec<BytecodeInstruction, StateAllocator>,
+    pub close_paths: BytecodeVec<BytecodeClosePath>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,8 +410,73 @@ pub struct BytecodeModule {
     pub profile: LuaProfile,
     pub numeric_config: u8,
     pub span: BytecodeSpan,
-    pub function_prototypes: Vec<(u32, ProtoId)>,
-    pub prototypes: Vec<BytecodePrototype>,
+    pub function_prototypes: AllocVec<(u32, ProtoId), StateAllocator>,
+    pub prototypes: AllocVec<BytecodePrototype, StateAllocator>,
+}
+
+/// Rust SDK 建構候選模組時，將標準 Vec 的 prototype 移入 Global backing。
+pub fn global_bytecode_prototypes(
+    values: Vec<BytecodePrototype>,
+) -> Result<AllocVec<BytecodePrototype, StateAllocator>, BytecodeError> {
+    let mut result = AllocVec::new_in(StateAllocator::Global);
+    result.try_reserve_exact(values.len()).map_err(|_| BytecodeError {
+        code: BytecodeErrorCode::AllocationFailed,
+        offset: 0,
+        message: String::from("bytecode prototype 配置失敗"),
+    })?;
+    result.extend(values);
+    Ok(result)
+}
+
+/// Rust SDK 建構候選模組時，將 function 對照表移入 Global backing。
+pub fn global_bytecode_function_prototypes(
+    values: Vec<(u32, ProtoId)>,
+) -> Result<AllocVec<(u32, ProtoId), StateAllocator>, BytecodeError> {
+    let mut result = AllocVec::new_in(StateAllocator::Global);
+    result.try_reserve_exact(values.len()).map_err(|_| BytecodeError {
+        code: BytecodeErrorCode::AllocationFailed,
+        offset: 0,
+        message: String::from("bytecode function 對照表配置失敗"),
+    })?;
+    result.extend(values);
+    Ok(result)
+}
+
+/// Rust SDK 建構巢狀 bytecode 容器時使用 Global backing。
+pub fn global_bytecode_vec<T>(values: Vec<T>) -> Result<AllocVec<T, StateAllocator>, BytecodeError> {
+    let mut result = AllocVec::new_in(StateAllocator::Global);
+    result.try_reserve_exact(values.len()).map_err(|_| BytecodeError {
+        code: BytecodeErrorCode::AllocationFailed,
+        offset: 0,
+        message: String::from("bytecode 容器配置失敗"),
+    })?;
+    result.extend(values);
+    Ok(result)
+}
+
+/// Rust SDK fixture 與候選模組明確選用 Global backing。
+pub fn global_bytecode_bytes(values: Vec<u8>) -> Result<BytecodeBytes, BytecodeError> {
+    let bytes = global_bytecode_vec(values)?;
+    let owner = StateAllocator::Global.shared_uninit::<BytecodeVec<u8>>(0)
+        .map_err(|_| BytecodeError {
+            code: BytecodeErrorCode::AllocationFailed,
+            offset: 0,
+            message: String::from("bytecode 字串 owner 配置失敗"),
+        })?;
+    Ok(owner.write(bytes))
+}
+
+/// Rust SDK fixture 與候選模組明確選用 Global close path owner。
+pub fn global_bytecode_close_path(
+    value: BytecodeClosePathData,
+) -> Result<BytecodeClosePath, BytecodeError> {
+    let owner = StateAllocator::Global.shared_uninit::<BytecodeClosePathData>(0)
+        .map_err(|_| BytecodeError {
+            code: BytecodeErrorCode::AllocationFailed,
+            offset: 0,
+            message: String::from("bytecode close path owner 配置失敗"),
+        })?;
+    Ok(owner.write(value))
 }
 
 /// 只能由 `verify_module` 或 `decode_module` 建立；僅提供不可變 candidate 檢視。
@@ -160,12 +488,80 @@ pub struct BytecodeModule {
 pub struct VerifiedModule {
     module: BytecodeModule,
     transport_scan_units: usize,
+    measurement_owner_count: usize,
     official_execution: Option<super::official_execution::OfficialExecutionPlan>,
-    official_artifact: Option<Arc<super::official_artifact::OfficialArtifact>>,
-    native_debug: Option<Arc<super::native_debug::NativeDebug>>,
+    official_artifact: Option<RetainedArc<super::official_artifact::OfficialArtifact>>,
+    native_debug: Option<RetainedArc<super::native_debug::NativeDebug>>,
 }
 
 impl VerifiedModule {
+    /// 將已驗證 prototype 的實體 backing 搬到呼叫端 state；先配置成功才移動。
+    pub fn rehome_prototypes<R: AllocationRecovery>(
+        &mut self,
+        recovery: &mut R,
+    ) -> Result<(), ReserveError<R::Error>> {
+        if !self.module.function_prototypes.allocator().same_binding(&recovery.allocator()) {
+            let mut next = AllocVec::new_in(recovery.allocator());
+            try_reserve_exact_with(&mut next, self.module.function_prototypes.len(), recovery)?;
+            let old = core::mem::replace(&mut self.module.function_prototypes, next);
+            self.module.function_prototypes.extend(old);
+        }
+        if !self.module.prototypes.allocator().same_binding(&recovery.allocator()) {
+            let mut next = AllocVec::new_in(recovery.allocator());
+            try_reserve_exact_with(&mut next, self.module.prototypes.len(), recovery)?;
+            let old = core::mem::replace(&mut self.module.prototypes, next);
+            self.module.prototypes.extend(old);
+        }
+        self.module.rehome_prototype_backing(recovery)?;
+        if let Some(plan) = &mut self.official_execution {
+            plan.rehome(recovery)?;
+        }
+        if let Some(artifact) = &mut self.official_artifact {
+            match artifact {
+                RetainedArc::State(value) => {
+                    if !value.allocator().same_binding(&recovery.allocator()) {
+                        return Err(ReserveError::AllocatorMismatch);
+                    }
+                }
+                RetainedArc::Global(value) => {
+                    Arc::make_mut(value).rehome(recovery)?;
+                    let header = try_shared_uninit_with::<
+                        super::official_artifact::OfficialArtifact, _
+                    >(recovery, 0)?;
+                    let Some(RetainedArc::Global(value)) = self.official_artifact.take() else {
+                        return Err(ReserveError::AllocatorMismatch);
+                    };
+                    let value = Arc::try_unwrap(value)
+                        .map_err(|_| ReserveError::AllocatorMismatch)?;
+                    self.official_artifact = Some(RetainedArc::State(header.write(value)));
+                }
+            }
+        }
+        if let Some(debug) = &mut self.native_debug {
+            match debug {
+                RetainedArc::State(value) => {
+                    if !value.allocator().same_binding(&recovery.allocator()) {
+                        return Err(ReserveError::AllocatorMismatch);
+                    }
+                }
+                RetainedArc::Global(value) => {
+                    if !value.is_state_for(&recovery.allocator()) {
+                        Arc::make_mut(value).rehome(recovery)?;
+                    }
+                    let header =
+                        try_shared_uninit_with::<super::native_debug::NativeDebug, _>(recovery, 0)?;
+                    let Some(RetainedArc::Global(value)) = self.native_debug.take() else {
+                        return Err(ReserveError::AllocatorMismatch);
+                    };
+                    let value = Arc::try_unwrap(value)
+                        .map_err(|_| ReserveError::AllocatorMismatch)?;
+                    self.native_debug = Some(RetainedArc::State(header.write(value)));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn format_version(&self) -> BytecodeVersion {
         self.module.format_version
     }
@@ -180,6 +576,10 @@ impl VerifiedModule {
 
     pub(crate) fn transport_scan_units(&self) -> usize {
         self.transport_scan_units
+    }
+
+    pub(crate) fn measurement_owner_count(&self) -> usize {
+        self.measurement_owner_count
     }
 
     pub fn official_execution(&self) -> Option<&super::official_execution::OfficialExecutionPlan> {
@@ -200,8 +600,8 @@ impl VerifiedModule {
 
     pub fn official_artifact_shared(
         &self,
-    ) -> Option<Arc<super::official_artifact::OfficialArtifact>> {
-        self.official_artifact.as_ref().map(Arc::clone)
+    ) -> Option<RetainedArc<super::official_artifact::OfficialArtifact>> {
+        self.official_artifact.clone()
     }
 
     pub fn native_debug(&self) -> Option<&super::native_debug::NativeDebug> {
@@ -217,19 +617,128 @@ impl VerifiedModule {
 
     pub(crate) fn set_official_artifact(
         &mut self,
-        artifact: Arc<super::official_artifact::OfficialArtifact>,
+        artifact: RetainedArc<super::official_artifact::OfficialArtifact>,
     ) {
         self.official_artifact = Some(artifact);
     }
 
     pub(crate) fn set_native_debug(&mut self, debug: Arc<super::native_debug::NativeDebug>) {
-        self.native_debug = Some(debug);
+        self.native_debug = Some(RetainedArc::Global(debug));
     }
+}
+
+impl BytecodeModule {
+    pub fn rehome_prototype_backing<R: AllocationRecovery>(
+        &mut self,
+        recovery: &mut R,
+    ) -> Result<(), ReserveError<R::Error>> {
+        for prototype in &mut self.prototypes {
+            rehome_bytecode_vec(&mut prototype.binding_registers, recovery)?;
+            rehome_bytecode_vec(&mut prototype.constants, recovery)?;
+            rehome_bytecode_vec(&mut prototype.upvalues, recovery)?;
+            for constant in &mut prototype.constants {
+                match constant {
+                    BytecodeConstant::Name(bytes) | BytecodeConstant::String(bytes) => {
+                        if !bytes.allocator().same_binding(&recovery.allocator())
+                            || !bytes.as_ref().allocator().same_binding(&recovery.allocator())
+                        {
+                            *bytes = rehome_bytecode_bytes(bytes, recovery)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // 先完整建立新 close path 清單，舊 owner 留到指令重連完成。
+            let old_paths = if !prototype.close_paths.allocator().same_binding(&recovery.allocator())
+                || prototype.close_paths.iter().any(|path| !close_path_uses_allocator(path, &recovery.allocator()))
+            {
+                let mut next = AllocVec::new_in(recovery.allocator());
+                try_reserve_exact_with(&mut next, prototype.close_paths.len(), recovery)?;
+                for path in &prototype.close_paths {
+                    next.push(rehome_bytecode_close_path(path, recovery)?);
+                }
+                Some(core::mem::replace(&mut prototype.close_paths, next))
+            } else {
+                None
+            };
+
+            rehome_bytecode_vec(&mut prototype.instructions, recovery)?;
+            for instruction in &mut prototype.instructions {
+                let Some(path) = &mut instruction.close_path else { continue };
+                if let Some(old) = &old_paths {
+                    if let Some(index) = old.iter().position(|previous| BytecodeClosePath::ptr_eq(previous, path)) {
+                        *path = prototype.close_paths[index].clone();
+                        continue;
+                    }
+                }
+                if !close_path_uses_allocator(path, &recovery.allocator()) {
+                    *path = rehome_bytecode_close_path(path, recovery)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn rehome_bytecode_vec<T, R: AllocationRecovery>(
+    values: &mut BytecodeVec<T>,
+    recovery: &mut R,
+) -> Result<(), ReserveError<R::Error>> {
+    if values.allocator().same_binding(&recovery.allocator()) {
+        return Ok(());
+    }
+    let mut next = AllocVec::new_in(recovery.allocator());
+    try_reserve_exact_with(&mut next, values.len(), recovery)?;
+    let old = core::mem::replace(values, next);
+    values.extend(old);
+    Ok(())
+}
+
+fn rehome_bytecode_bytes<R: AllocationRecovery>(
+    old: &BytecodeBytes,
+    recovery: &mut R,
+) -> Result<BytecodeBytes, ReserveError<R::Error>> {
+    let mut bytes = AllocVec::new_in(recovery.allocator());
+    try_reserve_exact_with(&mut bytes, old.len(), recovery)?;
+    bytes.extend_from_slice(old);
+    let owner = try_shared_uninit_with::<BytecodeVec<u8>, _>(recovery, 0)?;
+    Ok(owner.write(bytes))
+}
+
+fn close_path_uses_allocator(path: &BytecodeClosePath, allocator: &StateAllocator) -> bool {
+    path.allocator().same_binding(allocator)
+        && path.bindings.allocator().same_binding(allocator)
+        && path.registers.allocator().same_binding(allocator)
+}
+
+fn rehome_bytecode_close_path<R: AllocationRecovery>(
+    old: &BytecodeClosePath,
+    recovery: &mut R,
+) -> Result<BytecodeClosePath, ReserveError<R::Error>> {
+    if close_path_uses_allocator(old, &recovery.allocator()) {
+        return Ok(old.clone());
+    }
+    let mut bindings = AllocVec::new_in(recovery.allocator());
+    try_reserve_exact_with(&mut bindings, old.bindings.len(), recovery)?;
+    bindings.extend_from_slice(&old.bindings);
+    let mut registers = AllocVec::new_in(recovery.allocator());
+    try_reserve_exact_with(&mut registers, old.registers.len(), recovery)?;
+    registers.extend_from_slice(&old.registers);
+    let owner = try_shared_uninit_with::<BytecodeClosePathData, _>(recovery, 0)?;
+    Ok(owner.write(BytecodeClosePathData {
+        kind: old.kind,
+        span: old.span,
+        from_scope: old.from_scope,
+        target_scope: old.target_scope,
+        bindings,
+        registers,
+    }))
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EncodedModule {
-    bytes: Vec<u8>,
+    bytes: BytecodeVec<u8>,
     verified: VerifiedModule,
 }
 
@@ -266,6 +775,22 @@ impl EncodedModule {
         Ok(self)
     }
 
+    pub fn with_native_builtin_plan_with_recovery<R: AllocationRecovery>(
+        mut self,
+        candidate: super::official_execution::StateOfficialPlanCandidate,
+        limits: &VerifyLimits,
+        recovery: &mut R,
+    ) -> Result<Self, BytecodeRecoveryError<R::Error>> {
+        self.verified = super::official_execution::verify_native_builtin_plan_with_recovery(
+            self.verified,
+            candidate,
+            limits,
+            usize::MAX,
+            recovery,
+        )?;
+        Ok(self)
+    }
+
     /// P05 驗證後附加非 wire 的 native debug 資料。
     pub fn with_native_debug(
         mut self,
@@ -275,7 +800,32 @@ impl EncodedModule {
     ) -> Result<Self, BytecodeError> {
         let debug =
             super::native_debug::verify_native_debug(&self.verified, candidate, limits, work)?;
-        self.verified.native_debug = Some(Arc::new(debug));
+        self.verified.native_debug = Some(RetainedArc::Global(Arc::new(debug)));
+        Ok(self)
+    }
+
+    /// C state 候選資料沿用同一 allocator，驗證後才配置共享 debug owner。
+    pub fn with_native_debug_with_recovery<R: AllocationRecovery>(
+        mut self,
+        candidate: super::native_debug::StateNativeDebugCandidate,
+        limits: &VerifyLimits,
+        work: &mut super::official_translation::OfficialWorkBudget,
+        recovery: &mut R,
+    ) -> Result<Self, BytecodeRecoveryError<R::Error>> {
+        let debug = super::native_debug::verify_native_debug_with_recovery(
+            &self.verified,
+            candidate,
+            limits,
+            work,
+            recovery,
+        )?;
+        if !recovery.allocator().is_lua() {
+            self.verified.native_debug = Some(RetainedArc::Global(Arc::new(debug)));
+            return Ok(self);
+        }
+        let owner = try_shared_uninit_with::<super::native_debug::NativeDebug, _>(recovery, 0)
+            .map_err(BytecodeRecoveryError::Reserve)?;
+        self.verified.native_debug = Some(RetainedArc::State(owner.write(debug)));
         Ok(self)
     }
 }
@@ -284,6 +834,34 @@ pub fn verify_module(
     module: BytecodeModule,
     expected_profile: LuaProfile,
     limits: &VerifyLimits,
+) -> Result<VerifiedModule, BytecodeError> {
+    let mut recovery = GlobalAllocation;
+    verify_module_with_recovery(module, expected_profile, limits, &mut recovery)
+        .map_err(global_recovery_error)
+}
+
+pub fn verify_module_with_recovery<R: AllocationRecovery>(
+    module: BytecodeModule,
+    expected_profile: LuaProfile,
+    limits: &VerifyLimits,
+    recovery: &mut R,
+) -> Result<VerifiedModule, BytecodeRecoveryError<R::Error>> {
+    let mut scratch = Scratch::new(recovery);
+    let result = verify_module_inner(module, expected_profile, limits, &mut scratch);
+    match result {
+        Ok(module) => Ok(module),
+        Err(error) => Err(match scratch.take_refusal() {
+            Some(refusal) => BytecodeRecoveryError::Reserve(refusal),
+            None => BytecodeRecoveryError::Bytecode(error),
+        }),
+    }
+}
+
+fn verify_module_inner<R: AllocationRecovery>(
+    module: BytecodeModule,
+    expected_profile: LuaProfile,
+    limits: &VerifyLimits,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<VerifiedModule, BytecodeError> {
     if module.format_version != RVLU_V2 {
         return Err(verify(0, "RVLU v1 或未知 format version 不可驗證"));
@@ -303,8 +881,12 @@ pub fn verify_module(
     if module.function_prototypes.len() != module.prototypes.len() {
         return Err(verify(0, "RVLU function/prototype map 長度不符"));
     }
-    let mut seen_prototypes = Vec::new();
-    let mut seen_functions = Vec::new();
+    let mut seen_prototypes = scratch.vec();
+    scratch.reserve_exact(&mut seen_prototypes, module.prototypes.len())
+        .map_err(|_| allocation_failed("RVLU prototype ID 清單配置失敗"))?;
+    let mut seen_functions = scratch.vec();
+    scratch.reserve_exact(&mut seen_functions, module.prototypes.len())
+        .map_err(|_| allocation_failed("RVLU function ID 清單配置失敗"))?;
     let mut total_instructions = 0usize;
     let mut total_constants = 0usize;
     for prototype in &module.prototypes {
@@ -328,7 +910,7 @@ pub fn verify_module(
         }
         seen_prototypes.push(prototype.id);
         seen_functions.push(prototype.function);
-        validate_prototype(prototype, &module, limits)?;
+        validate_prototype(prototype, &module, limits, scratch)?;
     }
     for (function, proto) in &module.function_prototypes {
         let Some(candidate) = module
@@ -345,22 +927,24 @@ pub fn verify_module(
             return Err(verify(0, "RVLU function/prototype map 不符"));
         }
     }
-    let transport_scan_units = module_transport_scan_units(&module)?;
+    let (transport_scan_units, measurement_owner_count) = module_transport_scan_units(&module)?;
     Ok(VerifiedModule {
         module,
         transport_scan_units,
+        measurement_owner_count,
         official_execution: None,
         official_artifact: None,
         native_debug: None,
     })
 }
 
-fn module_transport_scan_units(module: &BytecodeModule) -> Result<usize, BytecodeError> {
+fn module_transport_scan_units(module: &BytecodeModule) -> Result<(usize, usize), BytecodeError> {
     let mut units = module
         .prototypes
         .len()
         .checked_add(1)
         .ok_or_else(|| limit(0, "transport scan work 溢位"))?;
+    let mut measurement_owner_count = 0usize;
     for proto in &module.prototypes {
         let mut add = |count: usize| -> Result<(), BytecodeError> {
             units = units
@@ -375,6 +959,9 @@ fn module_transport_scan_units(module: &BytecodeModule) -> Result<usize, Bytecod
         add(proto.close_paths.len())?;
         for constant in &proto.constants {
             if let BytecodeConstant::Name(bytes) | BytecodeConstant::String(bytes) = constant {
+                measurement_owner_count = measurement_owner_count
+                    .checked_add(1)
+                    .ok_or_else(|| limit(0, "量測 owner 引用數量溢位"))?;
                 add(bytes.len())?;
             }
         }
@@ -384,11 +971,14 @@ fn module_transport_scan_units(module: &BytecodeModule) -> Result<usize, Bytecod
                 .iter()
                 .filter_map(|instruction| instruction.close_path.as_ref()),
         ) {
+            measurement_owner_count = measurement_owner_count
+                .checked_add(1)
+                .ok_or_else(|| limit(0, "量測 owner 引用數量溢位"))?;
             add(path.bindings.len())?;
             add(path.registers.len())?;
         }
     }
-    Ok(units)
+    Ok((units, measurement_owner_count))
 }
 
 pub fn encode_module(
@@ -396,8 +986,28 @@ pub fn encode_module(
     expected_profile: LuaProfile,
     limits: &VerifyLimits,
 ) -> Result<EncodedModule, BytecodeError> {
-    let verified = verify_module(module, expected_profile, limits)?;
-    let bytes = encode_verified_module_bytes(&verified, limits)?;
+    let mut recovery = GlobalAllocation;
+    encode_module_with_recovery(module, expected_profile, limits, &mut recovery)
+        .map_err(global_recovery_error)
+}
+
+pub fn encode_module_with_recovery<R: AllocationRecovery>(
+    module: BytecodeModule,
+    expected_profile: LuaProfile,
+    limits: &VerifyLimits,
+    recovery: &mut R,
+) -> Result<EncodedModule, BytecodeRecoveryError<R::Error>> {
+    let verified = verify_module_with_recovery(module, expected_profile, limits, recovery)?;
+    let mut scratch = Scratch::new(recovery);
+    let result =
+        encode_verified_module_bytes_inner_with_recovery(&verified, limits, None, &mut scratch);
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(match scratch.take_refusal() {
+            Some(refusal) => BytecodeRecoveryError::Reserve(refusal),
+            None => BytecodeRecoveryError::Bytecode(error),
+        }),
+    };
     Ok(EncodedModule { bytes, verified })
 }
 
@@ -422,13 +1032,39 @@ fn encode_verified_module_bytes_inner(
     limits: &VerifyLimits,
     allocation_bound: Option<usize>,
 ) -> Result<Vec<u8>, BytecodeError> {
-    let mut writer = Writer::with_limit(allocation_bound);
+    let mut recovery = GlobalAllocation;
+    let mut scratch = Scratch::new(&mut recovery);
+    let result = encode_verified_module_bytes_inner_with_recovery(
+        verified,
+        limits,
+        allocation_bound,
+        &mut scratch,
+    );
+    let bytes = result.map_err(|error| match scratch.take_refusal() {
+        Some(_) => allocation_failed("RVLU 輸出配置失敗"),
+        None => error,
+    })?;
+    let mut result = Vec::new();
+    result.try_reserve_exact(bytes.len())
+        .map_err(|_| allocation_failed("RVLU 輸出配置失敗"))?;
+    result.extend_from_slice(&bytes);
+    Ok(result)
+}
+
+fn encode_verified_module_bytes_inner_with_recovery<R: AllocationRecovery>(
+    verified: &VerifiedModule,
+    limits: &VerifyLimits,
+    allocation_bound: Option<usize>,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<u8>, BytecodeError> {
+    let mut writer = Writer::with_limit(allocation_bound, scratch);
     writer.bytes(&RVLU_MAGIC);
     writer.u16(RVLU_V2.0);
     writer.u8(profile_tag(verified.profile()));
     writer.u8(verified.module.numeric_config);
     write_span(&mut writer, verified.module.span);
-    let prototype_section = encode_prototype_section(&verified.module, limits, allocation_bound)?;
+    let prototype_section =
+        encode_prototype_section(&verified.module, limits, allocation_bound, writer.scratch)?;
     writer.u32(checked_u32(
         prototype_section.len(),
         0,
@@ -445,6 +1081,36 @@ pub fn decode_module(
     bytes: &[u8],
     expected_profile: LuaProfile,
     limits: &VerifyLimits,
+) -> Result<VerifiedModule, BytecodeError> {
+    let mut recovery = GlobalAllocation;
+    decode_module_with_recovery(bytes, expected_profile, limits, &mut recovery).map_err(|error| {
+        match error {
+            BytecodeRecoveryError::Bytecode(error) => error,
+            BytecodeRecoveryError::Reserve(ReserveError::Recovery(never)) => match never {},
+            BytecodeRecoveryError::Reserve(_) => allocation_failed("RVLU 解碼配置失敗"),
+        }
+    })
+}
+
+pub fn decode_module_with_recovery<R: AllocationRecovery>(
+    bytes: &[u8],
+    expected_profile: LuaProfile,
+    limits: &VerifyLimits,
+    recovery: &mut R,
+) -> Result<VerifiedModule, BytecodeRecoveryError<R::Error>> {
+    let mut scratch = Scratch::new(recovery);
+    let result = decode_module_inner(bytes, expected_profile, limits, &mut scratch);
+    result.map_err(|error| match scratch.take_refusal() {
+        Some(refusal) => BytecodeRecoveryError::Reserve(refusal),
+        None => BytecodeRecoveryError::Bytecode(error),
+    })
+}
+
+fn decode_module_inner<R: AllocationRecovery>(
+    bytes: &[u8],
+    expected_profile: LuaProfile,
+    limits: &VerifyLimits,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<VerifiedModule, BytecodeError> {
     if bytes.len() > limits.max_module_bytes {
         return Err(limit(0, "RVLU module bytes 超過限制"));
@@ -475,7 +1141,8 @@ pub fn decode_module(
     }
     let mut prototypes_reader = Reader::new_at(prototype_section.bytes, prototype_section.start);
     let count = prototypes_reader.count(limits.max_prototypes, "RVLU prototype 數超過限制")?;
-    let mut prototypes = Vec::new();
+    let mut prototypes = scratch.vec();
+    scratch.reserve_exact(&mut prototypes, count).map_err(|_| allocation_failed("RVLU prototype 配置失敗"))?;
     let mut total_instructions = 0usize;
     let mut total_constants = 0usize;
     for _ in 0..count {
@@ -493,7 +1160,7 @@ pub fn decode_module(
             max_constants: remaining_constants,
             ..*limits
         };
-        let prototype = decode_prototype(record.bytes, &bounded_limits, record.start)?;
+        let prototype = decode_prototype(record.bytes, &bounded_limits, record.start, scratch)?;
         total_instructions = total_instructions
             .checked_add(prototype.instructions.len())
             .ok_or_else(|| limit(record.start, "RVLU instruction 總量溢位"))?;
@@ -508,11 +1175,12 @@ pub fn decode_module(
             "RVLU prototype section 尾端 bytes 無效",
         ));
     }
-    let mut mappings = Vec::new();
+    let mut mappings = scratch.vec();
+    scratch.reserve_exact(&mut mappings, prototypes.len()).map_err(|_| allocation_failed("RVLU function 索引配置失敗"))?;
     for prototype in &prototypes {
         mappings.push((prototype.function, prototype.id));
     }
-    verify_module(
+    verify_module_with_recovery(
         BytecodeModule {
             format_version: version,
             profile,
@@ -523,13 +1191,22 @@ pub fn decode_module(
         },
         expected_profile,
         limits,
+        scratch.recovery(),
     )
+    .map_err(|error| match error {
+        BytecodeRecoveryError::Bytecode(error) => error,
+        BytecodeRecoveryError::Reserve(error) => {
+            scratch.record_refusal(error);
+            allocation_failed("RVLU 驗證配置失敗")
+        }
+    })
 }
 
-fn validate_prototype(
+fn validate_prototype<R: AllocationRecovery>(
     prototype: &BytecodePrototype,
     module: &BytecodeModule,
     limits: &VerifyLimits,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<(), BytecodeError> {
     if prototype.span.start_byte > prototype.span.end_byte
         || prototype.span.end_byte > module.span.end_byte
@@ -625,7 +1302,7 @@ fn validate_prototype(
             }
         }
     }
-    validate_metadata(prototype)?;
+    validate_metadata(prototype, scratch)?;
     for (index, instruction) in prototype.instructions.iter().enumerate() {
         if instruction.span.start_byte > instruction.span.end_byte
             || instruction.span.end_byte > prototype.span.end_byte
@@ -634,13 +1311,18 @@ fn validate_prototype(
         }
         validate_instruction_shape(prototype, module, index, instruction)?;
     }
-    validate_close_declaration_markers(prototype)?;
-    validate_numeric_for_pairs(prototype)?;
-    verify_control_and_dataflow(prototype, limits)
+    validate_close_declaration_markers(prototype, scratch)?;
+    validate_numeric_for_pairs(prototype, scratch)?;
+    verify_control_and_dataflow(prototype, limits, scratch)
 }
 
-fn validate_metadata(prototype: &BytecodePrototype) -> Result<(), BytecodeError> {
-    let mut bindings = Vec::new();
+fn validate_metadata<R: AllocationRecovery>(
+    prototype: &BytecodePrototype,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<(), BytecodeError> {
+    let mut bindings = scratch.vec();
+    scratch.reserve_exact(&mut bindings, prototype.binding_registers.len())
+        .map_err(|_| allocation_failed("RVLU binding 清單配置失敗"))?;
     for (binding, register) in &prototype.binding_registers {
         if bindings.contains(binding) || register.0 >= prototype.register_count {
             return Err(verify(0, "RVLU binding/register metadata 無效"));
@@ -654,7 +1336,9 @@ fn validate_metadata(prototype: &BytecodePrototype) -> Result<(), BytecodeError>
     {
         return Err(verify(0, "RVLU root environment binding 缺少 register"));
     }
-    let mut upvalues = Vec::new();
+    let mut upvalues = scratch.vec();
+    scratch.reserve_exact(&mut upvalues, prototype.upvalues.len())
+        .map_err(|_| allocation_failed("RVLU upvalue 清單配置失敗"))?;
     for upvalue in &prototype.upvalues {
         if usize::from(upvalue.id.0) >= prototype.upvalues.len() || upvalues.contains(&upvalue.id) {
             return Err(verify(0, "RVLU upvalue metadata 無效"));
@@ -739,8 +1423,13 @@ fn validate_close_path(
     Ok(())
 }
 
-fn validate_close_declaration_markers(prototype: &BytecodePrototype) -> Result<(), BytecodeError> {
-    let mut declared = Vec::new();
+fn validate_close_declaration_markers<R: AllocationRecovery>(
+    prototype: &BytecodePrototype,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<(), BytecodeError> {
+    let mut declared = scratch.vec();
+    scratch.reserve_exact(&mut declared, prototype.instructions.len())
+        .map_err(|_| allocation_failed("RVLU close marker 清單配置失敗"))?;
     for entry in &prototype.instructions {
         let (Instruction::Move { dest, .. }, Some(path)) = (&entry.instruction, &entry.close_path)
         else {
@@ -995,7 +1684,10 @@ fn validate_numeric_for_registers(
 
 /// `NumericForNext` 不能自行建立 numeric mode；它必須唯一配對同一組
 /// control registers 的 `NumericForPrepare`，並回到該 Prepare 後的 body entry。
-fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), BytecodeError> {
+fn validate_numeric_for_pairs<R: AllocationRecovery>(
+    prototype: &BytecodePrototype,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<(), BytecodeError> {
     type Prepare = ((u16, u16, u16, u16), usize, InstructionOffset);
     let prepare_count = prototype
         .instructions
@@ -1007,10 +1699,9 @@ fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), Bytec
         .iter()
         .filter(|entry| matches!(entry.instruction, Instruction::NumericForNext { .. }))
         .count();
-    let mut prepares: Vec<Prepare> = Vec::new();
-    prepares
-        .try_reserve_exact(prepare_count)
-        .map_err(|_| limit(0, "RVLU NumericFor Prepare 索引配置失敗"))?;
+    let mut prepares: BytecodeVec<Prepare> = scratch.vec();
+    scratch.reserve_exact(&mut prepares, prepare_count)
+        .map_err(|_| allocation_failed("RVLU NumericFor Prepare 索引配置失敗"))?;
     for (prepare_index, instruction) in prototype.instructions.iter().enumerate() {
         let Instruction::NumericForPrepare {
             control,
@@ -1025,10 +1716,9 @@ fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), Bytec
         prepares.push(((control.0, limit.0, step.0, visible.0), prepare_index, exit));
     }
 
-    let mut pairs = Vec::new();
-    pairs
-        .try_reserve_exact(next_count)
-        .map_err(|_| limit(0, "RVLU NumericFor pair 索引配置失敗"))?;
+    let mut pairs = scratch.vec();
+    scratch.reserve_exact(&mut pairs, next_count)
+        .map_err(|_| allocation_failed("RVLU NumericFor pair 索引配置失敗"))?;
     for (next_index, instruction) in prototype.instructions.iter().enumerate() {
         let Instruction::NumericForNext {
             control,
@@ -1067,7 +1757,7 @@ fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), Bytec
         }
         pairs.push((*prepare_index, next_index));
     }
-    let scratch = prepares
+    let scratch_bytes = prepares
         .capacity()
         .checked_mul(core::mem::size_of::<Prepare>())
         .and_then(|bytes| {
@@ -1081,24 +1771,40 @@ fn validate_numeric_for_pairs(prototype: &BytecodePrototype) -> Result<(), Bytec
         .instructions
         .len()
         .checked_mul(256)
-        .is_none_or(|bound| scratch > bound)
+        .is_none_or(|bound| scratch_bytes > bound)
     {
         return Err(limit(0, "RVLU NumericFor pair 容量超過預准入上界"));
     }
-    validate_numeric_for_body_dominance(prototype, &pairs)
+    validate_numeric_for_body_dominance(prototype, &pairs, scratch)
 }
 
 /// 將 Prepare 的 body edge 拆成獨立 gate；gate 支配 Next 才表示每條
 /// 可達路徑都經過 Prepare 的成功分支，不能從入口或 exit 分支跳入 body。
-fn validate_numeric_for_body_dominance(
+fn push_numeric_cfg_edge<R: AllocationRecovery>(
+    edges: &mut [BytecodeVec<usize>],
+    from: usize,
+    to: usize,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<(), BytecodeError> {
+    scratch.reserve_exact(&mut edges[from], 1)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG edge 配置失敗"))?;
+    edges[from].push(to);
+    Ok(())
+}
+
+fn validate_numeric_for_body_dominance<R: AllocationRecovery>(
     prototype: &BytecodePrototype,
     pairs: &[(usize, usize)],
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<(), BytecodeError> {
     if pairs.is_empty() {
         return Ok(());
     }
     let count = prototype.instructions.len();
-    let mut gates = vec![None; count];
+    let mut gates = scratch.vec();
+    scratch.reserve_exact(&mut gates, count)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG gate 配置失敗"))?;
+    gates.resize(count, None);
     let mut next_gate = count;
     for (index, entry) in prototype.instructions.iter().enumerate() {
         if matches!(entry.instruction, Instruction::NumericForPrepare { .. }) {
@@ -1106,42 +1812,60 @@ fn validate_numeric_for_body_dominance(
             next_gate += 1;
         }
     }
-    let mut edges = vec![Vec::new(); next_gate];
+    let mut edges: BytecodeVec<BytecodeVec<usize>> = scratch.vec();
+    scratch.reserve_exact(&mut edges, next_gate)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG edges 配置失敗"))?;
+    for _ in 0..next_gate {
+        edges.push(scratch.vec());
+    }
     for (index, entry) in prototype.instructions.iter().enumerate() {
         match &entry.instruction {
-            Instruction::Jump { target } => edges[index].push(target.0 as usize),
+            Instruction::Jump { target } => push_numeric_cfg_edge(&mut edges, index, target.0 as usize, scratch)?,
             Instruction::JumpIfFalse { target, .. } => {
-                edges[index].push(target.0 as usize);
+                push_numeric_cfg_edge(&mut edges, index, target.0 as usize, scratch)?;
                 if index + 1 < count {
-                    edges[index].push(index + 1);
+                    push_numeric_cfg_edge(&mut edges, index, index + 1, scratch)?;
                 }
             }
             Instruction::NumericForPrepare { exit, .. } => {
-                edges[index].push(exit.0 as usize);
+                push_numeric_cfg_edge(&mut edges, index, exit.0 as usize, scratch)?;
                 if let Some(gate) = gates[index] {
-                    edges[index].push(gate);
-                    edges[gate].push(index + 1);
+                    push_numeric_cfg_edge(&mut edges, index, gate, scratch)?;
+                    push_numeric_cfg_edge(&mut edges, gate, index + 1, scratch)?;
                 }
             }
             Instruction::NumericForNext { target, exit, .. } => {
-                edges[index].push(target.0 as usize);
-                edges[index].push(exit.0 as usize);
+                push_numeric_cfg_edge(&mut edges, index, target.0 as usize, scratch)?;
+                push_numeric_cfg_edge(&mut edges, index, exit.0 as usize, scratch)?;
             }
             Instruction::Return { .. } | Instruction::TailCall { .. } => {}
-            _ if index + 1 < count => edges[index].push(index + 1),
+            _ if index + 1 < count => push_numeric_cfg_edge(&mut edges, index, index + 1, scratch)?,
             _ => {}
         }
     }
-    let mut predecessors = vec![Vec::new(); next_gate];
+    let mut predecessors: BytecodeVec<BytecodeVec<usize>> = scratch.vec();
+    scratch.reserve_exact(&mut predecessors, next_gate)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG predecessor 配置失敗"))?;
+    for _ in 0..next_gate {
+        predecessors.push(scratch.vec());
+    }
     for (node, successors) in edges.iter().enumerate() {
         for &successor in successors {
-            predecessors[successor].push(node);
+            push_numeric_cfg_edge(&mut predecessors, successor, node, scratch)?;
         }
     }
 
-    let mut visited = vec![false; next_gate];
-    let mut postorder = Vec::with_capacity(next_gate);
-    let mut dfs_stack = vec![(0usize, 0usize)];
+    let mut visited = scratch.vec();
+    scratch.reserve_exact(&mut visited, next_gate)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG visited 配置失敗"))?;
+    visited.resize(next_gate, false);
+    let mut postorder = scratch.vec();
+    scratch.reserve_exact(&mut postorder, next_gate)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG postorder 配置失敗"))?;
+    let mut dfs_stack = scratch.vec();
+    scratch.reserve_exact(&mut dfs_stack, next_gate)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG DFS stack 配置失敗"))?;
+    dfs_stack.push((0usize, 0usize));
     visited[0] = true;
     while let Some((node, next_successor)) = dfs_stack.last_mut() {
         if *next_successor < edges[*node].len() {
@@ -1157,16 +1881,22 @@ fn validate_numeric_for_body_dominance(
         }
     }
     postorder.reverse();
-    let mut order = vec![usize::MAX; next_gate];
+    let mut order = scratch.vec();
+    scratch.reserve_exact(&mut order, next_gate)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG order 配置失敗"))?;
+    order.resize(next_gate, usize::MAX);
     for (position, &node) in postorder.iter().enumerate() {
         order[node] = position;
     }
-    let mut immediate_dominator = vec![None; next_gate];
+    let mut immediate_dominator = scratch.vec();
+    scratch.reserve_exact(&mut immediate_dominator, next_gate)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG dominator 配置失敗"))?;
+    immediate_dominator.resize(next_gate, None);
     immediate_dominator[0] = Some(0usize);
     let vec_bytes = |capacity: usize, unit: usize| capacity.checked_mul(unit);
-    let nested_bytes = |lists: &Vec<Vec<usize>>| {
+    let nested_bytes = |lists: &BytecodeVec<BytecodeVec<usize>>| {
         lists.iter().try_fold(
-            vec_bytes(lists.capacity(), core::mem::size_of::<Vec<usize>>())?,
+            vec_bytes(lists.capacity(), core::mem::size_of::<BytecodeVec<usize>>())?,
             |total, list| {
                 total.checked_add(vec_bytes(list.capacity(), core::mem::size_of::<usize>())?)
             },
@@ -1239,16 +1969,30 @@ fn validate_numeric_for_body_dominance(
         }
     }
 
-    let mut dominator_children = vec![Vec::new(); next_gate];
+    let mut dominator_children: BytecodeVec<BytecodeVec<usize>> = scratch.vec();
+    scratch.reserve_exact(&mut dominator_children, next_gate)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG dominator children 配置失敗"))?;
+    for _ in 0..next_gate {
+        dominator_children.push(scratch.vec());
+    }
     for (node, parent) in immediate_dominator.iter().enumerate().skip(1) {
         if let Some(parent) = parent {
-            dominator_children[*parent].push(node);
+            push_numeric_cfg_edge(&mut dominator_children, *parent, node, scratch)?;
         }
     }
-    let mut entry = vec![0usize; next_gate];
-    let mut exit = vec![0usize; next_gate];
+    let mut entry = scratch.vec();
+    scratch.reserve_exact(&mut entry, next_gate)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG entry 配置失敗"))?;
+    entry.resize(next_gate, 0usize);
+    let mut exit = scratch.vec();
+    scratch.reserve_exact(&mut exit, next_gate)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG exit 配置失敗"))?;
+    exit.resize(next_gate, 0usize);
+    let mut tree_stack = scratch.vec();
+    scratch.reserve_exact(&mut tree_stack, next_gate.checked_mul(2).ok_or_else(|| limit(0, "RVLU NumericFor CFG tree stack 容量溢位"))?)
+        .map_err(|_| allocation_failed("RVLU NumericFor CFG tree stack 配置失敗"))?;
+    tree_stack.push((0usize, false));
     let mut tick = 0usize;
-    let mut tree_stack = vec![(0usize, false)];
     while let Some((node, leaving)) = tree_stack.pop() {
         tick += 1;
         if leaving {
@@ -1358,9 +2102,10 @@ fn require_jump_target(
     Ok(())
 }
 
-fn verify_control_and_dataflow(
+fn verify_control_and_dataflow<R: AllocationRecovery>(
     prototype: &BytecodePrototype,
     limits: &VerifyLimits,
+    scratch: &mut Scratch<'_, R>,
 ) -> Result<(), BytecodeError> {
     if prototype.instructions.is_empty() {
         return Err(verify(0, "RVLU prototype 不可空且不得 fall-through"));
@@ -1372,8 +2117,13 @@ fn verify_control_and_dataflow(
     if count > limits.max_instructions {
         return Err(limit(0, "RVLU CFG worklist 超過限制"));
     }
-    let mut states: Vec<Option<Option<Register>>> = vec![None; count];
-    let mut worklist = Vec::new();
+    let mut states: BytecodeVec<Option<Option<Register>>> = scratch.vec();
+    scratch.reserve_exact(&mut states, count)
+        .map_err(|_| allocation_failed("RVLU CFG state 配置失敗"))?;
+    states.resize(count, None);
+    let mut worklist = scratch.vec();
+    scratch.reserve_exact(&mut worklist, count)
+        .map_err(|_| allocation_failed("RVLU CFG worklist 配置失敗"))?;
     states[0] = Some(None);
     worklist.push(0usize);
     while let Some(index) = worklist.pop() {
@@ -1475,42 +2225,42 @@ fn verify_control_and_dataflow(
             } => None,
             _ => open,
         };
-        let mut successors = Vec::new();
+        let mut successors = [None; 2];
         match instruction {
-            Instruction::Jump { target } => successors.push(target.0 as usize),
+            Instruction::Jump { target } => successors[0] = Some(target.0 as usize),
             Instruction::JumpIfFalse { target, .. } => {
-                successors.push(target.0 as usize);
+                successors[0] = Some(target.0 as usize);
                 if index.checked_add(1).filter(|next| *next < count).is_none() {
                     return Err(verify(
                         0,
                         "RVLU conditional jump fall-through 到 proto 尾端",
                     ));
                 }
-                successors.push(index + 1);
+                successors[1] = Some(index + 1);
             }
             Instruction::NumericForPrepare { exit, .. } => {
-                successors.push(exit.0 as usize);
+                successors[0] = Some(exit.0 as usize);
                 if index.checked_add(1).filter(|next| *next < count).is_none() {
                     return Err(verify(
                         0,
                         "RVLU NumericForPrepare fall-through 到 proto 尾端",
                     ));
                 }
-                successors.push(index + 1);
+                successors[1] = Some(index + 1);
             }
             Instruction::NumericForNext { target, exit, .. } => {
-                successors.push(target.0 as usize);
-                successors.push(exit.0 as usize);
+                successors[0] = Some(target.0 as usize);
+                successors[1] = Some(exit.0 as usize);
             }
             Instruction::Return { .. } | Instruction::TailCall { .. } => {}
             _ => {
                 if index.checked_add(1).filter(|next| *next < count).is_none() {
                     return Err(verify(0, "RVLU reachable fall-through 到 proto 尾端"));
                 }
-                successors.push(index + 1);
+                successors[0] = Some(index + 1);
             }
         }
-        for successor in successors {
+        for successor in successors.into_iter().flatten() {
             let Some(state) = states.get_mut(successor) else {
                 return Err(verify(0, "RVLU CFG successor 超出範圍"));
             };
@@ -1532,31 +2282,33 @@ fn verify_control_and_dataflow(
     Ok(())
 }
 
-fn encode_prototype_section(
+fn encode_prototype_section<R: AllocationRecovery>(
     module: &BytecodeModule,
     limits: &VerifyLimits,
     allocation_bound: Option<usize>,
-) -> Result<Vec<u8>, BytecodeError> {
-    let mut writer = Writer::with_limit(allocation_bound);
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<u8>, BytecodeError> {
+    let mut writer = Writer::with_limit(allocation_bound, scratch);
     writer.u32(checked_u32(
         module.prototypes.len(),
         0,
         "RVLU prototype 數過大",
     )?);
     for prototype in &module.prototypes {
-        let record = encode_prototype(prototype, limits, allocation_bound)?;
+        let record = encode_prototype(prototype, limits, allocation_bound, writer.scratch)?;
         writer.u32(checked_u32(record.len(), 0, "RVLU prototype record 太大")?);
         writer.bytes(&record);
     }
     writer.finish()
 }
 
-fn encode_prototype(
+fn encode_prototype<R: AllocationRecovery>(
     prototype: &BytecodePrototype,
     limits: &VerifyLimits,
     allocation_bound: Option<usize>,
-) -> Result<Vec<u8>, BytecodeError> {
-    let mut writer = Writer::with_limit(allocation_bound);
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<u8>, BytecodeError> {
+    let mut writer = Writer::with_limit(allocation_bound, scratch);
     writer.u32(prototype.id.0);
     writer.u32(prototype.function);
     write_optional_proto(&mut writer, prototype.parent);
@@ -1575,21 +2327,21 @@ fn encode_prototype(
     write_frame(&mut writer, prototype.frame);
     writer.u16(prototype.global_environment.0);
     write_binding(&mut writer, prototype.global_environment_binding);
-    let constants = encode_constants(&prototype.constants, limits, allocation_bound)?;
+    let constants = encode_constants(&prototype.constants, limits, allocation_bound, writer.scratch)?;
     writer.u32(checked_u32(
         constants.len(),
         0,
         "RVLU constants section 太大",
     )?);
     writer.bytes(&constants);
-    let instructions = encode_instructions(&prototype.instructions, limits, allocation_bound)?;
+    let instructions = encode_instructions(&prototype.instructions, limits, allocation_bound, writer.scratch)?;
     writer.u32(checked_u32(
         instructions.len(),
         0,
         "RVLU instructions section 太大",
     )?);
     writer.bytes(&instructions);
-    let metadata = encode_metadata(prototype, limits, allocation_bound)?;
+    let metadata = encode_metadata(prototype, limits, allocation_bound, writer.scratch)?;
     writer.u32(checked_u32(
         metadata.len(),
         0,
@@ -1603,6 +2355,7 @@ fn decode_prototype(
     bytes: &[u8],
     limits: &VerifyLimits,
     base: usize,
+    scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<BytecodePrototype, BytecodeError> {
     let mut reader = Reader::new_at(bytes, base);
     let id = ProtoId(reader.u32()?);
@@ -1625,16 +2378,17 @@ fn decode_prototype(
     let global_environment = Register(reader.u16()?);
     let global_environment_binding = read_binding(&mut reader)?;
     let constants_section = reader.section()?;
-    let constants = decode_constants(constants_section.bytes, limits, constants_section.start)?;
+    let constants = decode_constants(constants_section.bytes, limits, constants_section.start, scratch)?;
     let instructions_section = reader.section()?;
     let instructions = decode_instructions(
         instructions_section.bytes,
         limits,
         instructions_section.start,
+        scratch,
     )?;
     let metadata_section = reader.section()?;
     let (binding_registers, upvalues, close_paths) =
-        decode_metadata(metadata_section.bytes, limits, metadata_section.start)?;
+        decode_metadata(metadata_section.bytes, limits, metadata_section.start, scratch)?;
     if !reader.is_empty() {
         return Err(verify(
             reader.location(),
@@ -1661,15 +2415,16 @@ fn decode_prototype(
     })
 }
 
-fn encode_constants(
+fn encode_constants<R: AllocationRecovery>(
     constants: &[BytecodeConstant],
     limits: &VerifyLimits,
     allocation_bound: Option<usize>,
-) -> Result<Vec<u8>, BytecodeError> {
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<u8>, BytecodeError> {
     if constants.len() > limits.max_constants {
         return Err(limit(0, "RVLU constant 數超過限制"));
     }
-    let mut writer = Writer::with_limit(allocation_bound);
+    let mut writer = Writer::with_limit(allocation_bound, scratch);
     writer.u32(checked_u32(constants.len(), 0, "RVLU constant 數過大")?);
     for constant in constants {
         match constant {
@@ -1702,17 +2457,19 @@ fn decode_constants(
     bytes: &[u8],
     limits: &VerifyLimits,
     base: usize,
-) -> Result<Vec<BytecodeConstant>, BytecodeError> {
+    scratch: &mut Scratch<'_, impl AllocationRecovery>,
+) -> Result<BytecodeVec<BytecodeConstant>, BytecodeError> {
     let mut reader = Reader::new_at(bytes, base);
     let count = reader.count(limits.max_constants, "RVLU constant 數超過限制")?;
-    let mut constants = Vec::new();
+    let mut constants = scratch.vec();
+    scratch.reserve_exact(&mut constants, count).map_err(|_| allocation_failed("RVLU constant 配置失敗"))?;
     for _ in 0..count {
         let tag_offset = reader.location();
         let constant = match reader.u8()? {
             0 => BytecodeConstant::Integer(reader.i64()?),
             1 => BytecodeConstant::FloatBits(reader.u64()?),
-            2 => BytecodeConstant::Name(reader.blob()?),
-            3 => BytecodeConstant::String(reader.blob()?),
+            2 => BytecodeConstant::Name(decode_blob(&mut reader, scratch)?),
+            3 => BytecodeConstant::String(decode_blob(&mut reader, scratch)?),
             4 => BytecodeConstant::Boolean(match reader.u8()? {
                 0 => false,
                 1 => true,
@@ -1731,15 +2488,27 @@ fn decode_constants(
     Ok(constants)
 }
 
-fn encode_instructions(
+fn decode_blob(
+    reader: &mut Reader<'_>,
+    scratch: &mut Scratch<'_, impl AllocationRecovery>,
+) -> Result<BytecodeBytes, BytecodeError> {
+    let source = reader.blob()?;
+    let mut bytes = scratch.vec();
+    scratch.reserve_exact(&mut bytes, source.len()).map_err(|_| allocation_failed("RVLU blob 配置失敗"))?;
+    bytes.extend_from_slice(source);
+    scratch.shared(bytes).map_err(|_| allocation_failed("RVLU blob owner 配置失敗"))
+}
+
+fn encode_instructions<R: AllocationRecovery>(
     instructions: &[BytecodeInstruction],
     limits: &VerifyLimits,
     allocation_bound: Option<usize>,
-) -> Result<Vec<u8>, BytecodeError> {
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<u8>, BytecodeError> {
     if instructions.len() > limits.max_instructions {
         return Err(limit(0, "RVLU instruction 數超過限制"));
     }
-    let mut writer = Writer::with_limit(allocation_bound);
+    let mut writer = Writer::with_limit(allocation_bound, scratch);
     writer.u32(checked_u32(
         instructions.len(),
         0,
@@ -1764,10 +2533,12 @@ fn decode_instructions(
     bytes: &[u8],
     limits: &VerifyLimits,
     base: usize,
-) -> Result<Vec<BytecodeInstruction>, BytecodeError> {
+    scratch: &mut Scratch<'_, impl AllocationRecovery>,
+) -> Result<BytecodeVec<BytecodeInstruction>, BytecodeError> {
     let mut reader = Reader::new_at(bytes, base);
     let count = reader.count(limits.max_instructions, "RVLU instruction 數超過限制")?;
-    let mut instructions = Vec::new();
+    let mut instructions = scratch.vec();
+    scratch.reserve_exact(&mut instructions, count).map_err(|_| allocation_failed("RVLU instruction 配置失敗"))?;
     for _ in 0..count {
         let instruction = read_instruction(&mut reader)?;
         let effect_offset = reader.location();
@@ -1788,7 +2559,7 @@ fn decode_instructions(
         let span = read_span(&mut reader)?;
         let close_path = match reader.u8()? {
             0 => None,
-            1 => Some(read_close_path(&mut reader, limits)?),
+            1 => Some(read_close_path(&mut reader, limits, scratch)?),
             _ => {
                 return Err(verify(
                     reader.location() - 1,
@@ -1811,15 +2582,16 @@ fn decode_instructions(
     Ok(instructions)
 }
 
-fn encode_metadata(
+fn encode_metadata<R: AllocationRecovery>(
     prototype: &BytecodePrototype,
     limits: &VerifyLimits,
     allocation_bound: Option<usize>,
-) -> Result<Vec<u8>, BytecodeError> {
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<u8>, BytecodeError> {
     if prototype.upvalues.len() > limits.max_upvalues_per_prototype {
         return Err(limit(0, "RVLU upvalue 數超過限制"));
     }
-    let mut writer = Writer::with_limit(allocation_bound);
+    let mut writer = Writer::with_limit(allocation_bound, scratch);
     writer.u32(checked_u32(
         prototype.binding_registers.len(),
         0,
@@ -1862,23 +2634,26 @@ fn decode_metadata(
     bytes: &[u8],
     limits: &VerifyLimits,
     base: usize,
+    scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<
     (
-        Vec<(BytecodeBindingId, Register)>,
-        Vec<BytecodeUpvalue>,
-        Vec<BytecodeClosePath>,
+        BytecodeVec<(BytecodeBindingId, Register)>,
+        BytecodeVec<BytecodeUpvalue>,
+        BytecodeVec<BytecodeClosePath>,
     ),
     BytecodeError,
 > {
     let mut reader = Reader::new_at(bytes, base);
     let binding_count = reader.count(limits.max_constants, "RVLU binding metadata 超過限制")?;
-    let mut binding_registers = Vec::new();
+    let mut binding_registers = scratch.vec();
+    scratch.reserve_exact(&mut binding_registers, binding_count).map_err(|_| allocation_failed("RVLU binding 配置失敗"))?;
     for _ in 0..binding_count {
         binding_registers.push((read_binding(&mut reader)?, Register(reader.u16()?)));
     }
     let upvalue_count =
         reader.count(limits.max_upvalues_per_prototype, "RVLU upvalue 數超過限制")?;
-    let mut upvalues = Vec::new();
+    let mut upvalues = scratch.vec();
+    scratch.reserve_exact(&mut upvalues, upvalue_count).map_err(|_| allocation_failed("RVLU upvalue 配置失敗"))?;
     for _ in 0..upvalue_count {
         let id = UpvalueId(reader.u16()?);
         let offset = reader.location();
@@ -1890,9 +2665,10 @@ fn decode_metadata(
         upvalues.push(BytecodeUpvalue { id, source });
     }
     let close_count = reader.count(limits.max_constants, "RVLU close metadata 超過限制")?;
-    let mut close_paths = Vec::new();
+    let mut close_paths = scratch.vec();
+    scratch.reserve_exact(&mut close_paths, close_count).map_err(|_| allocation_failed("RVLU close path 配置失敗"))?;
     for _ in 0..close_count {
-        close_paths.push(read_close_path(&mut reader, limits)?);
+        close_paths.push(read_close_path(&mut reader, limits, scratch)?);
     }
     if !reader.is_empty() {
         return Err(verify(
@@ -1903,7 +2679,7 @@ fn decode_metadata(
     Ok((binding_registers, upvalues, close_paths))
 }
 
-fn write_instruction(writer: &mut Writer, instruction: &Instruction) {
+fn write_instruction<R: AllocationRecovery>(writer: &mut Writer<'_, '_, R>, instruction: &Instruction) {
     match instruction {
         Instruction::LoadConst { dest, constant } => {
             writer.u8(0);
@@ -2145,7 +2921,7 @@ fn read_instruction(reader: &mut Reader<'_>) -> Result<Instruction, BytecodeErro
     })
 }
 
-fn write_frame(writer: &mut Writer, frame: FrameLayout) {
+fn write_frame<R: AllocationRecovery>(writer: &mut Writer<'_, '_, R>, frame: FrameLayout) {
     writer.u16(frame.register_limit);
     writer.u16(frame.initial_top.0);
     writer.u16(frame.dynamic_top.0);
@@ -2206,7 +2982,7 @@ fn read_frame(reader: &mut Reader<'_>) -> Result<FrameLayout, BytecodeError> {
     })
 }
 
-fn write_close_path(writer: &mut Writer, close: &BytecodeClosePath) -> Result<(), BytecodeError> {
+fn write_close_path<R: AllocationRecovery>(writer: &mut Writer<'_, '_, R>, close: &BytecodeClosePath) -> Result<(), BytecodeError> {
     writer.u8(exit_tag(close.kind));
     write_span(writer, close.span);
     writer.u32(close.from_scope);
@@ -2238,6 +3014,7 @@ fn write_close_path(writer: &mut Writer, close: &BytecodeClosePath) -> Result<()
 fn read_close_path(
     reader: &mut Reader<'_>,
     limits: &VerifyLimits,
+    scratch: &mut Scratch<'_, impl AllocationRecovery>,
 ) -> Result<BytecodeClosePath, BytecodeError> {
     let offset = reader.location();
     let kind = parse_exit(reader.u8()?, offset)?;
@@ -2254,7 +3031,8 @@ fn read_close_path(
         }
     };
     let binding_count = reader.count(limits.max_constants, "RVLU close bindings 超過限制")?;
-    let mut bindings = Vec::new();
+    let mut bindings = scratch.vec();
+    scratch.reserve_exact(&mut bindings, binding_count).map_err(|_| allocation_failed("RVLU close binding 配置失敗"))?;
     for _ in 0..binding_count {
         bindings.push(read_binding(reader)?)
     }
@@ -2262,24 +3040,25 @@ fn read_close_path(
         limits.max_registers as usize,
         "RVLU close registers 超過限制",
     )?;
-    let mut registers = Vec::new();
+    let mut registers = scratch.vec();
+    scratch.reserve_exact(&mut registers, register_count).map_err(|_| allocation_failed("RVLU close register 配置失敗"))?;
     for _ in 0..register_count {
         registers.push(Register(reader.u16()?))
     }
     if bindings.len() != registers.len() {
         return Err(verify(offset, "RVLU close bindings/registers 長度不符"));
     };
-    Ok(BytecodeClosePath {
+    scratch.shared(BytecodeClosePathData {
         kind,
         span,
         from_scope,
         target_scope,
         bindings,
         registers,
-    })
+    }).map_err(|_| allocation_failed("RVLU close path owner 配置失敗"))
 }
 
-fn write_span(writer: &mut Writer, span: BytecodeSpan) {
+fn write_span<R: AllocationRecovery>(writer: &mut Writer<'_, '_, R>, span: BytecodeSpan) {
     writer.u64(span.start_byte);
     writer.u64(span.end_byte)
 }
@@ -2294,7 +3073,7 @@ fn read_span(reader: &mut Reader<'_>) -> Result<BytecodeSpan, BytecodeError> {
         end_byte,
     })
 }
-fn write_binding(writer: &mut Writer, binding: BytecodeBindingId) {
+fn write_binding<R: AllocationRecovery>(writer: &mut Writer<'_, '_, R>, binding: BytecodeBindingId) {
     writer.u32(binding.function);
     writer.u32(binding.ordinal)
 }
@@ -2304,7 +3083,7 @@ fn read_binding(reader: &mut Reader<'_>) -> Result<BytecodeBindingId, BytecodeEr
         ordinal: reader.u32()?,
     })
 }
-fn write_optional_proto(writer: &mut Writer, proto: Option<ProtoId>) {
+fn write_optional_proto<R: AllocationRecovery>(writer: &mut Writer<'_, '_, R>, proto: Option<ProtoId>) {
     match proto {
         Some(proto) => {
             writer.u8(1);
@@ -2320,7 +3099,7 @@ fn read_optional_proto(reader: &mut Reader<'_>) -> Result<Option<ProtoId>, Bytec
         _ => Err(verify(reader.location() - 1, "RVLU parent flag 無效")),
     }
 }
-fn write_result_mode(writer: &mut Writer, mode: ResultMode) {
+fn write_result_mode<R: AllocationRecovery>(writer: &mut Writer<'_, '_, R>, mode: ResultMode) {
     match mode {
         ResultMode::Fixed(count) => {
             writer.u8(0);
@@ -2437,51 +3216,51 @@ fn parse_exit(tag: u8, offset: usize) -> Result<BytecodeExitKind, BytecodeError>
     }
 }
 
-#[derive(Default)]
-struct Writer {
-    bytes: Vec<u8>,
+struct Writer<'s, 'r, R: AllocationRecovery> {
+    bytes: BytecodeVec<u8>,
     allocation_bound: Option<usize>,
     failure: Option<BytecodeError>,
+    scratch: &'s mut Scratch<'r, R>,
 }
-impl Writer {
-    fn with_limit(allocation_bound: Option<usize>) -> Self {
+impl<'s, 'r, R: AllocationRecovery> Writer<'s, 'r, R> {
+    fn with_limit(allocation_bound: Option<usize>, scratch: &'s mut Scratch<'r, R>) -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: scratch.vec(),
             allocation_bound,
             failure: None,
+            scratch,
         }
     }
     fn write(&mut self, value: &[u8]) {
         if self.failure.is_some() {
             return;
         }
+        let Some(end) = self.bytes.len().checked_add(value.len()) else {
+            self.failure = Some(limit(0, "RVLU 輸出長度溢位"));
+            return;
+        };
         if let Some(bound) = self.allocation_bound {
-            let Some(end) = self.bytes.len().checked_add(value.len()) else {
-                self.failure = Some(limit(0, "RVLU 輸出長度溢位"));
-                return;
-            };
             if end > bound {
                 self.failure = Some(limit(0, "RVLU 輸出超出預准入"));
                 return;
             }
-            if end > self.bytes.capacity() {
-                if self.bytes.try_reserve_exact(value.len()).is_err() {
-                    self.failure = Some(BytecodeError {
-                        code: BytecodeErrorCode::AllocationFailed,
-                        offset: 0,
-                        message: "RVLU 輸出配置失敗".into(),
-                    });
-                    return;
-                }
-                if self.bytes.capacity() > bound {
-                    self.failure = Some(limit(0, "RVLU 實際容量超出預准入"));
-                    return;
-                }
+        }
+        if end > self.bytes.capacity() {
+            let target = self.bytes.capacity().saturating_mul(2).max(8).max(end);
+            let target = self.allocation_bound.map_or(target, |bound| target.min(bound));
+            let additional = target - self.bytes.len();
+            if self.scratch.reserve_exact(&mut self.bytes, additional).is_err() {
+                self.failure = Some(allocation_failed("RVLU 輸出配置失敗"));
+                return;
+            }
+            if self.allocation_bound.is_some_and(|bound| self.bytes.capacity() > bound) {
+                self.failure = Some(limit(0, "RVLU 實際容量超出預准入"));
+                return;
             }
         }
         self.bytes.extend_from_slice(value);
     }
-    fn finish(self) -> Result<Vec<u8>, BytecodeError> {
+    fn finish(self) -> Result<BytecodeVec<u8>, BytecodeError> {
         match self.failure {
             Some(error) => Err(error),
             None => Ok(self.bytes),
@@ -2578,10 +3357,10 @@ impl<'a> Reader<'a> {
         }
         Ok(count)
     }
-    fn blob(&mut self) -> Result<Vec<u8>, BytecodeError> {
+    fn blob(&mut self) -> Result<&'a [u8], BytecodeError> {
         let offset = self.location();
         let len = usize::try_from(self.u32()?).map_err(|_| limit(offset, "RVLU blob 過大"))?;
-        Ok(self.take(len)?.to_vec())
+        self.take(len)
     }
     fn section(&mut self) -> Result<Section<'a>, BytecodeError> {
         let offset = self.location();
@@ -2600,6 +3379,22 @@ fn verify(offset: usize, message: &str) -> BytecodeError {
         code: BytecodeErrorCode::Verify,
         offset,
         message: message.into(),
+    }
+}
+
+fn allocation_failed(message: &str) -> BytecodeError {
+    BytecodeError {
+        code: BytecodeErrorCode::AllocationFailed,
+        offset: 0,
+        message: String::from(message),
+    }
+}
+
+fn global_recovery_error(error: BytecodeRecoveryError<core::convert::Infallible>) -> BytecodeError {
+    match error {
+        BytecodeRecoveryError::Bytecode(error) => error,
+        BytecodeRecoveryError::Reserve(ReserveError::Recovery(never)) => match never {},
+        BytecodeRecoveryError::Reserve(_) => allocation_failed("RVLU 配置失敗"),
     }
 }
 fn limit(offset: usize, message: &str) -> BytecodeError {

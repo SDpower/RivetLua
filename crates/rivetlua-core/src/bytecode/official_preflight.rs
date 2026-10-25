@@ -1,13 +1,15 @@
-//! 官方 chunk 的無配置結構預掃描，供 P13 在 decode 前預扣工作與配置。
+//! 官方 chunk 的受限結構預掃描，供 P13 在 decode 前預扣工作與配置。
 
-use alloc::vec::Vec;
+use rivetlua_alloc::{AllocationRecovery, GlobalAllocation, ReserveError, StateAllocator};
 
 use core::mem::size_of;
 
-use super::official::{OfficialChunkError, OfficialChunkErrorKind, OfficialChunkLimits};
+use super::official::{OfficialChunkError, OfficialChunkErrorKind, OfficialChunkLimits, OfficialChunkRecoveryError};
+use super::codec::Scratch;
 use super::official_translation::OfficialPcMap;
 use super::{
     BytecodeBindingId, BytecodeClosePath, BytecodeConstant, BytecodeInstruction, BytecodePrototype,
+    BytecodeVec,
     BytecodeUpvalue, InstructionOffset, LuaProfile, OfficialPlanCall, OfficialPlanFrameInput,
     OfficialPlanRootBinding, OfficialPlanUpvalueMap, OfficialRvluPc, Register, VerifyLimits,
 };
@@ -15,6 +17,28 @@ use super::{
 const SIGNATURE: &[u8] = b"\x1bLua";
 const DATA: &[u8] = b"\x19\x93\r\n\x1a\n";
 const LUA54_INT_MAX: u32 = i32::MAX as u32 - 128;
+
+/// 官方 chunk 游標擴充 frame backing 前的暫存額度預付入口。
+#[doc(hidden)]
+pub trait OfficialChunkCursorBudget: AllocationRecovery {
+    fn claim_cursor_temporary(&mut self, additional: usize) -> Result<(), Self::Error>;
+}
+
+struct UnmeteredCursor<'a, R>(&'a mut R);
+
+impl<R: AllocationRecovery> AllocationRecovery for UnmeteredCursor<'_, R> {
+    type Error = R::Error;
+
+    fn allocator(&self) -> StateAllocator { self.0.allocator() }
+
+    fn recover_after_refusal(&mut self, before: u64) -> Result<bool, Self::Error> {
+        self.0.recover_after_refusal(before)
+    }
+}
+
+impl<R: AllocationRecovery> OfficialChunkCursorBudget for UnmeteredCursor<'_, R> {
+    fn claim_cursor_temporary(&mut self, _: usize) -> Result<(), Self::Error> { Ok(()) }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OfficialChunkPreflight {
@@ -98,6 +122,15 @@ struct Scan<'a> {
     limits: &'a OfficialChunkLimits,
     verify: &'a VerifyLimits,
     stats: Stats,
+    need_end: Option<usize>,
+}
+
+struct ScanFrame {
+    depth: usize,
+    max_stack: u8,
+    upvalue_count: usize,
+    code_count: usize,
+    remaining_children: usize,
 }
 
 impl<'a> Scan<'a> {
@@ -106,13 +139,13 @@ impl<'a> Scan<'a> {
             .offset
             .checked_add(len)
             .ok_or_else(|| overflow(self.offset))?;
-        let result = self.input.get(self.offset..end).ok_or_else(|| {
-            error(
-                OfficialChunkErrorKind::Truncated,
-                self.offset,
-                "官方 chunk 截斷",
-            )
-        })?;
+        if end > self.limits.max_bytes {
+            return Err(error(OfficialChunkErrorKind::LimitExceeded, 0, "chunk 長度超限"));
+        }
+        let Some(result) = self.input.get(self.offset..end) else {
+            self.need_end = Some(end);
+            return Err(error(OfficialChunkErrorKind::Truncated, self.offset, "官方 chunk 截斷"));
+        };
         self.offset = end;
         Ok(result)
     }
@@ -140,22 +173,17 @@ impl<'a> Scan<'a> {
     }
 
     fn varint(&mut self) -> Result<u64, OfficialChunkError> {
-        let mut result = 0_u64;
-        for _ in 0..10 {
-            let byte = self.byte()?;
-            if result > u64::MAX >> 7 {
-                return Err(overflow(self.offset));
+        match self.probe_varint(self.offset) {
+            Ok((value, end)) => {
+                self.offset = end;
+                Ok(value)
             }
-            result = (result << 7) | u64::from(byte & 0x7f);
-            let done = match self.profile {
-                LuaProfile::Lua55 => byte & 0x80 == 0,
-                LuaProfile::Lua54 => byte & 0x80 != 0,
-            };
-            if done {
-                return Ok(result);
+            Err(Pause::NeedMore { minimum_total, error }) => {
+                self.need_end = Some(minimum_total);
+                Err(error)
             }
+            Err(Pause::Failed(error)) => Err(error),
         }
-        Err(overflow(self.offset))
     }
 
     fn size(&mut self) -> Result<usize, OfficialChunkError> {
@@ -203,6 +231,77 @@ impl<'a> Scan<'a> {
             ));
         }
         Ok(())
+    }
+
+    fn require_at(&self, at: usize, len: usize, detail: &'static str) -> Result<(), Pause> {
+        let end = at.checked_add(len).ok_or_else(|| overflow(at))?;
+        if end > self.limits.max_bytes {
+            return Err(error(OfficialChunkErrorKind::LimitExceeded, 0, "chunk 長度超限").into());
+        }
+        if self.input.len() < end {
+            return Err(Pause::NeedMore {
+                minimum_total: end,
+                error: error(OfficialChunkErrorKind::Truncated, at, detail),
+            });
+        }
+        Ok(())
+    }
+
+    fn require_minimum(&self, count: usize, unit: usize) -> Result<(), Pause> {
+        let bytes = count.checked_mul(unit).ok_or_else(|| overflow(self.offset))?;
+        self.require_at(self.offset, bytes, "資料不足以容納宣稱項數")
+    }
+
+    fn probe_varint(&self, at: usize) -> Result<(u64, usize), Pause> {
+        let mut result = 0_u64;
+        for i in 0..10 {
+            let pos = at.checked_add(i).ok_or_else(|| overflow(at))?;
+            self.require_at(pos, 1, "官方 chunk 截斷")?;
+            let byte = self.input[pos];
+            let end = pos + 1;
+            if result > u64::MAX >> 7 {
+                return Err(overflow(end).into());
+            }
+            result = (result << 7) | u64::from(byte & 0x7f);
+            let done = match self.profile {
+                LuaProfile::Lua55 => byte & 0x80 == 0,
+                LuaProfile::Lua54 => byte & 0x80 != 0,
+            };
+            if done {
+                return Ok((result, end));
+            }
+        }
+        Err(overflow(at + 10).into())
+    }
+
+    fn probe_int(&self, at: usize) -> Result<usize, Pause> {
+        let (value, end) = self.probe_varint(at)?;
+        let limit = match self.profile {
+            LuaProfile::Lua55 => i32::MAX as u32,
+            LuaProfile::Lua54 => LUA54_INT_MAX,
+        };
+        if u32::try_from(value).ok().is_none_or(|value| value > limit) {
+            return Err(overflow(end).into());
+        }
+        Ok(end)
+    }
+
+    fn probe_string(&self, at: usize) -> Result<usize, Pause> {
+        let (raw_size, after_size) = self.probe_varint(at)?;
+        let size = usize::try_from(raw_size).map_err(|_| overflow(after_size))?;
+        if self.profile == LuaProfile::Lua55 && size == 0 {
+            return Ok(self.probe_varint(after_size)?.1);
+        }
+        if size == 0 {
+            return Ok(after_size);
+        }
+        let len = size - 1;
+        if len > self.limits.max_string_bytes {
+            return Err(error(OfficialChunkErrorKind::LimitExceeded, after_size, "單一字串超限").into());
+        }
+        let payload = if self.profile == LuaProfile::Lua55 { size } else { len };
+        self.require_at(after_size, payload, "資料不足以容納宣稱項數")?;
+        Ok(after_size + payload)
     }
 
     fn align4(&mut self) -> Result<(), OfficialChunkError> {
@@ -344,54 +443,12 @@ impl<'a> Scan<'a> {
         Ok(())
     }
 
-    fn prototype(
+    fn code(
         &mut self,
-        depth: usize,
-        parent: Option<(u8, usize)>,
-    ) -> Result<usize, OfficialChunkError> {
-        if depth > self.limits.max_depth.min(64) {
-            return Err(error(
-                OfficialChunkErrorKind::LimitExceeded,
-                self.offset,
-                "prototype 深度超限",
-            ));
-        }
-        self.count(
-            |stats| &mut stats.prototypes,
-            1,
-            self.limits.max_prototypes.min(self.verify.max_prototypes),
-        )?;
-        if self.profile == LuaProfile::Lua54 {
-            self.string()?;
-        }
-        let line_defined = self.int()?;
-        let last_line_defined = self.int()?;
-        let num_params = self.byte()?;
-        let flags = self.byte()?;
-        let max_stack = self.byte()?;
-        if max_stack == 0
-            || num_params > max_stack
-            || (last_line_defined != 0 && line_defined > last_line_defined)
-            || match self.profile {
-                LuaProfile::Lua55 => flags & !3 != 0,
-                LuaProfile::Lua54 => flags > 1,
-            }
-        {
-            return Err(error(
-                OfficialChunkErrorKind::InvalidFormat,
-                self.offset,
-                "prototype signature 不符",
-            ));
-        }
-
-        let code_count = self.int()? as usize;
-        self.count(
-            |stats| &mut stats.instructions,
-            code_count,
-            self.limits
-                .max_instructions
-                .min(self.verify.max_instructions),
-        )?;
+        code_count: usize,
+        num_params: u8,
+        max_stack: u8,
+    ) -> Result<(), OfficialChunkError> {
         add(&mut self.stats.stack_slots, max_stack as u128, self.offset)?;
         add(
             &mut self.stats.instruction_squares,
@@ -582,208 +639,841 @@ impl<'a> Scan<'a> {
             self.offset,
         )?;
 
-        let constant_count = self.int()? as usize;
-        self.count(
-            |stats| &mut stats.constants,
-            constant_count,
-            self.limits.max_constants.min(self.verify.max_constants),
-        )?;
-        self.require_min(constant_count, 1)?;
-        for _ in 0..constant_count {
-            match self.byte()? {
-                0 | 1 | 17 => {}
-                3 if self.profile == LuaProfile::Lua55 => {
-                    self.varint()?;
-                }
-                3 | 19 => {
-                    self.read(8)?;
-                }
-                4 | 20 => {
-                    if !self.string()? {
-                        return Err(error(
-                            OfficialChunkErrorKind::InvalidFormat,
-                            self.offset,
-                            "常數字串不可為 NULL",
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(error(
-                        OfficialChunkErrorKind::InvalidFormat,
-                        self.offset,
-                        "常數 tag 不符",
-                    ));
-                }
-            }
-        }
-
-        let upvalue_count = self.int()? as usize;
-        if upvalue_count > u8::MAX as usize
-            || upvalue_count > self.verify.max_upvalues_per_prototype
-        {
-            return Err(error(
-                OfficialChunkErrorKind::LimitExceeded,
-                self.offset,
-                "upvalue 數超限",
-            ));
-        }
-        self.count(
-            |stats| &mut stats.upvalues,
-            upvalue_count,
-            self.limits.max_upvalues,
-        )?;
-        let translated_upvalues = (upvalue_count as u128)
-            .checked_add(4)
-            .ok_or_else(|| budget_overflow(self.offset))?;
-        add(
-            &mut self.stats.upvalue_squares,
-            translated_upvalues
-                .checked_mul(translated_upvalues)
-                .ok_or_else(|| budget_overflow(self.offset))?,
-            self.offset,
-        )?;
-        self.require_min(upvalue_count, 3)?;
-        for _ in 0..upvalue_count {
-            let in_stack = self.byte()?;
-            let index = self.byte()?;
-            let kind = self.byte()?;
-            let max_kind = if self.profile == LuaProfile::Lua55 {
-                3
-            } else {
-                2
-            };
-            let valid_parent = match (parent, in_stack) {
-                (Some((stack, _)), 1) => index < stack,
-                (Some((_, upvalues)), 0) => (index as usize) < upvalues,
-                (None, 0 | 1) => true,
-                _ => false,
-            };
-            if in_stack > 1 || kind > max_kind || !valid_parent {
-                return Err(error(
-                    OfficialChunkErrorKind::InvalidFormat,
-                    self.offset,
-                    "upvalue parent index 或 kind 不符",
-                ));
-            }
-        }
-
-        let child_count = self.int()? as usize;
-        if child_count as u128 > self.limits.max_prototypes as u128 - self.stats.prototypes {
-            return Err(error(
-                OfficialChunkErrorKind::LimitExceeded,
-                self.offset,
-                "子 prototype 數超限",
-            ));
-        }
-        self.require_min(child_count, 1)?;
-        for _ in 0..child_count {
-            self.prototype(depth + 1, Some((max_stack, upvalue_count)))?;
-        }
-        if self.profile == LuaProfile::Lua55 {
-            self.string()?;
-        }
-        self.debug(code_count, upvalue_count)?;
-        Ok(upvalue_count)
+        Ok(())
     }
 
-    fn debug(&mut self, code_count: usize, upvalue_count: usize) -> Result<(), OfficialChunkError> {
-        let line_count = self.int()? as usize;
-        if line_count != 0 && line_count != code_count {
-            return Err(error(
-                OfficialChunkErrorKind::InvalidFormat,
-                self.offset,
-                "lineinfo 數與 code 不符",
-            ));
-        }
-        self.count(
-            |stats| &mut stats.debug_entries,
-            line_count,
-            self.limits.max_debug_entries,
-        )?;
-        self.require_min(line_count, 1)?;
-        let lines = self.read(line_count)?;
-        let marker_count = lines.iter().filter(|line| **line == 0x80).count();
-        let abs_count = self.int()? as usize;
-        self.count(
-            |stats| &mut stats.debug_entries,
-            abs_count,
-            self.limits.max_debug_entries,
-        )?;
-        if self.profile == LuaProfile::Lua55 && abs_count > 0 {
-            self.align4()?;
-        }
-        self.require_min(
-            abs_count,
-            if self.profile == LuaProfile::Lua55 {
-                8
-            } else {
-                2
-            },
-        )?;
-        let mut previous_pc = None;
-        for _ in 0..abs_count {
-            let (pc, line) = match self.profile {
-                LuaProfile::Lua55 => (self.u32()? as i32, self.u32()? as i32),
-                LuaProfile::Lua54 => (self.int()? as i32, self.int()? as i32),
+    fn push_frame<R: OfficialChunkCursorBudget>(
+        &self,
+        stack: &mut BytecodeVec<ScanFrame>,
+        frame: ScanFrame,
+        scratch: &mut Scratch<'_, R>,
+    ) -> Result<(), OfficialChunkError> {
+        if stack.len() == stack.capacity() {
+            let additional = stack.capacity().max(1);
+            let old_bytes = stack.capacity().saturating_mul(size_of::<ScanFrame>());
+            let Some(target_bytes) = stack.capacity().checked_add(additional)
+                .and_then(|capacity| capacity.checked_mul(size_of::<ScanFrame>())) else {
+                return Err(error(OfficialChunkErrorKind::LimitExceeded, self.offset, "預掃 cursor 配置超限"));
             };
-            if pc < 0
-                || pc as usize >= code_count
-                || line < 0
-                || previous_pc.is_some_and(|previous| pc <= previous)
-                || lines.get(pc as usize) != Some(&0x80)
-            {
-                return Err(error(
-                    OfficialChunkErrorKind::InvalidFormat,
-                    self.offset,
-                    "絕對行號 PC 或 line 不符",
-                ));
+            if target_bytes > self.limits.max_allocated_bytes {
+                return Err(error(OfficialChunkErrorKind::LimitExceeded, self.offset, "預掃 cursor 配置超限"));
             }
-            previous_pc = Some(pc);
-        }
-        if marker_count != abs_count {
-            return Err(error(
-                OfficialChunkErrorKind::InvalidFormat,
-                self.offset,
-                "絕對行號與 marker 不符",
-            ));
-        }
-        let local_count = self.int()? as usize;
-        self.count(
-            |stats| &mut stats.debug_entries,
-            local_count,
-            self.limits.max_debug_entries,
-        )?;
-        self.require_min(local_count, 3)?;
-        for _ in 0..local_count {
-            self.string()?;
-            let start = self.int()?;
-            let end = self.int()?;
-            if start > end || end as usize > code_count {
-                return Err(error(
-                    OfficialChunkErrorKind::InvalidFormat,
-                    self.offset,
-                    "local PC 範圍不符",
-                ));
+            if let Err(failure) = scratch.recovery().claim_cursor_temporary(target_bytes - old_bytes) {
+                scratch.record_refusal(ReserveError::Recovery(failure));
+                return Err(error(OfficialChunkErrorKind::AllocationFailed, self.offset, "預掃 cursor 額度不足"));
+            }
+            scratch.reserve_exact(stack, additional).map_err(|_| {
+                error(OfficialChunkErrorKind::AllocationFailed, self.offset, "預掃 cursor 配置失敗")
+            })?;
+            let Some(actual_bytes) = stack.capacity().checked_mul(size_of::<ScanFrame>()) else {
+                return Err(error(OfficialChunkErrorKind::LimitExceeded, self.offset, "預掃 cursor 實際容量超限"));
+            };
+            if actual_bytes > self.limits.max_allocated_bytes {
+                return Err(error(OfficialChunkErrorKind::LimitExceeded, self.offset, "預掃 cursor 實際容量超限"));
+            }
+            if actual_bytes > target_bytes {
+                if let Err(failure) = scratch.recovery().claim_cursor_temporary(actual_bytes - target_bytes) {
+                    scratch.record_refusal(ReserveError::Recovery(failure));
+                    return Err(error(OfficialChunkErrorKind::AllocationFailed, self.offset, "預掃 cursor 額度不足"));
+                }
             }
         }
-        let name_count = self.int()? as usize;
-        if name_count != 0 && name_count != upvalue_count {
-            return Err(error(
-                OfficialChunkErrorKind::InvalidFormat,
-                self.offset,
-                "upvalue debug name 數不符",
-            ));
-        }
-        self.count(
-            |stats| &mut stats.debug_entries,
-            name_count,
-            self.limits.max_debug_entries,
-        )?;
-        self.require_min(name_count, 1)?;
-        for _ in 0..name_count {
-            self.string()?;
-        }
+        stack.push(frame);
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum OfficialChunkProgress {
+    NeedMore { minimum_total: usize },
+    Complete { consumed: usize },
+}
+
+#[derive(Clone, Copy)]
+enum Stage {
+    Header,
+    RootUpvalues,
+    PrototypeStart,
+    PrototypeSource,
+    PrototypeHeader,
+    CodeCount,
+    Code,
+    ConstantCount,
+    Constants,
+    UpvalueCount,
+    Upvalues,
+    ChildCount,
+    ChildMinimum,
+    Children,
+    TailSource,
+    DebugLineCount,
+    DebugLines,
+    DebugAbsCount,
+    DebugAbs,
+    DebugLocalCount,
+    DebugLocals,
+    DebugLocalStart,
+    DebugLocalEnd,
+    DebugNameCount,
+    DebugNames,
+    Done,
+}
+
+enum Pause {
+    NeedMore { minimum_total: usize, error: OfficialChunkError },
+    Failed(OfficialChunkError),
+}
+
+impl From<OfficialChunkError> for Pause {
+    fn from(error: OfficialChunkError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// 只保存位移與解析狀態；輸入資料始終由呼叫者持有。
+#[doc(hidden)]
+pub struct OfficialChunkCursor {
+    profile: LuaProfile,
+    limits: OfficialChunkLimits,
+    verify: VerifyLimits,
+    allocator: StateAllocator,
+    offset: usize,
+    stats: Stats,
+    frames: BytecodeVec<ScanFrame>,
+    stage: Stage,
+    depth: usize,
+    parent: Option<(u8, usize)>,
+    line_defined: u32,
+    last_line_defined: u32,
+    num_params: u8,
+    flags: u8,
+    max_stack: u8,
+    code_count: usize,
+    upvalue_count: usize,
+    remaining: usize,
+    lines_start: usize,
+    line_count: usize,
+    local_start: u32,
+    marker_count: usize,
+    abs_count: usize,
+    previous_pc: Option<i32>,
+    root_upvalues: usize,
+    need: Option<(usize, OfficialChunkError)>,
+    complete: Option<usize>,
+}
+
+impl OfficialChunkCursor {
+    pub fn new(
+        profile: LuaProfile,
+        limits: OfficialChunkLimits,
+        verify: VerifyLimits,
+        allocator: StateAllocator,
+    ) -> Self {
+        Self {
+            profile,
+            limits,
+            verify,
+            frames: BytecodeVec::new_in(allocator.clone()),
+            allocator,
+            offset: 0,
+            stats: Stats::default(),
+            stage: Stage::Header,
+            depth: 0,
+            parent: None,
+            line_defined: 0,
+            last_line_defined: 0,
+            num_params: 0,
+            flags: 0,
+            max_stack: 0,
+            code_count: 0,
+            upvalue_count: 0,
+            remaining: 0,
+            lines_start: 0,
+            line_count: 0,
+            local_start: 0,
+            marker_count: 0,
+            abs_count: 0,
+            previous_pc: None,
+            root_upvalues: 0,
+            need: None,
+            complete: None,
+        }
+    }
+
+    pub fn temporary_allocation_bytes(&self) -> usize {
+        self.frames.capacity() * size_of::<ScanFrame>()
+    }
+
+    /// 在輸入結束時回傳與整塊預掃相同的截斷位置及原因。
+    pub fn eof_error(&self) -> OfficialChunkError {
+        self.need.as_ref().map(|(_, error)| error.clone()).unwrap_or_else(|| {
+            error(OfficialChunkErrorKind::Truncated, self.offset, "官方 chunk 截斷")
+        })
+    }
+
+    pub fn advance<R: AllocationRecovery>(
+        &mut self,
+        prefix: &[u8],
+        recovery: &mut R,
+    ) -> Result<OfficialChunkProgress, OfficialChunkRecoveryError<R::Error>> {
+        self.advance_budgeted(prefix, &mut UnmeteredCursor(recovery))
+    }
+
+    pub fn advance_budgeted<R: OfficialChunkCursorBudget>(
+        &mut self,
+        prefix: &[u8],
+        recovery: &mut R,
+    ) -> Result<OfficialChunkProgress, OfficialChunkRecoveryError<R::Error>> {
+        if !self.allocator.same_binding(&recovery.allocator()) {
+            return Err(OfficialChunkRecoveryError::Chunk(error(
+                OfficialChunkErrorKind::InvalidFormat, self.offset, "預掃 cursor 配置器不符",
+            )));
+        }
+        if let Some(consumed) = self.complete {
+            return Ok(OfficialChunkProgress::Complete { consumed });
+        }
+        if prefix.len() < self.offset {
+            return Err(OfficialChunkRecoveryError::Chunk(error(
+                OfficialChunkErrorKind::Truncated, prefix.len(), "累積輸入短於預掃位移",
+            )));
+        }
+        if let Some((minimum_total, _)) = self.need.as_ref() {
+            if prefix.len() < *minimum_total {
+                return Ok(OfficialChunkProgress::NeedMore { minimum_total: *minimum_total });
+            }
+        }
+        let mut scratch = Scratch::new(recovery);
+        let limits = self.limits;
+        let verify = self.verify;
+        let mut scan = Scan {
+            input: prefix,
+            offset: self.offset,
+            profile: self.profile,
+            limits: &limits,
+            verify: &verify,
+            stats: core::mem::take(&mut self.stats),
+            need_end: None,
+        };
+        let result = self.advance_inner(&mut scan, &mut scratch);
+        self.offset = scan.offset;
+        self.stats = scan.stats;
+        match result {
+            Ok(consumed) => {
+                self.complete = Some(consumed);
+                self.need = None;
+                Ok(OfficialChunkProgress::Complete { consumed })
+            }
+            Err(Pause::NeedMore { minimum_total, error }) => {
+                self.need = Some((minimum_total, error));
+                Ok(OfficialChunkProgress::NeedMore { minimum_total })
+            }
+            Err(Pause::Failed(error)) => Err(match scratch.take_refusal() {
+                Some(refusal) => OfficialChunkRecoveryError::Reserve(refusal),
+                None => OfficialChunkRecoveryError::Chunk(error),
+            }),
+        }
+    }
+
+    fn begin_prototype(&mut self, depth: usize, parent: Option<(u8, usize)>) {
+        self.depth = depth;
+        self.parent = parent;
+        self.stage = Stage::PrototypeStart;
+    }
+
+    fn advance_inner<R: OfficialChunkCursorBudget>(
+        &mut self,
+        scan: &mut Scan<'_>,
+        scratch: &mut Scratch<'_, R>,
+    ) -> Result<usize, Pause> {
+        loop {
+            match self.stage {
+                Stage::Header => {
+                    let mut header = Scan {
+                        input: scan.input,
+                        offset: 0,
+                        profile: scan.profile,
+                        limits: scan.limits,
+                        verify: scan.verify,
+                        stats: Stats::default(),
+                        need_end: None,
+                    };
+                    match header.header() {
+                        Ok(()) => {
+                            scan.offset = header.offset;
+                            self.stage = Stage::RootUpvalues;
+                        }
+                        Err(error) if error.kind == OfficialChunkErrorKind::Truncated => {
+                            return Err(Pause::NeedMore {
+                                minimum_total: header.need_end.expect("truncated read records length"),
+                                error,
+                            });
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Stage::RootUpvalues => {
+                    scan.require_at(scan.offset, 1, "官方 chunk 截斷")?;
+                    self.root_upvalues = scan.byte()? as usize;
+                    self.begin_prototype(1, None);
+                }
+                Stage::PrototypeStart => {
+                    if self.depth > scan.limits.max_depth {
+                        return Err(error(OfficialChunkErrorKind::LimitExceeded, scan.offset, "prototype 深度超限").into());
+                    }
+                    scan.count(
+                        |stats| &mut stats.prototypes, 1,
+                        scan.limits.max_prototypes.min(scan.verify.max_prototypes),
+                    )?;
+                    self.stage = if scan.profile == LuaProfile::Lua54 {
+                        Stage::PrototypeSource
+                    } else {
+                        Stage::PrototypeHeader
+                    };
+                }
+                Stage::PrototypeSource => {
+                    scan.probe_string(scan.offset)?;
+                    scan.string()?;
+                    self.stage = Stage::PrototypeHeader;
+                }
+                Stage::PrototypeHeader => {
+                    let end = scan.probe_int(scan.offset)?;
+                    let end = scan.probe_int(end)?;
+                    for index in 0..3 {
+                        scan.require_at(end + index, 1, "官方 chunk 截斷")?;
+                    }
+                    self.line_defined = scan.int()?;
+                    self.last_line_defined = scan.int()?;
+                    self.num_params = scan.byte()?;
+                    self.flags = scan.byte()?;
+                    self.max_stack = scan.byte()?;
+                    if self.max_stack == 0
+                        || self.num_params > self.max_stack
+                        || (self.last_line_defined != 0 && self.line_defined > self.last_line_defined)
+                        || match scan.profile {
+                            LuaProfile::Lua55 => self.flags & !3 != 0,
+                            LuaProfile::Lua54 => self.flags > 1,
+                        }
+                    {
+                        return Err(error(OfficialChunkErrorKind::InvalidFormat, scan.offset, "prototype signature 不符").into());
+                    }
+                    self.stage = Stage::CodeCount;
+                }
+                Stage::CodeCount => {
+                    scan.probe_varint(scan.offset)?;
+                    self.code_count = scan.int()? as usize;
+                    scan.count(
+                        |stats| &mut stats.instructions, self.code_count,
+                        scan.limits.max_instructions.min(scan.verify.max_instructions),
+                    )?;
+                    self.stage = Stage::Code;
+                }
+                Stage::Code => {
+                    if scan.profile == LuaProfile::Lua55 {
+                        let pad = (4 - scan.offset % 4) % 4;
+                        scan.require_at(scan.offset, pad, "官方 chunk 截斷")?;
+                        scan.align4()?;
+                    }
+                    let bytes = self.code_count.checked_mul(4).ok_or_else(|| budget_overflow(scan.offset))?;
+                    scan.require_at(scan.offset, bytes, "資料不足以容納宣稱項數")?;
+                    scan.code(self.code_count, self.num_params, self.max_stack)?;
+                    self.stage = Stage::ConstantCount;
+                }
+                Stage::ConstantCount => {
+                    scan.probe_varint(scan.offset)?;
+                    self.remaining = scan.int()? as usize;
+                    scan.count(
+                        |stats| &mut stats.constants, self.remaining,
+                        scan.limits.max_constants.min(scan.verify.max_constants),
+                    )?;
+                    self.stage = Stage::Constants;
+                }
+                Stage::Constants => {
+                    if self.remaining == 0 {
+                        self.stage = Stage::UpvalueCount;
+                        continue;
+                    }
+                    scan.require_minimum(self.remaining, 1)?;
+                    let tag = scan.input[scan.offset];
+                    match tag {
+                        0 | 1 | 17 => {}
+                        3 if scan.profile == LuaProfile::Lua55 => {
+                            scan.probe_varint(scan.offset + 1)?;
+                        }
+                        3 | 19 => {
+                            scan.require_at(scan.offset + 1, 8, "官方 chunk 截斷")?;
+                        }
+                        4 | 20 => {
+                            scan.probe_string(scan.offset + 1)?;
+                        }
+                        _ => {
+                            return Err(error(OfficialChunkErrorKind::InvalidFormat, scan.offset + 1, "常數 tag 不符").into());
+                        }
+                    }
+                    scan.byte()?;
+                    match tag {
+                        3 if scan.profile == LuaProfile::Lua55 => { scan.varint()?; }
+                        3 | 19 => { scan.read(8)?; }
+                        4 | 20 => {
+                            if !scan.string()? {
+                                return Err(error(OfficialChunkErrorKind::InvalidFormat, scan.offset, "常數字串不可為 NULL").into());
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.remaining -= 1;
+                }
+                Stage::UpvalueCount => {
+                    scan.probe_varint(scan.offset)?;
+                    self.upvalue_count = scan.int()? as usize;
+                    if self.upvalue_count > u8::MAX as usize
+                        || self.upvalue_count > scan.verify.max_upvalues_per_prototype
+                    {
+                        return Err(error(OfficialChunkErrorKind::LimitExceeded, scan.offset, "upvalue 數超限").into());
+                    }
+                    scan.count(|stats| &mut stats.upvalues, self.upvalue_count, scan.limits.max_upvalues)?;
+                    let translated = (self.upvalue_count as u128).checked_add(4).ok_or_else(|| budget_overflow(scan.offset))?;
+                    add(&mut scan.stats.upvalue_squares,
+                        translated.checked_mul(translated).ok_or_else(|| budget_overflow(scan.offset))?,
+                        scan.offset)?;
+                    self.remaining = self.upvalue_count;
+                    self.stage = Stage::Upvalues;
+                }
+                Stage::Upvalues => {
+                    if self.remaining == 0 {
+                        self.stage = Stage::ChildCount;
+                        continue;
+                    }
+                    scan.require_minimum(self.remaining, 3)?;
+                    let in_stack = scan.byte()?;
+                    let index = scan.byte()?;
+                    let kind = scan.byte()?;
+                    let max_kind = if scan.profile == LuaProfile::Lua55 { 3 } else { 2 };
+                    let valid_parent = match (self.parent, in_stack) {
+                        (Some((stack, _)), 1) => index < stack,
+                        (Some((_, upvalues)), 0) => (index as usize) < upvalues,
+                        (None, 0 | 1) => true,
+                        _ => false,
+                    };
+                    if in_stack > 1 || kind > max_kind || !valid_parent {
+                        return Err(error(OfficialChunkErrorKind::InvalidFormat, scan.offset, "upvalue parent index 或 kind 不符").into());
+                    }
+                    self.remaining -= 1;
+                }
+                Stage::ChildCount => {
+                    scan.probe_varint(scan.offset)?;
+                    self.remaining = scan.int()? as usize;
+                    if self.remaining as u128 > scan.limits.max_prototypes as u128 - scan.stats.prototypes {
+                        return Err(error(OfficialChunkErrorKind::LimitExceeded, scan.offset, "子 prototype 數超限").into());
+                    }
+                    self.stage = Stage::ChildMinimum;
+                }
+                Stage::ChildMinimum => {
+                    scan.require_minimum(self.remaining, 1)?;
+                    let frame = ScanFrame {
+                        depth: self.depth,
+                        max_stack: self.max_stack,
+                        upvalue_count: self.upvalue_count,
+                        code_count: self.code_count,
+                        remaining_children: self.remaining,
+                    };
+                    scan.push_frame(&mut self.frames, frame, scratch)?;
+                    self.stage = Stage::Children;
+                }
+                Stage::Children => {
+                    let frame = self.frames.last_mut().expect("prototype frame 已配置");
+                    if frame.remaining_children == 0 {
+                        self.stage = Stage::TailSource;
+                        continue;
+                    }
+                    frame.remaining_children -= 1;
+                    let depth = frame.depth.checked_add(1).ok_or_else(|| overflow(scan.offset))?;
+                    let parent = Some((frame.max_stack, frame.upvalue_count));
+                    self.begin_prototype(depth, parent);
+                }
+                Stage::TailSource => {
+                    if scan.profile == LuaProfile::Lua55 {
+                        scan.probe_string(scan.offset)?;
+                        scan.string()?;
+                    }
+                    self.stage = Stage::DebugLineCount;
+                }
+                Stage::DebugLineCount => {
+                    scan.probe_varint(scan.offset)?;
+                    self.line_count = scan.int()? as usize;
+                    let code_count = self.frames.last().expect("prototype frame 已配置").code_count;
+                    if self.line_count != 0 && self.line_count != code_count {
+                        return Err(error(OfficialChunkErrorKind::InvalidFormat, scan.offset, "lineinfo 數與 code 不符").into());
+                    }
+                    scan.count(|stats| &mut stats.debug_entries, self.line_count, scan.limits.max_debug_entries)?;
+                    self.stage = Stage::DebugLines;
+                }
+                Stage::DebugLines => {
+                    scan.require_at(scan.offset, self.line_count, "資料不足以容納宣稱項數")?;
+                    self.lines_start = scan.offset;
+                    let lines = scan.read(self.line_count)?;
+                    self.marker_count = lines.iter().filter(|line| **line == 0x80).count();
+                    self.stage = Stage::DebugAbsCount;
+                }
+                Stage::DebugAbsCount => {
+                    scan.probe_varint(scan.offset)?;
+                    self.abs_count = scan.int()? as usize;
+                    scan.count(|stats| &mut stats.debug_entries, self.abs_count, scan.limits.max_debug_entries)?;
+                    self.remaining = self.abs_count;
+                    self.previous_pc = None;
+                    self.stage = Stage::DebugAbs;
+                }
+                Stage::DebugAbs => {
+                    if self.remaining == 0 {
+                        if self.marker_count != self.abs_count {
+                            return Err(error(OfficialChunkErrorKind::InvalidFormat, scan.offset, "絕對行號與 marker 不符").into());
+                        }
+                        self.stage = Stage::DebugLocalCount;
+                        continue;
+                    }
+                    if scan.profile == LuaProfile::Lua55 {
+                        let pad = (4 - scan.offset % 4) % 4;
+                        scan.require_at(scan.offset, pad, "官方 chunk 截斷")?;
+                        scan.align4()?;
+                    }
+                    scan.require_minimum(self.remaining, if scan.profile == LuaProfile::Lua55 { 8 } else { 2 })?;
+                    if scan.profile == LuaProfile::Lua54 {
+                        let end = scan.probe_int(scan.offset)?;
+                        scan.probe_int(end)?;
+                    }
+                    let (pc, line) = match scan.profile {
+                        LuaProfile::Lua55 => (scan.u32()? as i32, scan.u32()? as i32),
+                        LuaProfile::Lua54 => (scan.int()? as i32, scan.int()? as i32),
+                    };
+                    let code_count = self.frames.last().expect("prototype frame 已配置").code_count;
+                    if pc < 0
+                        || pc as usize >= code_count
+                        || line < 0
+                        || self.previous_pc.is_some_and(|previous| pc <= previous)
+                        || self.lines_start.checked_add(pc as usize)
+                            .and_then(|index| scan.input.get(index)) != Some(&0x80)
+                    {
+                        return Err(error(OfficialChunkErrorKind::InvalidFormat, scan.offset, "絕對行號 PC 或 line 不符").into());
+                    }
+                    self.previous_pc = Some(pc);
+                    self.remaining -= 1;
+                }
+                Stage::DebugLocalCount => {
+                    scan.probe_varint(scan.offset)?;
+                    self.remaining = scan.int()? as usize;
+                    scan.count(|stats| &mut stats.debug_entries, self.remaining, scan.limits.max_debug_entries)?;
+                    self.stage = Stage::DebugLocals;
+                }
+                Stage::DebugLocals => {
+                    if self.remaining == 0 {
+                        self.stage = Stage::DebugNameCount;
+                        continue;
+                    }
+                    scan.require_minimum(self.remaining, 3)?;
+                    scan.probe_string(scan.offset)?;
+                    scan.string()?;
+                    self.stage = Stage::DebugLocalStart;
+                }
+                Stage::DebugLocalStart => {
+                    scan.probe_int(scan.offset)?;
+                    self.local_start = scan.int()?;
+                    self.stage = Stage::DebugLocalEnd;
+                }
+                Stage::DebugLocalEnd => {
+                    scan.probe_int(scan.offset)?;
+                    let end = scan.int()?;
+                    let code_count = self.frames.last().expect("prototype frame 已配置").code_count;
+                    if self.local_start > end || end as usize > code_count {
+                        return Err(error(OfficialChunkErrorKind::InvalidFormat, scan.offset, "local PC 範圍不符").into());
+                    }
+                    self.remaining -= 1;
+                    self.stage = Stage::DebugLocals;
+                }
+                Stage::DebugNameCount => {
+                    scan.probe_varint(scan.offset)?;
+                    self.remaining = scan.int()? as usize;
+                    let upvalue_count = self.frames.last().expect("prototype frame 已配置").upvalue_count;
+                    if self.remaining != 0 && self.remaining != upvalue_count {
+                        return Err(error(OfficialChunkErrorKind::InvalidFormat, scan.offset, "upvalue debug name 數不符").into());
+                    }
+                    scan.count(|stats| &mut stats.debug_entries, self.remaining, scan.limits.max_debug_entries)?;
+                    self.stage = Stage::DebugNames;
+                }
+                Stage::DebugNames => {
+                    if self.remaining == 0 {
+                        self.stage = Stage::Done;
+                        continue;
+                    }
+                    scan.require_minimum(self.remaining, 1)?;
+                    scan.probe_string(scan.offset)?;
+                    scan.string()?;
+                    self.remaining -= 1;
+                }
+                Stage::Done => {
+                    let done = self.frames.pop().expect("prototype frame 已配置");
+                    if self.frames.is_empty() {
+                        if done.upvalue_count != self.root_upvalues {
+                            return Err(error(OfficialChunkErrorKind::InvalidFormat, scan.offset, "root upvalue 數不符").into());
+                        }
+                        return Ok(scan.offset);
+                    }
+                    self.stage = Stage::Children;
+                }
+            }
+        }
+    }
+
+    fn preflight_stats(&self, input_len: usize) -> Result<OfficialChunkPreflight, OfficialChunkError> {
+        let s = &self.stats;
+        let offset = self.offset;
+        let profile = self.profile;
+        let limits = &self.limits;
+        let p = s.prototypes;
+        let i = s.instructions;
+        let c = s.constants;
+        let u = s.upvalues;
+        let d = s.debug_entries;
+        let strings = s.string_bytes;
+        let saved_index = (if profile == LuaProfile::Lua55 {
+            limits.max_strings.min(input_len / 2)
+        } else {
+            0
+        } as u128)
+            .checked_mul(size_of::<BytecodeVec<u8>>() as u128)
+            .ok_or_else(|| budget_overflow(offset))?;
+        // Reader 各 Vec、字串內容及 Lua 5.5 saved-string index/copy。
+        // Vec 的請求容量及實際 capacity 由 codec 前/後核對；2 倍供
+        // try_reserve_exact 的可能額外容量，超額仍由實際 capacity gate 拒絕。
+        let decoded = sum(
+            &[
+                mul(
+                    p,
+                    size_of::<super::official::OfficialPrototype>() as u128,
+                    offset,
+                )?,
+                mul(p, 2 * size_of::<super::official::DecodeFrame>() as u128, offset)?,
+                mul(p, 2 * size_of::<super::ProtoId>() as u128, offset)?,
+                mul(i, 4, offset)?,
+                mul(
+                    c,
+                    size_of::<super::official::OfficialConstant>() as u128,
+                    offset,
+                )?,
+                mul(
+                    u,
+                    size_of::<super::official::OfficialUpvalue>() as u128,
+                    offset,
+                )?,
+                mul(
+                    d,
+                    size_of::<super::official::OfficialLocal>() as u128,
+                    offset,
+                )?,
+                strings,
+                s.saved_bytes,
+                saved_index,
+            ],
+            offset,
+        )?;
+        // Reader 每個 prototype 的八個 retained Vec 與每個非 NULL 字串
+        // 都建立 SharedBlock owner；預扣與 Reader 的 state 配置額度一致。
+        let owners = sum(&[mul(p, 8, offset)?, s.strings, 2], offset)?;
+        let owner_bytes = mul(
+            owners,
+            StateAllocator::shared_block_size::<BytecodeVec<u8>>() as u128,
+            offset,
+        )?;
+        let decoded = sum(&[mul(decoded, 2, offset)?, 512, owner_bytes], offset)?;
+        // E_p=參數 prologue+每 op 最多 7 條固定 lowering（TFORCALL）
+        // +CONCAT 逐值合併+SETLIST 固定值複製+關閉時 captured≤stack
+        // 與 active≤TBC+8 條 prologue。各項按 source prototype 分別計入。
+        let expanded = s.expanded_instructions;
+        let close_cells = s.close_cells;
+        let constants_upper = sum(&[c, mul(i, 4, offset)?, mul(p, 16, offset)?], offset)?;
+        let upvalues_upper = sum(&[u, mul(p, 4, offset)?], offset)?;
+        let plan = sum(
+            &[
+                mul(
+                    upvalues_upper,
+                    size_of::<OfficialPlanRootBinding>() as u128,
+                    offset,
+                )?,
+                mul(p, 2 * size_of::<OfficialPlanUpvalueMap>() as u128, offset)?,
+                mul(
+                    p,
+                    8 * size_of::<(super::OfficialPlanBuiltin, super::UpvalueId)>() as u128,
+                    offset,
+                )?,
+                mul(p, 6 * size_of::<OfficialPlanFrameInput>() as u128, offset)?,
+                mul(
+                    s.internal_calls,
+                    2 * size_of::<OfficialPlanCall>() as u128,
+                    offset,
+                )?,
+                mul(s.call_inputs, 2 * size_of::<Register>() as u128, offset)?,
+            ],
+            offset,
+        )?;
+        // 各 grow Vec 以 2 倍容量計；binding_registers 依實際
+        // try_reserve_exact(2+stack+sourceI) 而不是邏輯 binding 數。
+        let rvlu = sum(
+            &[
+                mul(
+                    expanded,
+                    2 * size_of::<BytecodeInstruction>() as u128,
+                    offset,
+                )?,
+                mul(
+                    constants_upper,
+                    2 * size_of::<BytecodeConstant>() as u128,
+                    offset,
+                )?,
+                mul(
+                    upvalues_upper,
+                    2 * size_of::<BytecodeUpvalue>() as u128,
+                    offset,
+                )?,
+                mul(p, 2 * size_of::<BytecodePrototype>() as u128, offset)?,
+                mul(p, 2 * size_of::<(u32, super::ProtoId)>() as u128, offset)?,
+                mul(
+                    s.binding_capacity,
+                    2 * size_of::<(BytecodeBindingId, Register)>() as u128,
+                    offset,
+                )?,
+                mul(i, 2 * size_of::<BytecodeClosePath>() as u128, offset)?,
+                mul(
+                    close_cells,
+                    2 * (size_of::<BytecodeBindingId>() + size_of::<Register>()) as u128,
+                    offset,
+                )?,
+                mul(strings, 2, offset)?,
+                // 翻譯後的字串常數各自可能擁有獨立 SharedBlock。
+                mul(
+                    constants_upper,
+                    StateAllocator::shared_block_size::<BytecodeVec<u8>>() as u128,
+                    offset,
+                )?,
+                plan,
+            ],
+            offset,
+        )?;
+        // artifact 持有 source clone、I→E／E→I PC maps、每 source PC line。
+        let artifact = sum(
+            &[
+                decoded,
+                mul(
+                    i,
+                    2 * (size_of::<Option<InstructionOffset>>() + size_of::<Option<u32>>()) as u128,
+                    offset,
+                )?,
+                mul(expanded, 2 * size_of::<OfficialRvluPc>() as u128, offset)?,
+                mul(p, 2 * size_of::<OfficialPcMap>() as u128, offset)?,
+                mul(p, 2 * size_of::<Option<super::ProtoId>>() as u128, offset)?,
+                512,
+            ],
+            offset,
+        )?;
+        let retained = sum(&[rvlu, artifact], offset)?;
+        // decode、source clone、RVLU module、CFG/close/plan/verifier 暫存同時
+        // 存在的保守峰值；輸入 LoadBuffer 由 P13 獨立持有及計帳。
+        // NumericFor dominance 至多 N 個指令加 N 個 gate；保留舊、新 DFS
+        // stack 並以 2 倍 grow capacity 逐容器計 byte/N：gates 16；edges
+        // header/內層 48/64；predecessors 48/112；visited 2；postorder 16；
+        // 舊 stack 64；order 16；idom 32；dominator_children 48/96；entry/exit
+        // 各 16；新 stack 128，合計 722N。獨立預付 768E，兩階段核對實際
+        // 容量；其餘 256E 不拿來抵扣 numeric helper。
+        let access_entries = sum(
+            &[expanded, s.call_inputs, mul(s.internal_calls, 4, offset)?],
+            offset,
+        )?;
+        let temporary = sum(
+            &[
+                decoded,
+                retained,
+                mul(p, 2 * size_of::<ScanFrame>() as u128, offset)?,
+                // source_work_bytes=Σn(512+64t)：opcode/data/CFG 前後繼、
+                // close flow 與 Rc node、numeric tuple、patch、side Call 暫存。
+                s.source_work_bytes,
+                // 256E：一般 module verifier 的 metadata、NumericFor pair map、
+                // 非 numeric CFG states/worklist，以及 lowering 的短期索引。
+                mul(expanded, 256, offset)?,
+                s.numeric_cfg_bytes,
+                // 32R：P05 sensitive register 與 register-key 暫存。
+                mul(s.register_slots, 32, offset)?,
+                // 32 inputs：side、candidate 與 final Call input Vec 的重疊峰值。
+                mul(s.call_inputs, 32, offset)?,
+                // 2A：P05 allowed_reads tuple 的實際 grow capacity 上界。
+                mul(
+                    access_entries,
+                    2 * size_of::<(usize, usize, u16)>() as u128,
+                    offset,
+                )?,
+                // 64H：close active/path 建立與 clone 的暫存 binding/register。
+                mul(close_cells, 64, offset)?,
+                // 最終模組量測的 owner 排序暫存，按最大常數數量預留。
+                mul(
+                    constants_upper,
+                    2 * size_of::<(usize, usize)>() as u128,
+                    offset,
+                )?,
+            ],
+            offset,
+        )?;
+        // 先前 prescan 工作由 caller 單獨預扣；下列是 Reader、P05 source
+        // preflight/clone/CFG、module verifier、official plan 與 artifact copy。
+        let plan_call_checks = s
+            .internal_calls
+            .checked_mul(sum(
+                &[expanded, s.binding_capacity, mul(p, 24, offset)?],
+                offset,
+            )?)
+            .ok_or_else(|| budget_overflow(offset))?;
+        let work = sum(
+            &[
+                mul(input_len as u128, 3, offset)?,
+                mul(strings, 8, offset)?,
+                mul(sum(&[i, c, u, d, p], offset)?, 16, offset)?,
+                s.source_metered_work,
+                mul(s.source_cfg_work, 8, offset)?,
+                mul(s.plan_metered_work, 2, offset)?,
+                mul(s.binding_squares, 4, offset)?,
+                mul(s.upvalue_squares, 4, offset)?,
+                mul(s.close_binding_lookups, 8, offset)?,
+                mul(close_cells, 16, offset)?,
+                s.numeric_dominator_work,
+                mul(expanded, 32, offset)?,
+                sort_work(access_entries, offset)?,
+                sort_work(s.register_slots, offset)?,
+                sort_work(constants_upper, offset)?,
+                mul(constants_upper, 8, offset)?,
+                mul(
+                    p.checked_mul(p).ok_or_else(|| budget_overflow(offset))?,
+                    32,
+                    offset,
+                )?,
+                mul(
+                    p.checked_mul(expanded)
+                        .ok_or_else(|| budget_overflow(offset))?,
+                    8,
+                    offset,
+                )?,
+                plan_call_checks,
+            ],
+            offset,
+        )?;
+        let retained_bytes = bounded(retained, offset)?;
+        let temporary_bytes = bounded(temporary, offset)?;
+        let work = u64::try_from(work).map_err(|_| budget_overflow(offset))?;
+        Ok(OfficialChunkPreflight {
+            subsequent_work: work,
+            temporary_bytes,
+            retained_bytes,
+            decoded_bytes: bounded(decoded, offset)?,
+            prototypes: bounded(p, offset)?,
+            instructions: bounded(i, offset)?,
+            constants: bounded(c, offset)?,
+            expanded_instructions: bounded(expanded, offset)?,
+        })
     }
 }
 
@@ -814,262 +1504,45 @@ fn sort_work(items: u128, offset: usize) -> Result<u128, OfficialChunkError> {
     mul(items, u128::from(levels + 1) * 2, offset)
 }
 
-/// 只讀取輸入 bytes，不配置 heap。呼叫者須先預扣至少 `2*input.len() + 1`
-/// 個工作單位；第二次線性額度涵蓋 code opcode 與 line marker 走訪。
+/// 呼叫者須先預扣至少 `2*input.len() + 1` 個工作單位。
 pub fn preflight_official_chunk(
     input: &[u8],
     profile: LuaProfile,
     limits: &OfficialChunkLimits,
     verify: &VerifyLimits,
 ) -> Result<OfficialChunkPreflight, OfficialChunkError> {
+    let mut recovery = GlobalAllocation;
+    preflight_official_chunk_with_recovery(input, profile, limits, verify, &mut recovery)
+        .map_err(|failure| match failure {
+            OfficialChunkRecoveryError::Chunk(error) => error,
+            OfficialChunkRecoveryError::Reserve(ReserveError::Recovery(never)) => match never {},
+            OfficialChunkRecoveryError::Reserve(_) => error(OfficialChunkErrorKind::AllocationFailed, 0, "預掃 cursor 配置失敗"),
+        })
+}
+
+pub fn preflight_official_chunk_with_recovery<R: AllocationRecovery>(
+    input: &[u8],
+    profile: LuaProfile,
+    limits: &OfficialChunkLimits,
+    verify: &VerifyLimits,
+    recovery: &mut R,
+) -> Result<OfficialChunkPreflight, OfficialChunkRecoveryError<R::Error>> {
     if input.len() > limits.max_bytes {
-        return Err(error(
-            OfficialChunkErrorKind::LimitExceeded,
-            0,
-            "chunk 長度超限",
-        ));
+        return Err(OfficialChunkRecoveryError::Chunk(error(
+            OfficialChunkErrorKind::LimitExceeded, 0, "chunk 長度超限",
+        )));
     }
-    let mut scan = Scan {
-        input,
-        offset: 0,
-        profile,
-        limits,
-        verify,
-        stats: Stats::default(),
-    };
-    scan.header()?;
-    let root_upvalues = scan.byte()? as usize;
-    let root_count = scan.prototype(1, None)?;
-    if root_count != root_upvalues || scan.offset != input.len() {
-        return Err(error(
-            OfficialChunkErrorKind::InvalidFormat,
-            scan.offset,
-            "root upvalue 數或結尾不符",
-        ));
+    // 整塊輸入已先檢查長度；宣稱長度不足仍依舊回報截斷。
+    let mut scan_limits = *limits;
+    scan_limits.max_bytes = usize::MAX;
+    let mut cursor = OfficialChunkCursor::new(profile, scan_limits, *verify, recovery.allocator());
+    match cursor.advance(input, recovery)? {
+        OfficialChunkProgress::Complete { .. } => cursor.preflight_stats(input.len())
+            .map_err(OfficialChunkRecoveryError::Chunk),
+        OfficialChunkProgress::NeedMore { .. } => {
+            Err(OfficialChunkRecoveryError::Chunk(cursor.eof_error()))
+        }
     }
-    let s = &scan.stats;
-    let offset = scan.offset;
-    let p = s.prototypes;
-    let i = s.instructions;
-    let c = s.constants;
-    let u = s.upvalues;
-    let d = s.debug_entries;
-    let strings = s.string_bytes;
-    let saved_index = (if profile == LuaProfile::Lua55 {
-        limits.max_strings.min(input.len() / 2)
-    } else {
-        0
-    } as u128)
-        .checked_mul(size_of::<Vec<u8>>() as u128)
-        .ok_or_else(|| budget_overflow(offset))?;
-    // Reader 各 Vec、字串內容及 Lua 5.5 saved-string index/copy。
-    // Vec 的請求容量及實際 capacity 由 codec 前/後核對；2 倍供
-    // try_reserve_exact 的可能額外容量，超額仍由實際 capacity gate 拒絕。
-    let decoded = sum(
-        &[
-            mul(
-                p,
-                size_of::<super::official::OfficialPrototype>() as u128,
-                offset,
-            )?,
-            mul(i, 4, offset)?,
-            mul(
-                c,
-                size_of::<super::official::OfficialConstant>() as u128,
-                offset,
-            )?,
-            mul(
-                u,
-                size_of::<super::official::OfficialUpvalue>() as u128,
-                offset,
-            )?,
-            mul(
-                d,
-                size_of::<super::official::OfficialLocal>() as u128,
-                offset,
-            )?,
-            strings,
-            s.saved_bytes,
-            saved_index,
-        ],
-        offset,
-    )?;
-    let decoded = sum(&[mul(decoded, 2, offset)?, 512], offset)?;
-    // E_p=參數 prologue+每 op 最多 7 條固定 lowering（TFORCALL）
-    // +CONCAT 逐值合併+SETLIST 固定值複製+關閉時 captured≤stack
-    // 與 active≤TBC+8 條 prologue。各項按 source prototype 分別計入。
-    let expanded = s.expanded_instructions;
-    let close_cells = s.close_cells;
-    let constants_upper = sum(&[c, mul(i, 4, offset)?, mul(p, 16, offset)?], offset)?;
-    let upvalues_upper = sum(&[u, mul(p, 4, offset)?], offset)?;
-    let plan = sum(
-        &[
-            mul(
-                upvalues_upper,
-                size_of::<OfficialPlanRootBinding>() as u128,
-                offset,
-            )?,
-            mul(p, 2 * size_of::<OfficialPlanUpvalueMap>() as u128, offset)?,
-            mul(
-                p,
-                8 * size_of::<(super::OfficialPlanBuiltin, super::UpvalueId)>() as u128,
-                offset,
-            )?,
-            mul(p, 6 * size_of::<OfficialPlanFrameInput>() as u128, offset)?,
-            mul(
-                s.internal_calls,
-                2 * size_of::<OfficialPlanCall>() as u128,
-                offset,
-            )?,
-            mul(s.call_inputs, 2 * size_of::<Register>() as u128, offset)?,
-        ],
-        offset,
-    )?;
-    // 各 grow Vec 以 2 倍容量計；binding_registers 依實際
-    // try_reserve_exact(2+stack+sourceI) 而不是邏輯 binding 數。
-    let rvlu = sum(
-        &[
-            mul(
-                expanded,
-                2 * size_of::<BytecodeInstruction>() as u128,
-                offset,
-            )?,
-            mul(
-                constants_upper,
-                2 * size_of::<BytecodeConstant>() as u128,
-                offset,
-            )?,
-            mul(
-                upvalues_upper,
-                2 * size_of::<BytecodeUpvalue>() as u128,
-                offset,
-            )?,
-            mul(p, 2 * size_of::<BytecodePrototype>() as u128, offset)?,
-            mul(p, 2 * size_of::<(u32, super::ProtoId)>() as u128, offset)?,
-            mul(
-                s.binding_capacity,
-                2 * size_of::<(BytecodeBindingId, Register)>() as u128,
-                offset,
-            )?,
-            mul(i, 2 * size_of::<BytecodeClosePath>() as u128, offset)?,
-            mul(
-                close_cells,
-                2 * (size_of::<BytecodeBindingId>() + size_of::<Register>()) as u128,
-                offset,
-            )?,
-            mul(strings, 2, offset)?,
-            plan,
-        ],
-        offset,
-    )?;
-    // artifact 持有 source clone、I→E／E→I PC maps、每 source PC line。
-    let artifact = sum(
-        &[
-            decoded,
-            mul(
-                i,
-                2 * (size_of::<Option<InstructionOffset>>() + size_of::<Option<u32>>()) as u128,
-                offset,
-            )?,
-            mul(expanded, 2 * size_of::<OfficialRvluPc>() as u128, offset)?,
-            mul(p, 2 * size_of::<OfficialPcMap>() as u128, offset)?,
-            512,
-        ],
-        offset,
-    )?;
-    let retained = sum(&[rvlu, artifact], offset)?;
-    // decode、source clone、RVLU module、CFG/close/plan/verifier 暫存同時
-    // 存在的保守峰值；輸入 LoadBuffer 由 P13 獨立持有及計帳。
-    // NumericFor dominance 至多 N 個指令加 N 個 gate；保留舊、新 DFS
-    // stack 並以 2 倍 grow capacity 逐容器計 byte/N：gates 16；edges
-    // header/內層 48/64；predecessors 48/112；visited 2；postorder 16；
-    // 舊 stack 64；order 16；idom 32；dominator_children 48/96；entry/exit
-    // 各 16；新 stack 128，合計 722N。獨立預付 768E，兩階段核對實際
-    // 容量；其餘 256E 不拿來抵扣 numeric helper。
-    let access_entries = sum(
-        &[expanded, s.call_inputs, mul(s.internal_calls, 4, offset)?],
-        offset,
-    )?;
-    let temporary = sum(
-        &[
-            decoded,
-            retained,
-            // source_work_bytes=Σn(512+64t)：opcode/data/CFG 前後繼、
-            // close flow 與 Rc node、numeric tuple、patch、side Call 暫存。
-            s.source_work_bytes,
-            // 256E：一般 module verifier 的 metadata、NumericFor pair map、
-            // 非 numeric CFG states/worklist，以及 lowering 的短期索引。
-            mul(expanded, 256, offset)?,
-            s.numeric_cfg_bytes,
-            // 32R：P05 sensitive register 與 register-key 暫存。
-            mul(s.register_slots, 32, offset)?,
-            // 32 inputs：side、candidate 與 final Call input Vec 的重疊峰值。
-            mul(s.call_inputs, 32, offset)?,
-            // 2A：P05 allowed_reads tuple 的實際 grow capacity 上界。
-            mul(
-                access_entries,
-                2 * size_of::<(usize, usize, u16)>() as u128,
-                offset,
-            )?,
-            // 64H：close active/path 建立與 clone 的暫存 binding/register。
-            mul(close_cells, 64, offset)?,
-        ],
-        offset,
-    )?;
-    // 先前 prescan 工作由 caller 單獨預扣；下列是 Reader、P05 source
-    // preflight/clone/CFG、module verifier、official plan 與 artifact copy。
-    let plan_call_checks = s
-        .internal_calls
-        .checked_mul(sum(
-            &[expanded, s.binding_capacity, mul(p, 24, offset)?],
-            offset,
-        )?)
-        .ok_or_else(|| budget_overflow(offset))?;
-    let work = sum(
-        &[
-            mul(input.len() as u128, 3, offset)?,
-            mul(strings, 8, offset)?,
-            mul(sum(&[i, c, u, d, p], offset)?, 16, offset)?,
-            s.source_metered_work,
-            mul(s.source_cfg_work, 8, offset)?,
-            mul(s.plan_metered_work, 2, offset)?,
-            mul(s.binding_squares, 4, offset)?,
-            mul(s.upvalue_squares, 4, offset)?,
-            mul(s.close_binding_lookups, 8, offset)?,
-            mul(close_cells, 16, offset)?,
-            s.numeric_dominator_work,
-            mul(expanded, 32, offset)?,
-            sort_work(access_entries, offset)?,
-            sort_work(s.register_slots, offset)?,
-            mul(constants_upper, 8, offset)?,
-            mul(
-                p.checked_mul(p).ok_or_else(|| budget_overflow(offset))?,
-                32,
-                offset,
-            )?,
-            mul(
-                p.checked_mul(expanded)
-                    .ok_or_else(|| budget_overflow(offset))?,
-                8,
-                offset,
-            )?,
-            plan_call_checks,
-        ],
-        offset,
-    )?;
-    let retained_bytes = bounded(retained, offset)?;
-    let temporary_bytes = bounded(temporary, offset)?;
-    let work = u64::try_from(work).map_err(|_| budget_overflow(offset))?;
-    Ok(OfficialChunkPreflight {
-        subsequent_work: work,
-        temporary_bytes,
-        retained_bytes,
-        decoded_bytes: bounded(decoded, offset)?,
-        prototypes: bounded(p, offset)?,
-        instructions: bounded(i, offset)?,
-        constants: bounded(c, offset)?,
-        expanded_instructions: bounded(expanded, offset)?,
-    })
 }
 
 #[cfg(test)]

@@ -2,11 +2,13 @@
 //! 本模組只處理可界定資源的資料格式；指令語意與 CFG 由後續轉譯階段驗證。
 
 use alloc::vec::Vec;
+use rivetlua_alloc::{AllocationRecovery, GlobalAllocation, ReserveError, StateAllocator};
 
 use core::hash::{Hash, Hasher};
 use core::mem::size_of;
 
 use super::official_translation::OfficialWorkBudget;
+use super::codec::{BytecodeVec, RetainedVec, Scratch};
 use super::{LuaProfile, ProtoId};
 
 #[cfg(feature = "std")]
@@ -28,7 +30,6 @@ const INT_SENTINEL_55: i64 = -0x5678;
 const INSTRUCTION_SENTINEL_55: u32 = 0x1234_5678;
 const NUMBER_SENTINEL_54: f64 = 370.5;
 const NUMBER_SENTINEL_55: f64 = -370.5;
-const MAX_SAFE_DEPTH: usize = 64;
 const LUA54_INT_MAX: u32 = i32::MAX as u32 - 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +47,12 @@ pub struct OfficialChunkError {
     pub kind: OfficialChunkErrorKind,
     pub offset: usize,
     pub detail: &'static str,
+}
+
+#[derive(Debug)]
+pub enum OfficialChunkRecoveryError<E> {
+    Chunk(OfficialChunkError),
+    Reserve(ReserveError<E>),
 }
 
 impl core::fmt::Display for OfficialChunkError {
@@ -93,21 +100,22 @@ impl Default for OfficialChunkLimits {
 pub struct OfficialChunk {
     pub profile: LuaProfile,
     pub root_upvalues: u8,
-    pub main: OfficialPrototype,
+    pub main: ProtoId,
+    pub prototypes: RetainedVec<OfficialPrototype>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OfficialPrototype {
-    pub source: Option<Vec<u8>>,
+    pub source: Option<RetainedVec<u8>>,
     pub line_defined: u32,
     pub last_line_defined: u32,
     pub num_params: u8,
     pub flags: u8,
     pub max_stack_size: u8,
-    pub code: Vec<u32>,
-    pub constants: Vec<OfficialConstant>,
-    pub upvalues: Vec<OfficialUpvalue>,
-    pub children: Vec<OfficialPrototype>,
+    pub code: RetainedVec<u32>,
+    pub constants: RetainedVec<OfficialConstant>,
+    pub upvalues: RetainedVec<OfficialUpvalue>,
+    pub children: RetainedVec<ProtoId>,
     pub debug: OfficialDebug,
 }
 
@@ -117,7 +125,7 @@ pub enum OfficialConstant {
     Boolean(bool),
     Integer(i64),
     Number(f64),
-    String { bytes: Vec<u8>, long: bool },
+    String { bytes: RetainedVec<u8>, long: bool },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,10 +137,10 @@ pub struct OfficialUpvalue {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OfficialDebug {
-    pub line_info: Vec<i8>,
-    pub abs_line_info: Vec<OfficialAbsLine>,
-    pub locals: Vec<OfficialLocal>,
-    pub upvalue_names: Vec<Option<Vec<u8>>>,
+    pub line_info: RetainedVec<i8>,
+    pub abs_line_info: RetainedVec<OfficialAbsLine>,
+    pub locals: RetainedVec<OfficialLocal>,
+    pub upvalue_names: RetainedVec<Option<RetainedVec<u8>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,9 +151,149 @@ pub struct OfficialAbsLine {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OfficialLocal {
-    pub name: Option<Vec<u8>>,
+    pub name: Option<RetainedVec<u8>>,
     pub start_pc: u32,
     pub end_pc: u32,
+}
+
+impl OfficialChunk {
+    pub fn root(&self) -> Option<&OfficialPrototype> {
+        self.prototype(self.main)
+    }
+
+    pub fn root_mut(&mut self) -> Option<&mut OfficialPrototype> {
+        let main = self.main;
+        self.prototype_mut(main)
+    }
+
+    pub fn prototype(&self, id: ProtoId) -> Option<&OfficialPrototype> {
+        self.prototypes.get(id.0 as usize)
+    }
+
+    pub fn prototype_mut(&mut self, id: ProtoId) -> Option<&mut OfficialPrototype> {
+        self.prototypes.global_mut()?.get_mut(id.0 as usize)
+    }
+
+    pub(crate) fn rehome<R: AllocationRecovery>(
+        &mut self,
+        recovery: &mut R,
+    ) -> Result<(), ReserveError<R::Error>> {
+        if let Some(prototypes) = self.prototypes.global_mut() {
+            for prototype in prototypes {
+                prototype.rehome(recovery)?;
+            }
+        } else if !self.prototypes.is_state_for(&recovery.allocator()) {
+            return Err(ReserveError::AllocatorMismatch);
+        }
+        self.prototypes.rehome(recovery)
+    }
+
+    pub(crate) fn retained_backing_bytes(&self) -> Option<usize> {
+        let mut bytes = self.prototypes.retained_bytes()?;
+        for prototype in &self.prototypes {
+            bytes = bytes.checked_add(prototype.retained_backing_bytes()?)?;
+        }
+        Some(bytes)
+    }
+}
+
+impl OfficialPrototype {
+    fn empty() -> Self {
+        Self {
+            source: None,
+            line_defined: 0,
+            last_line_defined: 0,
+            num_params: 0,
+            flags: 0,
+            max_stack_size: 0,
+            code: RetainedVec::default(),
+            constants: RetainedVec::default(),
+            upvalues: RetainedVec::default(),
+            children: RetainedVec::default(),
+            debug: OfficialDebug::default(),
+        }
+    }
+
+    fn rehome<R: AllocationRecovery>(
+        &mut self,
+        recovery: &mut R,
+    ) -> Result<(), ReserveError<R::Error>> {
+        let allocator = recovery.allocator();
+        if let Some(source) = &mut self.source {
+            source.rehome(recovery)?;
+        }
+        if let Some(constants) = self.constants.global_mut() {
+            for constant in constants {
+                if let OfficialConstant::String { bytes, .. } = constant {
+                    bytes.rehome(recovery)?;
+                }
+            }
+        } else if !self.constants.is_state_for(&allocator) {
+            return Err(ReserveError::AllocatorMismatch);
+        }
+        if let Some(locals) = self.debug.locals.global_mut() {
+            for local in locals {
+                if let Some(name) = &mut local.name {
+                    name.rehome(recovery)?;
+                }
+            }
+        } else if !self.debug.locals.is_state_for(&allocator) {
+            return Err(ReserveError::AllocatorMismatch);
+        }
+        if let Some(names) = self.debug.upvalue_names.global_mut() {
+            for name in names {
+                if let Some(name) = name {
+                    name.rehome(recovery)?;
+                }
+            }
+        } else if !self.debug.upvalue_names.is_state_for(&allocator) {
+            return Err(ReserveError::AllocatorMismatch);
+        }
+        self.code.rehome(recovery)?;
+        self.constants.rehome(recovery)?;
+        self.upvalues.rehome(recovery)?;
+        self.children.rehome(recovery)?;
+        self.debug.line_info.rehome(recovery)?;
+        self.debug.abs_line_info.rehome(recovery)?;
+        self.debug.locals.rehome(recovery)?;
+        self.debug.upvalue_names.rehome(recovery)?;
+        Ok(())
+    }
+
+    pub(super) fn retained_backing_bytes(&self) -> Option<usize> {
+        let mut bytes = 0usize;
+        if let Some(source) = &self.source {
+            bytes = bytes.checked_add(source.retained_bytes()?)?;
+        }
+        for values in [
+            self.code.retained_bytes()?,
+            self.constants.retained_bytes()?,
+            self.upvalues.retained_bytes()?,
+            self.children.retained_bytes()?,
+            self.debug.line_info.retained_bytes()?,
+            self.debug.abs_line_info.retained_bytes()?,
+            self.debug.locals.retained_bytes()?,
+            self.debug.upvalue_names.retained_bytes()?,
+        ] {
+            bytes = bytes.checked_add(values)?;
+        }
+        for constant in &self.constants {
+            if let OfficialConstant::String { bytes: value, .. } = constant {
+                bytes = bytes.checked_add(value.retained_bytes()?)?;
+            }
+        }
+        for local in &self.debug.locals {
+            if let Some(name) = &local.name {
+                bytes = bytes.checked_add(name.retained_bytes()?)?;
+            }
+        }
+        for name in &self.debug.upvalue_names {
+            if let Some(name) = name {
+                bytes = bytes.checked_add(name.retained_bytes()?)?;
+            }
+        }
+        Some(bytes)
+    }
 }
 
 fn error(kind: OfficialChunkErrorKind, offset: usize, detail: &'static str) -> OfficialChunkError {
@@ -218,6 +366,24 @@ impl Budget {
             offset,
             "配置額度超限",
         )
+    }
+
+    fn retained_owner<T, R: AllocationRecovery>(
+        &mut self,
+        limits: &OfficialChunkLimits,
+        offset: usize,
+        scratch: &mut Scratch<'_, R>,
+    ) -> Result<(), OfficialChunkError> {
+        if scratch.recovery().allocator().is_lua() {
+            Self::charge(
+                &mut self.allocated,
+                StateAllocator::shared_block_size::<BytecodeVec<T>>(),
+                limits.max_allocated_bytes,
+                offset,
+                "retained owner 配置額度超限",
+            )?;
+        }
+        Ok(())
     }
 
     fn string(
@@ -306,16 +472,99 @@ fn bytes_saved_copy(
     Ok(result)
 }
 
-struct Reader<'a> {
+fn vector_with_recovery<T, R: AllocationRecovery>(
+    count: usize,
+    budget: &mut Budget,
+    limits: &OfficialChunkLimits,
+    offset: usize,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<T>, OfficialChunkError> {
+    budget.alloc::<T>(count, limits, offset)?;
+    let mut result = scratch.vec();
+    scratch.reserve_exact(&mut result, count).map_err(|_| {
+        error(OfficialChunkErrorKind::AllocationFailed, offset, "配置失敗")
+    })?;
+    budget.alloc::<T>(result.capacity() - count, limits, offset)?;
+    Ok(result)
+}
+
+fn bytes_owned_with_recovery<R: AllocationRecovery>(
+    bytes: &[u8],
+    budget: &mut Budget,
+    limits: &OfficialChunkLimits,
+    offset: usize,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<RetainedVec<u8>, OfficialChunkError> {
+    budget.string(bytes.len(), limits, offset)?;
+    let mut result = scratch.vec();
+    scratch.reserve_exact(&mut result, bytes.len()).map_err(|_| {
+        error(OfficialChunkErrorKind::AllocationFailed, offset, "字串配置失敗")
+    })?;
+    budget.alloc::<u8>(result.capacity() - bytes.len(), limits, offset)?;
+    result.extend_from_slice(bytes);
+    budget.retained_owner::<u8, _>(limits, offset, scratch)?;
+    scratch.retain(result).map_err(|_| {
+        error(OfficialChunkErrorKind::AllocationFailed, offset, "字串 owner 配置失敗")
+    })
+}
+
+fn bytes_saved_copy_with_recovery<R: AllocationRecovery>(
+    bytes: &[u8],
+    budget: &mut Budget,
+    limits: &OfficialChunkLimits,
+    offset: usize,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<u8>, OfficialChunkError> {
+    budget.alloc::<u8>(bytes.len(), limits, offset)?;
+    let mut result = scratch.vec();
+    scratch.reserve_exact(&mut result, bytes.len()).map_err(|_| {
+        error(OfficialChunkErrorKind::AllocationFailed, offset, "字串索引內容配置失敗")
+    })?;
+    budget.alloc::<u8>(result.capacity() - bytes.len(), limits, offset)?;
+    result.extend_from_slice(bytes);
+    Ok(result)
+}
+
+pub(super) struct DecodeFrame {
+    id: ProtoId,
+    depth: usize,
+    remaining_children: usize,
+    source: Option<RetainedVec<u8>>,
+    line_defined: u32,
+    last_line_defined: u32,
+    num_params: u8,
+    flags: u8,
+    max_stack_size: u8,
+    code_count: usize,
+    upvalue_count: usize,
+    code: BytecodeVec<u32>,
+    constants: BytecodeVec<OfficialConstant>,
+    upvalues: BytecodeVec<OfficialUpvalue>,
+    children: BytecodeVec<ProtoId>,
+}
+
+struct Reader<'a, 'r, R: AllocationRecovery> {
     bytes: &'a [u8],
     offset: usize,
     profile: LuaProfile,
     limits: &'a OfficialChunkLimits,
     budget: Budget,
-    saved_strings: Vec<Vec<u8>>,
+    saved_strings: BytecodeVec<BytecodeVec<u8>>,
+    scratch: Scratch<'r, R>,
 }
 
-impl<'a> Reader<'a> {
+impl<'a, 'r, R: AllocationRecovery> Reader<'a, 'r, R> {
+    fn retain_vec<T>(
+        &mut self,
+        values: BytecodeVec<T>,
+        detail: &'static str,
+    ) -> Result<RetainedVec<T>, OfficialChunkError> {
+        self.budget.retained_owner::<T, _>(self.limits, self.offset, &mut self.scratch)?;
+        self.scratch.retain(values).map_err(|_| {
+            error(OfficialChunkErrorKind::AllocationFailed, self.offset, detail)
+        })
+    }
+
     fn read(&mut self, n: usize) -> Result<&'a [u8], OfficialChunkError> {
         let end = self.offset.checked_add(n).ok_or_else(|| {
             error(
@@ -496,7 +745,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    fn string(&mut self) -> Result<Option<Vec<u8>>, OfficialChunkError> {
+    fn string(&mut self) -> Result<Option<RetainedVec<u8>>, OfficialChunkError> {
         let size = self.size()?;
         match self.profile {
             LuaProfile::Lua54 => {
@@ -513,11 +762,12 @@ impl<'a> Reader<'a> {
                 }
                 self.require_min(len, 1)?;
                 let bytes = self.read(len)?;
-                Ok(Some(bytes_owned(
+                Ok(Some(bytes_owned_with_recovery(
                     bytes,
                     &mut self.budget,
                     self.limits,
                     self.offset,
+                    &mut self.scratch,
                 )?))
             }
             LuaProfile::Lua55 => {
@@ -533,11 +783,12 @@ impl<'a> Reader<'a> {
                             "字串參照不是既存索引",
                         )
                     })?;
-                    return Ok(Some(bytes_owned(
+                    return Ok(Some(bytes_owned_with_recovery(
                         saved,
                         &mut self.budget,
                         self.limits,
                         self.offset,
+                        &mut self.scratch,
                     )?));
                 }
                 let len = size - 1;
@@ -557,9 +808,12 @@ impl<'a> Reader<'a> {
                         "5.5 字串缺少結尾 NUL",
                     ));
                 }
-                let owned = bytes_owned(&bytes[..len], &mut self.budget, self.limits, self.offset)?;
-                let saved =
-                    bytes_saved_copy(&bytes[..len], &mut self.budget, self.limits, self.offset)?;
+                let owned = bytes_owned_with_recovery(
+                    &bytes[..len], &mut self.budget, self.limits, self.offset, &mut self.scratch,
+                )?;
+                let saved = bytes_saved_copy_with_recovery(
+                    &bytes[..len], &mut self.budget, self.limits, self.offset, &mut self.scratch,
+                )?;
                 if self.saved_strings.len() == self.saved_strings.capacity() {
                     return Err(error(
                         OfficialChunkErrorKind::LimitExceeded,
@@ -573,12 +827,13 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn prototype(
+    fn prototype_head(
         &mut self,
         depth: usize,
         parent: Option<(u8, usize)>,
-    ) -> Result<OfficialPrototype, OfficialChunkError> {
-        if depth > self.limits.max_depth.min(MAX_SAFE_DEPTH) {
+        prototypes: &mut BytecodeVec<OfficialPrototype>,
+    ) -> Result<DecodeFrame, OfficialChunkError> {
+        if depth > self.limits.max_depth {
             return Err(error(
                 OfficialChunkErrorKind::LimitExceeded,
                 self.offset,
@@ -592,6 +847,23 @@ impl<'a> Reader<'a> {
             self.offset,
             "prototype 數超限",
         )?;
+        let id = ProtoId(u32::try_from(prototypes.len()).map_err(|_| {
+            error(OfficialChunkErrorKind::Overflow, self.offset, "prototype ID 溢位")
+        })?);
+        if prototypes.len() == prototypes.capacity() {
+            let additional = prototypes.capacity().max(1);
+            self.budget.alloc::<OfficialPrototype>(additional, self.limits, self.offset)?;
+            let previous = prototypes.capacity();
+            self.scratch.reserve_exact(prototypes, additional).map_err(|_| {
+                error(OfficialChunkErrorKind::AllocationFailed, self.offset, "prototype arena 配置失敗")
+            })?;
+            self.budget.alloc::<OfficialPrototype>(
+                prototypes.capacity() - previous - additional,
+                self.limits,
+                self.offset,
+            )?;
+        }
+        prototypes.push(OfficialPrototype::empty());
         let source = if self.profile == LuaProfile::Lua54 {
             self.string()?
         } else {
@@ -629,7 +901,9 @@ impl<'a> Reader<'a> {
             self.align4()?;
         }
         self.require_min(code_count, 4)?;
-        let mut code = vector(code_count, &mut self.budget, self.limits, self.offset)?;
+        let mut code = vector_with_recovery(
+            code_count, &mut self.budget, self.limits, self.offset, &mut self.scratch,
+        )?;
         for _ in 0..code_count {
             code.push(self.u32()?);
         }
@@ -643,7 +917,9 @@ impl<'a> Reader<'a> {
             "常數數超限",
         )?;
         self.require_min(constant_count, 1)?;
-        let mut constants = vector(constant_count, &mut self.budget, self.limits, self.offset)?;
+        let mut constants = vector_with_recovery(
+            constant_count, &mut self.budget, self.limits, self.offset, &mut self.scratch,
+        )?;
         for _ in 0..constant_count {
             let tag = self.byte()?;
             let constant = match tag {
@@ -699,7 +975,9 @@ impl<'a> Reader<'a> {
             "upvalue 數超限",
         )?;
         self.require_min(upvalue_count, 3)?;
-        let mut upvalues = vector(upvalue_count, &mut self.budget, self.limits, self.offset)?;
+        let mut upvalues = vector_with_recovery(
+            upvalue_count, &mut self.budget, self.limits, self.offset, &mut self.scratch,
+        )?;
         for _ in 0..upvalue_count {
             let in_stack = self.byte()?;
             let index = self.byte()?;
@@ -743,29 +1021,89 @@ impl<'a> Reader<'a> {
             ));
         }
         self.require_min(child_count, 1)?;
-        let mut children = vector(child_count, &mut self.budget, self.limits, self.offset)?;
-        for _ in 0..child_count {
-            children.push(self.prototype(depth + 1, Some((max_stack_size, upvalue_count)))?);
-        }
-        let source = if self.profile == LuaProfile::Lua55 {
-            self.string()?
-        } else {
-            source
-        };
-        let debug = self.debug(code_count, upvalue_count)?;
-        Ok(OfficialPrototype {
+        let children = vector_with_recovery(
+            child_count, &mut self.budget, self.limits, self.offset, &mut self.scratch,
+        )?;
+        Ok(DecodeFrame {
+            id,
+            depth,
             source,
             line_defined,
             last_line_defined,
             num_params,
             flags,
             max_stack_size,
+            code_count,
+            upvalue_count,
             code,
             constants,
             upvalues,
             children,
-            debug,
+            remaining_children: child_count,
         })
+    }
+
+    fn finish_prototype(
+        &mut self,
+        frame: DecodeFrame,
+        prototypes: &mut BytecodeVec<OfficialPrototype>,
+    ) -> Result<(), OfficialChunkError> {
+        let source = if self.profile == LuaProfile::Lua55 { self.string()? } else { frame.source };
+        let debug = self.debug(frame.code_count, frame.upvalue_count)?;
+        prototypes[frame.id.0 as usize] = OfficialPrototype {
+            source,
+            line_defined: frame.line_defined,
+            last_line_defined: frame.last_line_defined,
+            num_params: frame.num_params,
+            flags: frame.flags,
+            max_stack_size: frame.max_stack_size,
+            code: self.retain_vec(frame.code, "code owner 配置失敗")?,
+            constants: self.retain_vec(frame.constants, "constant owner 配置失敗")?,
+            upvalues: self.retain_vec(frame.upvalues, "upvalue owner 配置失敗")?,
+            children: self.retain_vec(frame.children, "prototype owner 配置失敗")?,
+            debug,
+        };
+        Ok(())
+    }
+
+    fn push_frame(&mut self, stack: &mut BytecodeVec<DecodeFrame>, frame: DecodeFrame) -> Result<(), OfficialChunkError> {
+        if stack.len() == stack.capacity() {
+            let additional = stack.capacity().max(1);
+            self.budget.alloc::<DecodeFrame>(additional, self.limits, self.offset)?;
+            let previous = stack.capacity();
+            self.scratch.reserve_exact(stack, additional).map_err(|_| {
+                error(OfficialChunkErrorKind::AllocationFailed, self.offset, "decode cursor 配置失敗")
+            })?;
+            self.budget.alloc::<DecodeFrame>(stack.capacity() - previous - additional, self.limits, self.offset)?;
+        }
+        stack.push(frame);
+        Ok(())
+    }
+
+    fn prototypes(&mut self, prototypes: &mut BytecodeVec<OfficialPrototype>) -> Result<ProtoId, OfficialChunkError> {
+        let mut stack = self.scratch.vec();
+        let root = self.prototype_head(1, None, prototypes)?;
+        let root_id = root.id;
+        self.push_frame(&mut stack, root)?;
+        while let Some(frame) = stack.last_mut() {
+            if frame.remaining_children != 0 {
+                frame.remaining_children -= 1;
+                let depth = frame.depth.checked_add(1).ok_or_else(|| {
+                    error(OfficialChunkErrorKind::Overflow, self.offset, "prototype 深度溢位")
+                })?;
+                let parent = Some((frame.max_stack_size, frame.upvalue_count));
+                let child = self.prototype_head(depth, parent, prototypes)?;
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(child.id);
+                }
+                self.push_frame(&mut stack, child)?;
+            } else {
+                if let Some(done) = stack.pop() {
+                    self.finish_prototype(done, prototypes)?;
+                }
+            }
+        }
+        Ok(root_id)
     }
 
     fn debug(
@@ -789,7 +1127,9 @@ impl<'a> Reader<'a> {
             "debug 項數超限",
         )?;
         self.require_min(line_count, 1)?;
-        let mut line_info = vector(line_count, &mut self.budget, self.limits, self.offset)?;
+        let mut line_info = vector_with_recovery(
+            line_count, &mut self.budget, self.limits, self.offset, &mut self.scratch,
+        )?;
         for _ in 0..line_count {
             line_info.push(self.byte()? as i8);
         }
@@ -813,7 +1153,9 @@ impl<'a> Reader<'a> {
                 2
             },
         )?;
-        let mut abs_line_info = vector(abs_count, &mut self.budget, self.limits, self.offset)?;
+        let mut abs_line_info = vector_with_recovery(
+            abs_count, &mut self.budget, self.limits, self.offset, &mut self.scratch,
+        )?;
         let mut previous_pc = None;
         for _ in 0..abs_count {
             let (pc, line) = match self.profile {
@@ -855,7 +1197,9 @@ impl<'a> Reader<'a> {
             "debug 項數超限",
         )?;
         self.require_min(local_count, 3)?;
-        let mut locals = vector(local_count, &mut self.budget, self.limits, self.offset)?;
+        let mut locals = vector_with_recovery(
+            local_count, &mut self.budget, self.limits, self.offset, &mut self.scratch,
+        )?;
         for _ in 0..local_count {
             let name = self.string()?;
             let start_pc = self.int()?;
@@ -890,15 +1234,17 @@ impl<'a> Reader<'a> {
             "debug 項數超限",
         )?;
         self.require_min(name_count, 1)?;
-        let mut upvalue_names = vector(name_count, &mut self.budget, self.limits, self.offset)?;
+        let mut upvalue_names = vector_with_recovery(
+            name_count, &mut self.budget, self.limits, self.offset, &mut self.scratch,
+        )?;
         for _ in 0..name_count {
             upvalue_names.push(self.string()?);
         }
         Ok(OfficialDebug {
-            line_info,
-            abs_line_info,
-            locals,
-            upvalue_names,
+            line_info: self.retain_vec(line_info, "line owner 配置失敗")?,
+            abs_line_info: self.retain_vec(abs_line_info, "abs line owner 配置失敗")?,
+            locals: self.retain_vec(locals, "local owner 配置失敗")?,
+            upvalue_names: self.retain_vec(upvalue_names, "upvalue name owner 配置失敗")?,
         })
     }
 }
@@ -908,30 +1254,52 @@ pub fn decode_official_chunk(
     profile: LuaProfile,
     limits: &OfficialChunkLimits,
 ) -> Result<OfficialChunk, OfficialChunkError> {
+    let mut recovery = GlobalAllocation;
+    decode_official_chunk_with_recovery(bytes, profile, limits, &mut recovery).map_err(|failure| {
+        match failure {
+            OfficialChunkRecoveryError::Chunk(error) => error,
+            OfficialChunkRecoveryError::Reserve(ReserveError::Recovery(never)) => match never {},
+            OfficialChunkRecoveryError::Reserve(_) => {
+                error(OfficialChunkErrorKind::AllocationFailed, 0, "官方 chunk 配置失敗")
+            }
+        }
+    })
+}
+
+pub fn decode_official_chunk_with_recovery<R: AllocationRecovery>(
+    bytes: &[u8],
+    profile: LuaProfile,
+    limits: &OfficialChunkLimits,
+    recovery: &mut R,
+) -> Result<OfficialChunk, OfficialChunkRecoveryError<R::Error>> {
     if bytes.len() > limits.max_bytes {
-        return Err(error(
+        return Err(OfficialChunkRecoveryError::Chunk(error(
             OfficialChunkErrorKind::LimitExceeded,
             0,
             "chunk 長度超限",
-        ));
+        )));
     }
+    let scratch = Scratch::new(recovery);
+    let saved_strings = scratch.vec();
     let mut reader = Reader {
         bytes,
         offset: 0,
         profile,
         limits,
         budget: Budget::default(),
-        saved_strings: Vec::new(),
+        saved_strings,
+        scratch,
     };
+    let result = (|| -> Result<OfficialChunk, OfficialChunkError> {
     reader.header()?;
     if profile == LuaProfile::Lua55 {
         let capacity = limits.max_strings.min(bytes.len() / 2);
         reader
             .budget
-            .alloc::<Vec<u8>>(capacity, limits, reader.offset)?;
+            .alloc::<BytecodeVec<u8>>(capacity, limits, reader.offset)?;
         reader
-            .saved_strings
-            .try_reserve_exact(capacity)
+            .scratch
+            .reserve_exact(&mut reader.saved_strings, capacity)
             .map_err(|_| {
                 error(
                     OfficialChunkErrorKind::AllocationFailed,
@@ -939,36 +1307,59 @@ pub fn decode_official_chunk(
                     "字串索引配置失敗",
                 )
             })?;
-        reader.budget.alloc::<Vec<u8>>(
+        reader.budget.alloc::<BytecodeVec<u8>>(
             reader.saved_strings.capacity() - capacity,
             limits,
             reader.offset,
         )?;
     }
     let root_upvalues = reader.byte()?;
-    let main = reader.prototype(1, None)?;
-    if usize::from(root_upvalues) != main.upvalues.len() || reader.offset != bytes.len() {
+    let mut prototypes = reader.scratch.vec();
+    let main = reader.prototypes(&mut prototypes)?;
+    if usize::from(root_upvalues) != prototypes[main.0 as usize].upvalues.len() {
         return Err(error(
             OfficialChunkErrorKind::InvalidFormat,
             reader.offset,
-            "root upvalue 數或結尾不符",
+            "root upvalue 數不符",
         ));
     }
+    reader.budget.retained_owner::<OfficialPrototype, _>(limits, reader.offset, &mut reader.scratch)?;
+    let prototypes = reader.scratch.retain(prototypes).map_err(|_| {
+        error(OfficialChunkErrorKind::AllocationFailed, reader.offset, "prototype arena owner 配置失敗")
+    })?;
     Ok(OfficialChunk {
         profile,
         root_upvalues,
         main,
+        prototypes,
+    })
+    })();
+    result.map_err(|error| match reader.scratch.take_refusal() {
+        Some(refusal) => OfficialChunkRecoveryError::Reserve(refusal),
+        None => OfficialChunkRecoveryError::Chunk(error),
     })
 }
 
 fn validate_string(
-    value: Option<&Vec<u8>>,
+    value: Option<&RetainedVec<u8>>,
     budget: &mut Budget,
     limits: &OfficialChunkLimits,
 ) -> Result<(), OfficialChunkError> {
     if let Some(bytes) = value {
         budget.string(bytes.len(), limits, 0)?;
         budget.alloc::<u8>(bytes.capacity() - bytes.len(), limits, 0)?;
+        validate_retained_owner(bytes, budget, limits)?;
+    }
+    Ok(())
+}
+
+fn validate_retained_owner<T>(
+    values: &RetainedVec<T>,
+    budget: &mut Budget,
+    limits: &OfficialChunkLimits,
+) -> Result<(), OfficialChunkError> {
+    if matches!(values, RetainedVec::State(_)) {
+        budget.alloc::<u8>(StateAllocator::shared_block_size::<BytecodeVec<T>>(), limits, 0)?;
     }
     Ok(())
 }
@@ -976,7 +1367,6 @@ fn validate_string(
 fn validate_prototype(
     prototype: &OfficialPrototype,
     profile: LuaProfile,
-    depth: usize,
     parent: Option<(u8, usize)>,
     budget: &mut Budget,
     limits: &OfficialChunkLimits,
@@ -1001,13 +1391,6 @@ fn validate_prototype(
             )
         })?;
     meter(work, scan_units, 0)?;
-    if depth > limits.max_depth.min(MAX_SAFE_DEPTH) {
-        return Err(error(
-            OfficialChunkErrorKind::LimitExceeded,
-            0,
-            "prototype 深度超限",
-        ));
-    }
     Budget::charge(
         &mut budget.prototypes,
         1,
@@ -1042,6 +1425,7 @@ fn validate_prototype(
         "指令數超限",
     )?;
     budget.alloc::<u32>(prototype.code.capacity(), limits, 0)?;
+    validate_retained_owner(&prototype.code, budget, limits)?;
     Budget::charge(
         &mut budget.constants,
         prototype.constants.len(),
@@ -1050,6 +1434,7 @@ fn validate_prototype(
         "常數數超限",
     )?;
     budget.alloc::<OfficialConstant>(prototype.constants.capacity(), limits, 0)?;
+    validate_retained_owner(&prototype.constants, budget, limits)?;
     Budget::charge(
         &mut budget.upvalues,
         prototype.upvalues.len(),
@@ -1058,7 +1443,9 @@ fn validate_prototype(
         "upvalue 數超限",
     )?;
     budget.alloc::<OfficialUpvalue>(prototype.upvalues.capacity(), limits, 0)?;
-    budget.alloc::<OfficialPrototype>(prototype.children.capacity(), limits, 0)?;
+    validate_retained_owner(&prototype.upvalues, budget, limits)?;
+    budget.alloc::<ProtoId>(prototype.children.capacity(), limits, 0)?;
+    validate_retained_owner(&prototype.children, budget, limits)?;
     validate_string(prototype.source.as_ref(), budget, limits)?;
     for constant in &prototype.constants {
         if let OfficialConstant::String { bytes, .. } = constant {
@@ -1107,9 +1494,13 @@ fn validate_prototype(
         )?;
     }
     budget.alloc::<i8>(debug.line_info.capacity(), limits, 0)?;
+    validate_retained_owner(&debug.line_info, budget, limits)?;
     budget.alloc::<OfficialAbsLine>(debug.abs_line_info.capacity(), limits, 0)?;
+    validate_retained_owner(&debug.abs_line_info, budget, limits)?;
     budget.alloc::<OfficialLocal>(debug.locals.capacity(), limits, 0)?;
-    budget.alloc::<Option<Vec<u8>>>(debug.upvalue_names.capacity(), limits, 0)?;
+    validate_retained_owner(&debug.locals, budget, limits)?;
+    budget.alloc::<Option<RetainedVec<u8>>>(debug.upvalue_names.capacity(), limits, 0)?;
+    validate_retained_owner(&debug.upvalue_names, budget, limits)?;
     let mut previous_pc = None;
     for abs in &debug.abs_line_info {
         if abs.pc as usize >= prototype.code.len()
@@ -1145,16 +1536,63 @@ fn validate_prototype(
     for name in &debug.upvalue_names {
         validate_string(name.as_ref(), budget, limits)?;
     }
-    for child in &prototype.children {
-        validate_prototype(
-            child,
-            profile,
-            depth + 1,
-            Some((prototype.max_stack_size, prototype.upvalues.len())),
-            budget,
-            limits,
-            work,
-        )?;
+    Ok(())
+}
+
+fn validate_chunk<R: AllocationRecovery>(
+    chunk: &OfficialChunk,
+    budget: &mut Budget,
+    limits: &OfficialChunkLimits,
+    work: &mut Option<&mut OfficialWorkBudget>,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<(), OfficialChunkError> {
+    if chunk.main != ProtoId(0) || chunk.prototypes.is_empty() {
+        return Err(error(OfficialChunkErrorKind::InvalidFormat, 0, "root prototype ID 不符"));
+    }
+    if usize::from(chunk.root_upvalues) != chunk.prototypes[0].upvalues.len() {
+        return Err(error(OfficialChunkErrorKind::InvalidFormat, 0, "root upvalue 數不符"));
+    }
+    if chunk.prototypes[0].children.len() > chunk.prototypes.len() - 1 {
+        return Err(error(OfficialChunkErrorKind::InvalidFormat, 0, "root child 數超過 arena"));
+    }
+    budget.alloc::<OfficialPrototype>(chunk.prototypes.capacity(), limits, 0)?;
+    validate_retained_owner(&chunk.prototypes, budget, limits)?;
+    let mut stack = scratch.vec();
+    let capacity = chunk.prototypes.len();
+    budget.alloc::<(ProtoId, usize, Option<(u8, usize)>)>(capacity, limits, 0)?;
+    scratch.reserve_exact(&mut stack, capacity).map_err(|_| {
+        error(OfficialChunkErrorKind::AllocationFailed, 0, "prototype 驗證暫存配置失敗")
+    })?;
+    budget.alloc::<(ProtoId, usize, Option<(u8, usize)>)>(stack.capacity() - capacity, limits, 0)?;
+    stack.push((chunk.main, 1, None));
+    let mut next = 0usize;
+    while let Some((id, depth, parent)) = stack.pop() {
+        if id.0 as usize != next {
+            return Err(error(OfficialChunkErrorKind::InvalidFormat, 0, "prototype 前序或 parent 不符"));
+        }
+        if depth > limits.max_depth {
+            return Err(error(OfficialChunkErrorKind::LimitExceeded, 0, "prototype 深度超限"));
+        }
+        let prototype = &chunk.prototypes[next];
+        validate_prototype(prototype, chunk.profile, parent, budget, limits, work)?;
+        next += 1;
+        if stack.len().checked_add(prototype.children.len())
+            .is_none_or(|frontier| frontier > chunk.prototypes.len() - next)
+        {
+            return Err(error(OfficialChunkErrorKind::InvalidFormat, 0, "prototype frontier 超過 arena"));
+        }
+        let child_depth = depth.checked_add(1).ok_or_else(|| {
+            error(OfficialChunkErrorKind::Overflow, 0, "prototype 深度溢位")
+        })?;
+        for &child in prototype.children.iter().rev() {
+            if child.0 as usize >= chunk.prototypes.len() {
+                return Err(error(OfficialChunkErrorKind::InvalidFormat, 0, "child prototype ID 不符"));
+            }
+            stack.push((child, child_depth, Some((prototype.max_stack_size, prototype.upvalues.len()))));
+        }
+    }
+    if next != chunk.prototypes.len() {
+        return Err(error(OfficialChunkErrorKind::InvalidFormat, 0, "prototype 含未到達節點"));
     }
     Ok(())
 }
@@ -1200,7 +1638,7 @@ fn copy_prototype(
             OfficialConstant::Integer(value) => OfficialConstant::Integer(*value),
             OfficialConstant::Number(value) => OfficialConstant::Number(*value),
             OfficialConstant::String { bytes, long } => OfficialConstant::String {
-                bytes: copy_bytes(bytes, budget, limits)?,
+                bytes: copy_bytes(bytes, budget, limits)?.into(),
                 long: *long,
             },
         });
@@ -1208,36 +1646,148 @@ fn copy_prototype(
     let mut locals = vector(source.debug.locals.len(), budget, limits, 0)?;
     for local in &source.debug.locals {
         locals.push(OfficialLocal {
-            name: copy_optional_bytes(local.name.as_deref(), budget, limits)?,
+            name: copy_optional_bytes(local.name.as_deref(), budget, limits)?.map(Into::into),
             start_pc: local.start_pc,
             end_pc: local.end_pc,
         });
     }
     let mut upvalue_names = vector(source.debug.upvalue_names.len(), budget, limits, 0)?;
     for name in &source.debug.upvalue_names {
-        upvalue_names.push(copy_optional_bytes(name.as_deref(), budget, limits)?);
-    }
-    let mut children = vector(source.children.len(), budget, limits, 0)?;
-    for child in &source.children {
-        children.push(copy_prototype(child, budget, limits)?);
+        upvalue_names.push(copy_optional_bytes(name.as_deref(), budget, limits)?.map(Into::into));
     }
     Ok(OfficialPrototype {
-        source: copy_optional_bytes(source.source.as_deref(), budget, limits)?,
+        source: copy_optional_bytes(source.source.as_deref(), budget, limits)?.map(Into::into),
         line_defined: source.line_defined,
         last_line_defined: source.last_line_defined,
         num_params: source.num_params,
         flags: source.flags,
         max_stack_size: source.max_stack_size,
-        code: copy_scalars(&source.code, budget, limits)?,
-        constants,
-        upvalues: copy_scalars(&source.upvalues, budget, limits)?,
-        children,
+        code: copy_scalars(&source.code, budget, limits)?.into(),
+        constants: constants.into(),
+        upvalues: copy_scalars(&source.upvalues, budget, limits)?.into(),
+        children: copy_scalars(&source.children, budget, limits)?.into(),
         debug: OfficialDebug {
-            line_info: copy_scalars(&source.debug.line_info, budget, limits)?,
-            abs_line_info: copy_scalars(&source.debug.abs_line_info, budget, limits)?,
-            locals,
-            upvalue_names,
+            line_info: copy_scalars(&source.debug.line_info, budget, limits)?.into(),
+            abs_line_info: copy_scalars(&source.debug.abs_line_info, budget, limits)?.into(),
+            locals: locals.into(),
+            upvalue_names: upvalue_names.into(),
         },
+    })
+}
+
+fn copy_bytes_with_recovery<R: AllocationRecovery>(
+    source: &[u8],
+    budget: &mut Budget,
+    limits: &OfficialChunkLimits,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<RetainedVec<u8>, OfficialChunkError> {
+    bytes_owned_with_recovery(source, budget, limits, 0, scratch)
+}
+
+fn copy_optional_bytes_with_recovery<R: AllocationRecovery>(
+    source: Option<&[u8]>,
+    budget: &mut Budget,
+    limits: &OfficialChunkLimits,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<Option<RetainedVec<u8>>, OfficialChunkError> {
+    source
+        .map(|bytes| copy_bytes_with_recovery(bytes, budget, limits, scratch))
+        .transpose()
+}
+
+fn copy_scalars_with_recovery<T: Copy, R: AllocationRecovery>(
+    source: &[T],
+    budget: &mut Budget,
+    limits: &OfficialChunkLimits,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<RetainedVec<T>, OfficialChunkError> {
+    let mut target = vector_with_recovery(source.len(), budget, limits, 0, scratch)?;
+    target.extend_from_slice(source);
+    retain_with_budget(target, budget, limits, scratch)
+}
+
+fn retain_with_budget<T, R: AllocationRecovery>(
+    values: BytecodeVec<T>,
+    budget: &mut Budget,
+    limits: &OfficialChunkLimits,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<RetainedVec<T>, OfficialChunkError> {
+    budget.retained_owner::<T, _>(limits, 0, scratch)?;
+    scratch.retain(values).map_err(|_| error(OfficialChunkErrorKind::AllocationFailed, 0, "owner 配置失敗"))
+}
+
+fn copy_prototype_with_recovery<R: AllocationRecovery>(
+    source: &OfficialPrototype,
+    budget: &mut Budget,
+    limits: &OfficialChunkLimits,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<OfficialPrototype, OfficialChunkError> {
+    let mut constants = vector_with_recovery(source.constants.len(), budget, limits, 0, scratch)?;
+    for constant in &source.constants {
+        constants.push(match constant {
+            OfficialConstant::Nil => OfficialConstant::Nil,
+            OfficialConstant::Boolean(value) => OfficialConstant::Boolean(*value),
+            OfficialConstant::Integer(value) => OfficialConstant::Integer(*value),
+            OfficialConstant::Number(value) => OfficialConstant::Number(*value),
+            OfficialConstant::String { bytes, long } => OfficialConstant::String {
+                bytes: copy_bytes_with_recovery(bytes, budget, limits, scratch)?,
+                long: *long,
+            },
+        });
+    }
+    let mut locals = vector_with_recovery(source.debug.locals.len(), budget, limits, 0, scratch)?;
+    for local in &source.debug.locals {
+        locals.push(OfficialLocal {
+            name: copy_optional_bytes_with_recovery(local.name.as_deref(), budget, limits, scratch)?,
+            start_pc: local.start_pc,
+            end_pc: local.end_pc,
+        });
+    }
+    let mut upvalue_names = vector_with_recovery(source.debug.upvalue_names.len(), budget, limits, 0, scratch)?;
+    for name in &source.debug.upvalue_names {
+        upvalue_names.push(copy_optional_bytes_with_recovery(name.as_deref(), budget, limits, scratch)?);
+    }
+    Ok(OfficialPrototype {
+        source: copy_optional_bytes_with_recovery(source.source.as_deref(), budget, limits, scratch)?,
+        line_defined: source.line_defined,
+        last_line_defined: source.last_line_defined,
+        num_params: source.num_params,
+        flags: source.flags,
+        max_stack_size: source.max_stack_size,
+        code: copy_scalars_with_recovery(&source.code, budget, limits, scratch)?,
+        constants: retain_with_budget(constants, budget, limits, scratch)?,
+        upvalues: copy_scalars_with_recovery(&source.upvalues, budget, limits, scratch)?,
+        children: copy_scalars_with_recovery(&source.children, budget, limits, scratch)?,
+        debug: OfficialDebug {
+            line_info: copy_scalars_with_recovery(&source.debug.line_info, budget, limits, scratch)?,
+            abs_line_info: copy_scalars_with_recovery(&source.debug.abs_line_info, budget, limits, scratch)?,
+            locals: retain_with_budget(locals, budget, limits, scratch)?,
+            upvalue_names: retain_with_budget(upvalue_names, budget, limits, scratch)?,
+        },
+    })
+}
+
+pub(crate) fn clone_official_chunk_checked_with_recovery<R: AllocationRecovery>(
+    source: &OfficialChunk,
+    limits: &OfficialChunkLimits,
+    recovery: &mut R,
+) -> Result<(OfficialChunk, usize), OfficialChunkRecoveryError<R::Error>> {
+    let mut scratch = Scratch::new(recovery);
+    let result = (|| -> Result<(OfficialChunk, usize), OfficialChunkError> {
+        let mut validation = Budget::default();
+        let mut no_work = None;
+        validate_chunk(source, &mut validation, limits, &mut no_work, &mut scratch)?;
+        let mut copy_budget = Budget::default();
+        let mut prototypes = vector_with_recovery(source.prototypes.len(), &mut copy_budget, limits, 0, &mut scratch)?;
+        for prototype in &source.prototypes {
+            prototypes.push(copy_prototype_with_recovery(prototype, &mut copy_budget, limits, &mut scratch)?);
+        }
+        let prototypes = retain_with_budget(prototypes, &mut copy_budget, limits, &mut scratch)?;
+        Ok((OfficialChunk { profile: source.profile, root_upvalues: source.root_upvalues, main: source.main, prototypes }, copy_budget.allocated))
+    })();
+    result.map_err(|error| match scratch.take_refusal() {
+        Some(refusal) => OfficialChunkRecoveryError::Reserve(refusal),
+        None => OfficialChunkRecoveryError::Chunk(error),
     })
 }
 
@@ -1246,31 +1796,22 @@ pub(crate) fn clone_official_chunk_checked(
     source: &OfficialChunk,
     limits: &OfficialChunkLimits,
 ) -> Result<(OfficialChunk, usize), OfficialChunkError> {
-    if usize::from(source.root_upvalues) != source.main.upvalues.len() {
-        return Err(error(
-            OfficialChunkErrorKind::InvalidFormat,
-            0,
-            "root upvalue 數不符",
-        ));
-    }
     let mut validation = Budget::default();
     let mut no_work = None;
-    validate_prototype(
-        &source.main,
-        source.profile,
-        1,
-        None,
-        &mut validation,
-        limits,
-        &mut no_work,
-    )?;
+    let mut recovery = GlobalAllocation;
+    let mut scratch = Scratch::new(&mut recovery);
+    validate_chunk(source, &mut validation, limits, &mut no_work, &mut scratch)?;
     let mut copy_budget = Budget::default();
-    let main = copy_prototype(&source.main, &mut copy_budget, limits)?;
+    let mut prototypes = vector(source.prototypes.len(), &mut copy_budget, limits, 0)?;
+    for prototype in &source.prototypes {
+        prototypes.push(copy_prototype(prototype, &mut copy_budget, limits)?);
+    }
     Ok((
         OfficialChunk {
             profile: source.profile,
             root_upvalues: source.root_upvalues,
-            main,
+            main: source.main,
+            prototypes: prototypes.into(),
         },
         copy_budget.allocated,
     ))
@@ -1283,19 +1824,20 @@ struct SavedString<'a> {
 }
 
 struct StringIndex<'a> {
-    slots: Vec<Option<SavedString<'a>>>,
+    slots: BytecodeVec<Option<SavedString<'a>>>,
     count: usize,
 }
 
 impl<'a> StringIndex<'a> {
-    fn new(
+    fn new<R: AllocationRecovery>(
         max_entries: usize,
         limits: &OfficialChunkLimits,
         work: &mut Option<&mut OfficialWorkBudget>,
+        scratch: &mut Scratch<'_, R>,
     ) -> Result<Self, OfficialChunkError> {
         if max_entries == 0 {
             return Ok(Self {
-                slots: Vec::new(),
+                slots: scratch.vec(),
                 count: 0,
             });
         }
@@ -1314,8 +1856,8 @@ impl<'a> StringIndex<'a> {
             ));
         }
         meter(work, slot_count, 0)?;
-        let mut slots = Vec::new();
-        slots.try_reserve_exact(slot_count).map_err(|_| {
+        let mut slots = scratch.vec();
+        scratch.reserve_exact(&mut slots, slot_count).map_err(|_| {
             error(
                 OfficialChunkErrorKind::AllocationFailed,
                 0,
@@ -1405,7 +1947,7 @@ impl<'a> StringIndex<'a> {
 }
 
 struct Writer<'a, 'w> {
-    bytes: Vec<u8>,
+    bytes: BytecodeVec<u8>,
     measured_len: usize,
     measuring: bool,
     base_allocated: usize,
@@ -1590,7 +2132,7 @@ impl<'a, 'w> Writer<'a, 'w> {
         Ok(())
     }
 
-    fn prototype(
+    fn prototype_head(
         &mut self,
         prototype: &'a OfficialPrototype,
         strip: bool,
@@ -1655,9 +2197,14 @@ impl<'a, 'w> Writer<'a, 'w> {
         }
         self.int(prototype.children.len())?;
         meter(&mut self.work, prototype.children.len(), 0)?;
-        for child in &prototype.children {
-            self.prototype(child, strip)?;
-        }
+        Ok(())
+    }
+
+    fn prototype_tail(
+        &mut self,
+        prototype: &'a OfficialPrototype,
+        strip: bool,
+    ) -> Result<(), OfficialChunkError> {
         if self.profile == LuaProfile::Lua55 {
             self.string(if strip {
                 None
@@ -1706,6 +2253,33 @@ impl<'a, 'w> Writer<'a, 'w> {
         }
         Ok(())
     }
+
+    fn prototypes<R: AllocationRecovery>(
+        &mut self,
+        chunk: &'a OfficialChunk,
+        strip: bool,
+        scratch: &mut Scratch<'_, R>,
+    ) -> Result<(), OfficialChunkError> {
+        let mut stack = scratch.vec();
+        scratch.reserve_exact(&mut stack, chunk.prototypes.len()).map_err(|_| {
+            error(OfficialChunkErrorKind::AllocationFailed, 0, "編碼 prototype cursor 配置失敗")
+        })?;
+        stack.push((chunk.main, 0usize, false));
+        while let Some((id, child_index, entered)) = stack.last_mut() {
+            let prototype = &chunk.prototypes[id.0 as usize];
+            if !*entered {
+                self.prototype_head(prototype, strip)?;
+                *entered = true;
+            } else if let Some(&child) = prototype.children.get(*child_index) {
+                *child_index += 1;
+                stack.push((child, 0, false));
+            } else {
+                self.prototype_tail(prototype, strip)?;
+                stack.pop();
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn encode_official_chunk(
@@ -1713,7 +2287,13 @@ pub fn encode_official_chunk(
     strip: bool,
     limits: &OfficialChunkLimits,
 ) -> Result<Vec<u8>, OfficialChunkError> {
-    encode_official_chunk_inner(chunk, strip, limits, None)
+    let mut recovery = GlobalAllocation;
+    let mut scratch = Scratch::new(&mut recovery);
+    let bytes = encode_official_chunk_inner(chunk, strip, limits, None, &mut scratch)?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(bytes.len()).map_err(|_| error(OfficialChunkErrorKind::AllocationFailed, 0, "輸出配置失敗"))?;
+    output.extend_from_slice(&bytes);
+    Ok(output)
 }
 
 pub(super) fn encode_official_chunk_metered(
@@ -1722,33 +2302,35 @@ pub(super) fn encode_official_chunk_metered(
     limits: &OfficialChunkLimits,
     work: &mut OfficialWorkBudget,
 ) -> Result<Vec<u8>, OfficialChunkError> {
-    encode_official_chunk_inner(chunk, strip, limits, Some(work))
+    let mut recovery = GlobalAllocation;
+    let mut scratch = Scratch::new(&mut recovery);
+    let bytes = encode_official_chunk_inner(chunk, strip, limits, Some(work), &mut scratch)?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(bytes.len()).map_err(|_| error(OfficialChunkErrorKind::AllocationFailed, 0, "輸出配置失敗"))?;
+    output.extend_from_slice(&bytes);
+    Ok(output)
 }
 
-fn encode_official_chunk_inner(
+pub(super) fn encode_official_chunk_metered_with_recovery<R: AllocationRecovery>(
+    chunk: &OfficialChunk,
+    strip: bool,
+    limits: &OfficialChunkLimits,
+    work: &mut OfficialWorkBudget,
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<u8>, OfficialChunkError> {
+    encode_official_chunk_inner(chunk, strip, limits, Some(work), scratch)
+}
+
+fn encode_official_chunk_inner<R: AllocationRecovery>(
     chunk: &OfficialChunk,
     strip: bool,
     limits: &OfficialChunkLimits,
     mut work: Option<&mut OfficialWorkBudget>,
-) -> Result<Vec<u8>, OfficialChunkError> {
-    if usize::from(chunk.root_upvalues) != chunk.main.upvalues.len() {
-        return Err(error(
-            OfficialChunkErrorKind::InvalidFormat,
-            0,
-            "root upvalue 數不符",
-        ));
-    }
+    scratch: &mut Scratch<'_, R>,
+) -> Result<BytecodeVec<u8>, OfficialChunkError> {
     let mut budget = Budget::default();
     budget.alloc::<OfficialChunk>(1, limits, 0)?;
-    validate_prototype(
-        &chunk.main,
-        chunk.profile,
-        1,
-        None,
-        &mut budget,
-        limits,
-        &mut work,
-    )?;
+    validate_chunk(chunk, &mut budget, limits, &mut work, scratch)?;
     let remaining = limits
         .max_allocated_bytes
         .checked_sub(budget.allocated)
@@ -1759,36 +2341,16 @@ fn encode_official_chunk_inner(
     };
     let table_entries = if chunk.profile == LuaProfile::Lua55 {
         if strip {
-            fn constant_strings(
-                proto: &OfficialPrototype,
-                work: &mut Option<&mut OfficialWorkBudget>,
-            ) -> Result<usize, OfficialChunkError> {
-                meter(
-                    work,
-                    proto
-                        .constants
-                        .len()
-                        .checked_add(proto.children.len())
-                        .ok_or_else(|| {
-                            error(OfficialChunkErrorKind::Overflow, 0, "字串表掃描 work 溢位")
-                        })?,
-                    0,
-                )?;
-                let mut total = proto
-                    .constants
-                    .iter()
-                    .filter(|constant| matches!(constant, OfficialConstant::String { .. }))
-                    .count();
-                for child in &proto.children {
-                    total = total
-                        .checked_add(constant_strings(child, work)?)
-                        .ok_or_else(|| {
-                            error(OfficialChunkErrorKind::Overflow, 0, "字串表項數溢位")
-                        })?;
-                }
-                Ok(total)
+            let mut total = 0usize;
+            for proto in &chunk.prototypes {
+                meter(&mut work, proto.constants.len().checked_add(proto.children.len()).ok_or_else(|| {
+                    error(OfficialChunkErrorKind::Overflow, 0, "字串表掃描 work 溢位")
+                })?, 0)?;
+                total = total.checked_add(proto.constants.iter().filter(|constant| matches!(constant, OfficialConstant::String { .. })).count()).ok_or_else(|| {
+                    error(OfficialChunkErrorKind::Overflow, 0, "字串表項數溢位")
+                })?;
             }
-            constant_strings(&chunk.main, &mut work)?
+            total
         } else {
             budget.strings
         }
@@ -1796,22 +2358,22 @@ fn encode_official_chunk_inner(
         0
     };
     let mut measured = Writer {
-        bytes: Vec::new(),
+        bytes: scratch.vec(),
         measured_len: 0,
         measuring: true,
         base_allocated: budget.allocated,
         profile: chunk.profile,
         limits,
-        saved_strings: StringIndex::new(table_entries, &table_limits, &mut work)?,
+        saved_strings: StringIndex::new(table_entries, &table_limits, &mut work, scratch)?,
         work: work.as_deref_mut(),
     };
     measured.header()?;
     measured.byte(chunk.root_upvalues)?;
-    measured.prototype(&chunk.main, strip)?;
+    measured.prototypes(chunk, strip, scratch)?;
     let output_len = measured.measured_len;
     drop(measured);
 
-    let table = StringIndex::new(table_entries, &table_limits, &mut work)?;
+    let table = StringIndex::new(table_entries, &table_limits, &mut work, scratch)?;
     let preflight_total = budget
         .allocated
         .checked_add(table.allocated())
@@ -1824,9 +2386,9 @@ fn encode_official_chunk_inner(
             "配置額度超限",
         ));
     }
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(output_len)
+    let mut bytes = scratch.vec();
+    scratch
+        .reserve_exact(&mut bytes, output_len)
         .map_err(|_| error(OfficialChunkErrorKind::AllocationFailed, 0, "輸出配置失敗"))?;
     if budget
         .allocated
@@ -1852,7 +2414,7 @@ fn encode_official_chunk_inner(
     };
     writer.header()?;
     writer.byte(chunk.root_upvalues)?;
-    writer.prototype(&chunk.main, strip)?;
+    writer.prototypes(chunk, strip, scratch)?;
     if writer.bytes.len() != output_len {
         return Err(error(
             OfficialChunkErrorKind::InvalidFormat,
