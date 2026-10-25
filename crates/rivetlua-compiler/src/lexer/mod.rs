@@ -1,9 +1,11 @@
-//! P02 byte-slice lexer 入口。
+//! Lua byte lexer；同一 scanner 可由完整 slice 或可續接 job 驅動。
 
-mod cursor;
-mod scanner;
+pub(crate) mod scanner;
+pub(crate) mod incremental;
 
-use cursor::Cursor;
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{AllocationRecovery, GlobalAllocation, ReserveError, SharedBlock, StateAllocator, try_reserve_exact_with};
+use incremental::{ByteAvailability, ByteInput, LexProgress, LexerState};
 
 /// 支援的 Lua 語言 profile。
 pub use rivetlua_core::LuaProfile as LanguageProfile;
@@ -65,27 +67,6 @@ pub struct Diagnostic {
     pub start: SourcePosition,
     pub end: SourcePosition,
     pub message: &'static str,
-}
-
-impl Diagnostic {
-    pub(in crate::lexer) fn at(
-        code: DiagnosticCode,
-        start_byte: usize,
-        start: SourcePosition,
-        cursor: &Cursor<'_>,
-        message: &'static str,
-    ) -> Self {
-        Self {
-            code,
-            span: Span {
-                start_byte,
-                end_byte: cursor.offset(),
-            },
-            start,
-            end: cursor.position(),
-            message,
-        }
-    }
 }
 
 /// 原始 bytes 的半開來源範圍。
@@ -169,12 +150,23 @@ pub enum Symbol {
 }
 
 /// 只有具 payload 的 token 才能保存 literal。
+pub type SharedBytes = SharedBlock<AllocVec<u8, StateAllocator>>;
+
+/// SDK 建構 AST 或測試 fixture 時，明確選擇全域配置的共享 bytes。
+pub fn try_global_shared_bytes(bytes: &[u8]) -> Option<SharedBytes> {
+    let mut values = AllocVec::new_in(StateAllocator::Global);
+    values.try_reserve_exact(bytes.len()).ok()?;
+    values.extend_from_slice(bytes);
+    let owner = StateAllocator::Global.shared_uninit(0).ok()?;
+    Some(owner.write(values))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Literal {
-    Name(Vec<u8>),
+    Name(SharedBytes),
     Integer(rivetlua_core::Number),
     Float(rivetlua_core::Number),
-    String(Vec<u8>),
+    String(SharedBytes),
 }
 
 /// 詞法種類。
@@ -204,7 +196,7 @@ pub struct Token {
 pub struct LexedChunk {
     pub profile: LanguageProfile,
     pub source_len: usize,
-    pub tokens: Vec<Token>,
+    pub tokens: AllocVec<Token, StateAllocator>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,8 +206,10 @@ pub(crate) enum NumericCharge {
     HexPowi,
 }
 
-pub(crate) trait NumericBudget {
-    type Error;
+pub(crate) trait NumericBudget: AllocationRecovery {
+    fn check_fault(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     fn before_conversion(&mut self, charge: NumericCharge) -> Result<(), Self::Error>;
 }
@@ -224,6 +218,7 @@ pub(crate) trait NumericBudget {
 pub(crate) enum ScanError<E> {
     Diagnostic(Diagnostic),
     Budget(E),
+    AllocationFailed,
 }
 
 impl<E> From<Diagnostic> for ScanError<E> {
@@ -234,9 +229,19 @@ impl<E> From<Diagnostic> for ScanError<E> {
 
 struct UnmeteredNumeric;
 
-impl NumericBudget for UnmeteredNumeric {
+impl AllocationRecovery for UnmeteredNumeric {
     type Error = core::convert::Infallible;
 
+    fn allocator(&self) -> StateAllocator {
+        GlobalAllocation.allocator()
+    }
+
+    fn recover_after_refusal(&mut self, _before: u64) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
+
+impl NumericBudget for UnmeteredNumeric {
     fn before_conversion(&mut self, _: NumericCharge) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -252,6 +257,13 @@ pub fn lex(
         Ok(chunk) => Ok(chunk),
         Err(ScanError::Diagnostic(diagnostic)) => Err(diagnostic),
         Err(ScanError::Budget(never)) => match never {},
+        Err(ScanError::AllocationFailed) => Err(Diagnostic {
+            code: DiagnosticCode::CompileLimit,
+            span: Span { start_byte: 0, end_byte: 0 },
+            start: SourcePosition { line: 1, column: 1 },
+            end: SourcePosition { line: 1, column: 1 },
+            message: "token 配置失敗",
+        }),
     }
 }
 
@@ -273,27 +285,81 @@ pub(crate) fn lex_with_numeric_budget<B: NumericBudget>(
             message: "來源超過編譯限制",
         }));
     }
-    let mut cursor = Cursor::new(input, profile);
-    scanner::scan(&mut cursor, limits, budget)
+    let mut source = SliceFeed { bytes: input, offset: 0, budget };
+    let mut lexer = LexerState::new(profile);
+    let mut tokens = AllocVec::new_in(source.allocator());
+    loop {
+        match lexer.next_token(limits, &mut source)? {
+            LexProgress::NeedInput(_) => return Err(ScanError::Diagnostic(Diagnostic {
+                code: DiagnosticCode::Lex,
+                span: Span { start_byte: lexer.offset(), end_byte: lexer.offset() },
+                start: SourcePosition { line: 1, column: 1 },
+                end: SourcePosition { line: 1, column: 1 },
+                message: "lexer slice 狀態不完整",
+            })),
+            LexProgress::Token(token) => {
+                let eof = token.kind == TokenKind::Eof;
+                push_token(&mut tokens, token, limits, &mut source)?;
+                if eof { break; }
+            }
+        }
+    }
+    Ok(LexedChunk { profile, source_len: lexer.offset(), tokens })
 }
 
-pub(in crate::lexer) fn push_token(
-    tokens: &mut Vec<Token>,
+pub(in crate::lexer) fn push_token<B: NumericBudget>(
+    tokens: &mut AllocVec<Token, StateAllocator>,
     token: Token,
     limits: &CompileLimits,
-    cursor: &Cursor<'_>,
-) -> Result<(), Diagnostic> {
+    budget: &mut B,
+) -> Result<(), ScanError<B::Error>> {
+    budget.check_fault().map_err(ScanError::Budget)?;
     if tokens.len() >= limits.max_tokens {
-        return Err(Diagnostic::at(
-            DiagnosticCode::CompileLimit,
-            token.span.start_byte,
-            token.start,
-            cursor,
-            "token 數超過編譯限制",
-        ));
+        return Err(ScanError::Diagnostic(Diagnostic {
+            code: DiagnosticCode::CompileLimit, span: token.span,
+            start: token.start, end: token.end, message: "token 數超過編譯限制",
+        }));
+    }
+    if tokens.len() == tokens.capacity() {
+        let target = tokens.capacity().saturating_mul(2).max(4).min(limits.max_tokens);
+        try_reserve_exact_with(tokens, target - tokens.len(), budget).map_err(|error| match error {
+            ReserveError::Recovery(error) => ScanError::Budget(error),
+            ReserveError::AllocatorMismatch
+            | ReserveError::CallbackRefused
+            | ReserveError::AllocationFailed => ScanError::AllocationFailed,
+        })?;
     }
     tokens.push(token);
     Ok(())
+}
+
+struct SliceFeed<'source, 'budget, B> {
+    bytes: &'source [u8],
+    offset: usize,
+    budget: &'budget mut B,
+}
+
+impl<B: NumericBudget> AllocationRecovery for SliceFeed<'_, '_, B> {
+    type Error = B::Error;
+    fn allocator(&self) -> StateAllocator { self.budget.allocator() }
+    fn recover_after_refusal(&mut self, before: u64) -> Result<bool, Self::Error> {
+        self.budget.recover_after_refusal(before)
+    }
+}
+
+impl<B: NumericBudget> NumericBudget for SliceFeed<'_, '_, B> {
+    fn check_fault(&mut self) -> Result<(), Self::Error> { self.budget.check_fault() }
+    fn before_conversion(&mut self, charge: NumericCharge) -> Result<(), Self::Error> {
+        self.budget.before_conversion(charge)
+    }
+}
+
+impl<B: NumericBudget> ByteInput for SliceFeed<'_, '_, B> {
+    fn next_byte(&mut self) -> Result<ByteAvailability, Self::Error> {
+        let Some(byte) = self.bytes.get(self.offset).copied() else { return Ok(ByteAvailability::Eof); };
+        self.offset += 1;
+        Ok(ByteAvailability::Byte(byte))
+    }
 }
 
 #[cfg(test)]

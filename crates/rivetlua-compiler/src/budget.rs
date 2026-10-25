@@ -1,15 +1,22 @@
 //! 編譯器的分段資源准入；不依賴執行期的 ledger 或 VM。
 
+mod incremental;
+pub use incremental::{BorrowedSource, CompileAdvance, CompileJob, CompileProgress, CompileSource, StreamSource};
+
 use core::mem::size_of;
 
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{AllocationRecovery, ReserveError, StateAllocator, try_reserve_exact_with};
+
 use crate::ast::{
-    Block, Expr, FunctionBody, GlobalDeclaration, LocalName, Module, Stmt, TableField,
+    AstVec, Block, Expr, FunctionBody, GlobalDeclaration, LocalName, Module, Stmt, TableField,
 };
 use crate::ir::{IrClosePath, IrConstant, IrModule, IrPrototype};
-use crate::lexer::{NumericBudget, NumericCharge, ScanError};
+use crate::lexer::{NumericBudget, NumericCharge};
 use crate::resolve::{
     ClosePath, ResolvedBlock, ResolvedExpr, ResolvedFunctionBody, ResolvedGlobalDeclaration,
     ResolvedLocalName, ResolvedModule, ResolvedName, ResolvedStmt, ResolvedTableField,
+    ResolveError,
 };
 use crate::{CompileLimits, Diagnostic, IrError, LexedChunk, Literal};
 
@@ -20,11 +27,46 @@ pub trait CompileBudgetSink {
     fn spend_work(&mut self, units: usize) -> Result<(), Self::Error>;
     fn claim_temporary(&mut self, bytes: usize) -> Result<(), Self::Error>;
     fn claim_module_allocation(&mut self, bytes: usize) -> Result<(), Self::Error>;
+
+    fn state_allocator(&self) -> StateAllocator {
+        StateAllocator::Global
+    }
+
+    fn recover_allocator_refusal(&mut self, _before: u64) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PullRefill {
+    Appended,
+    Eof,
+}
+
+#[doc(hidden)]
+pub trait PullCompileInput: CompileBudgetSink {
+    type Source: AsRef<[u8]>;
+
+    /// 回傳目前可見的累積來源前綴；下一次 refill 前不保留此借用。
+    fn bytes(&self) -> &[u8];
+    /// required_len 是累積 bytes 下限；Appended 必須增加可見長度，但可少於下限。
+    fn refill(&mut self, required_len: usize) -> Result<PullRefill, Self::Error>;
+    /// 只在成功讀到 EOF 後呼叫一次，移交完整來源的獨立 owner。
+    fn take_source(&mut self) -> Self::Source;
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum PullCompileError<E> {
+    Compile(BudgetedCompileError<E>),
+    Refill(E),
 }
 
 #[derive(Debug)]
 pub enum BudgetedCompileError<E> {
     Budget(E),
+    AllocationFailed,
     Frontend(Diagnostic),
     Ir(IrError),
     Bytecode(rivetlua_core::BytecodeError),
@@ -55,9 +97,36 @@ fn admit<E, S: CompileBudgetSink<Error = E>>(
 
 struct SinkNumericBudget<'a, S>(&'a mut S);
 
-impl<S: CompileBudgetSink> NumericBudget for SinkNumericBudget<'_, S> {
+impl<S: CompileBudgetSink> AllocationRecovery for SinkNumericBudget<'_, S> {
     type Error = BudgetedCompileError<S::Error>;
 
+    fn allocator(&self) -> StateAllocator {
+        self.0.state_allocator()
+    }
+
+    fn recover_after_refusal(&mut self, before: u64) -> Result<bool, Self::Error> {
+        self.0
+            .recover_allocator_refusal(before)
+            .map_err(BudgetedCompileError::Budget)
+    }
+}
+
+fn reserve_shape<T, S: CompileBudgetSink>(
+    values: &mut AllocVec<T, StateAllocator>,
+    additional: usize,
+    sink: &mut S,
+) -> Result<(), BudgetedCompileError<S::Error>> {
+    try_reserve_exact_with(values, additional, &mut SinkNumericBudget(sink)).map_err(|error| {
+        match error {
+            ReserveError::Recovery(error) => error,
+            ReserveError::AllocatorMismatch
+            | ReserveError::CallbackRefused
+            | ReserveError::AllocationFailed => BudgetedCompileError::AllocationFailed,
+        }
+    })
+}
+
+impl<S: CompileBudgetSink> NumericBudget for SinkNumericBudget<'_, S> {
     fn before_conversion(&mut self, charge: NumericCharge) -> Result<(), Self::Error> {
         // 分類器只走訪已複製的 numeral bytes，不配置；這次 metadata pass
         // 已由 LEX 的 288*(source bytes+1) 支付。以下只預付實際轉換。
@@ -72,14 +141,18 @@ impl<S: CompileBudgetSink> NumericBudget for SinkNumericBudget<'_, S> {
         // 16*26*1694=704704，小於固定 1000000。
         // 額外 64/byte 支付 numeral 解析與長尾數走訪。hex powi 的
         // compiler-rt i32 指數迴圈至多 32 次，固定 512 預付。
-        let work = match charge {
-            NumericCharge::DecimalFast(bytes) => add(512, mul(bytes, 64)?)?,
-            NumericCharge::DecimalConservative(bytes) => add(1_000_000, mul(bytes, 64)?)?,
-            NumericCharge::HexPowi => 512,
-        };
+        let work = numeric_conversion_work(charge)?;
         self.0
             .spend_work(work)
             .map_err(BudgetedCompileError::Budget)
+    }
+}
+
+fn numeric_conversion_work<E>(charge: NumericCharge) -> Result<usize, BudgetedCompileError<E>> {
+    match charge {
+        NumericCharge::DecimalFast(bytes) => add(512, mul(bytes, 64)?),
+        NumericCharge::DecimalConservative(bytes) => add(1_000_000, mul(bytes, 64)?),
+        NumericCharge::HexPowi => Ok(512),
     }
 }
 
@@ -113,7 +186,7 @@ fn lex_admission<E>(
     let token_storage = mul(mul(token_slots, 2)?.max(4), size_of::<crate::Token>())?;
     let literals = add(mul(bytes, 12)?, 8)?;
     let temporary = add(token_storage, literals)?;
-    // Cursor 只向前 advance，每次至少消耗一 byte（CRLF 可消耗兩 byte），
+    // scanner 只向前索取來源，每次至少消耗一 byte（CRLF 同一邏輯換行），
     // 所有 scanner 主迴圈、escape、literal push、token emit 與座標更新
     // 依消耗位置攤銷至多 48 單位。keyword 只有 23 個固定 ASCII 形式，
     // 最長 8 byte；每個 identifier token 至多 23 次長度及 8 byte
@@ -137,6 +210,10 @@ fn lex_admission<E>(
     Ok((work, temporary))
 }
 
+// 逐 byte 的來源准入與每個 token 的線上形狀准入需要額外固定 work。
+const PULL_BYTE_WORK: usize = 64;
+const PULL_TOKEN_WORK: usize = 128;
+
 #[derive(Default)]
 struct ParseTokenBounds {
     literal_bytes: usize,
@@ -156,16 +233,13 @@ fn bump<E>(value: &mut usize) -> Result<(), BudgetedCompileError<E>> {
     Ok(())
 }
 
-fn parse_token_bounds<E>(chunk: &LexedChunk) -> Result<ParseTokenBounds, BudgetedCompileError<E>> {
-    use crate::{Keyword as K, Symbol as S, TokenKind as T};
 
-    let mut bounds = ParseTokenBounds {
-        block_containers: 1, // root Block
-        ..ParseTokenBounds::default()
-    };
-    // 這一趟 metadata 掃描只讀 kind 與 literal.capacity()；LEX admission
-    // 已預付 parse_admission 的 token/literal 遍歷，無 payload byte scan。
-    for token in &chunk.tokens {
+
+fn update_parse_token_bounds<E>(
+    bounds: &mut ParseTokenBounds,
+    token: &crate::Token,
+) -> Result<(), BudgetedCompileError<E>> {
+    use crate::{Keyword as K, Symbol as S, TokenKind as T};
         if let Some(literal) = token.literal.as_ref() {
             bounds.literal_bytes = add(bounds.literal_bytes, literal_bytes(literal))?;
         }
@@ -238,8 +312,7 @@ fn parse_token_bounds<E>(chunk: &LexedChunk) -> Result<ParseTokenBounds, Budgete
             }
             T::Eof => {}
         }
-    }
-    Ok(bounds)
+    Ok(())
 }
 
 fn parse_vec_bytes<E>(
@@ -254,18 +327,24 @@ fn parse_vec_bytes<E>(
     Ok((mul(slots, width)?, mul(elements, width)?))
 }
 
-fn parse_admission<E>(
-    chunk: &LexedChunk,
+fn meaning_vec_bytes<E>(elements: usize, containers: usize, width: usize)
+    -> Result<usize, BudgetedCompileError<E>> {
+    let (retained, growth) = parse_vec_bytes(elements, containers, width)?;
+    add(retained, growth)
+}
+
+
+
+fn parse_admission_from_bounds<E>(
+    tokens: usize,
+    bounds: &ParseTokenBounds,
     limits: &CompileLimits,
 ) -> Result<(usize, usize, CompileLimits), BudgetedCompileError<E>> {
-    let tokens = chunk.tokens.len();
     // 原有動態節點限額與 parser 自身限制保持不變。function_name 的
     // FieldExpr/Box 並未 reserve_node，故 heap 上界另外依 token 建立。
     let node_ceiling = add(mul(tokens, 4)?, 4)?.min(limits.max_ast_nodes);
     let mut local_limits = *limits;
     local_limits.max_ast_nodes = node_ceiling;
-    let bounds = parse_token_bounds(chunk)?;
-
     // 每個 StmtVec element 有一個獨有的 statement keyword、label/empty
     // 符號，或 assignment/call 的 =、(、:、string/{ 觸發 token。
     // ExprVec element 有獨有 prefix token；LocalNameVec element 有 name。
@@ -312,22 +391,28 @@ fn parse_admission<E>(
     let payload = mul(bounds.literal_bytes, 4)?;
     // 同一時刻至多一個 Vec grow，舊＋新 buffer 由 vec_storage 加上
     // 各族最大的 growth_scratch 覆蓋；Box 與 payload 另計。
-    let temporary = add(
+    let ast_temporary = add(
         add(add(vec_storage, growth_scratch)?, add(boxes, payload)?)?,
         256,
     )?;
-    // Cursor、Pratt、list 與 AstMeter 皆對 token/AST 單調走訪；每
+    // scanner、Pratt frame、list 與 AstMeter 皆對 token/AST 單調走訪；每
     // token 512 單位覆蓋固定判斷與結構 walk。Vec element 建構/傳回、
     // push 及倍增舊 buffer 搬移合計不超過 2*vec_storage；Box
     // 建構與移入不超過 2*boxes；byte clone/走訪由 16*aggregate
     // payload capacity 支付。所有值都先 checked，再送 BudgetSink。
-    let work = add(
+    let ast_work = add(
         add(
             mul(tokens, 512)?,
             add(mul(vec_storage, 2)?, mul(boxes, 2)?)?,
         )?,
         mul(bounds.literal_bytes, 16)?,
     )?;
+    // 顯式 grammar frame 的容量與一次 grow 舊 buffer 都在前端暫存額度內。
+    let frame_slots = add(mul(tokens, 8)?, 8)?
+        .min(limits.max_parse_depth.saturating_mul(8).saturating_add(16));
+    let frame_storage = mul(mul(frame_slots, 3)?, crate::parser::frame_size())?;
+    let temporary = add(ast_temporary, frame_storage)?;
+    let work = add(ast_work, mul(frame_storage, 2)?)?;
     Ok((work, temporary, local_limits))
 }
 
@@ -337,57 +422,79 @@ pub(crate) struct BudgetedFrontend {
     pub(crate) ast_nodes: usize,
 }
 
-pub(crate) fn lex_parse_with_budget<S: CompileBudgetSink>(
-    source: &[u8],
-    profile: crate::LanguageProfile,
-    limits: &CompileLimits,
-    sink: &mut S,
-) -> Result<BudgetedFrontend, BudgetedCompileError<S::Error>> {
-    if source.len() > limits.max_source_bytes {
-        return Err(BudgetedCompileError::Frontend(
-            crate::lex(source, profile, limits).unwrap_err(),
-        ));
-    }
-    let (work, temporary) = lex_admission(source.len(), limits)?;
-    admit(sink, work, temporary)?;
-    let lexed = crate::lexer::lex_with_numeric_budget(
-        source,
-        profile,
-        limits,
-        &mut SinkNumericBudget(sink),
-    )
-    .map_err(|error| match error {
-        ScanError::Diagnostic(diagnostic) => BudgetedCompileError::Frontend(diagnostic),
-        ScanError::Budget(error) => error,
-    })?;
-    if lexed_allocation_bytes(&lexed)? > temporary {
-        return Err(BudgetedCompileError::AdmissionUnderestimated);
-    }
-    let (work, temporary, local_limits) = parse_admission(&lexed, limits)?;
-    admit(sink, work, temporary)?;
-    let (ast, ast_nodes) = crate::parser::parse_with_metrics(&lexed, profile, &local_limits)
-        .map_err(BudgetedCompileError::Frontend)?;
-    if ast_nodes > local_limits.max_ast_nodes || ast_allocation_bytes(&ast)? > temporary {
-        return Err(BudgetedCompileError::AdmissionUnderestimated);
-    }
-    Ok(BudgetedFrontend {
-        lexed,
-        ast,
-        ast_nodes,
-    })
+struct PullParseMeter {
+    bounds: ParseTokenBounds,
+    work: usize,
+    temporary: usize,
 }
+
+impl PullParseMeter {
+    fn new() -> Self {
+        Self {
+            bounds: ParseTokenBounds {
+                block_containers: 1,
+                ..ParseTokenBounds::default()
+            },
+            work: 0,
+            temporary: 0,
+        }
+    }
+
+    fn admit_token<S: CompileBudgetSink>(
+        &mut self,
+        token: &crate::Token,
+        count: usize,
+        limits: &CompileLimits,
+        sink: &mut S,
+    ) -> Result<(), BudgetedCompileError<S::Error>> {
+        update_parse_token_bounds(&mut self.bounds, token)?;
+        let (base_work, temporary, _) = parse_admission_from_bounds(count, &self.bounds, limits)?;
+        let extra_work = mul(count, PULL_TOKEN_WORK)?;
+        let work = add(base_work, extra_work)?;
+        let work_delta = work.checked_sub(self.work)
+            .ok_or(BudgetedCompileError::AdmissionUnderestimated)?;
+        let temporary_delta = temporary.checked_sub(self.temporary)
+            .ok_or(BudgetedCompileError::AdmissionUnderestimated)?;
+        sink.spend_work(work_delta).map_err(BudgetedCompileError::Budget)?;
+        sink.claim_temporary(temporary_delta).map_err(BudgetedCompileError::Budget)?;
+        self.work = work;
+        self.temporary = temporary;
+        Ok(())
+    }
+}
+
+
 
 struct AstMeter {
     bytes: usize,
 }
 
+trait MeterVector {
+    fn capacity_bytes(&self) -> Option<usize>;
+}
+
+impl<T> MeterVector for Vec<T> {
+    fn capacity_bytes(&self) -> Option<usize> {
+        self.capacity().checked_mul(size_of::<T>())
+    }
+}
+
+impl<T> MeterVector for AstVec<T> {
+    fn capacity_bytes(&self) -> Option<usize> {
+        self.capacity().checked_mul(size_of::<T>())
+    }
+}
+
 impl AstMeter {
-    fn vec<T, E>(&mut self, values: &Vec<T>) -> Result<(), BudgetedCompileError<E>> {
-        self.bytes = add(self.bytes, mul(values.capacity(), size_of::<T>())?)?;
+    fn vec<E>(&mut self, values: &impl MeterVector) -> Result<(), BudgetedCompileError<E>> {
+        self.bytes = add(
+            self.bytes,
+            values.capacity_bytes().ok_or(BudgetedCompileError::AdmissionOverflow)?,
+        )?;
         Ok(())
     }
 
-    fn name<E>(&mut self, value: &Vec<u8>) -> Result<(), BudgetedCompileError<E>> {
+    fn name<E>(&mut self, value: &crate::ast::AstName) -> Result<(), BudgetedCompileError<E>> {
         self.bytes = add(self.bytes, value.capacity())?;
         Ok(())
     }
@@ -400,7 +507,7 @@ impl AstMeter {
         Ok(())
     }
 
-    fn locals<E>(&mut self, locals: &Vec<LocalName>) -> Result<(), BudgetedCompileError<E>> {
+    fn locals<E>(&mut self, locals: &AstVec<LocalName>) -> Result<(), BudgetedCompileError<E>> {
         self.vec(locals)?;
         for local in locals {
             self.local(local)?;
@@ -408,7 +515,7 @@ impl AstMeter {
         Ok(())
     }
 
-    fn expressions<E>(&mut self, values: &Vec<Expr>) -> Result<(), BudgetedCompileError<E>> {
+    fn expressions<E>(&mut self, values: &AstVec<Expr>) -> Result<(), BudgetedCompileError<E>> {
         self.vec(values)?;
         for value in values {
             self.expression(value)?;
@@ -652,7 +759,7 @@ struct ResolveShape {
     // Lua 5.4 自由名稱只經 _ENV，Lua 5.5 才可能宣告 implicit global。
     lua55_implicit_globals: bool,
     // 預付容量後才啟用；每個 function 按名稱去重，保留當前祖先 prefix。
-    distinct_global_names: Option<Vec<Vec<u8>>>,
+    distinct_global_names: Option<AllocVec<AllocVec<u8, StateAllocator>, StateAllocator>>,
     key_compare_ops: usize,
     key_compare_work: usize,
     depth: usize,
@@ -661,12 +768,20 @@ struct ResolveShape {
 
 impl ResolveShape {
     fn root(profile: crate::LanguageProfile, distinct_implicit_globals: bool) -> Self {
+        Self::root_in(profile, distinct_implicit_globals, StateAllocator::Global)
+    }
+
+    fn root_in(
+        profile: crate::LanguageProfile,
+        distinct_implicit_globals: bool,
+        allocator: StateAllocator,
+    ) -> Self {
         Self {
             functions: 1,
             current_bindings: 1, // resolver 在 AST 前宣告 root _ENV
             current_key_bytes: 8,
             lua55_implicit_globals: profile == crate::LanguageProfile::Lua55,
-            distinct_global_names: distinct_implicit_globals.then(Vec::new),
+            distinct_global_names: distinct_implicit_globals.then(|| AllocVec::new_in(allocator)),
             depth: 1,
             max_depth: 1,
             ..Self::default()
@@ -679,8 +794,8 @@ impl ResolveShape {
     }
 
     fn finish_function_key_work<E>(&mut self) -> Result<(), BudgetedCompileError<E>> {
-        // resolver 的名稱表只含目前 function 與建立 child 時的祖先
-        // prefix；兄弟 function 的 key 不可能出現在這次碰撞比較。
+        // MeaningState 只查目前 function 與有效祖先的名稱索引；
+        // 兄弟 function 的 key 不會參與這次碰撞比較。
         let operations = add(
             add(
                 mul(self.current_references, 4)?,
@@ -719,14 +834,14 @@ impl ResolveShape {
         Ok(())
     }
 
-    fn name<E>(&mut self, name: &Vec<u8>) -> Result<(), BudgetedCompileError<E>> {
+    fn name<E>(&mut self, name: &crate::ast::AstName) -> Result<(), BudgetedCompileError<E>> {
         self.name_bytes = add(self.name_bytes, name.capacity())?;
         Ok(())
     }
 
-    fn key_name<E>(&mut self, name: &Vec<u8>) -> Result<(), BudgetedCompileError<E>> {
+    fn key_name<E>(&mut self, name: &crate::ast::AstName) -> Result<(), BudgetedCompileError<E>> {
         self.name(name)?;
-        self.current_key_bytes = add(self.current_key_bytes, name.capacity())?;
+        self.current_key_bytes = add(self.current_key_bytes, name.len())?;
         Ok(())
     }
 
@@ -746,27 +861,32 @@ impl ResolveShape {
         Ok(())
     }
 
-    fn expressions<E>(&mut self, expressions: &[Expr]) -> Result<(), BudgetedCompileError<E>> {
+    fn expressions<S: CompileBudgetSink>(
+        &mut self,
+        expressions: &[Expr],
+        sink: &mut S,
+    ) -> Result<(), BudgetedCompileError<S::Error>> {
         for expression in expressions {
-            self.expression(expression)?;
+            self.expression(expression, sink)?;
         }
         Ok(())
     }
 
-    fn function<E>(
+    fn function<S: CompileBudgetSink>(
         &mut self,
         body: &FunctionBody,
         method: bool,
-    ) -> Result<(), BudgetedCompileError<E>> {
+        sink: &mut S,
+    ) -> Result<(), BudgetedCompileError<S::Error>> {
         bump(&mut self.functions)?;
-        // child 的兩張 parent map 只含建立當下的祖先 prefix。兄弟
-        // function 的宣告、參照與 close path 不會進入該 child。
+        // 子 function 的查找與 capture 只涉及建立當下的祖先 prefix；
+        // 兄弟 function 的宣告、參照與 close path 不會進入該 child。
         let inherited = add(self.inherited_bindings, self.current_bindings)?;
         let inherited_keys = add(self.inherited_key_bytes, self.current_key_bytes)?;
         self.inherited_sum = add(self.inherited_sum, inherited)?;
         self.inherited_square_sum = add(self.inherited_square_sum, mul(inherited, inherited)?)?;
         self.inherited_key_sum = add(self.inherited_key_sum, inherited_keys)?;
-        // child 的兩張 parent map 僅複製此刻可見的祖先 prefix。
+        // 對祖先 prefix 的索引探查保留碰撞工作上界。
         let clone_ops = mul(inherited, 2)?;
         self.key_compare_ops = add(self.key_compare_ops, clone_ops)?;
         self.key_compare_work = add(self.key_compare_work, mul(clone_ops, inherited_keys)?)?;
@@ -792,7 +912,9 @@ impl ResolveShape {
         self.current_reference_name_bytes = 0;
         self.current_labels = 0;
         self.current_gotos = 0;
-        self.distinct_global_names = saved_distinct_names.as_ref().map(|_| Vec::new());
+        self.distinct_global_names = saved_distinct_names
+            .as_ref()
+            .map(|names| AllocVec::new_in(names.allocator().clone()));
         self.depth = add(self.depth, 1)?;
         self.max_depth = self.max_depth.max(self.depth);
         if method {
@@ -810,7 +932,7 @@ impl ResolveShape {
         {
             self.declaration(name)?;
         }
-        self.block(&body.body)?;
+        self.block(&body.body, sink)?;
         self.close_binding_pairs = add(
             self.close_binding_pairs,
             mul(self.current_close_paths, self.current_bindings)?,
@@ -832,32 +954,40 @@ impl ResolveShape {
         Ok(())
     }
 
-    fn block<E>(&mut self, block: &Block) -> Result<(), BudgetedCompileError<E>> {
+    fn block<S: CompileBudgetSink>(
+        &mut self,
+        block: &Block,
+        sink: &mut S,
+    ) -> Result<(), BudgetedCompileError<S::Error>> {
         bump(&mut self.blocks)?;
         self.add_close_paths(2)?; // normal 與 error
         for statement in &block.statements {
-            self.statement(statement)?;
+            self.statement(statement, sink)?;
         }
         Ok(())
     }
 
-    fn statement<E>(&mut self, statement: &Stmt) -> Result<(), BudgetedCompileError<E>> {
+    fn statement<S: CompileBudgetSink>(
+        &mut self,
+        statement: &Stmt,
+        sink: &mut S,
+    ) -> Result<(), BudgetedCompileError<S::Error>> {
         match statement {
             Stmt::Empty { .. } => {}
             Stmt::Return { values, .. } => {
                 self.add_close_paths(1)?;
-                self.expressions(values)?;
+                self.expressions(values, sink)?;
             }
             Stmt::Assignment {
                 targets, values, ..
             } => {
-                self.expressions(targets)?;
-                self.expressions(values)?;
+                self.expressions(targets, sink)?;
+                self.expressions(values, sink)?;
             }
-            Stmt::Call { call, .. } => self.expression(call)?,
+            Stmt::Call { call, .. } => self.expression(call, sink)?,
             Stmt::Local { names, values, .. } => {
                 self.declarations(names)?;
-                self.expressions(values)?;
+                self.expressions(values, sink)?;
             }
             Stmt::Global { declaration, .. } => match declaration {
                 GlobalDeclaration::Names {
@@ -867,7 +997,7 @@ impl ResolveShape {
                     ..
                 } => {
                     self.declarations(names)?;
-                    self.expressions(values)?;
+                    self.expressions(values, sink)?;
                     if let Some(attribute) = prefix_attribute {
                         self.name(&attribute.name)?;
                     }
@@ -882,7 +1012,7 @@ impl ResolveShape {
                 GlobalDeclaration::Function { name, body, .. } => {
                     self.binding()?;
                     self.key_name(name)?;
-                    self.function(body, false)?;
+                    self.function(body, false, sink)?;
                 }
             },
             Stmt::Break { .. } => self.add_close_paths(1)?,
@@ -897,18 +1027,18 @@ impl ResolveShape {
                 bump(&mut self.current_labels)?;
                 self.key_name(name)?;
             }
-            Stmt::Do { body, .. } => self.block(body)?,
+            Stmt::Do { body, .. } => self.block(body, sink)?,
             Stmt::If {
                 clauses,
                 else_block,
                 ..
             } => {
                 for (condition, body) in clauses {
-                    self.expression(condition)?;
-                    self.block(body)?;
+                    self.expression(condition, sink)?;
+                    self.block(body, sink)?;
                 }
                 if let Some(body) = else_block {
-                    self.block(body)?;
+                    self.block(body, sink)?;
                 }
             }
             Stmt::While {
@@ -917,8 +1047,8 @@ impl ResolveShape {
             | Stmt::Repeat {
                 condition, body, ..
             } => {
-                self.expression(condition)?;
-                self.block(body)?;
+                self.expression(condition, sink)?;
+                self.block(body, sink)?;
             }
             Stmt::NumericFor {
                 name,
@@ -929,12 +1059,12 @@ impl ResolveShape {
                 ..
             } => {
                 self.declaration(name)?;
-                self.expression(initial)?;
-                self.expression(limit)?;
+                self.expression(initial, sink)?;
+                self.expression(limit, sink)?;
                 if let Some(step) = step {
-                    self.expression(step)?;
+                    self.expression(step, sink)?;
                 }
-                self.block(body)?;
+                self.block(body, sink)?;
             }
             Stmt::GenericFor {
                 names,
@@ -946,27 +1076,31 @@ impl ResolveShape {
                 self.binding()?; // 隱藏的 generic-for close binding
                 self.add_close_paths(1)?;
                 self.declarations(names)?;
-                self.expressions(values)?;
-                self.block(body)?;
+                self.expressions(values, sink)?;
+                self.block(body, sink)?;
             }
             Stmt::Function {
                 name, method, body, ..
             } => {
-                self.expression(name)?;
+                self.expression(name, sink)?;
                 if let Some(method) = method {
                     self.name(&method.name)?;
                 }
-                self.function(body, method.is_some())?;
+                self.function(body, method.is_some(), sink)?;
             }
             Stmt::LocalFunction { name, body, .. } => {
                 self.declaration(name)?;
-                self.function(body, false)?;
+                self.function(body, false, sink)?;
             }
         }
         Ok(())
     }
 
-    fn expression<E>(&mut self, expression: &Expr) -> Result<(), BudgetedCompileError<E>> {
+    fn expression<S: CompileBudgetSink>(
+        &mut self,
+        expression: &Expr,
+        sink: &mut S,
+    ) -> Result<(), BudgetedCompileError<S::Error>> {
         match expression {
             Expr::Literal { literal, .. } => {
                 self.literal_bytes = add(self.literal_bytes, literal_bytes(literal))?;
@@ -975,9 +1109,9 @@ impl ResolveShape {
             Expr::Name { name, .. } => {
                 bump(&mut self.references)?;
                 bump(&mut self.current_references)?;
-                self.reference_name_bytes = add(self.reference_name_bytes, name.capacity())?;
+                self.reference_name_bytes = add(self.reference_name_bytes, name.len())?;
                 self.current_reference_name_bytes =
-                    add(self.current_reference_name_bytes, name.capacity())?;
+                    add(self.current_reference_name_bytes, name.len())?;
                 self.name(name)?;
                 if self.lua55_implicit_globals {
                     // implicit_globals 在每個 function 以名稱為 key，並按
@@ -990,14 +1124,13 @@ impl ResolveShape {
                         {
                             false
                         } else {
-                            let mut owned = Vec::new();
-                            owned
-                                .try_reserve_exact(name.len())
-                                .map_err(|_| BudgetedCompileError::AdmissionOverflow)?;
+                            let mut owned = AllocVec::new_in(sink.state_allocator());
+                            reserve_shape(&mut owned, name.len(), sink)?;
                             owned.extend_from_slice(name);
-                            names
-                                .try_reserve(1)
-                                .map_err(|_| BudgetedCompileError::AdmissionOverflow)?;
+                            if names.len() == names.capacity() {
+                                let additional = names.len().max(1);
+                                reserve_shape(names, additional, sink)?;
+                            }
                             names.push(owned);
                             true
                         }
@@ -1013,30 +1146,30 @@ impl ResolveShape {
                                 1
                             },
                         )?;
-                        self.current_key_bytes = add(self.current_key_bytes, name.capacity())?;
+                        self.current_key_bytes = add(self.current_key_bytes, name.len())?;
                     }
                 }
             }
             Expr::Unary { expression, .. } | Expr::Paren { expression, .. } => {
-                self.expression(expression)?;
+                self.expression(expression, sink)?;
             }
             Expr::Binary { left, right, .. } => {
-                self.expression(left)?;
-                self.expression(right)?;
+                self.expression(left, sink)?;
+                self.expression(right, sink)?;
             }
             Expr::Index { base, index, .. } => {
-                self.expression(base)?;
-                self.expression(index)?;
+                self.expression(base, sink)?;
+                self.expression(index, sink)?;
             }
             Expr::Field { base, name, .. } => {
-                self.expression(base)?;
+                self.expression(base, sink)?;
                 self.name(name)?;
             }
             Expr::Call {
                 callee, arguments, ..
             } => {
-                self.expression(callee)?;
-                self.expressions(arguments)?;
+                self.expression(callee, sink)?;
+                self.expressions(arguments, sink)?;
             }
             Expr::MethodCall {
                 receiver,
@@ -1044,22 +1177,22 @@ impl ResolveShape {
                 arguments,
                 ..
             } => {
-                self.expression(receiver)?;
+                self.expression(receiver, sink)?;
                 self.name(method)?;
-                self.expressions(arguments)?;
+                self.expressions(arguments, sink)?;
             }
-            Expr::Function { body, .. } => self.function(body, false)?,
+            Expr::Function { body, .. } => self.function(body, false, sink)?,
             Expr::TableConstructor { fields, .. } => {
                 for field in fields {
                     match field {
-                        TableField::Array { value, .. } => self.expression(value)?,
+                        TableField::Array { value, .. } => self.expression(value, sink)?,
                         TableField::Named { name, value, .. } => {
                             self.name(name)?;
-                            self.expression(value)?;
+                            self.expression(value, sink)?;
                         }
                         TableField::Indexed { key, value, .. } => {
-                            self.expression(key)?;
-                            self.expression(value)?;
+                            self.expression(key, sink)?;
+                            self.expression(value, sink)?;
                         }
                     }
                 }
@@ -1110,7 +1243,7 @@ fn resolve_admission<E>(
     .into_iter()
     .max()
     .unwrap_or(0);
-    let (scope_size, label_size, parent_size, access_size) = crate::resolve::budget_layout_sizes();
+    let (scope_size, label_size, parent_size) = crate::resolve::budget_layout_sizes();
     let map_entry = add(
         16,
         [
@@ -1121,7 +1254,6 @@ fn resolve_admission<E>(
                 size_of::<Vec<u8>>(),
                 mul(size_of::<Option<crate::BindingId>>(), 2)?,
             )?,
-            add(size_of::<crate::BindingId>(), access_size)?,
             size_of::<(crate::BindingId, crate::UpvalueId)>(),
         ]
         .into_iter()
@@ -1132,13 +1264,13 @@ fn resolve_admission<E>(
     // rustc 1.98.1 所用 hashbrown 0.17.1：小表至少 4 buckets，大表
     // 容量為 buckets 的 7/8；成長目標是 max(所需數,舊容量+1)，
     // clone 保留 bucket 數。舊＋新表、bucket control/alignment 以五倍
-    // entry bytes 加每表 128 bytes 支付；包含 scope bindings/labels、implicit globals、
-    // upvalue ids、每層 child 的 parent-visible 與 parent-metadata clone。
+    // entry bytes 加每表 128 bytes 支付；包含 scope labels 與
+    // MeaningState 的可見名稱、implicit global 索引的保守上界。
     let map_entries = [
         visible_bindings,
         shape.labels,
         shape.references,
-        // parent-visible、parent-metadata、upvalue-id 與 clone scratch
+    // parent-visible、upvalue-id 與 clone scratch
         // 的 key 數皆受每個 child 建立當下的祖先 binding prefix 限制。
         mul(shape.inherited_sum, 4)?,
     ]
@@ -1146,18 +1278,9 @@ fn resolve_admission<E>(
     .try_fold(0usize, add)?;
     let output_nodes = mul(mul(node_slots, node_size)?, 3)?;
     let output_metadata = mul(mul(bindings, size_of::<crate::resolve::BindingMeta>())?, 4)?;
-    // ScopeFrame 的 sizeof 僅包含 Vec handle；三個 backing buffer
-    // 分別是 local bindings、close bindings、宣告 span snapshot。
-    let scope_vectors = mul(
-        mul(
-            bindings,
-            add(
-                mul(size_of::<crate::BindingId>(), 2)?,
-                size_of::<crate::Span>(),
-            )?,
-        )?,
-        4,
-    )?;
+    // ScopeFrame 的 sizeof 僅包含 Vec handle；兩個 backing buffer
+    // 分別是 local bindings 與 close bindings。
+    let scope_vectors = mul(mul(bindings, mul(size_of::<crate::BindingId>(), 2)?)?, 4)?;
     let upvalue_metadata = mul(
         mul(
             shape.inherited_sum,
@@ -1210,6 +1333,22 @@ fn resolve_admission<E>(
         )?,
         mul(shape.literal_bytes, 2)?,
     )?;
+    let [function_size, meaning_scope_size, meaning_binding_size, meaning_label_size,
+        pending_goto_size, queued_label_size, implicit_global_size] =
+        crate::resolve::meaning::budget_layout_sizes();
+    let model_captures = mul(shape.references, shape.max_depth)?;
+    let model_pending = mul(shape.gotos, shape.max_depth)?;
+    let meaning_temporary = [
+        meaning_vec_bytes(shape.max_depth, 1, function_size)?,
+        meaning_vec_bytes(scopes, functions, meaning_scope_size)?,
+        meaning_vec_bytes(bindings, functions, meaning_binding_size)?,
+        meaning_vec_bytes(bindings, scopes, size_of::<crate::BindingId>())?,
+        meaning_vec_bytes(shape.labels, scopes, meaning_label_size)?,
+        meaning_vec_bytes(shape.labels, scopes, queued_label_size)?,
+        meaning_vec_bytes(model_pending, scopes, pending_goto_size)?,
+        meaning_vec_bytes(model_captures, functions, size_of::<crate::BindingId>())?,
+        meaning_vec_bytes(shape.references, functions, implicit_global_size)?,
+    ].into_iter().try_fold(0usize, add)?;
     let temporary = [
         output_nodes,
         output_metadata,
@@ -1221,18 +1360,16 @@ fn resolve_admission<E>(
         close_lists,
         maps,
         payload,
+        meaning_temporary,
     ]
     .into_iter()
     .try_fold(0usize, add)?;
 
-    // 每次名稱查找至多掃全部 scope，binding_kind/readonly 線性掃本
-    // function bindings；child visible map 對每個 entry 也呼叫
-    // binding_kind，祖先 capture 最多經 F 層轉接。goto 掃宣告快照，
+    // 每次名稱查找至多探查全部有效 scope，readonly 檢查可掃
+    // function bindings；祖先 capture 最多經 F 層轉接。goto 掃宣告快照，
     // close_path 掃所有離開的 scope 及其 local/close bindings。
     let lookup = mul(mul(shape.references, 4)?, add(scopes, bindings)?)?;
-    // 每個 child 的 visible_bindings/visible_binding_access 只複製
-    // prefix；binding_kind 最多線性掃該 prefix，兩段 walk 各以
-    // prefix² 支付，包含空 parent map 與極端不均勻分布。
+    // 祖先 prefix 在極端碰撞與多層 capture 時仍保留平方工作額度。
     let visible = mul(shape.inherited_square_sum, 2)?;
     let capture = mul(
         mul(shape.references, shape.max_depth)?,
@@ -1244,8 +1381,8 @@ fn resolve_admission<E>(
         .into_iter()
         .try_fold(0usize, add)?;
     // HashMap 最壞碰撞仍按整張可見表的 key bytes 支付。AST walk
-    // 已把每次查找歸到當前 function，加上其 ancestor prefix；child
-    // map clone 只見建立當下的 prefix。另將原本每個 function 的
+    // 已把每次查找歸到當前 function，加上其 ancestor prefix。
+    // 另將每個 function 的
     // generated-key 額度套到每次操作，保留未知隱含名稱的保守界。
     let hash_work = add(
         shape.key_compare_work,
@@ -1260,7 +1397,7 @@ fn resolve_admission<E>(
         )?,
         128,
     )?;
-    let work = add(add(base, mul(structural, 4)?)?, mul(byte_work, 2)?)?;
+    let work = add(add(base, mul(structural, 8)?)?, mul(byte_work, 4)?)?;
     Ok((work, temporary))
 }
 
@@ -1278,6 +1415,16 @@ pub(crate) fn resolve_with_budget<S: CompileBudgetSink>(
     limits: &CompileLimits,
     sink: &mut S,
 ) -> Result<BudgetedResolved, BudgetedCompileError<S::Error>> {
+    resolve_with_budget_context(frontend, profile, limits, sink, None)
+}
+
+fn resolve_with_budget_context<S: CompileBudgetSink>(
+    frontend: BudgetedFrontend,
+    profile: crate::LanguageProfile,
+    limits: &CompileLimits,
+    sink: &mut S,
+    failure: Option<&mut Option<crate::official_failure::OfficialFailure>>,
+) -> Result<BudgetedResolved, BudgetedCompileError<S::Error>> {
     // Parser 將 AST 節點數限於 4*(token 數)+4；此固定 scalar walk 每
     // node/field 不配置，只讀 enum、Vec length/capacity 並 checked 加總。
     // 先付 512 單位/token，才開始讀取實際宣告與 close-site shape。
@@ -1285,14 +1432,20 @@ pub(crate) fn resolve_with_budget<S: CompileBudgetSink>(
     sink.spend_work(shape_work)
         .map_err(BudgetedCompileError::Budget)?;
     let mut shape = ResolveShape::root(profile, false);
-    shape.block(&frontend.ast.root)?;
+    shape.block(&frontend.ast.root, sink)?;
     shape.finish_function_key_work()?;
     if profile == crate::LanguageProfile::Lua55 {
         // 第一輪無配置且只讀 AST，先以逐 function R²、R*B 的 checked
         // 上界預付；第二輪才可配置暫存名稱表。所有 live function 名稱
         // 都來自互斥的 AST 參照，Vec grow 舊＋新 buffer 至多 4R handles。
         let distinct_temporary = add(
-            mul(mul(shape.references, size_of::<Vec<u8>>())?, 4)?,
+            mul(
+                mul(
+                    shape.references,
+                    size_of::<AllocVec<u8, StateAllocator>>(),
+                )?,
+                4,
+            )?,
             mul(shape.reference_name_bytes, 4)?,
         )?;
         admit(
@@ -1300,15 +1453,26 @@ pub(crate) fn resolve_with_budget<S: CompileBudgetSink>(
             add(shape.distinct_scan_work, shape_work)?,
             distinct_temporary,
         )?;
-        let mut distinct_shape = ResolveShape::root(profile, true);
-        distinct_shape.block(&frontend.ast.root)?;
+        let mut distinct_shape = ResolveShape::root_in(profile, true, sink.state_allocator());
+        distinct_shape.block(&frontend.ast.root, sink)?;
         distinct_shape.finish_function_key_work()?;
         shape = distinct_shape;
     }
     let (work, temporary) = resolve_admission(&frontend, &shape)?;
     admit(sink, work, temporary)?;
-    let resolved = crate::resolve(&frontend.ast, &frontend.lexed, profile, limits)
-        .map_err(BudgetedCompileError::Frontend)?;
+    let resolved = crate::resolve::resolve_with_recovery_context(
+        &frontend.ast,
+        &frontend.lexed,
+        profile,
+        limits,
+        &mut SinkNumericBudget(sink),
+        failure,
+    )
+    .map_err(|error| match error {
+        ResolveError::Diagnostic(diagnostic) => BudgetedCompileError::Frontend(diagnostic),
+        ResolveError::Recovery(error) => error,
+        ResolveError::AllocationFailed => BudgetedCompileError::AllocationFailed,
+    })?;
     if resolved_allocation_bytes(&resolved)? > temporary
         || resolved.functions.len() != shape.functions
     {
@@ -1341,7 +1505,7 @@ impl AstMeter {
 
     fn resolved_locals<E>(
         &mut self,
-        values: &Vec<ResolvedLocalName>,
+        values: &crate::resolve::ResolvedVec<ResolvedLocalName>,
     ) -> Result<(), BudgetedCompileError<E>> {
         self.vec(values)?;
         for value in values {
@@ -1352,7 +1516,7 @@ impl AstMeter {
 
     fn resolved_expressions<E>(
         &mut self,
-        values: &Vec<ResolvedExpr>,
+        values: &crate::resolve::ResolvedVec<ResolvedExpr>,
     ) -> Result<(), BudgetedCompileError<E>> {
         self.vec(values)?;
         for value in values {
@@ -1631,6 +1795,7 @@ struct LowerShape {
     exited_bindings: usize,
     generic_for_name_exits: usize,
     native_list_writes: usize,
+    native_global_nil_checks: usize,
 }
 
 impl LowerShape {
@@ -1645,7 +1810,7 @@ impl LowerShape {
         Ok(())
     }
 
-    fn name<E>(&mut self, name: &Vec<u8>) -> Result<(), BudgetedCompileError<E>> {
+    fn name<E>(&mut self, name: &crate::ast::AstName) -> Result<(), BudgetedCompileError<E>> {
         self.name_bytes = add(self.name_bytes, name.capacity())?;
         Ok(())
     }
@@ -1720,11 +1885,19 @@ impl LowerShape {
             ResolvedGlobalDeclaration::Names { names, values, .. } => {
                 self.locals(names)?;
                 self.expressions(values)?;
+                if !values.is_empty() {
+                    self.native_global_nil_checks = add(self.native_global_nil_checks, names.len())?;
+                    for name in names {
+                        self.name(&name.name)?;
+                    }
+                }
             }
             ResolvedGlobalDeclaration::Star { .. } => {}
             ResolvedGlobalDeclaration::Function { name, body, .. } => {
                 self.name(name)?;
                 self.function(body)?;
+                bump(&mut self.native_global_nil_checks)?;
+                self.name(name)?;
             }
         }
         Ok(())
@@ -2022,7 +2195,7 @@ fn lower_admission<E>(
             mul(functions, 8)?,
         )?
     };
-    let instruction_ceiling = structural_ceiling.min(mul(functions, limits.max_instructions)?);
+    let instruction_ceiling = structural_ceiling.min(functions.saturating_mul(limits.max_instructions));
     let mut local_limits = *limits;
     local_limits.max_instructions = structural_ceiling.min(limits.max_instructions);
     // 每個非空 Vec 最少可配置 4 個元素；倍增時最壞同時持有舊＋新
@@ -2090,6 +2263,7 @@ fn lower_admission<E>(
         shape.labels,
         shape.gotos,
         shape.native_list_writes,
+        shape.native_global_nil_checks,
     ]
     .into_iter()
     .try_fold(0usize, add)?;
@@ -2103,7 +2277,7 @@ fn lower_admission<E>(
         mul(mul(instruction_ceiling, 4)?, size_of::<usize>())?,
     )?;
     let metadata = mul(
-        mul(add(upvalues, functions)?, 4)?,
+        mul(add(upvalues, mul(functions, 2)?)?, 4)?,
         size_of::<crate::ir::IrUpvalue>(),
     )?;
     // lower 先複製 functions metadata；整個 ResolvedModule 的已測量
@@ -2227,7 +2401,13 @@ pub(crate) fn lower_with_budget<S: CompileBudgetSink>(
     shape.block(&resolved.resolved.root)?;
     let (work, temporary, local_limits) = lower_admission(&resolved, limits, &shape)?;
     admit(sink, work, temporary)?;
-    let ir = crate::lower(&resolved.resolved, &local_limits).map_err(BudgetedCompileError::Ir)?;
+    let ir = crate::codegen::lower_with_recovery(
+        &resolved.resolved, &local_limits, &mut SinkNumericBudget(sink),
+    ).map_err(|error| match error {
+        crate::codegen::LowerError::Ir(error) => BudgetedCompileError::Ir(error),
+        crate::codegen::LowerError::Recovery(error) => error,
+        crate::codegen::LowerError::AllocationFailed => BudgetedCompileError::AllocationFailed,
+    })?;
     if ir_allocation_bytes(&ir)? > temporary {
         return Err(BudgetedCompileError::AdmissionUnderestimated);
     }
@@ -2279,6 +2459,7 @@ fn ir_allocation_bytes<E>(module: &IrModule) -> Result<usize, BudgetedCompileErr
             meter.vec(&debug.non_counted_pcs)?;
         }
         meter.vec(&prototype.native_list_writes)?;
+        meter.vec(&prototype.native_global_nil_checks)?;
     }
     Ok(meter.bytes)
 }
@@ -2292,7 +2473,10 @@ fn vec_upper<E>(len: usize, element_size: usize) -> Result<usize, BudgetedCompil
 
 fn close_candidate_upper<E>(close: &IrClosePath) -> Result<usize, BudgetedCompileError<E>> {
     add(
-        size_of::<rivetlua_core::BytecodeClosePath>(),
+        add(
+            size_of::<rivetlua_core::BytecodeClosePath>(),
+            StateAllocator::shared_block_size::<rivetlua_core::BytecodeClosePathData>(),
+        )?,
         add(
             vec_upper(
                 close.bindings.len(),
@@ -2303,7 +2487,7 @@ fn close_candidate_upper<E>(close: &IrClosePath) -> Result<usize, BudgetedCompil
     )
 }
 
-fn candidate_upper<E>(ir: &IrModule) -> Result<usize, BudgetedCompileError<E>> {
+fn candidate_upper<E>(ir: &IrModule) -> Result<(usize, usize), BudgetedCompileError<E>> {
     let mut total = add(
         size_of::<rivetlua_core::BytecodeModule>(),
         add(
@@ -2317,6 +2501,8 @@ fn candidate_upper<E>(ir: &IrModule) -> Result<usize, BudgetedCompileError<E>> {
             )?,
         )?,
     )?;
+    let mut measurement_owner_refs = 0usize;
+    let owner_size = StateAllocator::shared_block_size::<rivetlua_core::BytecodeVec<u8>>();
     for proto in &ir.prototypes {
         let arrays = [
             vec_upper(
@@ -2345,41 +2531,80 @@ fn candidate_upper<E>(ir: &IrModule) -> Result<usize, BudgetedCompileError<E>> {
         }
         for constant in &proto.constants {
             match constant {
-                IrConstant::Literal(literal) => total = add(total, literal_bytes(literal))?,
-                IrConstant::Name(name) => total = add(total, name.len())?,
+                IrConstant::Literal(literal) => {
+                    total = add(total, literal_bytes(literal))?;
+                    if matches!(literal, Literal::Name(_) | Literal::String(_)) {
+                        total = add(total, owner_size)?;
+                        measurement_owner_refs = add(measurement_owner_refs, 1)?;
+                    }
+                }
+                IrConstant::Name(name) => {
+                    total = add(total, add(name.capacity(), owner_size)?)?;
+                    measurement_owner_refs = add(measurement_owner_refs, 1)?;
+                }
                 IrConstant::Boolean(_) => {}
             }
         }
         for close in &proto.close_paths {
             total = add(total, close_candidate_upper(close)?)?;
+            measurement_owner_refs = add(measurement_owner_refs, 1)?;
         }
         for instruction in &proto.instructions {
             if let Some(close) = &instruction.close_path {
                 total = add(total, close_candidate_upper(close)?)?;
+                measurement_owner_refs = add(measurement_owner_refs, 1)?;
             }
         }
     }
-    Ok(total)
+    Ok((total, measurement_owner_refs))
+}
+
+fn owner_sort_work<E>(count: usize) -> Result<usize, BudgetedCompileError<E>> {
+    let levels = if count == 0 { 0 } else { usize::BITS - count.leading_zeros() };
+    mul(count, (levels as usize + 1) * 2)
 }
 
 pub(crate) struct BudgetedCandidate {
     pub(crate) resolved: ResolvedModule,
     pub(crate) ir: IrModule,
     pub(crate) bytecode: rivetlua_core::BytecodeModule,
+    measurement_owner_refs: usize,
 }
 
 pub(crate) fn candidate_with_budget<S: CompileBudgetSink>(
     lowered: BudgetedIr,
     sink: &mut S,
 ) -> Result<BudgetedCandidate, BudgetedCompileError<S::Error>> {
-    let upper = candidate_upper(&lowered.ir)?;
+    let (upper, measurement_owner_refs) = candidate_upper(&lowered.ir)?;
     // candidate clone、實際容量核對、wire 上界及後段 emit admission
     // 的唯讀掃描共至多四次走訪；每次所見元素/bytes 均包含於 upper。
-    admit(sink, mul(upper, 4)?, upper)?;
-    let bytecode =
-        crate::codegen::bytecode_module(&lowered.ir).map_err(BudgetedCompileError::Bytecode)?;
-    let actual = rivetlua_core::bytecode_module_allocation_bytes(&bytecode)
-        .map_err(|_| BudgetedCompileError::AdmissionOverflow)?;
+    admit(
+        sink,
+        add(mul(upper, 4)?, mul(owner_sort_work(measurement_owner_refs)?, 2)?)?,
+        add(upper, mul(measurement_owner_refs, size_of::<(usize, usize)>())?)?,
+    )?;
+    let bytecode = crate::codegen::bytecode_module_with_recovery(
+        &lowered.ir,
+        &mut SinkNumericBudget(sink),
+    )
+    .map_err(|error| match error {
+        crate::codegen::CandidateBuildError::Bytecode(error) =>
+            BudgetedCompileError::Bytecode(error),
+        crate::codegen::CandidateBuildError::Reserve(ReserveError::Recovery(error)) => error,
+        crate::codegen::CandidateBuildError::Reserve(_) => BudgetedCompileError::AllocationFailed,
+    })?;
+    let actual = rivetlua_core::bytecode_module_allocation_bytes_with_recovery(
+        &bytecode,
+        &mut SinkNumericBudget(sink),
+    )
+    .map_err(|error| match error {
+        rivetlua_core::TransportMeasureRecoveryError::Transport(_) =>
+            BudgetedCompileError::AdmissionOverflow,
+        rivetlua_core::TransportMeasureRecoveryError::Reserve(ReserveError::Recovery(error)) =>
+            error,
+        rivetlua_core::TransportMeasureRecoveryError::Reserve(_) =>
+            BudgetedCompileError::AllocationFailed,
+    })?;
     if actual > upper {
         return Err(BudgetedCompileError::AdmissionUnderestimated);
     }
@@ -2387,6 +2612,7 @@ pub(crate) fn candidate_with_budget<S: CompileBudgetSink>(
         resolved: lowered.resolved,
         ir: lowered.ir,
         bytecode,
+        measurement_owner_refs,
     })
 }
 
@@ -2527,7 +2753,7 @@ fn emit_shape<E>(
             .prototypes
             .iter()
             .find(|entry| entry.id == proto.id)
-            .map_or(0, |entry| entry.native_list_writes.len());
+            .map_or(0, |entry| entry.native_list_writes.len() + entry.native_global_nil_checks.len());
         let debug = candidate
             .ir
             .prototypes
@@ -2587,7 +2813,7 @@ fn emit_shape<E>(
         let debug_parts = [
             vec_upper(i, size_of::<u32>())?,
             vec_upper(l, size_of::<rivetlua_core::NativeLocal>())?,
-            vec_upper(u, size_of::<Option<Vec<u8>>>())?,
+            vec_upper(u, size_of::<Option<rivetlua_core::bytecode::codec::RetainedVec<u8>>>())?,
             vec_upper(
                 l,
                 size_of::<rivetlua_core::bytecode::native_debug::NativeStorageInterval>(),
@@ -2711,8 +2937,18 @@ fn emit_admission<S: CompileBudgetSink>(
 ) -> Result<(usize, usize, usize, usize), BudgetedCompileError<S::Error>> {
     let wire = rivetlua_core::bytecode_wire_upper_bytes(&candidate.bytecode)
         .map_err(|_| BudgetedCompileError::AdmissionOverflow)?;
-    let base = rivetlua_core::bytecode_module_allocation_bytes(&candidate.bytecode)
-        .map_err(|_| BudgetedCompileError::AdmissionOverflow)?;
+    let base = rivetlua_core::bytecode_module_allocation_bytes_with_recovery(
+        &candidate.bytecode,
+        &mut SinkNumericBudget(sink),
+    )
+    .map_err(|error| match error {
+        rivetlua_core::TransportMeasureRecoveryError::Transport(_) =>
+            BudgetedCompileError::AdmissionOverflow,
+        rivetlua_core::TransportMeasureRecoveryError::Reserve(ReserveError::Recovery(error)) =>
+            error,
+        rivetlua_core::TransportMeasureRecoveryError::Reserve(_) =>
+            BudgetedCompileError::AllocationFailed,
+    })?;
     // candidate 已預付 wire 與容量遍歷；新增的純 scalar shape 遍歷先付
     // 四次 wire：Builder 使 debug local≤binding、helper call≤instruction；
     // 編碼上界含這些元素及 close payload，支付 scalar 計數。四次 F²
@@ -2806,12 +3042,29 @@ fn emit_admission<S: CompileBudgetSink>(
             }
         }
     }
+    if sink.state_allocator().is_lua() {
+        // State 的每個 retained debug Vec 另有 SharedBlock owner；以
+        // prototype、名稱及 Close 的既有上界涵蓋巢狀 owner。
+        let owners = add(
+            10,
+            add(
+                mul(functions, 6)?,
+                add(shape.bindings, add(shape.upvalues, shape.instructions)?)?,
+            )?,
+        )?;
+        let owner_bytes = StateAllocator::shared_block_size::<rivetlua_core::BytecodeVec<u8>>();
+        shape.debug = add(shape.debug, mul(owners, owner_bytes)?)?;
+        shape.debug = add(
+            shape.debug,
+            StateAllocator::shared_block_size::<rivetlua_core::NativeDebug>(),
+        )?;
+    }
     let functions = candidate.ir.prototypes.len();
     let plan = if shape.helper_calls == 0 {
         0
     } else {
         [
-            vec_upper(1, size_of::<rivetlua_core::OfficialPlanRootBinding>())?,
+            vec_upper(2, size_of::<rivetlua_core::OfficialPlanRootBinding>())?,
             vec_upper(
                 functions,
                 size_of::<rivetlua_core::OfficialPlanUpvalueMap>(),
@@ -2819,7 +3072,7 @@ fn emit_admission<S: CompileBudgetSink>(
             mul(
                 functions,
                 vec_upper(
-                    1,
+                    2,
                     size_of::<(rivetlua_core::OfficialPlanBuiltin, rivetlua_core::UpvalueId)>(),
                 )?,
             )?,
@@ -2859,6 +3112,7 @@ fn emit_admission<S: CompileBudgetSink>(
         mul(shape.bindings, mul(8, size_of::<usize>())?)?,
         mul(shape.upvalues, mul(8, size_of::<usize>())?)?,
         mul(functions, mul(16, size_of::<usize>())?)?,
+        mul(candidate.measurement_owner_refs, size_of::<(usize, usize)>())?,
     ]
     .into_iter()
     .try_fold(0usize, add)?;
@@ -2871,6 +3125,7 @@ fn emit_admission<S: CompileBudgetSink>(
         mul(name_bytes, 4)?,
         shape.name_lookup,
         shape.helper_calls,
+        owner_sort_work(candidate.measurement_owner_refs)?,
     ]
     .into_iter()
     .try_fold(0usize, add)?;
@@ -2886,25 +3141,82 @@ pub fn compile_with_budget<S: CompileBudgetSink>(
     verify_limits: &rivetlua_core::VerifyLimits,
     sink: &mut S,
 ) -> Result<rivetlua_core::VerifiedModule, BudgetedCompileError<S::Error>> {
-    let frontend = lex_parse_with_budget(source, profile, compile_limits, sink)?;
-    let resolved = resolve_with_budget(frontend, profile, compile_limits, sink)?;
+    let mut adapter = BorrowedSource::new(source);
+    let mut job = CompileJob::new(profile, *compile_limits, *ir_limits, *verify_limits);
+    let result = job.advance(source, true, &mut adapter, chunk_name, sink)?;
+    match result.progress {
+        CompileProgress::Complete(module) => Ok(module),
+        CompileProgress::NeedInput { .. } => Err(BudgetedCompileError::AdmissionUnderestimated),
+    }
+}
+
+#[doc(hidden)]
+pub fn compile_with_budget_pull<I: PullCompileInput>(
+    input: &mut I,
+    chunk_name: &[u8],
+    profile: crate::LanguageProfile,
+    compile_limits: &CompileLimits,
+    ir_limits: &rivetlua_core::IrLimits,
+    verify_limits: &rivetlua_core::VerifyLimits,
+) -> Result<rivetlua_core::VerifiedModule, PullCompileError<I::Error>> {
+    incremental::compile_with_budget_pull(
+        input, chunk_name, profile, compile_limits, ir_limits, verify_limits,
+    )
+}
+
+fn compile_frontend_with_budget<S: CompileBudgetSink>(
+    frontend: BudgetedFrontend,
+    source: &[u8],
+    chunk_name: &[u8],
+    profile: crate::LanguageProfile,
+    compile_limits: &CompileLimits,
+    ir_limits: &rivetlua_core::IrLimits,
+    verify_limits: &rivetlua_core::VerifyLimits,
+    sink: &mut S,
+    failure: Option<&mut Option<crate::official_failure::OfficialFailure>>,
+) -> Result<rivetlua_core::VerifiedModule, BudgetedCompileError<S::Error>> {
+    let resolved = resolve_with_budget_context(frontend, profile, compile_limits, sink, failure)?;
     let lowered = lower_with_budget(resolved, ir_limits, sink)?;
     let candidate = candidate_with_budget(lowered, sink)?;
     let (work, temporary, retained, wire) = emit_admission(&candidate, source, chunk_name, sink)?;
     admit(sink, work, temporary)?;
     sink.claim_module_allocation(retained)
         .map_err(BudgetedCompileError::Budget)?;
-    let encoded = crate::codegen::emit_with_native_debug_candidate(
+    let encoded = crate::codegen::emit_with_native_debug_candidate_with_recovery(
         &candidate.ir,
         &candidate.resolved,
         source,
         chunk_name,
         verify_limits,
         candidate.bytecode,
+        &mut SinkNumericBudget(sink),
     )
-    .map_err(BudgetedCompileError::Bytecode)?;
-    let actual = rivetlua_core::verified_module_allocation_bytes(encoded.verified())
-        .map_err(|_| BudgetedCompileError::AdmissionOverflow)?;
+    .map_err(|error| match error {
+        crate::codegen::CandidateBuildError::Bytecode(error)
+            if error.code == rivetlua_core::BytecodeErrorCode::AllocationFailed =>
+        {
+            BudgetedCompileError::AllocationFailed
+        }
+        crate::codegen::CandidateBuildError::Bytecode(error) => {
+            BudgetedCompileError::Bytecode(error)
+        }
+        crate::codegen::CandidateBuildError::Reserve(ReserveError::Recovery(error)) => error,
+        crate::codegen::CandidateBuildError::Reserve(_) => {
+            BudgetedCompileError::AllocationFailed
+        }
+    })?;
+    let actual = rivetlua_core::verified_module_allocation_bytes_with_recovery(
+        encoded.verified(),
+        &mut SinkNumericBudget(sink),
+    )
+    .map_err(|error| match error {
+        rivetlua_core::TransportMeasureRecoveryError::Transport(_) =>
+            BudgetedCompileError::AdmissionOverflow,
+        rivetlua_core::TransportMeasureRecoveryError::Reserve(ReserveError::Recovery(error)) =>
+            error,
+        rivetlua_core::TransportMeasureRecoveryError::Reserve(_) =>
+            BudgetedCompileError::AllocationFailed,
+    })?;
     if actual > retained || encoded.encoded_bytes_capacity() > mul(wire, 2)? {
         return Err(BudgetedCompileError::AdmissionUnderestimated);
     }

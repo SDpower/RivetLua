@@ -1,5 +1,18 @@
 //! P03 擁有資料的語法樹。
 use crate::{LanguageProfile, Literal, Span};
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::StateAllocator;
+pub type AstVec<T> = AllocVec<T, StateAllocator>;
+pub type AstBox<T> = rivetlua_alloc::SharedBlock<T>;
+
+/// SDK 建構公開 AST fixture 時，明確選擇全域配置。
+pub fn try_global_ast_vec<T>(values: Vec<T>) -> Option<AstVec<T>> {
+    let mut output = AstVec::new_in(StateAllocator::Global);
+    output.try_reserve_exact(values.len()).ok()?;
+    output.extend(values);
+    Some(output)
+}
+pub type AstName = crate::lexer::SharedBytes;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
@@ -9,7 +22,7 @@ pub struct Module {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Block {
-    pub statements: Vec<Stmt>,
+    pub statements: AstVec<Stmt>,
     pub terminator: Option<Span>,
     pub span: Span,
 }
@@ -19,12 +32,12 @@ pub enum Stmt {
         span: Span,
     },
     Return {
-        values: Vec<Expr>,
+        values: AstVec<Expr>,
         span: Span,
     },
     Assignment {
-        targets: Vec<Expr>,
-        values: Vec<Expr>,
+        targets: AstVec<Expr>,
+        values: AstVec<Expr>,
         span: Span,
     },
     Call {
@@ -32,8 +45,8 @@ pub enum Stmt {
         span: Span,
     },
     Local {
-        names: Vec<LocalName>,
-        values: Vec<Expr>,
+        names: AstVec<LocalName>,
+        values: AstVec<Expr>,
         span: Span,
     },
     Global {
@@ -44,12 +57,12 @@ pub enum Stmt {
         span: Span,
     },
     Goto {
-        name: Vec<u8>,
+        name: AstName,
         name_span: Span,
         span: Span,
     },
     Label {
-        name: Vec<u8>,
+        name: AstName,
         name_span: Span,
         span: Span,
     },
@@ -58,7 +71,7 @@ pub enum Stmt {
         span: Span,
     },
     If {
-        clauses: Vec<(Expr, Block)>,
+        clauses: AstVec<(Expr, Block)>,
         else_block: Option<Block>,
         span: Span,
     },
@@ -81,8 +94,8 @@ pub enum Stmt {
         span: Span,
     },
     GenericFor {
-        names: Vec<LocalName>,
-        values: Vec<Expr>,
+        names: AstVec<LocalName>,
+        values: AstVec<Expr>,
         body: Block,
         span: Span,
     },
@@ -100,26 +113,26 @@ pub enum Stmt {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct MethodName {
-    pub name: Vec<u8>,
+    pub name: AstName,
     pub colon_span: Span,
     pub span: Span,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalName {
-    pub name: Vec<u8>,
+    pub name: AstName,
     pub attribute: Option<Attribute>,
     pub span: Span,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Attribute {
-    pub name: Vec<u8>,
+    pub name: AstName,
     pub span: Span,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum GlobalDeclaration {
     Names {
-        names: Vec<LocalName>,
-        values: Vec<Expr>,
+        names: AstVec<LocalName>,
+        values: AstVec<Expr>,
         prefix_attribute: Option<Attribute>,
         span: Span,
     },
@@ -128,7 +141,7 @@ pub enum GlobalDeclaration {
         span: Span,
     },
     Function {
-        name: Vec<u8>,
+        name: AstName,
         body: FunctionBody,
         span: Span,
     },
@@ -140,7 +153,7 @@ pub enum FieldSeparator {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct FunctionBody {
-    pub parameters: Vec<LocalName>,
+    pub parameters: AstVec<LocalName>,
     pub vararg: Option<Vararg>,
     pub body: Block,
     pub span: Span,
@@ -164,7 +177,7 @@ pub enum Expr {
         span: Span,
     },
     Name {
-        name: Vec<u8>,
+        name: AstName,
         span: Span,
     },
     Vararg {
@@ -172,38 +185,38 @@ pub enum Expr {
     },
     Unary {
         op: UnaryOp,
-        expression: Box<Expr>,
+        expression: AstBox<Expr>,
         span: Span,
     },
     Binary {
         op: BinaryOp,
-        left: Box<Expr>,
-        right: Box<Expr>,
+        left: AstBox<Expr>,
+        right: AstBox<Expr>,
         span: Span,
     },
     Paren {
-        expression: Box<Expr>,
+        expression: AstBox<Expr>,
         span: Span,
     },
     Index {
-        base: Box<Expr>,
-        index: Box<Expr>,
+        base: AstBox<Expr>,
+        index: AstBox<Expr>,
         span: Span,
     },
     Field {
-        base: Box<Expr>,
-        name: Vec<u8>,
+        base: AstBox<Expr>,
+        name: AstName,
         span: Span,
     },
     Call {
-        callee: Box<Expr>,
-        arguments: Vec<Expr>,
+        callee: AstBox<Expr>,
+        arguments: AstVec<Expr>,
         span: Span,
     },
     MethodCall {
-        receiver: Box<Expr>,
-        method: Vec<u8>,
-        arguments: Vec<Expr>,
+        receiver: AstBox<Expr>,
+        method: AstName,
+        arguments: AstVec<Expr>,
         span: Span,
     },
     Function {
@@ -211,7 +224,7 @@ pub enum Expr {
         span: Span,
     },
     TableConstructor {
-        fields: Vec<TableField>,
+        fields: AstVec<TableField>,
         span: Span,
     },
 }
@@ -223,7 +236,7 @@ pub enum TableField {
         span: Span,
     },
     Named {
-        name: Vec<u8>,
+        name: AstName,
         value: Expr,
         separator: Option<FieldSeparator>,
         span: Span,

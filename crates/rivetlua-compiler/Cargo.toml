@@ -8,4 +8,10 @@ repository.workspace = true
 description = "RivetLua 編譯器前端。"
 
 [dependencies]
+allocator-api2 = { version = "=0.2.21", default-features = false, features = ["alloc"] }
+hashbrown = { version = "=0.16.1", default-features = false, features = ["allocator-api2"] }
+rivetlua-alloc = { path = "../rivetlua-alloc" }
 rivetlua-core = { path = "../rivetlua-core" }
+
+[dev-dependencies]
+rivetlua-alloc = { path = "../rivetlua-alloc", features = ["test-support"] }

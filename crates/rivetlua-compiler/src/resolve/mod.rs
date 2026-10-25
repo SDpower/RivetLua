@@ -1,11 +1,110 @@
 //! P04 名稱與作用域解析；只消費 P03 owned AST 與 P02 位置資料。
 
+pub(crate) mod meaning;
+
 use crate::{
     Attribute, BinaryOp, Block, CompileLimits, Diagnostic, DiagnosticCode, Expr, FieldSeparator,
     FunctionBody, GlobalDeclaration, LanguageProfile, LexedChunk, Literal, LocalName, MethodName,
     Module, SourcePosition, Span, Stmt, TableField, Token, TokenKind, UnaryOp,
 };
-use std::collections::HashMap;
+use crate::ast::AstName;
+use crate::parser::ParseError;
+use meaning::{MeaningContext, MeaningEvent, MeaningFunction, MeaningState, Unmetered};
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{AllocationRecovery, GlobalAllocation, ReserveError, SharedBlock, StateAllocator, try_reserve_exact_with, try_shared_uninit_with};
+use hashbrown::HashMap;
+use std::collections::hash_map::RandomState;
+use std::hash::Hash;
+
+pub type ResolvedVec<T> = AllocVec<T, StateAllocator>;
+pub type ResolvedBox<T> = SharedBlock<T>;
+
+/// SDK 建構公開 resolved fixture 時，明確選擇全域配置。
+pub fn try_global_resolved_box<T>(value: T) -> Option<ResolvedBox<T>> {
+    Some(StateAllocator::Global.shared_uninit::<T>(0).ok()?.write(value))
+}
+type StateMap<K, V> = HashMap<K, V, RandomState, StateAllocator>;
+
+fn new_state_map<K, V>(allocator: StateAllocator) -> StateMap<K, V> {
+    StateMap::with_hasher_in(RandomState::new(), allocator)
+}
+
+fn reserve_map_with<K: Eq + Hash, V, R: AllocationRecovery>(
+    values: &mut StateMap<K, V>,
+    additional: usize,
+    recovery: &mut R,
+) -> Result<(), ResolveError<R::Error>> {
+    let allocator = values.allocator().clone();
+    if !allocator.same_binding(&recovery.allocator()) {
+        return Err(ResolveError::AllocationFailed);
+    }
+    let before = allocator.refusal_count();
+    if values.try_reserve(additional).is_ok() {
+        return Ok(());
+    }
+    if !allocator.is_lua() || allocator.refusal_count() == before {
+        return Err(ResolveError::AllocationFailed);
+    }
+    if !recovery.recover_after_refusal(before).map_err(ResolveError::Recovery)? {
+        return Err(ResolveError::AllocationFailed);
+    }
+    values.try_reserve(additional).map_err(|_| ResolveError::AllocationFailed)
+}
+
+/// SDK 建構公開 resolved fixture 時，明確選擇全域配置。
+pub fn try_global_resolved_vec<T>(values: Vec<T>) -> Option<ResolvedVec<T>> {
+    let mut output = ResolvedVec::new_in(StateAllocator::Global);
+    output.try_reserve_exact(values.len()).ok()?;
+    output.extend(values);
+    Some(output)
+}
+
+fn reserve_geometric_with<T, R: AllocationRecovery>(
+    values: &mut ResolvedVec<T>,
+    additional: usize,
+    recovery: &mut R,
+) -> Result<(), ResolveError<R::Error>> {
+    let required = values.len().checked_add(additional)
+        .ok_or(ResolveError::AllocationFailed)?;
+    if required <= values.capacity() {
+        return Ok(());
+    }
+    let target = values.capacity().saturating_mul(2).max(4).max(required);
+    try_reserve_exact_with(values, target - values.len(), recovery).map_err(map_reserve_error)
+}
+
+pub(crate) enum ResolveError<E> {
+    Diagnostic(Diagnostic),
+    Recovery(E),
+    AllocationFailed,
+}
+
+fn shared_name<R: AllocationRecovery>(
+    recovery: &mut R,
+    bytes: &[u8],
+) -> Result<AstName, ResolveError<R::Error>> {
+    let mut name = AllocVec::new_in(recovery.allocator());
+    try_reserve_exact_with(&mut name, bytes.len(), recovery).map_err(map_reserve_error)?;
+    name.extend_from_slice(bytes);
+    let owner = try_shared_uninit_with::<AllocVec<u8, StateAllocator>, _>(recovery, 0)
+        .map_err(map_reserve_error)?;
+    Ok(owner.write(name))
+}
+
+fn map_reserve_error<E>(error: ReserveError<E>) -> ResolveError<E> {
+    match error {
+        ReserveError::Recovery(error) => ResolveError::Recovery(error),
+        ReserveError::AllocatorMismatch
+        | ReserveError::CallbackRefused
+        | ReserveError::AllocationFailed => ResolveError::AllocationFailed,
+    }
+}
+
+impl<E> From<Diagnostic> for ResolveError<E> {
+    fn from(value: Diagnostic) -> Self {
+        Self::Diagnostic(value)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FunctionId(pub u32);
@@ -41,7 +140,7 @@ pub enum BindingKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BindingMeta {
     pub id: BindingId,
-    pub name: Vec<u8>,
+    pub name: AstName,
     pub span: Span,
     pub kind: BindingKind,
     pub owner: FunctionId,
@@ -55,7 +154,7 @@ pub struct BindingMeta {
 pub enum ResolvedName {
     Local(BindingId),
     Upvalue(UpvalueId),
-    EnvField { env: BindingId, name: Vec<u8> },
+    EnvField { env: BindingId, name: AstName },
     Global(BindingId),
 }
 
@@ -76,7 +175,7 @@ pub struct ResolvedModule {
     pub profile: LanguageProfile,
     pub span: Span,
     pub root: ResolvedBlock,
-    pub functions: Vec<ResolvedFunction>,
+    pub functions: ResolvedVec<ResolvedFunction>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -84,14 +183,14 @@ pub struct ResolvedFunction {
     pub id: FunctionId,
     pub parent: Option<FunctionId>,
     pub span: Span,
-    pub bindings: Vec<BindingMeta>,
-    pub upvalues: Vec<UpvalueSource>,
+    pub bindings: ResolvedVec<BindingMeta>,
+    pub upvalues: ResolvedVec<UpvalueSource>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedBlock {
     pub scope: ScopeId,
-    pub statements: Vec<ResolvedStmt>,
+    pub statements: ResolvedVec<ResolvedStmt>,
     pub terminator: Option<Span>,
     pub span: Span,
     pub normal_close_path: ClosePath,
@@ -104,14 +203,14 @@ pub struct ClosePath {
     pub span: Span,
     pub from_scope: ScopeId,
     pub target_scope: Option<ScopeId>,
-    pub bindings: Vec<BindingId>,
-    pub exited_bindings: Vec<BindingId>,
+    pub bindings: ResolvedVec<BindingId>,
+    pub exited_bindings: ResolvedVec<BindingId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedLocalName {
     pub binding: BindingId,
-    pub name: Vec<u8>,
+    pub name: AstName,
     pub attribute: Option<Attribute>,
     pub span: Span,
 }
@@ -129,9 +228,9 @@ pub struct ResolvedGenericForClose {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedFunctionBody {
     pub function: FunctionId,
-    pub parameters: Vec<ResolvedLocalName>,
+    pub parameters: ResolvedVec<ResolvedLocalName>,
     pub vararg: Option<ResolvedVararg>,
-    pub body: Box<ResolvedBlock>,
+    pub body: ResolvedBox<ResolvedBlock>,
     pub span: Span,
 }
 
@@ -150,8 +249,8 @@ pub struct ResolvedIfClause {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResolvedGlobalDeclaration {
     Names {
-        names: Vec<ResolvedLocalName>,
-        values: Vec<ResolvedExpr>,
+        names: ResolvedVec<ResolvedLocalName>,
+        values: ResolvedVec<ResolvedExpr>,
         prefix_attribute: Option<Attribute>,
         span: Span,
     },
@@ -161,7 +260,7 @@ pub enum ResolvedGlobalDeclaration {
     },
     Function {
         binding: BindingId,
-        name: Vec<u8>,
+        name: AstName,
         body: ResolvedFunctionBody,
         span: Span,
     },
@@ -173,13 +272,13 @@ pub enum ResolvedStmt {
         span: Span,
     },
     Return {
-        values: Vec<ResolvedExpr>,
+        values: ResolvedVec<ResolvedExpr>,
         close_path: ClosePath,
         span: Span,
     },
     Assignment {
-        targets: Vec<ResolvedExpr>,
-        values: Vec<ResolvedExpr>,
+        targets: ResolvedVec<ResolvedExpr>,
+        values: ResolvedVec<ResolvedExpr>,
         span: Span,
     },
     Call {
@@ -187,9 +286,9 @@ pub enum ResolvedStmt {
         span: Span,
     },
     Local {
-        bindings: Vec<BindingId>,
-        names: Vec<ResolvedLocalName>,
-        values: Vec<ResolvedExpr>,
+        bindings: ResolvedVec<BindingId>,
+        names: ResolvedVec<ResolvedLocalName>,
+        values: ResolvedVec<ResolvedExpr>,
         span: Span,
     },
     Global {
@@ -201,13 +300,13 @@ pub enum ResolvedStmt {
         span: Span,
     },
     Goto {
-        name: Vec<u8>,
+        name: AstName,
         name_span: Span,
         close_path: ClosePath,
         span: Span,
     },
     Label {
-        name: Vec<u8>,
+        name: AstName,
         name_span: Span,
         span: Span,
     },
@@ -216,7 +315,7 @@ pub enum ResolvedStmt {
         span: Span,
     },
     If {
-        clauses: Vec<ResolvedIfClause>,
+        clauses: ResolvedVec<ResolvedIfClause>,
         else_block: Option<ResolvedBlock>,
         span: Span,
     },
@@ -239,8 +338,8 @@ pub enum ResolvedStmt {
         span: Span,
     },
     GenericFor {
-        names: Vec<ResolvedLocalName>,
-        values: Vec<ResolvedExpr>,
+        names: ResolvedVec<ResolvedLocalName>,
+        values: ResolvedVec<ResolvedExpr>,
         closing: ResolvedGenericForClose,
         body: ResolvedBlock,
         close_path: ClosePath,
@@ -273,7 +372,7 @@ pub enum ResolvedExpr {
         span: Span,
     },
     Name {
-        name: Vec<u8>,
+        name: AstName,
         resolution: ResolvedName,
         span: Span,
     },
@@ -283,38 +382,38 @@ pub enum ResolvedExpr {
     },
     Unary {
         op: UnaryOp,
-        expression: Box<ResolvedExpr>,
+        expression: ResolvedBox<ResolvedExpr>,
         span: Span,
     },
     Binary {
         op: BinaryOp,
-        left: Box<ResolvedExpr>,
-        right: Box<ResolvedExpr>,
+        left: ResolvedBox<ResolvedExpr>,
+        right: ResolvedBox<ResolvedExpr>,
         span: Span,
     },
     Paren {
-        expression: Box<ResolvedExpr>,
+        expression: ResolvedBox<ResolvedExpr>,
         span: Span,
     },
     Index {
-        base: Box<ResolvedExpr>,
-        index: Box<ResolvedExpr>,
+        base: ResolvedBox<ResolvedExpr>,
+        index: ResolvedBox<ResolvedExpr>,
         span: Span,
     },
     Field {
-        base: Box<ResolvedExpr>,
-        name: Vec<u8>,
+        base: ResolvedBox<ResolvedExpr>,
+        name: AstName,
         span: Span,
     },
     Call {
-        callee: Box<ResolvedExpr>,
-        arguments: Vec<ResolvedExpr>,
+        callee: ResolvedBox<ResolvedExpr>,
+        arguments: ResolvedVec<ResolvedExpr>,
         span: Span,
     },
     MethodCall {
-        receiver: Box<ResolvedExpr>,
-        method: Vec<u8>,
-        arguments: Vec<ResolvedExpr>,
+        receiver: ResolvedBox<ResolvedExpr>,
+        method: AstName,
+        arguments: ResolvedVec<ResolvedExpr>,
         span: Span,
     },
     Function {
@@ -322,7 +421,7 @@ pub enum ResolvedExpr {
         span: Span,
     },
     TableConstructor {
-        fields: Vec<ResolvedTableField>,
+        fields: ResolvedVec<ResolvedTableField>,
         span: Span,
     },
 }
@@ -335,7 +434,7 @@ pub enum ResolvedTableField {
         span: Span,
     },
     Named {
-        name: Vec<u8>,
+        name: AstName,
         value: ResolvedExpr,
         separator: Option<FieldSeparator>,
         span: Span,
@@ -355,50 +454,67 @@ pub fn resolve(
     expected_profile: LanguageProfile,
     limits: &CompileLimits,
 ) -> Result<ResolvedModule, Diagnostic> {
+    match resolve_with_recovery(module, lexed, expected_profile, limits, &mut GlobalAllocation) {
+        Ok(result) => Ok(result),
+        Err(ResolveError::Diagnostic(diagnostic)) => Err(diagnostic),
+        Err(ResolveError::Recovery(never)) => match never {},
+        Err(ResolveError::AllocationFailed) => Err(diagnostic(
+            lexed.tokens.last(), DiagnosticCode::CompileLimit, "resolver 配置失敗",
+        )),
+    }
+}
+
+pub(crate) fn resolve_with_recovery<R: AllocationRecovery>(
+    module: &Module,
+    lexed: &LexedChunk,
+    expected_profile: LanguageProfile,
+    limits: &CompileLimits,
+    recovery: &mut R,
+) -> Result<ResolvedModule, ResolveError<R::Error>> {
+    resolve_with_recovery_context(module, lexed, expected_profile, limits, recovery, None)
+}
+
+pub(crate) fn resolve_with_recovery_context<R: AllocationRecovery>(
+    module: &Module,
+    lexed: &LexedChunk,
+    expected_profile: LanguageProfile,
+    limits: &CompileLimits,
+    recovery: &mut R,
+    mut failure: Option<&mut Option<crate::official_failure::OfficialFailure>>,
+) -> Result<ResolvedModule, ResolveError<R::Error>> {
     validate_input(module, lexed, expected_profile)?;
+    let mut meaning = MeaningState::new(expected_profile, *limits, recovery.allocator());
+    let root_scope = meaning.begin(module.span, &mut Unmetered(recovery))
+        .map_err(|error| map_meaning_parse_error(meaning::parse_error(error, &lexed.tokens)))?;
+    let result = (|| {
     let mut resolver = Resolver {
         lexed,
         limits,
         profile: expected_profile,
         owner: FunctionId(0),
-        next_binding: 0,
-        next_function: 1,
-        next_scope: 0,
-        bindings: Vec::new(),
-        upvalues: Vec::new(),
-        upvalue_ids: HashMap::new(),
-        upvalue_bindings: Vec::new(),
-        pending_ancestor_captures: Vec::new(),
-        scopes: Vec::new(),
-        loops: Vec::new(),
-        parent_metadata: HashMap::new(),
-        vararg_available: true,
-        vararg_binding: None,
-        label_count: 0,
-        goto_count: 0,
-        parent_visible: None,
-        root_environment_binding: None,
-        inherited_global_mode: None,
-        implicit_globals: HashMap::new(),
-        completed_functions: Vec::new(),
+        scopes: ResolvedVec::new_in(recovery.allocator()),
+        loops: ResolvedVec::new_in(recovery.allocator()),
+        completed_functions: ResolvedVec::new_in(recovery.allocator()),
+        meaning: Some(&mut meaning),
+        recovery: Some(recovery),
     };
-    resolver.enter_scope(module.span)?;
-    resolver.root_environment_binding = Some(resolver.declare_binding(
-        b"_ENV".to_vec(),
-        module.span,
-        None,
-        BindingKind::Environment,
-        false,
-    )?);
+    resolver.enter_scope_with_id(root_scope)?;
     let root = resolver.resolve_block(&module.root)?;
+    let root_function = resolver.meaning_finish_function(module.span)?;
     resolver.scopes.pop();
-    let mut functions = vec![ResolvedFunction {
+    let mut functions = resolver.new_list();
+    let function_count = resolver.completed_functions.len().checked_add(1)
+        .ok_or(ResolveError::AllocationFailed)?;
+    resolver.reserve_list(&mut functions, function_count)?;
+    let (bindings, upvalues) = root_function.into_resolved(
+        resolver.recovery.as_deref_mut().expect("resolver recovery 有效"))?;
+    functions.push(ResolvedFunction {
         id: resolver.owner,
         parent: None,
         span: module.span,
-        bindings: resolver.bindings,
-        upvalues: resolver.upvalues,
-    }];
+        bindings,
+        upvalues,
+    });
     functions.extend(resolver.completed_functions);
     Ok(ResolvedModule {
         profile: expected_profile,
@@ -406,6 +522,13 @@ pub fn resolve(
         root,
         functions,
     })
+    })();
+    if result.is_err() {
+        if let Some(slot) = failure.as_mut() {
+            **slot = meaning.take_official_failure();
+        }
+    }
+    result
 }
 
 fn validate_input(
@@ -447,52 +570,35 @@ fn validate_input(
     Ok(())
 }
 
-struct Resolver<'a> {
+struct Resolver<'a, R: AllocationRecovery> {
     lexed: &'a LexedChunk,
     limits: &'a CompileLimits,
     profile: LanguageProfile,
     owner: FunctionId,
-    next_binding: usize,
-    next_function: u32,
-    next_scope: u32,
-    bindings: Vec<BindingMeta>,
-    upvalues: Vec<UpvalueSource>,
-    upvalue_ids: HashMap<BindingId, UpvalueId>,
-    upvalue_bindings: Vec<BindingId>,
-    pending_ancestor_captures: Vec<(BindingId, UpvalueId)>,
-    scopes: Vec<ScopeFrame>,
-    loops: Vec<ScopeId>,
-    parent_metadata: HashMap<BindingId, BindingAccess>,
-    vararg_available: bool,
-    vararg_binding: Option<BindingId>,
-    label_count: usize,
-    goto_count: usize,
-    parent_visible: Option<HashMap<Vec<u8>, ParentBinding>>,
-    root_environment_binding: Option<BindingId>,
-    inherited_global_mode: Option<GlobalMode>,
-    implicit_globals: HashMap<Vec<u8>, [Option<BindingId>; 2]>,
-    completed_functions: Vec<ResolvedFunction>,
+    scopes: ResolvedVec<ScopeFrame>,
+    loops: ResolvedVec<ScopeId>,
+    completed_functions: ResolvedVec<ResolvedFunction>,
+    meaning: Option<&'a mut MeaningState>,
+    recovery: Option<&'a mut R>,
+}
+
+fn map_meaning_parse_error<E>(error: ParseError<E>) -> ResolveError<E> {
+    match error {
+        ParseError::Diagnostic(diagnostic) => ResolveError::Diagnostic(diagnostic),
+        ParseError::Recovery(error) => ResolveError::Recovery(error),
+        ParseError::AllocationFailed => ResolveError::AllocationFailed,
+    }
+}
+
+fn map_meaning_error<E>(error: meaning::MeaningError<E>, tokens: &[Token]) -> ResolveError<E> {
+    map_meaning_parse_error(meaning::parse_error(error, tokens))
 }
 
 struct ScopeFrame {
     id: ScopeId,
-    bindings: HashMap<Vec<u8>, BindingId>,
-    local_bindings: Vec<BindingId>,
-    close_bindings: Vec<BindingId>,
-    labels: HashMap<Vec<u8>, LabelInfo>,
-    declaration_spans: Vec<Span>,
-    global_mode: Option<GlobalMode>,
-}
-
-#[derive(Clone, Copy)]
-enum GlobalMode {
-    NamedOnly,
-    Wildcard { readonly: bool },
-}
-
-#[derive(Clone, Copy)]
-struct BindingAccess {
-    readonly: bool,
+    local_bindings: ResolvedVec<BindingId>,
+    close_bindings: ResolvedVec<BindingId>,
+    labels: StateMap<AstName, LabelInfo>,
 }
 
 #[derive(Clone, Copy)]
@@ -502,47 +608,146 @@ struct LabelInfo {
     span: Span,
 }
 
-#[derive(Clone, Copy)]
-enum ParentBinding {
-    Direct(BindingId),
-    Ancestor(BindingId),
-    Global(BindingId),
-}
 
 // 預算層需要 private resolver 容器的實際元素大小；不公開其表示或語意。
-pub(crate) fn budget_layout_sizes() -> (usize, usize, usize, usize) {
+pub(crate) fn budget_layout_sizes() -> (usize, usize, usize) {
     (
         core::mem::size_of::<ScopeFrame>(),
         core::mem::size_of::<LabelInfo>(),
-        core::mem::size_of::<ParentBinding>(),
-        core::mem::size_of::<BindingAccess>(),
+        core::mem::size_of::<BindingId>(),
     )
 }
 
-impl<'a> Resolver<'a> {
-    fn enter_scope(&mut self, span: Span) -> Result<(), Diagnostic> {
-        if self.scopes.len() >= self.limits.max_scope_depth {
-            return Err(self.limit(span, "作用域深度超過編譯限制"));
+impl<R: AllocationRecovery> Resolver<'_, R> {
+    fn meaning_event(&mut self, event: MeaningEvent<'_>) -> Result<(), ResolveError<R::Error>> {
+        self.meaning.as_deref_mut().expect("resolver meaning 有效")
+            .event(event, &self.lexed.tokens,
+                &mut Unmetered(self.recovery.as_deref_mut().expect("resolver recovery 有效")))
+            .map_err(map_meaning_parse_error)
+    }
+    fn meaning_name(&mut self, name: &AstName, span: Span) -> Result<ResolvedName, ResolveError<R::Error>> {
+        self.meaning.as_deref_mut().expect("resolver meaning 有效")
+            .name_event(name, span, &self.lexed.tokens,
+                &mut Unmetered(self.recovery.as_deref_mut().expect("resolver recovery 有效")))
+            .map_err(map_meaning_parse_error)
+    }
+    fn meaning_enter_scope(&mut self, span: Span) -> Result<ScopeId, ResolveError<R::Error>> {
+        let result = self.meaning.as_deref_mut().expect("resolver meaning 有效")
+            .enter_scope(span, &mut Unmetered(self.recovery.as_deref_mut().expect("resolver recovery 有效")));
+        result.map_err(|error| map_meaning_error(error, &self.lexed.tokens))
+    }
+    fn meaning_declare(&mut self, name: &LocalName, attribute: Option<&Attribute>,
+        kind: BindingKind, readonly: bool) -> Result<BindingId, ResolveError<R::Error>> {
+        let result = self.meaning.as_deref_mut().expect("resolver meaning 有效")
+            .declare_with_attribute(name, attribute, kind, readonly,
+                &mut Unmetered(self.recovery.as_deref_mut().expect("resolver recovery 有效")));
+        let id = result.map_err(|error| map_meaning_error(error, &self.lexed.tokens))?;
+        self.track_binding(id)?;
+        Ok(id)
+    }
+    fn meaning_generic_close(&mut self, span: Span) -> Result<BindingId, ResolveError<R::Error>> {
+        let result = self.meaning.as_deref_mut().expect("resolver meaning 有效")
+            .declare_generic_close(span,
+                &mut Unmetered(self.recovery.as_deref_mut().expect("resolver recovery 有效")));
+        let id = result.map_err(|error| map_meaning_error(error, &self.lexed.tokens))?;
+        self.track_binding(id)?;
+        Ok(id)
+    }
+    fn meaning_enter_function(&mut self, body: &FunctionBody, method: Option<&MethodName>)
+        -> Result<FunctionId, ResolveError<R::Error>> {
+        let result = self.meaning.as_deref_mut().expect("resolver meaning 有效")
+            .enter_function(&body.parameters,
+                body.vararg.as_ref().and_then(|value| value.table_name.as_ref()),
+                body.vararg.is_some(), method.map(|value| value.colon_span), body.span,
+                &mut Unmetered(self.recovery.as_deref_mut().expect("resolver recovery 有效")));
+        result.map_err(|error| map_meaning_error(error, &self.lexed.tokens))
+    }
+    fn meaning_finish_function(&mut self, span: Span) -> Result<MeaningFunction, ResolveError<R::Error>> {
+        let result = self.meaning.as_deref_mut().expect("resolver meaning 有效")
+            .leave_function(span,
+                &mut Unmetered(self.recovery.as_deref_mut().expect("resolver recovery 有效")));
+        result.map_err(|error| map_meaning_error(error, &self.lexed.tokens))
+    }
+    fn track_binding(&mut self, id: BindingId) -> Result<(), ResolveError<R::Error>> {
+        let info = self.meaning.as_ref().expect("resolver meaning 有效")
+            .binding_info(id).ok_or_else(|| self.resolve_error(self.lexed.tokens.last()
+                .map_or(Span { start_byte: 0, end_byte: 0 }, |token| token.span),
+                "meaning binding 索引不符"))?;
+        let scope = self.scopes.last_mut().expect("root scope 已建立");
+        let recovery = self.recovery.as_deref_mut().expect("resolver recovery 有效");
+        if !matches!(info.kind, BindingKind::Environment | BindingKind::Global) {
+            reserve_geometric_with(&mut scope.local_bindings, 1, &mut *recovery)?;
+            scope.local_bindings.push(id);
         }
-        let ordinal = self
-            .next_scope
-            .checked_add(1)
-            .ok_or_else(|| self.limit(span, "作用域數超過編譯限制"))?;
-        let id = ScopeId(self.next_scope);
-        self.next_scope = ordinal;
+        if info.close_marker.is_some() {
+            reserve_geometric_with(&mut scope.close_bindings, 1, &mut *recovery)?;
+            scope.close_bindings.push(id);
+        }
+        Ok(())
+    }
+    fn new_list<T>(&self) -> ResolvedVec<T> {
+        ResolvedVec::new_in(
+            self.recovery.as_ref().expect("resolver recovery 有效").allocator(),
+        )
+    }
+
+    fn reserve_list<T>(
+        &mut self,
+        values: &mut ResolvedVec<T>,
+        additional: usize,
+    ) -> Result<(), ResolveError<R::Error>> {
+        try_reserve_exact_with(
+            values,
+            additional,
+            self.recovery.as_deref_mut().expect("resolver recovery 有效"),
+        )
+        .map_err(map_reserve_error)
+    }
+
+    fn push_loop(&mut self, scope: ScopeId) -> Result<(), ResolveError<R::Error>> {
+        reserve_geometric_with(&mut self.loops, 1,
+            self.recovery.as_deref_mut().expect("resolver recovery 有效"))?;
+        self.loops.push(scope);
+        Ok(())
+    }
+
+    fn shared_name(&mut self, bytes: &[u8]) -> Result<AstName, ResolveError<R::Error>> {
+        shared_name(self.recovery.as_deref_mut().expect("resolver recovery 有效"), bytes)
+    }
+
+    fn box_value<T>(&mut self, value: T) -> Result<ResolvedBox<T>, ResolveError<R::Error>> {
+        let owner = try_shared_uninit_with::<T, _>(
+            self.recovery.as_deref_mut().expect("resolver recovery 有效"), 0,
+        ).map_err(map_reserve_error)?;
+        Ok(owner.write(value))
+    }
+
+    fn resolve_boxed_expr(&mut self, expression: &Expr) -> Result<ResolvedBox<ResolvedExpr>, ResolveError<R::Error>> {
+        let value = self.resolve_expr(expression)?;
+        self.box_value(value)
+    }
+
+    fn enter_scope(&mut self, span: Span) -> Result<(), ResolveError<R::Error>> {
+        let id = self.meaning_enter_scope(span)?;
+        self.enter_scope_with_id(id)
+    }
+
+    fn enter_scope_with_id(&mut self, id: ScopeId) -> Result<(), ResolveError<R::Error>> {
+        reserve_geometric_with(&mut self.scopes, 1,
+            self.recovery.as_deref_mut().expect("resolver recovery 有效"))?;
+        let local_bindings = self.new_list();
+        let close_bindings = self.new_list();
+        let labels = new_state_map(self.recovery.as_ref().expect("resolver recovery 有效").allocator());
         self.scopes.push(ScopeFrame {
             id,
-            bindings: HashMap::new(),
-            local_bindings: Vec::new(),
-            close_bindings: Vec::new(),
-            labels: HashMap::new(),
-            declaration_spans: Vec::new(),
-            global_mode: None,
+            local_bindings,
+            close_bindings,
+            labels,
         });
         Ok(())
     }
 
-    fn resolve_block(&mut self, block: &Block) -> Result<ResolvedBlock, Diagnostic> {
+    fn resolve_block(&mut self, block: &Block) -> Result<ResolvedBlock, ResolveError<R::Error>> {
         self.resolve_block_with_terminal_labels(block, true)
     }
 
@@ -550,21 +755,22 @@ impl<'a> Resolver<'a> {
         &mut self,
         block: &Block,
         terminal_labels_end_scope: bool,
-    ) -> Result<ResolvedBlock, Diagnostic> {
+    ) -> Result<ResolvedBlock, ResolveError<R::Error>> {
         if block.statements.len() > self.limits.max_statements
             || block.statements.len() > self.limits.max_ast_nodes
         {
             return Err(self.limit(block.span, "陳述式數超過編譯限制"));
         }
         self.register_labels(block, terminal_labels_end_scope)?;
-        self.validate_block_gotos(block)?;
-        let mut statements = Vec::new();
-        statements
-            .try_reserve(block.statements.len())
-            .map_err(|_| self.limit(block.span, "陳述式配置超過編譯限制"))?;
+        let mut statements = self.new_list();
+        self.reserve_list(&mut statements, block.statements.len())?;
         for statement in &block.statements {
+            if !matches!(statement, Stmt::Empty { .. } | Stmt::Label { .. }) {
+                self.meaning_event(MeaningEvent::FlushLabels { terminal: false })?;
+            }
             statements.push(self.resolve_statement(statement)?);
         }
+        self.meaning_event(MeaningEvent::FlushLabels { terminal: terminal_labels_end_scope })?;
         let terminal_suffix_start = block
             .statements
             .iter()
@@ -586,12 +792,12 @@ impl<'a> Resolver<'a> {
             statements,
             terminator: block.terminator,
             span: block.span,
-            normal_close_path: self.close_path(ExitKind::Normal, target_scope, block.span),
-            error_close_path: self.close_path(ExitKind::Error, None, block.span),
+            normal_close_path: self.close_path(ExitKind::Normal, target_scope, block.span)?,
+            error_close_path: self.close_path(ExitKind::Error, None, block.span)?,
         })
     }
 
-    fn resolve_statement(&mut self, statement: &Stmt) -> Result<ResolvedStmt, Diagnostic> {
+    fn resolve_statement(&mut self, statement: &Stmt) -> Result<ResolvedStmt, ResolveError<R::Error>> {
         match statement {
             Stmt::Empty { span } => Ok(ResolvedStmt::Empty { span: *span }),
             Stmt::Do { body, span } => Ok(ResolvedStmt::Do {
@@ -605,62 +811,43 @@ impl<'a> Resolver<'a> {
             } => {
                 self.ensure_list(values.len(), *span)?;
                 self.ensure_list(names.len(), *span)?;
-                self.ensure_binding_capacity(names.len(), *span)?;
-                let mut resolved_values = Vec::new();
-                resolved_values
-                    .try_reserve(values.len())
-                    .map_err(|_| self.limit(*span, "運算式配置超過編譯限制"))?;
+                self.meaning_event(MeaningEvent::BeginDeclarations)?;
+                for name in names {
+                    self.meaning_event(MeaningEvent::DeclarationAttribute {
+                        attribute: name.attribute.as_ref(), global: false, span: name.span })?;
+                }
+                let mut resolved_values = self.new_list();
+                self.reserve_list(&mut resolved_values, values.len())?;
                 for value in values {
                     resolved_values.push(self.resolve_expr(value)?);
                 }
-                let mut bindings = Vec::new();
-                bindings
-                    .try_reserve(names.len())
-                    .map_err(|_| self.limit(*span, "binding 配置超過編譯限制"))?;
-                let mut close_count = 0;
+                let mut bindings = self.new_list();
+                self.reserve_list(&mut bindings, names.len())?;
                 for name in names {
-                    let binding =
-                        self.declare_local(name.name.clone(), name.span, name.attribute.clone())?;
-                    if name
-                        .attribute
-                        .as_ref()
-                        .is_some_and(|attribute| attribute.name.as_slice() == b"close")
-                    {
-                        close_count += 1;
-                        if close_count > 1 {
-                            return Err(
-                                self.resolve_error(name.span, "local 宣告含多個 close 變數")
-                            );
-                        }
-                    }
+                    let binding = self.meaning_declare(name, name.attribute.as_ref(),
+                        BindingKind::Local, false)?;
                     bindings.push(binding);
                 }
-                let names = names
-                    .iter()
-                    .zip(bindings.iter().copied())
-                    .map(|(name, binding)| ResolvedLocalName {
+                let mut resolved_names = self.new_list();
+                self.reserve_list(&mut resolved_names, names.len())?;
+                for (name, binding) in names.iter().zip(bindings.iter().copied()) {
+                    resolved_names.push(ResolvedLocalName {
                         binding,
                         name: name.name.clone(),
                         attribute: name.attribute.clone(),
                         span: name.span,
-                    })
-                    .collect();
+                    });
+                }
                 Ok(ResolvedStmt::Local {
                     bindings,
-                    names,
+                    names: resolved_names,
                     values: resolved_values,
                     span: *span,
                 })
             }
             Stmt::LocalFunction { name, body, span } => {
-                self.ensure_binding_capacity(1, *span)?;
-                let binding = self.declare_binding(
-                    name.name.clone(),
-                    name.span,
-                    name.attribute.clone(),
-                    BindingKind::LocalFunction,
-                    false,
-                )?;
+                let binding = self.meaning_declare(name, name.attribute.as_ref(),
+                    BindingKind::LocalFunction, false)?;
                 let resolved_name = ResolvedLocalName {
                     binding,
                     name: name.name.clone(),
@@ -678,7 +865,7 @@ impl<'a> Resolver<'a> {
                 let resolved_values = self.resolve_expression_list(values, *span)?;
                 Ok(ResolvedStmt::Return {
                     values: resolved_values,
-                    close_path: self.close_path(ExitKind::Return, None, *span),
+                    close_path: self.close_path(ExitKind::Return, None, *span)?,
                     span: *span,
                 })
             }
@@ -688,10 +875,8 @@ impl<'a> Resolver<'a> {
                 span,
             } => {
                 self.ensure_list(targets.len(), *span)?;
-                let mut resolved_targets = Vec::new();
-                resolved_targets
-                    .try_reserve(targets.len())
-                    .map_err(|_| self.limit(*span, "assignment target 配置超過編譯限制"))?;
+                let mut resolved_targets = self.new_list();
+                self.reserve_list(&mut resolved_targets, targets.len())?;
                 for target in targets {
                     resolved_targets.push(self.resolve_assignment_target(target)?);
                 }
@@ -712,11 +897,10 @@ impl<'a> Resolver<'a> {
                 Ok(ResolvedStmt::Call { call, span: *span })
             }
             Stmt::Break { span } => {
-                let Some(target) = self.loops.last().copied() else {
-                    return Err(self.resolve_error(*span, "break 不在 loop 內"));
-                };
+                self.meaning_event(MeaningEvent::CheckBreak(*span))?;
+                let target = self.loops.last().copied().unwrap_or_else(|| self.current_scope());
                 Ok(ResolvedStmt::Break {
-                    close_path: self.close_path(ExitKind::Break, Some(target), *span),
+                    close_path: self.close_path(ExitKind::Break, Some(target), *span)?,
                     span: *span,
                 })
             }
@@ -725,17 +909,15 @@ impl<'a> Resolver<'a> {
                 name_span,
                 span,
             } => {
-                if self.goto_count >= self.limits.max_gotos {
-                    return Err(self.limit(*span, "goto 數超過編譯限制"));
-                }
-                self.goto_count += 1;
-                let label = self
-                    .find_label(name)
-                    .ok_or_else(|| self.resolve_error(*span, "找不到 goto label"))?;
+                self.meaning_event(MeaningEvent::Goto { name, span: *name_span })?;
+                let close_path = match self.find_label(name) {
+                    Some(label) => self.goto_close_path(label, *span)?,
+                    None => self.close_path(ExitKind::Goto, None, *span)?,
+                };
                 Ok(ResolvedStmt::Goto {
                     name: name.clone(),
                     name_span: *name_span,
-                    close_path: self.goto_close_path(label, *span)?,
+                    close_path,
                     span: *span,
                 })
             }
@@ -744,10 +926,7 @@ impl<'a> Resolver<'a> {
                 name_span,
                 span,
             } => {
-                if self.label_count >= self.limits.max_labels {
-                    return Err(self.limit(*span, "label 數超過編譯限制"));
-                }
-                self.label_count += 1;
+                self.meaning_event(MeaningEvent::QueueLabel { name, span: *name_span })?;
                 Ok(ResolvedStmt::Label {
                     name: name.clone(),
                     name_span: *name_span,
@@ -760,10 +939,8 @@ impl<'a> Resolver<'a> {
                 span,
             } => {
                 self.ensure_list(clauses.len(), *span)?;
-                let mut resolved_clauses = Vec::new();
-                resolved_clauses
-                    .try_reserve(clauses.len())
-                    .map_err(|_| self.limit(*span, "if clause 配置超過編譯限制"))?;
+                let mut resolved_clauses = self.new_list();
+                self.reserve_list(&mut resolved_clauses, clauses.len())?;
                 for (condition, body) in clauses {
                     resolved_clauses.push(ResolvedIfClause {
                         condition: self.resolve_expr(condition)?,
@@ -786,9 +963,11 @@ impl<'a> Resolver<'a> {
             } => {
                 let condition = self.resolve_expr(condition)?;
                 let target = self.current_scope();
-                self.loops.push(target);
+                self.meaning_event(MeaningEvent::EnterLoop)?;
+                self.push_loop(target)?;
                 let body = self.resolve_nested_block(body);
                 self.loops.pop();
+                self.meaning_event(MeaningEvent::LeaveLoop)?;
                 Ok(ResolvedStmt::While {
                     condition,
                     body: body?,
@@ -819,12 +998,22 @@ impl<'a> Resolver<'a> {
                 method,
                 body,
                 span,
-            } => Ok(ResolvedStmt::Function {
-                name: self.resolve_assignment_target(name)?,
-                method: method.clone(),
-                body: self.resolve_function_body(body, method.as_ref())?,
-                span: *span,
-            }),
+            } => {
+                let resolved_name = self.resolve_expr(name)?;
+                if !matches!(&resolved_name, ResolvedExpr::Name { .. }
+                    | ResolvedExpr::Field { .. } | ResolvedExpr::Index { .. }) {
+                    return Err(self.resolve_error(name.span(), "assignment target 不可指派"));
+                }
+                if self.profile == LanguageProfile::Lua55 {
+                    self.meaning_event(MeaningEvent::WriteTarget(name))?;
+                }
+                let resolved_body = self.resolve_function_body(body, method.as_ref())?;
+                if self.profile == LanguageProfile::Lua54 {
+                    self.meaning_event(MeaningEvent::WriteTarget(name))?;
+                }
+                Ok(ResolvedStmt::Function { name: resolved_name,
+                    method: method.clone(), body: resolved_body, span: *span })
+            }
             Stmt::Global { declaration, span } => self.resolve_global(declaration, *span),
         }
     }
@@ -833,7 +1022,7 @@ impl<'a> Resolver<'a> {
         &mut self,
         declaration: &GlobalDeclaration,
         span: Span,
-    ) -> Result<ResolvedStmt, Diagnostic> {
+    ) -> Result<ResolvedStmt, ResolveError<R::Error>> {
         if !self.profile.rules().global_declarations {
             return Err(self.resolve_error(span, "lua54 不支援 lua55 global declaration"));
         }
@@ -842,8 +1031,8 @@ impl<'a> Resolver<'a> {
                 prefix_attribute,
                 span,
             } => {
-                let readonly = self.global_attribute_readonly(prefix_attribute.as_ref(), *span)?;
-                self.set_wildcard_global_mode(readonly);
+                self.meaning_event(MeaningEvent::WildcardGlobalMode {
+                    attribute: prefix_attribute.as_ref(), span: *span })?;
                 Ok(ResolvedStmt::Global {
                     declaration: ResolvedGlobalDeclaration::Star {
                         prefix_attribute: prefix_attribute.clone(),
@@ -860,22 +1049,29 @@ impl<'a> Resolver<'a> {
             } => {
                 self.ensure_list(names.len(), *span)?;
                 self.ensure_list(values.len(), *span)?;
-                self.ensure_binding_capacity(names.len(), *span)?;
-                self.set_named_global_mode();
-                let mut resolved_names = Vec::new();
-                resolved_names
-                    .try_reserve(names.len())
-                    .map_err(|_| self.limit(*span, "global name 配置超過編譯限制"))?;
+                let mut resolved_names = self.new_list();
+                self.reserve_list(&mut resolved_names, names.len())?;
+                if let Some(prefix) = prefix_attribute.as_ref() {
+                    self.meaning_event(MeaningEvent::Attribute {
+                        attribute: Some(prefix), global: true, span: prefix.span })?;
+                }
+                self.meaning_event(MeaningEvent::BeginDeclarations)?;
                 for name in names {
                     let attribute = name.attribute.as_ref().or(prefix_attribute.as_ref());
-                    self.global_attribute_readonly(attribute, name.span)?;
-                    let binding = self.declare_binding(
-                        name.name.clone(),
-                        name.span,
-                        attribute.cloned(),
-                        BindingKind::Global,
-                        false,
-                    )?;
+                    self.meaning_event(MeaningEvent::DeclarationAttribute {
+                        attribute, global: true, span: name.span })?;
+                }
+                if !values.is_empty() {
+                    for name in names {
+                        self.meaning_event(MeaningEvent::GlobalTarget {
+                            name: &name.name, span: name.span })?;
+                    }
+                }
+                let values = self.resolve_expression_list(values, *span)?;
+                self.meaning_event(MeaningEvent::NamedGlobalMode)?;
+                for name in names {
+                    let attribute = name.attribute.as_ref().or(prefix_attribute.as_ref());
+                    let binding = self.meaning_declare(name, attribute, BindingKind::Global, false)?;
                     resolved_names.push(ResolvedLocalName {
                         binding,
                         name: name.name.clone(),
@@ -883,7 +1079,6 @@ impl<'a> Resolver<'a> {
                         span: name.span,
                     });
                 }
-                let values = self.resolve_expression_list(values, *span)?;
                 Ok(ResolvedStmt::Global {
                     declaration: ResolvedGlobalDeclaration::Names {
                         names: resolved_names,
@@ -895,10 +1090,10 @@ impl<'a> Resolver<'a> {
                 })
             }
             GlobalDeclaration::Function { name, body, span } => {
-                self.ensure_binding_capacity(1, *span)?;
-                self.set_named_global_mode();
-                let binding =
-                    self.declare_binding(name.clone(), *span, None, BindingKind::Global, false)?;
+                self.meaning_event(MeaningEvent::NamedGlobalMode)?;
+                let declaration = LocalName { name: name.clone(), attribute: None, span: *span };
+                let binding = self.meaning_declare(&declaration, None, BindingKind::Global, false)?;
+                self.meaning_event(MeaningEvent::GlobalTarget { name, span: *span })?;
                 let body = self.resolve_function_body(body, None)?;
                 Ok(ResolvedStmt::Global {
                     declaration: ResolvedGlobalDeclaration::Function {
@@ -913,7 +1108,7 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn resolve_expr(&mut self, expression: &Expr) -> Result<ResolvedExpr, Diagnostic> {
+    fn resolve_expr(&mut self, expression: &Expr) -> Result<ResolvedExpr, ResolveError<R::Error>> {
         match expression {
             Expr::Literal { literal, span } => Ok(ResolvedExpr::Literal {
                 literal: literal.clone(),
@@ -925,29 +1120,8 @@ impl<'a> Resolver<'a> {
                 span: *span,
             }),
             Expr::Name { name, span } => {
-                let resolution = match self.lookup(name, *span)? {
-                    Some(ResolvedName::Global(binding))
-                        if self.profile.rules().global_declarations =>
-                    {
-                        if let Some(env) = self.lexical_environment_shadow(*span)? {
-                            Some(ResolvedName::EnvField {
-                                env,
-                                name: name.clone(),
-                            })
-                        } else {
-                            Some(ResolvedName::Global(binding))
-                        }
-                    }
-                    Some(resolution) => Some(resolution),
-                    None => self.resolve_free_name(name, *span)?,
-                };
-                resolution
-                    .map(|resolution| ResolvedExpr::Name {
-                        name: name.clone(),
-                        resolution,
-                        span: *span,
-                    })
-                    .ok_or_else(|| self.resolve_error(*span, "名稱尚未宣告"))
+                let resolution = self.meaning_name(name, *span)?;
+                Ok(ResolvedExpr::Name { name: name.clone(), resolution, span: *span })
             }
             Expr::Unary {
                 op,
@@ -955,7 +1129,7 @@ impl<'a> Resolver<'a> {
                 span,
             } => Ok(ResolvedExpr::Unary {
                 op: *op,
-                expression: Box::new(self.resolve_expr(expression)?),
+                expression: self.resolve_boxed_expr(expression)?,
                 span: *span,
             }),
             Expr::Binary {
@@ -965,21 +1139,21 @@ impl<'a> Resolver<'a> {
                 span,
             } => Ok(ResolvedExpr::Binary {
                 op: *op,
-                left: Box::new(self.resolve_expr(left)?),
-                right: Box::new(self.resolve_expr(right)?),
+                left: self.resolve_boxed_expr(left)?,
+                right: self.resolve_boxed_expr(right)?,
                 span: *span,
             }),
             Expr::Paren { expression, span } => Ok(ResolvedExpr::Paren {
-                expression: Box::new(self.resolve_expr(expression)?),
+                expression: self.resolve_boxed_expr(expression)?,
                 span: *span,
             }),
             Expr::Index { base, index, span } => Ok(ResolvedExpr::Index {
-                base: Box::new(self.resolve_expr(base)?),
-                index: Box::new(self.resolve_expr(index)?),
+                base: self.resolve_boxed_expr(base)?,
+                index: self.resolve_boxed_expr(index)?,
                 span: *span,
             }),
             Expr::Field { base, name, span } => Ok(ResolvedExpr::Field {
-                base: Box::new(self.resolve_expr(base)?),
+                base: self.resolve_boxed_expr(base)?,
                 name: name.clone(),
                 span: *span,
             }),
@@ -988,7 +1162,7 @@ impl<'a> Resolver<'a> {
                 arguments,
                 span,
             } => Ok(ResolvedExpr::Call {
-                callee: Box::new(self.resolve_expr(callee)?),
+                callee: self.resolve_boxed_expr(callee)?,
                 arguments: self.resolve_expression_list(arguments, *span)?,
                 span: *span,
             }),
@@ -998,7 +1172,7 @@ impl<'a> Resolver<'a> {
                 arguments,
                 span,
             } => Ok(ResolvedExpr::MethodCall {
-                receiver: Box::new(self.resolve_expr(receiver)?),
+                receiver: self.resolve_boxed_expr(receiver)?,
                 method: method.clone(),
                 arguments: self.resolve_expression_list(arguments, *span)?,
                 span: *span,
@@ -1009,10 +1183,8 @@ impl<'a> Resolver<'a> {
             }),
             Expr::TableConstructor { fields, span } => {
                 self.ensure_list(fields.len(), *span)?;
-                let mut resolved_fields = Vec::new();
-                resolved_fields
-                    .try_reserve(fields.len())
-                    .map_err(|_| self.limit(*span, "table field 配置超過編譯限制"))?;
+                let mut resolved_fields = self.new_list();
+                self.reserve_list(&mut resolved_fields, fields.len())?;
                 for field in fields {
                     resolved_fields.push(self.resolve_table_field(field)?);
                 }
@@ -1022,11 +1194,10 @@ impl<'a> Resolver<'a> {
                 })
             }
             Expr::Vararg { span } => {
-                if !self.vararg_available {
-                    return Err(self.resolve_error(*span, "vararg 不在 function 內"));
-                }
+                self.meaning_event(MeaningEvent::CheckVararg(*span))?;
                 Ok(ResolvedExpr::Vararg {
-                    binding: self.vararg_binding,
+                    binding: self.meaning.as_ref().expect("resolver meaning 有效")
+                        .current_vararg_binding(),
                     span: *span,
                 })
             }
@@ -1037,12 +1208,10 @@ impl<'a> Resolver<'a> {
         &mut self,
         expressions: &[Expr],
         span: Span,
-    ) -> Result<Vec<ResolvedExpr>, Diagnostic> {
+    ) -> Result<ResolvedVec<ResolvedExpr>, ResolveError<R::Error>> {
         self.ensure_list(expressions.len(), span)?;
-        let mut resolved = Vec::new();
-        resolved
-            .try_reserve(expressions.len())
-            .map_err(|_| self.limit(span, "運算式配置超過編譯限制"))?;
+        let mut resolved = self.new_list();
+        self.reserve_list(&mut resolved, expressions.len())?;
         for expression in expressions {
             resolved.push(self.resolve_expr(expression)?);
         }
@@ -1052,7 +1221,7 @@ impl<'a> Resolver<'a> {
     fn resolve_table_field(
         &mut self,
         field: &TableField,
-    ) -> Result<ResolvedTableField, Diagnostic> {
+    ) -> Result<ResolvedTableField, ResolveError<R::Error>> {
         match field {
             TableField::Array {
                 value,
@@ -1088,13 +1257,11 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn resolve_assignment_target(&mut self, target: &Expr) -> Result<ResolvedExpr, Diagnostic> {
+    fn resolve_assignment_target(&mut self, target: &Expr) -> Result<ResolvedExpr, ResolveError<R::Error>> {
         let resolved = self.resolve_expr(target)?;
         match &resolved {
-            ResolvedExpr::Name {
-                resolution, span, ..
-            } => {
-                self.ensure_writable(resolution, *span)?;
+            ResolvedExpr::Name { .. } => {
+                self.meaning_event(MeaningEvent::WriteTarget(target))?;
                 Ok(resolved)
             }
             ResolvedExpr::Index { .. } | ResolvedExpr::Field { .. } => Ok(resolved),
@@ -1102,43 +1269,21 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn ensure_writable(&self, resolution: &ResolvedName, span: Span) -> Result<(), Diagnostic> {
-        let binding = match resolution {
-            ResolvedName::Local(binding) => Some(*binding),
-            ResolvedName::Upvalue(upvalue) => Some(self.upvalue_binding(*upvalue, span)?),
-            ResolvedName::Global(binding) => Some(*binding),
-            ResolvedName::EnvField { name, .. } if self.profile.rules().global_declarations => {
-                self.visible_named_global(name)
-            }
-            ResolvedName::EnvField { .. } => None,
-        };
-        if binding.is_some_and(|binding| self.binding_readonly(binding).unwrap_or(false)) {
-            return Err(self.resolve_error(span, "不可指派 readonly binding"));
-        }
-        if matches!(resolution, ResolvedName::EnvField { .. })
-            && binding.is_none()
-            && matches!(
-                self.effective_global_mode(),
-                Some(GlobalMode::Wildcard { readonly: true })
-            )
-        {
-            return Err(self.resolve_error(span, "不可指派 readonly binding"));
-        }
-        Ok(())
-    }
-
     fn resolve_repeat(
         &mut self,
         body: &Block,
         condition: &Expr,
         span: Span,
-    ) -> Result<ResolvedStmt, Diagnostic> {
+    ) -> Result<ResolvedStmt, ResolveError<R::Error>> {
         let target = self.current_scope();
         self.enter_scope(body.span)?;
-        self.loops.push(target);
+        self.meaning_event(MeaningEvent::EnterLoop)?;
+        self.push_loop(target)?;
         let result = (|| {
             let body = self.resolve_block_with_terminal_labels(body, false)?;
             let condition = self.resolve_expr(condition)?;
+            self.meaning_event(MeaningEvent::LeaveLoop)?;
+            self.meaning_event(MeaningEvent::LeaveScope { span, terminal: false })?;
             Ok(ResolvedStmt::Repeat {
                 body,
                 condition,
@@ -1158,24 +1303,20 @@ impl<'a> Resolver<'a> {
         step: Option<&Expr>,
         body: &Block,
         span: Span,
-    ) -> Result<ResolvedStmt, Diagnostic> {
+    ) -> Result<ResolvedStmt, ResolveError<R::Error>> {
         let initial = self.resolve_expr(initial)?;
         let limit = self.resolve_expr(limit)?;
         let step = step.map(|step| self.resolve_expr(step)).transpose()?;
-        self.ensure_binding_capacity(1, span)?;
         let target = self.current_scope();
         self.enter_scope(span)?;
         let result = (|| {
-            let binding = self.declare_binding(
-                name.name.clone(),
-                name.span,
-                name.attribute.clone(),
-                BindingKind::NumericFor,
-                self.profile.rules().readonly_for_control,
-            )?;
-            self.loops.push(target);
+            let binding = self.meaning_declare(name, None, BindingKind::NumericFor,
+                self.profile.rules().readonly_for_control)?;
+            self.meaning_event(MeaningEvent::EnterLoop)?;
+            self.push_loop(target)?;
             let body = self.resolve_nested_block(body);
             self.loops.pop();
+            self.meaning_event(MeaningEvent::LeaveLoop)?;
             Ok(ResolvedStmt::NumericFor {
                 name: ResolvedLocalName {
                     binding,
@@ -1190,6 +1331,7 @@ impl<'a> Resolver<'a> {
                 span,
             })
         })();
+        if result.is_ok() { self.meaning_event(MeaningEvent::LeaveScope { span, terminal: true })?; }
         self.scopes.pop();
         result
     }
@@ -1200,34 +1342,22 @@ impl<'a> Resolver<'a> {
         values: &[Expr],
         body: &Block,
         span: Span,
-    ) -> Result<ResolvedStmt, Diagnostic> {
+    ) -> Result<ResolvedStmt, ResolveError<R::Error>> {
         let closing_span = values.get(3).map(Expr::span).unwrap_or(span);
         let values = self.resolve_expression_list(values, span)?;
         self.ensure_list(names.len(), span)?;
-        let binding_count = names
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| self.limit(span, "generic-for binding 數超過編譯限制"))?;
-        self.ensure_binding_capacity(binding_count, span)?;
         let target = self.current_scope();
         self.enter_scope(span)?;
         let result = (|| {
             let closing = ResolvedGenericForClose {
-                binding: self.declare_generic_for_close(closing_span)?,
+                binding: self.meaning_generic_close(closing_span)?,
                 span: closing_span,
             };
-            let mut resolved_names = Vec::new();
-            resolved_names
-                .try_reserve(names.len())
-                .map_err(|_| self.limit(span, "generic-for name 配置超過編譯限制"))?;
+            let mut resolved_names = self.new_list();
+            self.reserve_list(&mut resolved_names, names.len())?;
             for (index, name) in names.iter().enumerate() {
-                let binding = self.declare_binding(
-                    name.name.clone(),
-                    name.span,
-                    name.attribute.clone(),
-                    BindingKind::GenericFor,
-                    index == 0 && self.profile.rules().readonly_for_control,
-                )?;
+                let binding = self.meaning_declare(name, None, BindingKind::GenericFor,
+                    index == 0 && self.profile.rules().readonly_for_control)?;
                 resolved_names.push(ResolvedLocalName {
                     binding,
                     name: name.name.clone(),
@@ -1235,26 +1365,32 @@ impl<'a> Resolver<'a> {
                     span: name.span,
                 });
             }
-            self.loops.push(target);
+            self.meaning_event(MeaningEvent::EnterLoop)?;
+            self.push_loop(target)?;
             let body = self.resolve_nested_block(body);
             self.loops.pop();
+            self.meaning_event(MeaningEvent::LeaveLoop)?;
             let body = body?;
             Ok(ResolvedStmt::GenericFor {
                 names: resolved_names,
                 values,
                 closing,
-                close_path: self.close_path(ExitKind::Normal, Some(target), span),
+                close_path: self.close_path(ExitKind::Normal, Some(target), span)?,
                 body,
                 span,
             })
         })();
+        if result.is_ok() { self.meaning_event(MeaningEvent::LeaveScope { span, terminal: true })?; }
         self.scopes.pop();
         result
     }
 
-    fn resolve_nested_block(&mut self, block: &Block) -> Result<ResolvedBlock, Diagnostic> {
+    fn resolve_nested_block(&mut self, block: &Block) -> Result<ResolvedBlock, ResolveError<R::Error>> {
         self.enter_scope(block.span)?;
         let result = self.resolve_block(block);
+        if result.is_ok() {
+            self.meaning_event(MeaningEvent::LeaveScope { span: block.span, terminal: true })?;
+        }
         self.scopes.pop();
         result
     }
@@ -1263,62 +1399,35 @@ impl<'a> Resolver<'a> {
         &mut self,
         body: &FunctionBody,
         method: Option<&MethodName>,
-    ) -> Result<ResolvedFunctionBody, Diagnostic> {
-        let function = FunctionId(self.next_function);
-        self.next_function = self
-            .next_function
-            .checked_add(1)
-            .ok_or_else(|| self.limit(body.span, "function 數超過編譯限制"))?;
+    ) -> Result<ResolvedFunctionBody, ResolveError<R::Error>> {
+        let function = self.meaning_enter_function(body, method)?;
         let mut child = Resolver {
             lexed: self.lexed,
             limits: self.limits,
             profile: self.profile,
             owner: function,
-            next_binding: 0,
-            next_function: self.next_function,
-            next_scope: 0,
-            bindings: Vec::new(),
-            upvalues: Vec::new(),
-            upvalue_ids: HashMap::new(),
-            upvalue_bindings: Vec::new(),
-            pending_ancestor_captures: Vec::new(),
-            scopes: Vec::new(),
-            loops: Vec::new(),
-            parent_metadata: self.visible_binding_access(),
-            vararg_available: false,
-            vararg_binding: None,
-            label_count: 0,
-            goto_count: 0,
-            parent_visible: Some(self.visible_bindings()),
-            root_environment_binding: self.root_environment_binding,
-            inherited_global_mode: self.effective_global_mode(),
-            implicit_globals: HashMap::new(),
-            completed_functions: Vec::new(),
+            scopes: self.new_list(),
+            loops: self.new_list(),
+            completed_functions: self.new_list(),
+            meaning: self.meaning.take(),
+            recovery: self.recovery.take(),
         };
-        child.enter_scope(body.span)?;
+        let scope = child.meaning.as_ref().expect("resolver meaning 有效").current_scope_id();
+        child.enter_scope_with_id(scope)?;
         child.ensure_list(body.parameters.len(), body.span)?;
         let parameter_count = body
             .parameters
             .len()
             .checked_add(usize::from(method.is_some()))
             .ok_or_else(|| child.limit(body.span, "參數超過編譯限制"))?;
-        if parameter_count > child.limits.max_parameters {
-            return Err(child.limit(body.span, "參數超過編譯限制"));
-        }
-        child.ensure_binding_capacity(parameter_count, body.span)?;
-        let mut parameters = Vec::new();
-        parameters
-            .try_reserve(parameter_count)
-            .map_err(|_| child.limit(body.span, "parameter 配置超過編譯限制"))?;
+        let mut parameters = child.new_list();
+        child.reserve_list(&mut parameters, parameter_count)?;
         if let Some(method) = method {
-            let name = b"self".to_vec();
-            let binding = child.declare_binding(
-                name.clone(),
-                method.colon_span,
-                None,
-                BindingKind::Parameter,
-                false,
-            )?;
+            let name = child.shared_name(b"self")?;
+            let binding = child.meaning.as_ref().expect("resolver meaning 有效")
+                .current_binding_id(0).ok_or_else(|| child.resolve_error(method.colon_span,
+                    "method self binding 索引不符"))?;
+            child.track_binding(binding)?;
             parameters.push(ResolvedLocalName {
                 binding,
                 name,
@@ -1326,14 +1435,12 @@ impl<'a> Resolver<'a> {
                 span: method.colon_span,
             });
         }
-        for parameter in &body.parameters {
-            let binding = child.declare_binding(
-                parameter.name.clone(),
-                parameter.span,
-                parameter.attribute.clone(),
-                BindingKind::Parameter,
-                false,
-            )?;
+        for (index, parameter) in body.parameters.iter().enumerate() {
+            let ordinal = index + usize::from(method.is_some());
+            let binding = child.meaning.as_ref().expect("resolver meaning 有效")
+                .current_binding_id(ordinal).ok_or_else(|| child.resolve_error(parameter.span,
+                    "parameter binding 索引不符"))?;
+            child.track_binding(binding)?;
             parameters.push(ResolvedLocalName {
                 binding,
                 name: parameter.name.clone(),
@@ -1349,14 +1456,11 @@ impl<'a> Resolver<'a> {
             }
             let table_binding = match &vararg.table_name {
                 Some(name) => {
-                    child.ensure_binding_capacity(1, name.span)?;
-                    Some(child.declare_binding(
-                        name.name.clone(),
-                        name.span,
-                        name.attribute.clone(),
-                        BindingKind::VarargTable,
-                        true,
-                    )?)
+                    let binding = child.meaning.as_ref().expect("resolver meaning 有效")
+                        .current_vararg_binding().ok_or_else(|| child.resolve_error(name.span,
+                            "vararg binding 索引不符"))?;
+                    child.track_binding(binding)?;
+                    Some(binding)
                 }
                 None => None,
             };
@@ -1367,484 +1471,42 @@ impl<'a> Resolver<'a> {
         } else {
             None
         };
-        child.vararg_available = vararg.is_some();
-        child.vararg_binding = vararg.as_ref().and_then(|vararg| vararg.table_binding);
         let resolved_body = child.resolve_block(&body.body)?;
+        let finished = child.meaning_finish_function(body.span)?;
         child.scopes.pop();
-        for (binding, child_upvalue) in std::mem::take(&mut child.pending_ancestor_captures) {
-            let parent_upvalue = self.capture_for_child(binding, body.span)?;
-            let index = child_upvalue.0 as usize;
-            if index >= child.upvalues.len() {
-                return Err(child.resolve_error(body.span, "upvalue 轉接索引不符"));
-            }
-            child.upvalues[index] = UpvalueSource::ParentUpvalue(parent_upvalue);
-        }
-        self.next_function = child.next_function;
+        let (bindings, upvalues) = finished.into_resolved(
+            child.recovery.as_deref_mut().expect("resolver recovery 有效"))?;
+        self.meaning = child.meaning.take();
+        self.recovery = child.recovery.take();
+        let boxed_body = self.box_value(resolved_body)?;
         let metadata = ResolvedFunction {
             id: function,
             parent: Some(self.owner),
             span: body.span,
-            bindings: child.bindings,
-            upvalues: child.upvalues,
+            bindings,
+            upvalues,
         };
+        let completed_count = child.completed_functions.len().checked_add(1)
+            .ok_or(ResolveError::AllocationFailed)?;
+        let recovery = self.recovery.as_deref_mut().expect("resolver recovery 有效");
+        reserve_geometric_with(&mut self.completed_functions, completed_count, recovery)?;
         self.completed_functions.push(metadata);
         self.completed_functions.extend(child.completed_functions);
         Ok(ResolvedFunctionBody {
             function,
             parameters,
             vararg,
-            body: Box::new(resolved_body),
+            body: boxed_body,
             span: body.span,
         })
     }
 
-    fn ensure_list(&self, len: usize, span: Span) -> Result<(), Diagnostic> {
+    fn ensure_list(&self, len: usize, span: Span) -> Result<(), ResolveError<R::Error>> {
         if len > self.limits.max_ast_nodes {
             Err(self.limit(span, "list 超過編譯限制"))
         } else {
             Ok(())
         }
-    }
-
-    fn ensure_binding_capacity(&self, count: usize, span: Span) -> Result<(), Diagnostic> {
-        if count
-            > self
-                .limits
-                .max_bindings_per_function
-                .saturating_sub(self.bindings.len())
-        {
-            Err(self.limit(span, "binding 數超過編譯限制"))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn declare_local(
-        &mut self,
-        name: Vec<u8>,
-        span: Span,
-        attribute: Option<Attribute>,
-    ) -> Result<BindingId, Diagnostic> {
-        self.declare_binding(name, span, attribute, BindingKind::Local, false)
-    }
-
-    fn declare_binding(
-        &mut self,
-        name: Vec<u8>,
-        span: Span,
-        attribute: Option<Attribute>,
-        kind: BindingKind,
-        readonly: bool,
-    ) -> Result<BindingId, Diagnostic> {
-        let (readonly, close_marker) = self.binding_flags(attribute.as_ref(), readonly, span)?;
-        let scope_depth = self.scopes.len().saturating_sub(1);
-        let id = self.allocate_binding(
-            name.clone(),
-            span,
-            attribute,
-            kind,
-            readonly,
-            close_marker,
-            scope_depth,
-        )?;
-        let scope = self.scopes.last_mut().expect("root scope 已建立");
-        scope.bindings.insert(name, id);
-        if !matches!(kind, BindingKind::Environment | BindingKind::Global) {
-            scope.local_bindings.push(id);
-        }
-        if close_marker.is_some() {
-            scope.close_bindings.push(id);
-        }
-        Ok(id)
-    }
-
-    fn declare_generic_for_close(&mut self, span: Span) -> Result<BindingId, Diagnostic> {
-        let scope_depth = self.scopes.len().saturating_sub(1);
-        let binding = self.allocate_binding(
-            b"<generic-for-close>".to_vec(),
-            span,
-            None,
-            BindingKind::GenericForClose,
-            true,
-            Some(span),
-            scope_depth,
-        )?;
-        // 隱藏 binding 僅是 close-path metadata，絕不能被 Lua 名稱查找或指派取得。
-        let scope = self.scopes.last_mut().expect("generic-for scope 已建立");
-        scope.local_bindings.push(binding);
-        scope.close_bindings.push(binding);
-        Ok(binding)
-    }
-
-    fn declare_implicit_global(
-        &mut self,
-        name: &[u8],
-        span: Span,
-        readonly: bool,
-    ) -> Result<BindingId, Diagnostic> {
-        let index = usize::from(readonly);
-        if let Some(binding) = self
-            .implicit_globals
-            .get(name)
-            .and_then(|bindings| bindings[index])
-        {
-            return Ok(binding);
-        }
-        let binding = self.allocate_binding(
-            name.to_vec(),
-            span,
-            None,
-            BindingKind::Global,
-            readonly,
-            None,
-            0,
-        )?;
-        self.implicit_globals
-            .entry(name.to_vec())
-            .or_insert([None, None])[index] = Some(binding);
-        Ok(binding)
-    }
-
-    fn allocate_binding(
-        &mut self,
-        name: Vec<u8>,
-        span: Span,
-        attribute: Option<Attribute>,
-        kind: BindingKind,
-        readonly: bool,
-        close_marker: Option<Span>,
-        scope_depth: usize,
-    ) -> Result<BindingId, Diagnostic> {
-        if self.bindings.len() >= self.limits.max_bindings_per_function {
-            return Err(self.limit(span, "binding 數超過編譯限制"));
-        }
-        let ordinal = u32::try_from(self.next_binding)
-            .map_err(|_| self.limit(span, "binding 數超過編譯限制"))?;
-        self.next_binding += 1;
-        let id = BindingId {
-            function: self.owner,
-            ordinal,
-        };
-        self.bindings.push(BindingMeta {
-            id,
-            name: name.clone(),
-            span,
-            kind,
-            owner: self.owner,
-            scope_depth,
-            readonly,
-            attribute,
-            close_marker,
-        });
-        Ok(id)
-    }
-
-    fn lookup(&mut self, name: &[u8], span: Span) -> Result<Option<ResolvedName>, Diagnostic> {
-        if let Some(binding) = self
-            .scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.bindings.get(name).copied())
-        {
-            return Ok(Some(
-                if self.binding_kind(binding) == Some(BindingKind::Global) {
-                    ResolvedName::Global(binding)
-                } else {
-                    ResolvedName::Local(binding)
-                },
-            ));
-        }
-        if let Some(binding) = self
-            .parent_visible
-            .as_ref()
-            .and_then(|visible| visible.get(name).copied())
-        {
-            return match binding {
-                ParentBinding::Direct(binding) => Ok(Some(ResolvedName::Upvalue(
-                    self.capture_parent_local(binding, span)?,
-                ))),
-                ParentBinding::Ancestor(binding) => Ok(Some(ResolvedName::Upvalue(
-                    self.capture_ancestor(binding, span)?,
-                ))),
-                ParentBinding::Global(binding) => Ok(Some(ResolvedName::Global(binding))),
-            };
-        }
-        Ok(None)
-    }
-
-    fn resolve_free_name(
-        &mut self,
-        name: &[u8],
-        span: Span,
-    ) -> Result<Option<ResolvedName>, Diagnostic> {
-        if name == b"_ENV" {
-            return Ok(None);
-        }
-        if self.profile.rules().global_declarations {
-            let mode = self.effective_global_mode();
-            if matches!(mode, Some(GlobalMode::NamedOnly)) {
-                Ok(None)
-            } else if let Some(env) = self.lexical_environment_shadow(span)? {
-                Ok(Some(ResolvedName::EnvField {
-                    env,
-                    name: name.to_vec(),
-                }))
-            } else {
-                Ok(Some(ResolvedName::Global(self.declare_implicit_global(
-                    name,
-                    span,
-                    matches!(mode, Some(GlobalMode::Wildcard { readonly: true })),
-                )?)))
-            }
-        } else {
-            match self.lookup(b"_ENV", span)? {
-                Some(ResolvedName::Local(env)) => Ok(Some(ResolvedName::EnvField {
-                    env,
-                    name: name.to_vec(),
-                })),
-                Some(ResolvedName::Upvalue(upvalue)) => Ok(Some(ResolvedName::EnvField {
-                    env: self.upvalue_binding(upvalue, span)?,
-                    name: name.to_vec(),
-                })),
-                Some(ResolvedName::EnvField { .. } | ResolvedName::Global(_)) | None => Ok(None),
-            }
-        }
-    }
-
-    fn lexical_environment_shadow(&mut self, span: Span) -> Result<Option<BindingId>, Diagnostic> {
-        let current = self
-            .scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.bindings.get(b"_ENV".as_slice()).copied());
-        let origin = if let Some(binding) = current {
-            if self.binding_kind(binding) == Some(BindingKind::Global) {
-                return Ok(None);
-            }
-            Some(binding)
-        } else {
-            match self
-                .parent_visible
-                .as_ref()
-                .and_then(|visible| visible.get(b"_ENV".as_slice()))
-            {
-                Some(ParentBinding::Direct(binding) | ParentBinding::Ancestor(binding)) => {
-                    Some(*binding)
-                }
-                Some(ParentBinding::Global(_)) | None => None,
-            }
-        };
-        if origin.is_none() || origin == self.root_environment_binding {
-            return Ok(None);
-        }
-        match self.lookup(b"_ENV", span)? {
-            Some(ResolvedName::Local(env)) => Ok(Some(env)),
-            Some(ResolvedName::Upvalue(upvalue)) => Ok(Some(self.upvalue_binding(upvalue, span)?)),
-            _ => Ok(None),
-        }
-    }
-
-    fn capture_parent_local(
-        &mut self,
-        binding: BindingId,
-        span: Span,
-    ) -> Result<UpvalueId, Diagnostic> {
-        self.reserve_upvalue(binding, UpvalueSource::ParentLocal(binding), span)
-    }
-
-    fn capture_ancestor(
-        &mut self,
-        binding: BindingId,
-        span: Span,
-    ) -> Result<UpvalueId, Diagnostic> {
-        if let Some(id) = self.upvalue_ids.get(&binding).copied() {
-            return Ok(id);
-        }
-        let id = self.reserve_upvalue(binding, UpvalueSource::ParentLocal(binding), span)?;
-        self.pending_ancestor_captures.push((binding, id));
-        Ok(id)
-    }
-
-    fn capture_for_child(
-        &mut self,
-        binding: BindingId,
-        span: Span,
-    ) -> Result<UpvalueId, Diagnostic> {
-        let source =
-            self.parent_visible
-                .as_ref()
-                .and_then(|visible| {
-                    visible
-                        .values()
-                        .find(|candidate| match candidate {
-                            ParentBinding::Direct(candidate)
-                            | ParentBinding::Ancestor(candidate) => *candidate == binding,
-                            ParentBinding::Global(_) => false,
-                        })
-                        .copied()
-                })
-                .ok_or_else(|| self.resolve_error(span, "upvalue 轉接來源不在父 function"))?;
-        match source {
-            ParentBinding::Direct(binding) => self.capture_parent_local(binding, span),
-            ParentBinding::Ancestor(binding) => self.capture_ancestor(binding, span),
-            ParentBinding::Global(_) => Err(self.resolve_error(span, "global 不可作 upvalue 轉接")),
-        }
-    }
-
-    fn reserve_upvalue(
-        &mut self,
-        binding: BindingId,
-        source: UpvalueSource,
-        span: Span,
-    ) -> Result<UpvalueId, Diagnostic> {
-        if let Some(id) = self.upvalue_ids.get(&binding).copied() {
-            return Ok(id);
-        }
-        if self.upvalues.len() >= self.limits.max_upvalues_per_function {
-            return Err(self.limit(span, "upvalue 數超過編譯限制"));
-        }
-        let id = UpvalueId(
-            u32::try_from(self.upvalues.len())
-                .map_err(|_| self.limit(span, "upvalue 數超過編譯限制"))?,
-        );
-        self.upvalues.push(source);
-        self.upvalue_bindings.push(binding);
-        self.upvalue_ids.insert(binding, id);
-        Ok(id)
-    }
-
-    fn upvalue_binding(&self, upvalue: UpvalueId, span: Span) -> Result<BindingId, Diagnostic> {
-        self.upvalue_bindings
-            .get(upvalue.0 as usize)
-            .copied()
-            .ok_or_else(|| self.resolve_error(span, "upvalue binding 索引不符"))
-    }
-
-    fn binding_flags(
-        &self,
-        attribute: Option<&Attribute>,
-        requested_readonly: bool,
-        span: Span,
-    ) -> Result<(bool, Option<Span>), Diagnostic> {
-        let Some(attribute) = attribute else {
-            return Ok((requested_readonly, None));
-        };
-        match attribute.name.as_slice() {
-            b"const" => Ok((true, None)),
-            b"close" => Ok((true, Some(attribute.span))),
-            _ => Err(self.resolve_error(span, "未知 local attribute")),
-        }
-    }
-
-    fn binding_readonly(&self, binding: BindingId) -> Option<bool> {
-        self.bindings
-            .iter()
-            .find(|meta| meta.id == binding)
-            .map(|meta| meta.readonly)
-            .or_else(|| self.parent_metadata.get(&binding).map(|meta| meta.readonly))
-    }
-
-    fn visible_binding_access(&self) -> HashMap<BindingId, BindingAccess> {
-        let mut visible = self.parent_metadata.clone();
-        for binding in &self.bindings {
-            visible.insert(
-                binding.id,
-                BindingAccess {
-                    readonly: binding.readonly,
-                },
-            );
-        }
-        visible
-    }
-
-    fn visible_bindings(&self) -> HashMap<Vec<u8>, ParentBinding> {
-        let mut visible: HashMap<Vec<u8>, ParentBinding> = self
-            .parent_visible
-            .as_ref()
-            .into_iter()
-            .flat_map(|bindings| bindings.iter())
-            .map(|(name, binding)| {
-                let binding = match binding {
-                    ParentBinding::Direct(binding) | ParentBinding::Ancestor(binding) => *binding,
-                    ParentBinding::Global(binding) => {
-                        return (name.clone(), ParentBinding::Global(*binding));
-                    }
-                };
-                (name.clone(), ParentBinding::Ancestor(binding))
-            })
-            .collect();
-        for scope in &self.scopes {
-            for (name, binding) in &scope.bindings {
-                let parent = if self.binding_kind(*binding) == Some(BindingKind::Global) {
-                    ParentBinding::Global(*binding)
-                } else {
-                    ParentBinding::Direct(*binding)
-                };
-                visible.insert(name.clone(), parent);
-            }
-        }
-        visible
-    }
-
-    fn binding_kind(&self, binding: BindingId) -> Option<BindingKind> {
-        self.bindings
-            .iter()
-            .find(|meta| meta.id == binding)
-            .map(|meta| meta.kind)
-    }
-
-    fn effective_global_mode(&self) -> Option<GlobalMode> {
-        let mut named = false;
-        for scope in self.scopes.iter().rev() {
-            match scope.global_mode {
-                Some(mode @ GlobalMode::Wildcard { .. }) => return Some(mode),
-                Some(GlobalMode::NamedOnly) => named = true,
-                None => {}
-            }
-        }
-        match self.inherited_global_mode {
-            Some(mode @ GlobalMode::Wildcard { .. }) => Some(mode),
-            Some(GlobalMode::NamedOnly) => Some(GlobalMode::NamedOnly),
-            None if named => Some(GlobalMode::NamedOnly),
-            None => None,
-        }
-    }
-
-    fn set_named_global_mode(&mut self) {
-        let scope = self.scopes.last_mut().expect("scope 已建立");
-        if scope.global_mode.is_none() {
-            scope.global_mode = Some(GlobalMode::NamedOnly);
-        }
-    }
-
-    fn set_wildcard_global_mode(&mut self, readonly: bool) {
-        self.scopes.last_mut().expect("scope 已建立").global_mode =
-            Some(GlobalMode::Wildcard { readonly });
-    }
-
-    fn global_attribute_readonly(
-        &self,
-        attribute: Option<&Attribute>,
-        span: Span,
-    ) -> Result<bool, Diagnostic> {
-        match attribute.map(|attribute| attribute.name.as_slice()) {
-            None => Ok(false),
-            Some(b"const") => Ok(true),
-            Some(b"close") => Err(self.resolve_error(span, "global 不可為 close binding")),
-            Some(_) => Err(self.resolve_error(span, "未知 global attribute")),
-        }
-    }
-
-    fn visible_named_global(&self, name: &[u8]) -> Option<BindingId> {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.bindings.get(name).copied())
-            .filter(|binding| self.binding_kind(*binding) == Some(BindingKind::Global))
-            .or_else(|| match self.parent_visible.as_ref()?.get(name)? {
-                ParentBinding::Global(binding) => Some(*binding),
-                ParentBinding::Direct(_) | ParentBinding::Ancestor(_) => None,
-            })
     }
 
     fn current_scope(&self) -> ScopeId {
@@ -1855,72 +1517,33 @@ impl<'a> Resolver<'a> {
         &mut self,
         block: &Block,
         terminal_labels_end_scope: bool,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<(), ResolveError<R::Error>> {
         let scope = self.current_scope();
         let label_count = block
             .statements
             .iter()
             .filter(|statement| matches!(statement, Stmt::Label { .. }))
             .count();
-        if self.label_count.saturating_add(label_count) > self.limits.max_labels {
-            return Err(self.limit(block.span, "label 數超過編譯限制"));
-        }
-        let declaration_count = block
-            .statements
-            .iter()
-            .map(|statement| match statement {
-                Stmt::Local { names, .. } => names.len(),
-                Stmt::LocalFunction { .. } => 1,
-                _ => 0,
-            })
-            .sum::<usize>();
-        self.ensure_binding_capacity(declaration_count, block.span)?;
-        let reserve_error = self.limit(block.span, "label 配置超過編譯限制");
-        let declaration_reserve_error = self.limit(block.span, "local snapshot 配置超過編譯限制");
         let frame = self.scopes.last_mut().expect("scope 已建立");
-        frame
-            .labels
-            .try_reserve(label_count)
-            .map_err(|_| reserve_error)?;
-        frame
-            .declaration_spans
-            .try_reserve(declaration_count)
-            .map_err(|_| declaration_reserve_error)?;
+        reserve_map_with(&mut frame.labels, label_count,
+            self.recovery.as_deref_mut().expect("resolver recovery 有效"))?;
         let last_non_void = block
             .statements
             .iter()
             .rposition(|statement| !matches!(statement, Stmt::Empty { .. } | Stmt::Label { .. }));
         for (index, statement) in block.statements.iter().enumerate() {
-            match statement {
-                Stmt::Local { names, .. } => frame
-                    .declaration_spans
-                    .extend(names.iter().map(|name| name.span)),
-                Stmt::LocalFunction { name, .. } => {
-                    frame.declaration_spans.push(name.span);
-                }
-                _ => {}
-            }
             let Stmt::Label {
                 name, name_span, ..
             } = statement
             else {
                 continue;
             };
-            if frame
-                .labels
-                .insert(
-                    name.clone(),
-                    LabelInfo {
-                        scope,
-                        terminal: terminal_labels_end_scope
-                            && last_non_void.map_or(true, |last| index > last),
-                        span: *name_span,
-                    },
-                )
-                .is_some()
-            {
-                return Err(self.resolve_error(*name_span, "同一作用域的 label 重複"));
-            }
+            frame.labels.insert(name.clone(), LabelInfo {
+                scope,
+                terminal: terminal_labels_end_scope
+                    && last_non_void.map_or(true, |last| index > last),
+                span: *name_span,
+            });
         }
         Ok(())
     }
@@ -1932,54 +1555,25 @@ impl<'a> Resolver<'a> {
             .find_map(|scope| scope.labels.get(name).copied())
     }
 
-    fn validate_block_gotos(&self, block: &Block) -> Result<(), Diagnostic> {
-        let gotos = block
-            .statements
-            .iter()
-            .filter(|statement| matches!(statement, Stmt::Goto { .. }))
-            .count();
-        if self.goto_count.saturating_add(gotos) > self.limits.max_gotos {
-            return Err(self.limit(block.span, "goto 數超過編譯限制"));
-        }
-        for statement in &block.statements {
-            let Stmt::Goto { name, span, .. } = statement else {
-                continue;
-            };
-            let label = self
-                .find_label(name)
-                .ok_or_else(|| self.resolve_error(*span, "找不到 goto label"))?;
-            let enters_local = self
-                .scopes
-                .iter()
-                .find(|scope| scope.id == label.scope)
-                .is_some_and(|scope| {
-                    scope.declaration_spans.iter().any(|declaration| {
-                        declaration.start_byte > span.start_byte
-                            && declaration.start_byte < label.span.start_byte
-                    })
-                });
-            if enters_local && !label.terminal {
-                return Err(self.resolve_error(*span, "goto 不可跳入 local scope"));
-            }
-        }
-        Ok(())
-    }
-
-    fn goto_close_path(&self, label: LabelInfo, span: Span) -> Result<ClosePath, Diagnostic> {
-        let mut path = self.close_path(ExitKind::Goto, Some(label.scope), span);
+    fn goto_close_path(&mut self, label: LabelInfo, span: Span) -> Result<ClosePath, ResolveError<R::Error>> {
+        let mut path = self.close_path(ExitKind::Goto, Some(label.scope), span)?;
         if !label.terminal && label.span.start_byte >= span.start_byte {
             return Ok(path);
         }
-        let target = self
+        let target_count = self
             .scopes
             .iter()
             .find(|scope| scope.id == label.scope)
+            .ok_or_else(|| self.resolve_error(span, "goto 目標作用域不符"))?
+            .local_bindings.len();
+        self.reserve_list(&mut path.exited_bindings, target_count)?;
+        self.reserve_list(&mut path.bindings, target_count)?;
+        let target = self.scopes.iter().find(|scope| scope.id == label.scope)
             .ok_or_else(|| self.resolve_error(span, "goto 目標作用域不符"))?;
         for binding in target.local_bindings.iter().rev() {
             let meta = self
-                .bindings
-                .get(binding.ordinal as usize)
-                .filter(|meta| meta.id == *binding)
+                .meaning.as_ref().expect("resolver meaning 有效")
+                .binding_info(*binding)
                 .ok_or_else(|| self.resolve_error(span, "goto binding 索引不符"))?;
             if !label.terminal && meta.span.start_byte <= label.span.start_byte {
                 break;
@@ -1994,9 +1588,23 @@ impl<'a> Resolver<'a> {
         Ok(path)
     }
 
-    fn close_path(&self, kind: ExitKind, target_scope: Option<ScopeId>, span: Span) -> ClosePath {
-        let mut bindings = Vec::new();
-        let mut exited_bindings = Vec::new();
+    fn close_path(&mut self, kind: ExitKind, target_scope: Option<ScopeId>, span: Span) -> Result<ClosePath, ResolveError<R::Error>> {
+        let from_scope = self.current_scope();
+        let mut close_count = 0usize;
+        let mut local_count = 0usize;
+        for scope in self.scopes.iter().rev() {
+            if Some(scope.id) == target_scope {
+                break;
+            }
+            close_count = close_count.checked_add(scope.close_bindings.len())
+                .ok_or(ResolveError::AllocationFailed)?;
+            local_count = local_count.checked_add(scope.local_bindings.len())
+                .ok_or(ResolveError::AllocationFailed)?;
+        }
+        let mut bindings = self.new_list();
+        let mut exited_bindings = self.new_list();
+        self.reserve_list(&mut bindings, close_count)?;
+        self.reserve_list(&mut exited_bindings, local_count)?;
         for scope in self.scopes.iter().rev() {
             if Some(scope.id) == target_scope {
                 break;
@@ -2004,22 +1612,22 @@ impl<'a> Resolver<'a> {
             bindings.extend(scope.close_bindings.iter().rev().copied());
             exited_bindings.extend(scope.local_bindings.iter().rev().copied());
         }
-        ClosePath {
+        Ok(ClosePath {
             kind,
             span,
-            from_scope: self.current_scope(),
+            from_scope,
             target_scope,
             bindings,
             exited_bindings,
-        }
+        })
     }
 
-    fn limit(&self, span: Span, message: &'static str) -> Diagnostic {
-        diagnostic_at_span(self.lexed, span, DiagnosticCode::CompileLimit, message)
+    fn limit(&self, span: Span, message: &'static str) -> ResolveError<R::Error> {
+        diagnostic_at_span(self.lexed, span, DiagnosticCode::CompileLimit, message).into()
     }
 
-    fn resolve_error(&self, span: Span, message: &'static str) -> Diagnostic {
-        diagnostic_at_span(self.lexed, span, DiagnosticCode::Resolve, message)
+    fn resolve_error(&self, span: Span, message: &'static str) -> ResolveError<R::Error> {
+        diagnostic_at_span(self.lexed, span, DiagnosticCode::Resolve, message).into()
     }
 }
 

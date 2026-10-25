@@ -7,11 +7,17 @@ pub mod budget;
 pub mod codegen;
 pub mod ir;
 pub mod lexer;
+#[doc(hidden)]
+pub mod official_failure;
 pub mod parser;
 pub mod resolve;
 
 pub use ast::*;
-pub use budget::{BudgetedCompileError, CompileBudgetSink, compile_with_budget};
+pub use budget::{
+    BorrowedSource, BudgetedCompileError, CompileAdvance, CompileBudgetSink, CompileJob,
+    CompileProgress, CompileSource, PullCompileError, PullCompileInput, PullRefill, StreamSource,
+    compile_with_budget, compile_with_budget_pull,
+};
 pub use codegen::official::{
     OfficialFixedBuiltin, OfficialFrameInput, OfficialFrameInputSource, OfficialInternalCall,
     OfficialPcMap, OfficialRootBinding, OfficialRootBindingSource, OfficialTranslation,
@@ -21,7 +27,7 @@ pub use codegen::{IrError, emit, emit_with_native_debug, lower};
 pub use ir::*;
 pub use lexer::{
     CompileLimits, Diagnostic, DiagnosticCode, Keyword, LanguageProfile, LexedChunk, Literal,
-    SourcePosition, Span, Symbol, Token, TokenKind, lex,
+    SourcePosition, Span, Symbol, Token, TokenKind, lex, try_global_shared_bytes,
 };
 pub use parser::parse;
 pub use resolve::*;

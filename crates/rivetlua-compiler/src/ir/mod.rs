@@ -1,6 +1,8 @@
 //! P05 owned typed IR；只保存 P04 resolved tree 降階結果，尚未封裝 bytecode 或執行。
 
 use crate::{BindingId, ExitKind, FunctionId, Literal, ScopeId, Span, UpvalueSource};
+use allocator_api2::vec::Vec as AllocVec;
+use rivetlua_alloc::{SharedBlock, StateAllocator};
 use rivetlua_core::{
     FrameLayout, Instruction, InstructionOffset, LuaProfile, ProtoId, Register, UpvalueId,
 };
@@ -9,7 +11,7 @@ use rivetlua_core::{
 pub enum IrConstant {
     Literal(Literal),
     Boolean(bool),
-    Name(Vec<u8>),
+    Name(crate::ast::AstName),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -19,14 +21,17 @@ pub struct IrInstruction {
     pub close_path: Option<IrClosePath>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct IrClosePath {
+pub type IrVec<T> = AllocVec<T, StateAllocator>;
+pub type IrClosePath = SharedBlock<IrClosePathData>;
+
+#[derive(Debug, PartialEq)]
+pub struct IrClosePathData {
     pub kind: ExitKind,
     pub span: Span,
     pub from_scope: ScopeId,
     pub target_scope: Option<ScopeId>,
-    pub bindings: Vec<BindingId>,
-    pub registers: Vec<Register>,
+    pub bindings: IrVec<BindingId>,
+    pub registers: IrVec<Register>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,10 +53,10 @@ pub struct IrNativeLocal {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IrNativeDebug {
-    pub locals: Vec<IrNativeLocal>,
-    pub temporaries: Vec<IrNativeTemporary>,
-    pub initializer_temporaries: Vec<IrNativeInitializerTemporary>,
-    pub non_counted_pcs: Vec<InstructionOffset>,
+    pub locals: IrVec<IrNativeLocal>,
+    pub temporaries: IrVec<IrNativeTemporary>,
+    pub initializer_temporaries: IrVec<IrNativeInitializerTemporary>,
+    pub non_counted_pcs: IrVec<InstructionOffset>,
     pub max_active_locals: u16,
 }
 
@@ -93,22 +98,24 @@ pub struct IrPrototype {
     pub frame: FrameLayout,
     pub global_environment: Register,
     pub global_environment_binding: BindingId,
-    pub binding_registers: Vec<(BindingId, Register)>,
-    pub constants: Vec<IrConstant>,
-    pub upvalues: Vec<IrUpvalue>,
-    pub instructions: Vec<IrInstruction>,
-    pub close_paths: Vec<IrClosePath>,
+    pub binding_registers: IrVec<(BindingId, Register)>,
+    pub constants: IrVec<IrConstant>,
+    pub upvalues: IrVec<IrUpvalue>,
+    pub instructions: IrVec<IrInstruction>,
+    pub close_paths: IrVec<IrClosePath>,
     pub native_debug: Option<IrNativeDebug>,
     pub native_list_write_upvalue: Option<UpvalueId>,
-    pub native_list_writes: Vec<IrNativeListWrite>,
+    pub native_list_writes: IrVec<IrNativeListWrite>,
+    pub native_global_nil_check_upvalue: Option<UpvalueId>,
+    pub native_global_nil_checks: IrVec<(InstructionOffset, Register)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IrModule {
     pub profile: LuaProfile,
     pub span: Span,
-    pub function_prototypes: Vec<(FunctionId, ProtoId)>,
-    pub prototypes: Vec<IrPrototype>,
+    pub function_prototypes: IrVec<(FunctionId, ProtoId)>,
+    pub prototypes: IrVec<IrPrototype>,
 }
 
 impl IrModule {
